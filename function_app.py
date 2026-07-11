@@ -19,10 +19,16 @@ def version(req: func.HttpRequest) -> func.HttpResponse:
         "Version 1.0.0",
         status_code=200
     )
-@app.route(route="process", methods=["POST"])
+@app.route(route="process", methods=["GET", "POST"])
 def process(req: func.HttpRequest) -> func.HttpResponse:
 
+    if req.method == "GET":
+        return func.HttpResponse(
+            "Process endpoint is working. Use POST to upload files.",
+            status_code=200
+        )
+
     return func.HttpResponse(
-        "Process endpoint is working",
+        "Process POST endpoint is working",
         status_code=200
     )
