@@ -1,1 +1,4 @@
 azure-functions
+pandas
+openpyxl
+xlrd
