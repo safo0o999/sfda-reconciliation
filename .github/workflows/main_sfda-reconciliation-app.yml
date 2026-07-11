@@ -75,11 +75,11 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_D57BA3F0BD1F4199A96E44DA5E102117 }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_F7881D9CCEF9483F953C7F423CFACB41 }}
 
-      - name: 'Deploy to Azure Functions'
+      -      - name: 'Deploy to Azure Functions'
         uses: Azure/functions-action@v1
         id: deploy-to-function
         with:
           app-name: 'sfda-reconciliation-app'
-          slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
+          remote-build: true
           
