@@ -58,10 +58,11 @@ class ReconciliationEngine:
 
     def export(self):
 
-        result = self.calculate()
+    result = self.calculate()
 
-        return {
-            "accept": Exporter.to_csv(result["accept"]),
-            "dispatch": Exporter.to_csv(result["dispatch"]),
-            "variance": Exporter.to_csv(result["variance"])
-        }
+    return {
+        "master": result["master"],
+        "accept": result.get("accept"),
+        "dispatch": result.get("dispatch"),
+        "variance": result.get("variance")
+    }
