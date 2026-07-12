@@ -21,8 +21,7 @@ class Normalizer:
                 series,
                 errors="coerce",
                 dayfirst=True
-            )
-            .dt.normalize()
+            ).dt.normalize()
         )
 
     @staticmethod
@@ -32,6 +31,71 @@ class Normalizer:
             pd.to_numeric(
                 series,
                 errors="coerce"
-            )
-            .fillna(0)
+            ).fillna(0)
         )
+
+    @staticmethod
+    def normalize_asn(df):
+
+        df = df.copy()
+
+        df["BN"] = Normalizer.text(df["Batch Number"])
+        df["Expiry Date"] = Normalizer.date(df["Expiration Date"])
+        df["Received Quantity"] = Normalizer.number(df["Received Qty"])
+        df["Trade Name"] = Normalizer.text(df["Trade Description"])
+
+        return df
+
+    @staticmethod
+    def normalize_inventory(df):
+
+        df = df.copy()
+
+        df["BN"] = Normalizer.text(df["Lot No/Batch"])
+        df["Expiry Date"] = Normalizer.date(df["Expiry Date"])
+        df["Available Quantity"] = Normalizer.number(df["Available Qty"])
+        df["Trade Name"] = Normalizer.text(df["Trade Item Description"])
+
+        return df
+
+    @staticmethod
+    def normalize_dispatch(df):
+
+        df = df.copy()
+
+        df["BN"] = Normalizer.text(df["Batch/Lot"])
+        df["Expiry Date"] = Normalizer.date(df["Best Before Date"])
+        df["Dispatched Quantity"] = Normalizer.number(df["Pick Qty"])
+        df["Trade Name"] = Normalizer.text(df["Trade Description"])
+
+        return df
+
+    @staticmethod
+    def normalize_sfda(df):
+
+        df = df.copy()
+
+        df["BN"] = Normalizer.text(df["BN"])
+        df["Expiry Date"] = Normalizer.date(df["Expiry Date"])
+        df["Drug Name"] = Normalizer.text(df["Drug Name"])
+
+        df["Quantity"] = Normalizer.number(df["Quantity"])
+        df["Active"] = Normalizer.number(df["Active"])
+        df["Quantity Receive Pending"] = Normalizer.number(
+            df["Quantity Receive Pending"]
+        )
+        df["Quantity sent pending"] = Normalizer.number(
+            df["Quantity sent pending"]
+        )
+
+        return df
+
+    @staticmethod
+    def normalize_packsize(df):
+
+        df = df.copy()
+
+        df["Trade Name"] = Normalizer.text(df["Trade Name"])
+        df["PackageSize"] = Normalizer.number(df["PackageSize"])
+
+        return df
