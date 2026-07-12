@@ -1,42 +1,23 @@
-from engine.reader import ExcelReader
 from engine.validator import Validator
 from engine.normalizer import Normalizer
 from engine.calculator import Calculator
-from engine.exporter import Exporter
 
 
 class ReconciliationEngine:
 
     def __init__(
         self,
-        asn_file,
-        inventory_file,
-        dispatch_file,
-        sfda_file,
-        packsize_file
+        asn_df,
+        inventory_df,
+        dispatch_df,
+        sfda_df,
+        packsize_df
     ):
-
-        self.asn_file = asn_file
-        self.inventory_file = inventory_file
-        self.dispatch_file = dispatch_file
-        self.sfda_file = sfda_file
-        self.packsize_file = packsize_file
-
-    def load(self):
-
-        self.asn = ExcelReader.read(self.asn_file)
-        self.inventory = ExcelReader.read(self.inventory_file)
-        self.dispatch = ExcelReader.read(self.dispatch_file)
-        self.sfda = ExcelReader.read(self.sfda_file)
-        self.packsize = ExcelReader.read(self.packsize_file)
-
-    def validate(self):
-
-        Validator.validate(self.asn, "ASN")
-        Validator.validate(self.inventory, "INVENTORY")
-        Validator.validate(self.dispatch, "DISPATCH")
-        Validator.validate(self.sfda, "SFDA")
-        Validator.validate(self.packsize, "PACKSIZE")
+        self.asn = asn_df.copy()
+        self.inventory = inventory_df.copy()
+        self.dispatch = dispatch_df.copy()
+        self.sfda = sfda_df.copy()
+        self.packsize = packsize_df.copy()
 
     def normalize(self):
 
@@ -46,23 +27,27 @@ class ReconciliationEngine:
         self.sfda = Normalizer.normalize_sfda(self.sfda)
         self.packsize = Normalizer.normalize_packsize(self.packsize)
 
+    def validate(self):
+
+        Validator.validate(self.asn, "ASN")
+        Validator.validate(self.inventory, "INVENTORY")
+        Validator.validate(self.dispatch, "DISPATCH")
+        Validator.validate(self.sfda, "SFDA")
+        Validator.validate(self.packsize, "PACKSIZE")
+
     def calculate(self):
 
         return Calculator.calculate(
-            self.sfda,
-            self.asn,
-            self.inventory,
-            self.dispatch,
-            self.packsize
+            sfda_df=self.sfda,
+            receiving_df=self.asn,
+            inventory_df=self.inventory,
+            dispatch_df=self.dispatch,
+            packsize_df=self.packsize
         )
 
-    def export(self):
+    def run(self):
 
-        result = self.calculate()
+        self.normalize()
+        self.validate()
 
-        return {
-            "master": result["master"],
-            "accept": result.get("accept"),
-            "dispatch": result.get("dispatch"),
-            "variance": result.get("variance")
-        }
+        return self.calculate()
