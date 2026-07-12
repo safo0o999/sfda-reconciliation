@@ -355,6 +355,7 @@ class Exporter:
         return output
 
     @staticmethod
+        @staticmethod
     def build_formatted_excel_file(
         df,
         file_name,
@@ -363,6 +364,10 @@ class Exporter:
         columns=None,
         sort_columns=None
     ):
+
+        print("Exporter Version 2.0")
+
+        report = df.copy()
 
         report = df.copy()
 
