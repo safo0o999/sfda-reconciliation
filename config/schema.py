@@ -1,7 +1,6 @@
 REQUIRED_COLUMNS = {
 
     "ASN": [
-        "GTIN",
         "BN",
         "Expiry Date",
         "Trade Name",
@@ -9,25 +8,27 @@ REQUIRED_COLUMNS = {
     ],
 
     "INVENTORY": [
-        "GTIN",
         "BN",
         "Expiry Date",
+        "Trade Name",
         "Available Quantity"
     ],
 
     "DISPATCH": [
-        "GTIN",
         "BN",
         "Expiry Date",
-        "Dispatched Quantity"
+        "Trade Name",
+        "Dispatched Quantity",
+        "To Address",
+        "Sales Order Number"
     ],
 
     "SFDA": [
         "GTIN",
+        "Drug Name",
         "BN",
         "Expiry Date",
-        "Drug Name",
-        "PZ",
+        "Quantity",
         "Active",
         "Quantity Receive Pending",
         "Quantity sent pending"
