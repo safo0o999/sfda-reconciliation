@@ -503,26 +503,74 @@
             container.appendChild(link);
         }
 
-        function addFilesToGroup(containerId, files) {
-            const container = document.getElementById(containerId);
-            const entries = Object.entries(files || {});
+        <script>
+    function downloadFilesAsZip(files, zipFileName) {
+        const entries = Object.entries(files || {});
 
-            if (!entries.length) {
-                const empty = document.createElement("div");
-                empty.className = "empty-message";
-                empty.textContent = "No files generated.";
-                container.appendChild(empty);
-                return;
-            }
-
-            entries.forEach(([fileName, content]) => {
-                addDownloadLink(
-                    containerId,
-                    fileName,
-                    content
-                );
-            });
+        if (!entries.length) {
+            return;
         }
+
+        if (typeof JSZip === "undefined") {
+            throw new Error("ZIP library is not loaded.");
+        }
+
+        const zip = new JSZip();
+
+        entries.forEach(([fileName, content]) => {
+            zip.file(fileName, content);
+        });
+
+        zip.generateAsync({
+            type: "blob"
+        }).then((blob) => {
+            const url = URL.createObjectURL(blob);
+
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = zipFileName;
+
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+
+            URL.revokeObjectURL(url);
+        });
+    }
+
+    function addFilesToGroup(
+        containerId,
+        files,
+        buttonText,
+        zipFileName
+    ) {
+        const container = document.getElementById(containerId);
+        const entries = Object.entries(files || {});
+
+        if (!entries.length) {
+            const empty = document.createElement("div");
+            empty.className = "empty-message";
+            empty.textContent = "No files generated.";
+            container.appendChild(empty);
+            return;
+        }
+
+        const button = document.createElement("button");
+
+        button.type = "button";
+        button.className = "download-button";
+        button.textContent = buttonText;
+
+        button.addEventListener("click", () => {
+            downloadFilesAsZip(
+                files,
+                zipFileName
+            );
+        });
+
+        container.appendChild(button);
+    }
+</script>
 
         form.addEventListener("submit", async (event) => {
             event.preventDefault();
