@@ -16,52 +16,16 @@ class Exporter:
     MAX_QUANTITY_PER_FILE = 100000
     GTIN_LENGTH = 14
 
-    HEADER_FILL = "17365D"
-    HEADER_FONT = "FFFFFF"
-    TITLE_FILL = "0F6CBD"
-    TITLE_FONT = "FFFFFF"
-    ALTERNATE_FILL = "EAF2F8"
-    BORDER_COLOR = "B8C4CE"
-
     @staticmethod
     def _normalize_identifier(value):
 
         if pd.isna(value):
             return ""
 
-        if isinstance(value, bool):
-            return str(value)
-
-        if isinstance(value, int):
-            return str(value)
-
-        if isinstance(value, float):
-
-            if pd.isna(value):
-                return ""
-
-            if value.is_integer():
-                return format(value, ".0f")
-
-            return format(
-                value,
-                "f"
-            ).rstrip("0").rstrip(".")
-
         text = str(value).strip()
 
-        if not text:
-            return ""
-
-        if re.fullmatch(
-            r"[+-]?\d+(\.0+)?",
-            text
-        ):
-            text = re.sub(
-                r"\.0+$",
-                "",
-                text
-            )
+        if text.endswith(".0"):
+            text = text[:-2]
 
         if re.fullmatch(
             r"[+-]?\d+(\.\d+)?[eE][+-]?\d+",
@@ -71,15 +35,7 @@ class Exporter:
                 text = format(
                     Decimal(text),
                     "f"
-                )
-
-                if "." in text:
-                    text = (
-                        text
-                        .rstrip("0")
-                        .rstrip(".")
-                    )
-
+                ).rstrip("0").rstrip(".")
             except InvalidOperation:
                 pass
 
@@ -90,15 +46,7 @@ class Exporter:
 
         gtin = Exporter._normalize_identifier(
             value
-        )
-
-        if not gtin:
-            return ""
-
-        gtin = gtin.replace(
-            " ",
-            ""
-        )
+        ).replace(" ", "")
 
         if gtin.isdigit():
             gtin = gtin.zfill(
@@ -108,12 +56,32 @@ class Exporter:
         return gtin
 
     @staticmethod
-    def _normalize_batch(value):
+    def _normalize_quantity(value):
 
-        if pd.isna(value):
-            return ""
+        quantity = pd.to_numeric(
+            value,
+            errors="coerce"
+        )
 
-        return str(value).strip()
+        if pd.isna(quantity):
+            return 0
+
+        try:
+            return max(
+                0,
+                int(
+                    Decimal(str(quantity))
+                    .to_integral_value(
+                        rounding=ROUND_FLOOR
+                    )
+                )
+            )
+        except (
+            InvalidOperation,
+            ValueError,
+            TypeError
+        ):
+            return 0
 
     @staticmethod
     def _normalize_expiry(value):
@@ -132,66 +100,17 @@ class Exporter:
         )
 
     @staticmethod
-    def _normalize_quantity(value):
+    def _safe_file_name(value):
 
-        quantity = pd.to_numeric(
-            value,
-            errors="coerce"
+        text = str(value).strip()
+
+        text = re.sub(
+            r"[^A-Za-z0-9_-]+",
+            "_",
+            text
         )
 
-        if pd.isna(quantity):
-            return 0
-
-        try:
-            quantity = Decimal(
-                str(quantity)
-            )
-
-            quantity = quantity.to_integral_value(
-                rounding=ROUND_FLOOR
-            )
-
-            return max(
-                0,
-                int(quantity)
-            )
-
-        except (
-            InvalidOperation,
-            ValueError,
-            TypeError
-        ):
-            return 0
-
-    @staticmethod
-    def _split_large_quantity(record):
-
-        quantity = Exporter._normalize_quantity(
-            record.get("QUANTITY")
-        )
-
-        split_records = []
-
-        while quantity > 0:
-
-            split_quantity = min(
-                quantity,
-                Exporter.MAX_QUANTITY_PER_FILE
-            )
-
-            split_record = record.copy()
-
-            split_record["QUANTITY"] = (
-                split_quantity
-            )
-
-            split_records.append(
-                split_record
-            )
-
-            quantity -= split_quantity
-
-        return split_records
+        return text.strip("_") or "DUMMY"
 
     @staticmethod
     def _prepare_records(
@@ -199,65 +118,49 @@ class Exporter:
         quantity_column
     ):
 
-        required_columns = [
-            "GTIN",
-            "BN",
-            "Expiry Date",
-            quantity_column
-        ]
-
-        missing_columns = [
-            column
-            for column in required_columns
-            if column not in df.columns
-        ]
-
-        if missing_columns:
-            raise ValueError(
-                "Missing export columns: "
-                f"{missing_columns}"
-            )
-
         records = []
 
         for _, row in df.iterrows():
 
-            quantity = (
-                Exporter._normalize_quantity(
-                    row.get(quantity_column)
-                )
+            quantity = Exporter._normalize_quantity(
+                row.get(quantity_column)
             )
 
             if quantity <= 0:
                 continue
 
-            base_record = {
-                "GTIN": Exporter._normalize_gtin(
-                    row.get("GTIN")
-                ),
-                "QUANTITY": quantity,
-                "BN": Exporter._normalize_batch(
-                    row.get("BN")
-                ),
-                "XD": Exporter._normalize_expiry(
-                    row.get("Expiry Date")
-                )
-            }
-
-            if not base_record["GTIN"]:
-                continue
-
-            if not base_record["BN"]:
-                continue
-
-            if not base_record["XD"]:
-                continue
-
-            records.extend(
-                Exporter._split_large_quantity(
-                    base_record
-                )
+            gtin = Exporter._normalize_gtin(
+                row.get("GTIN")
             )
+
+            batch = str(
+                row.get("BN", "")
+            ).strip()
+
+            expiry = Exporter._normalize_expiry(
+                row.get("Expiry Date")
+            )
+
+            if not gtin or not batch or not expiry:
+                continue
+
+            remaining = quantity
+
+            while remaining > 0:
+
+                split_quantity = min(
+                    remaining,
+                    Exporter.MAX_QUANTITY_PER_FILE
+                )
+
+                records.append({
+                    "GTIN": gtin,
+                    "QUANTITY": split_quantity,
+                    "BN": batch,
+                    "XD": expiry
+                })
+
+                remaining -= split_quantity
 
         return records
 
@@ -266,76 +169,53 @@ class Exporter:
 
         files = []
 
-        current_file = []
-        current_total_quantity = 0
+        current_rows = []
+        current_quantity = 0
 
         for record in records:
 
-            remaining_quantity = int(
+            remaining = int(
                 record["QUANTITY"]
             )
 
-            while remaining_quantity > 0:
+            while remaining > 0:
 
                 if (
-                    len(current_file)
+                    len(current_rows)
                     >= Exporter.MAX_ROWS_PER_FILE
-                    or current_total_quantity
+                    or current_quantity
                     >= Exporter.MAX_QUANTITY_PER_FILE
                 ):
-
                     files.append(
-                        current_file
+                        current_rows
                     )
 
-                    current_file = []
-                    current_total_quantity = 0
+                    current_rows = []
+                    current_quantity = 0
 
-                available_quantity = (
+                available = (
                     Exporter.MAX_QUANTITY_PER_FILE
-                    - current_total_quantity
+                    - current_quantity
                 )
 
-                quantity_for_current_file = min(
-                    remaining_quantity,
-                    available_quantity
+                quantity = min(
+                    remaining,
+                    available
                 )
 
-                file_record = record.copy()
+                new_record = record.copy()
+                new_record["QUANTITY"] = quantity
 
-                file_record["QUANTITY"] = (
-                    quantity_for_current_file
+                current_rows.append(
+                    new_record
                 )
 
-                current_file.append(
-                    file_record
-                )
+                current_quantity += quantity
+                remaining -= quantity
 
-                current_total_quantity += (
-                    quantity_for_current_file
-                )
-
-                remaining_quantity -= (
-                    quantity_for_current_file
-                )
-
-                if (
-                    len(current_file)
-                    >= Exporter.MAX_ROWS_PER_FILE
-                    or current_total_quantity
-                    >= Exporter.MAX_QUANTITY_PER_FILE
-                ):
-
-                    files.append(
-                        current_file
-                    )
-
-                    current_file = []
-                    current_total_quantity = 0
-
-        if current_file:
+        if current_rows:
             files.append(
-                current_file
+                current_rows
             )
 
         return files
@@ -374,14 +254,14 @@ class Exporter:
             quantity_column=quantity_column
         )
 
-        file_groups = Exporter._split_into_files(
+        groups = Exporter._split_into_files(
             records
         )
 
-        output_files = {}
+        output = {}
 
-        for index, file_records in enumerate(
-            file_groups,
+        for index, records_group in enumerate(
+            groups,
             start=1
         ):
 
@@ -389,129 +269,90 @@ class Exporter:
                 f"{file_prefix}_{index:03d}.csv"
             )
 
-            output_files[file_name] = (
+            output[file_name] = (
                 Exporter._build_sfda_content(
-                    file_records
+                    records_group
                 )
             )
 
-        return output_files
+        return output
 
     @staticmethod
-    def _clean_sheet_name(sheet_name):
-
-        cleaned = re.sub(
-            r'[:\\/*?\[\]]',
-            "_",
-            str(sheet_name)
-        )
-
-        return cleaned[:31] or "Report"
-
-    @staticmethod
-    def _prepare_excel_dataframe(
-        df,
-        columns=None,
-        sort_columns=None
+    def build_dispatch_files_by_customer(
+        dispatch_df
     ):
 
-        details = df.copy()
+        output = {}
 
-        if columns:
+        if dispatch_df.empty:
+            return output
 
-            available_columns = [
-                column
-                for column in columns
-                if column in details.columns
-            ]
-
-            details = details[
-                available_columns
-            ]
-
-        if sort_columns:
-
-            available_sort_columns = [
-                column
-                for column in sort_columns
-                if column in details.columns
-            ]
-
-            if available_sort_columns:
-
-                details = details.sort_values(
-                    by=available_sort_columns,
-                    kind="stable"
-                )
-
-        details = details.reset_index(
-            drop=True
-        )
-
-        return details
-
-    @staticmethod
-    def _excel_value(
-        value,
-        column_name
-    ):
-
-        if pd.isna(value):
-            return None
-
-        column_text = str(
-            column_name
-        ).lower()
-
-        identifier_columns = [
-            "gtin",
-            "trade item",
-            "sales order",
-            "order line",
-            "inbound shipment",
-            "asn line",
-            "batch",
-            "bn"
+        customer_columns = [
+            "Customer Status",
+            "GLN",
+            "To Address"
         ]
 
-        if any(
-            identifier in column_text
-            for identifier in identifier_columns
+        for (
+            customer_status,
+            gln,
+            to_address
+        ), customer_df in dispatch_df.groupby(
+            customer_columns,
+            dropna=False,
+            sort=True
         ):
-            return Exporter._normalize_identifier(
-                value
+
+            is_dummy = (
+                str(customer_status).upper()
+                == "DUMMY"
             )
 
-        if "date" in column_text or "expiry" in column_text:
-
-            converted = pd.to_datetime(
-                value,
-                errors="coerce"
+            customer_code = (
+                "DUMMY"
+                if is_dummy
+                else Exporter._safe_file_name(
+                    gln
+                )
             )
 
-            if pd.isna(converted):
-                return str(value)
-
-            return converted.to_pydatetime()
-
-        if isinstance(
-            value,
-            (
-                pd.Timestamp,
+            customer_name = (
+                "DUMMY_CUSTOMER"
+                if is_dummy
+                else Exporter._safe_file_name(
+                    to_address
+                )
             )
-        ):
-            return value.to_pydatetime()
 
-        if hasattr(
-            value,
-            "item"
-        ):
-            try:
-                return value.item()
-            except Exception:
-                pass
+            records = Exporter._prepare_records(
+                df=customer_df,
+                quantity_column=(
+                    "Allocated To Be Dispatch"
+                )
+            )
 
-        return value
+            groups = Exporter._split_into_files(
+                records
+            )
+
+            for index, records_group in enumerate(
+                groups,
+                start=1
+            ):
+
+                file_name = (
+                    f"Dispatch_{customer_code}_"
+                    f"{customer_name}_"
+                    f"{index:03d}.csv"
+                )
+
+                output[file_name] = (
+                    Exporter._build_sfda_content(
+                        records_group
+                    )
+                )
+
+        return output
 
     @staticmethod
     def build_formatted_excel_file(
@@ -523,25 +364,42 @@ class Exporter:
         sort_columns=None
     ):
 
-        details = Exporter._prepare_excel_dataframe(
-            df=df,
-            columns=columns,
-            sort_columns=sort_columns
+        report = df.copy()
+
+        if columns:
+            report = report[
+                [
+                    column
+                    for column in columns
+                    if column in report.columns
+                ]
+            ]
+
+        if sort_columns:
+
+            available_sort_columns = [
+                column
+                for column in sort_columns
+                if column in report.columns
+            ]
+
+            if available_sort_columns:
+                report = report.sort_values(
+                    by=available_sort_columns,
+                    kind="stable"
+                )
+
+        report = report.reset_index(
+            drop=True
         )
 
         workbook = Workbook()
-
         worksheet = workbook.active
-
-        worksheet.title = (
-            Exporter._clean_sheet_name(
-                sheet_name
-            )
-        )
+        worksheet.title = sheet_name[:31]
 
         column_count = max(
             1,
-            len(details.columns)
+            len(report.columns)
         )
 
         last_column = get_column_letter(
@@ -552,47 +410,43 @@ class Exporter:
             f"A1:{last_column}1"
         )
 
-        title_cell = worksheet["A1"]
-        title_cell.value = title
-        title_cell.fill = PatternFill(
-            fill_type="solid",
-            fgColor=Exporter.TITLE_FILL
-        )
-        title_cell.font = Font(
-            color=Exporter.TITLE_FONT,
+        worksheet["A1"] = title
+        worksheet["A1"].font = Font(
             bold=True,
+            color="FFFFFF",
             size=16
         )
-        title_cell.alignment = Alignment(
-            horizontal="center",
-            vertical="center"
+        worksheet["A1"].fill = PatternFill(
+            fill_type="solid",
+            fgColor="0F6CBD"
         )
-
-        worksheet.row_dimensions[1].height = 28
+        worksheet["A1"].alignment = Alignment(
+            horizontal="center"
+        )
 
         header_row = 3
 
-        thin_border = Border(
+        border = Border(
             left=Side(
                 style="thin",
-                color=Exporter.BORDER_COLOR
+                color="B8C4CE"
             ),
             right=Side(
                 style="thin",
-                color=Exporter.BORDER_COLOR
+                color="B8C4CE"
             ),
             top=Side(
                 style="thin",
-                color=Exporter.BORDER_COLOR
+                color="B8C4CE"
             ),
             bottom=Side(
                 style="thin",
-                color=Exporter.BORDER_COLOR
+                color="B8C4CE"
             )
         )
 
         for column_index, column_name in enumerate(
-            details.columns,
+            report.columns,
             start=1
         ):
 
@@ -602,28 +456,23 @@ class Exporter:
                 value=str(column_name)
             )
 
-            cell.fill = PatternFill(
-                fill_type="solid",
-                fgColor=Exporter.HEADER_FILL
+            cell.font = Font(
+                bold=True,
+                color="FFFFFF"
             )
 
-            cell.font = Font(
-                color=Exporter.HEADER_FONT,
-                bold=True
+            cell.fill = PatternFill(
+                fill_type="solid",
+                fgColor="17365D"
             )
 
             cell.alignment = Alignment(
-                horizontal="center",
-                vertical="center"
+                horizontal="center"
             )
 
-            cell.border = thin_border
+            cell.border = border
 
-        worksheet.row_dimensions[
-            header_row
-        ].height = 22
-
-        for row_index, row in details.iterrows():
+        for row_index, row in report.iterrows():
 
             excel_row = (
                 header_row
@@ -632,14 +481,52 @@ class Exporter:
             )
 
             for column_index, column_name in enumerate(
-                details.columns,
+                report.columns,
                 start=1
             ):
 
-                value = Exporter._excel_value(
-                    row[column_name],
-                    column_name
-                )
+                value = row[column_name]
+
+                if pd.isna(value):
+                    value = None
+
+                elif (
+                    "Date" in str(column_name)
+                    or "Expiry" in str(column_name)
+                ):
+                    converted = pd.to_datetime(
+                        value,
+                        errors="coerce"
+                    )
+
+                    if not pd.isna(converted):
+                        value = converted.to_pydatetime()
+
+                elif any(
+                    identifier in str(
+                        column_name
+                    ).lower()
+                    for identifier in [
+                        "gtin",
+                        "trade item",
+                        "sales order",
+                        "order line",
+                        "gln",
+                        "bn"
+                    ]
+                ):
+                    value = Exporter._normalize_identifier(
+                        value
+                    )
+
+                elif hasattr(
+                    value,
+                    "item"
+                ):
+                    try:
+                        value = value.item()
+                    except Exception:
+                        pass
 
                 cell = worksheet.cell(
                     row=excel_row,
@@ -647,24 +534,22 @@ class Exporter:
                     value=value
                 )
 
-                cell.border = thin_border
-
-                cell.alignment = Alignment(
-                    vertical="center"
-                )
+                cell.border = border
 
                 column_text = str(
                     column_name
                 ).lower()
 
-                if (
-                    "gtin" in column_text
-                    or "trade item" in column_text
-                    or "sales order" in column_text
-                    or "order line" in column_text
-                    or "inbound shipment" in column_text
-                    or "asn line" in column_text
-                    or column_text in ["bn", "batch"]
+                if any(
+                    identifier in column_text
+                    for identifier in [
+                        "gtin",
+                        "trade item",
+                        "sales order",
+                        "order line",
+                        "gln",
+                        "bn"
+                    ]
                 ):
                     cell.number_format = "@"
 
@@ -672,7 +557,9 @@ class Exporter:
                     "date" in column_text
                     or "expiry" in column_text
                 ):
-                    cell.number_format = "dd-mm-yyyy"
+                    cell.number_format = (
+                        "dd-mm-yyyy"
+                    )
 
                 elif isinstance(
                     value,
@@ -681,47 +568,33 @@ class Exporter:
                         float
                     )
                 ):
-                    cell.number_format = "#,##0.##"
+                    cell.number_format = (
+                        "#,##0.##"
+                    )
 
                 if row_index % 2 == 1:
 
                     cell.fill = PatternFill(
                         fill_type="solid",
-                        fgColor=Exporter.ALTERNATE_FILL
+                        fgColor="EAF2F8"
                     )
 
-        if len(details) > 0:
-
-            table_reference = (
-                f"A{header_row}:"
-                f"{last_column}"
-                f"{header_row + len(details)}"
-            )
-
-            table_name = re.sub(
-                r"\W+",
-                "",
-                sheet_name
-            )
-
-            table_name = (
-                table_name[:20]
-                or "ReportTable"
-            )
+        if len(report) > 0:
 
             table = Table(
-                displayName=(
-                    f"{table_name}Table"
-                ),
-                ref=table_reference
+                displayName="ReportTable",
+                ref=(
+                    f"A{header_row}:"
+                    f"{last_column}"
+                    f"{header_row + len(report)}"
+                )
             )
 
-            table.tableStyleInfo = TableStyleInfo(
-                name="TableStyleMedium2",
-                showFirstColumn=False,
-                showLastColumn=False,
-                showRowStripes=False,
-                showColumnStripes=False
+            table.tableStyleInfo = (
+                TableStyleInfo(
+                    name="TableStyleMedium2",
+                    showRowStripes=False
+                )
             )
 
             worksheet.add_table(
@@ -732,14 +605,10 @@ class Exporter:
             f"A{header_row + 1}"
         )
 
-        worksheet.auto_filter.ref = (
-            f"A{header_row}:"
-            f"{last_column}"
-            f"{max(header_row, header_row + len(details))}"
-        )
+        worksheet.sheet_view.showGridLines = False
 
         for column_index, column_name in enumerate(
-            details.columns,
+            report.columns,
             start=1
         ):
 
@@ -747,43 +616,26 @@ class Exporter:
                 str(column_name)
             )
 
-            for row_index in range(
-                header_row + 1,
-                header_row + len(details) + 1
-            ):
-
-                value = worksheet.cell(
-                    row=row_index,
-                    column=column_index
-                ).value
-
-                if value is None:
-                    continue
-
-                value_length = len(
-                    str(value)
-                )
+            for value in report[
+                column_name
+            ].astype(str):
 
                 max_length = max(
                     max_length,
-                    value_length
+                    len(value)
                 )
 
-            width = min(
+            worksheet.column_dimensions[
+                get_column_letter(
+                    column_index
+                )
+            ].width = min(
                 max(
                     max_length + 2,
                     12
                 ),
                 45
             )
-
-            worksheet.column_dimensions[
-                get_column_letter(
-                    column_index
-                )
-            ].width = width
-
-        worksheet.sheet_view.showGridLines = False
 
         output = io.BytesIO()
 
@@ -793,7 +645,7 @@ class Exporter:
 
         output.seek(0)
 
-        encoded_content = base64.b64encode(
+        content = base64.b64encode(
             output.read()
         ).decode(
             "ascii"
@@ -801,7 +653,7 @@ class Exporter:
 
         return {
             file_name: {
-                "content": encoded_content,
+                "content": content,
                 "encoding": "base64",
                 "mime_type": (
                     "application/vnd.openxmlformats-"
