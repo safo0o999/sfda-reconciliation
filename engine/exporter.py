@@ -1,9 +1,13 @@
+import base64
 import io
 import re
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
-from math import floor
 
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
 class Exporter:
@@ -12,24 +16,12 @@ class Exporter:
     MAX_QUANTITY_PER_FILE = 100000
     GTIN_LENGTH = 14
 
-    @staticmethod
-    def to_csv(
-        df,
-        separator=",",
-        include_header=True
-    ):
-
-        output = io.StringIO()
-
-        df.to_csv(
-            output,
-            index=False,
-            sep=separator,
-            header=include_header,
-            lineterminator="\r\n"
-        )
-
-        return output.getvalue()
+    HEADER_FILL = "17365D"
+    HEADER_FONT = "FFFFFF"
+    TITLE_FILL = "0F6CBD"
+    TITLE_FONT = "FFFFFF"
+    ALTERNATE_FILL = "EAF2F8"
+    BORDER_COLOR = "B8C4CE"
 
     @staticmethod
     def _normalize_identifier(value):
@@ -51,7 +43,10 @@ class Exporter:
             if value.is_integer():
                 return format(value, ".0f")
 
-            return format(value, "f").rstrip("0").rstrip(".")
+            return format(
+                value,
+                "f"
+            ).rstrip("0").rstrip(".")
 
         text = str(value).strip()
 
@@ -403,9 +398,19 @@ class Exporter:
         return output_files
 
     @staticmethod
-    def build_details_file(
+    def _clean_sheet_name(sheet_name):
+
+        cleaned = re.sub(
+            r'[:\\/*?\[\]]',
+            "_",
+            str(sheet_name)
+        )
+
+        return cleaned[:31] or "Report"
+
+    @staticmethod
+    def _prepare_excel_dataframe(
         df,
-        file_name,
         columns=None,
         sort_columns=None
     ):
@@ -439,34 +444,368 @@ class Exporter:
                     kind="stable"
                 )
 
-        for column in details.columns:
+        details = details.reset_index(
+            drop=True
+        )
 
-            if "Date" in str(column):
+        return details
 
-                converted_date = pd.to_datetime(
-                    details[column],
-                    errors="coerce"
+    @staticmethod
+    def _excel_value(
+        value,
+        column_name
+    ):
+
+        if pd.isna(value):
+            return None
+
+        column_text = str(
+            column_name
+        ).lower()
+
+        identifier_columns = [
+            "gtin",
+            "trade item",
+            "sales order",
+            "order line",
+            "inbound shipment",
+            "asn line",
+            "batch",
+            "bn"
+        ]
+
+        if any(
+            identifier in column_text
+            for identifier in identifier_columns
+        ):
+            return Exporter._normalize_identifier(
+                value
+            )
+
+        if "date" in column_text or "expiry" in column_text:
+
+            converted = pd.to_datetime(
+                value,
+                errors="coerce"
+            )
+
+            if pd.isna(converted):
+                return str(value)
+
+            return converted.to_pydatetime()
+
+        if isinstance(
+            value,
+            (
+                pd.Timestamp,
+            )
+        ):
+            return value.to_pydatetime()
+
+        if hasattr(
+            value,
+            "item"
+        ):
+            try:
+                return value.item()
+            except Exception:
+                pass
+
+        return value
+
+    @staticmethod
+    def build_formatted_excel_file(
+        df,
+        file_name,
+        sheet_name,
+        title,
+        columns=None,
+        sort_columns=None
+    ):
+
+        details = Exporter._prepare_excel_dataframe(
+            df=df,
+            columns=columns,
+            sort_columns=sort_columns
+        )
+
+        workbook = Workbook()
+
+        worksheet = workbook.active
+
+        worksheet.title = (
+            Exporter._clean_sheet_name(
+                sheet_name
+            )
+        )
+
+        column_count = max(
+            1,
+            len(details.columns)
+        )
+
+        last_column = get_column_letter(
+            column_count
+        )
+
+        worksheet.merge_cells(
+            f"A1:{last_column}1"
+        )
+
+        title_cell = worksheet["A1"]
+        title_cell.value = title
+        title_cell.fill = PatternFill(
+            fill_type="solid",
+            fgColor=Exporter.TITLE_FILL
+        )
+        title_cell.font = Font(
+            color=Exporter.TITLE_FONT,
+            bold=True,
+            size=16
+        )
+        title_cell.alignment = Alignment(
+            horizontal="center",
+            vertical="center"
+        )
+
+        worksheet.row_dimensions[1].height = 28
+
+        header_row = 3
+
+        thin_border = Border(
+            left=Side(
+                style="thin",
+                color=Exporter.BORDER_COLOR
+            ),
+            right=Side(
+                style="thin",
+                color=Exporter.BORDER_COLOR
+            ),
+            top=Side(
+                style="thin",
+                color=Exporter.BORDER_COLOR
+            ),
+            bottom=Side(
+                style="thin",
+                color=Exporter.BORDER_COLOR
+            )
+        )
+
+        for column_index, column_name in enumerate(
+            details.columns,
+            start=1
+        ):
+
+            cell = worksheet.cell(
+                row=header_row,
+                column=column_index,
+                value=str(column_name)
+            )
+
+            cell.fill = PatternFill(
+                fill_type="solid",
+                fgColor=Exporter.HEADER_FILL
+            )
+
+            cell.font = Font(
+                color=Exporter.HEADER_FONT,
+                bold=True
+            )
+
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center"
+            )
+
+            cell.border = thin_border
+
+        worksheet.row_dimensions[
+            header_row
+        ].height = 22
+
+        for row_index, row in details.iterrows():
+
+            excel_row = (
+                header_row
+                + row_index
+                + 1
+            )
+
+            for column_index, column_name in enumerate(
+                details.columns,
+                start=1
+            ):
+
+                value = Exporter._excel_value(
+                    row[column_name],
+                    column_name
                 )
 
-                valid_dates = (
-                    converted_date.notna()
+                cell = worksheet.cell(
+                    row=excel_row,
+                    column=column_index,
+                    value=value
                 )
 
-                details.loc[
-                    valid_dates,
-                    column
-                ] = converted_date.loc[
-                    valid_dates
-                ].dt.strftime(
-                    "%d-%m-%Y"
+                cell.border = thin_border
+
+                cell.alignment = Alignment(
+                    vertical="center"
                 )
 
-        content = Exporter.to_csv(
-            df=details,
-            separator=",",
-            include_header=True
+                column_text = str(
+                    column_name
+                ).lower()
+
+                if (
+                    "gtin" in column_text
+                    or "trade item" in column_text
+                    or "sales order" in column_text
+                    or "order line" in column_text
+                    or "inbound shipment" in column_text
+                    or "asn line" in column_text
+                    or column_text in ["bn", "batch"]
+                ):
+                    cell.number_format = "@"
+
+                elif (
+                    "date" in column_text
+                    or "expiry" in column_text
+                ):
+                    cell.number_format = "dd-mm-yyyy"
+
+                elif isinstance(
+                    value,
+                    (
+                        int,
+                        float
+                    )
+                ):
+                    cell.number_format = "#,##0.##"
+
+                if row_index % 2 == 1:
+
+                    cell.fill = PatternFill(
+                        fill_type="solid",
+                        fgColor=Exporter.ALTERNATE_FILL
+                    )
+
+        if len(details) > 0:
+
+            table_reference = (
+                f"A{header_row}:"
+                f"{last_column}"
+                f"{header_row + len(details)}"
+            )
+
+            table_name = re.sub(
+                r"\W+",
+                "",
+                sheet_name
+            )
+
+            table_name = (
+                table_name[:20]
+                or "ReportTable"
+            )
+
+            table = Table(
+                displayName=(
+                    f"{table_name}Table"
+                ),
+                ref=table_reference
+            )
+
+            table.tableStyleInfo = TableStyleInfo(
+                name="TableStyleMedium2",
+                showFirstColumn=False,
+                showLastColumn=False,
+                showRowStripes=False,
+                showColumnStripes=False
+            )
+
+            worksheet.add_table(
+                table
+            )
+
+        worksheet.freeze_panes = (
+            f"A{header_row + 1}"
+        )
+
+        worksheet.auto_filter.ref = (
+            f"A{header_row}:"
+            f"{last_column}"
+            f"{max(header_row, header_row + len(details))}"
+        )
+
+        for column_index, column_name in enumerate(
+            details.columns,
+            start=1
+        ):
+
+            max_length = len(
+                str(column_name)
+            )
+
+            for row_index in range(
+                header_row + 1,
+                header_row + len(details) + 1
+            ):
+
+                value = worksheet.cell(
+                    row=row_index,
+                    column=column_index
+                ).value
+
+                if value is None:
+                    continue
+
+                value_length = len(
+                    str(value)
+                )
+
+                max_length = max(
+                    max_length,
+                    value_length
+                )
+
+            width = min(
+                max(
+                    max_length + 2,
+                    12
+                ),
+                45
+            )
+
+            worksheet.column_dimensions[
+                get_column_letter(
+                    column_index
+                )
+            ].width = width
+
+        worksheet.sheet_view.showGridLines = False
+
+        output = io.BytesIO()
+
+        workbook.save(
+            output
+        )
+
+        output.seek(0)
+
+        encoded_content = base64.b64encode(
+            output.read()
+        ).decode(
+            "ascii"
         )
 
         return {
-            file_name: content
+            file_name: {
+                "content": encoded_content,
+                "encoding": "base64",
+                "mime_type": (
+                    "application/vnd.openxmlformats-"
+                    "officedocument.spreadsheetml.sheet"
+                )
+            }
         }
