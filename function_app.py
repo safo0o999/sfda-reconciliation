@@ -23,7 +23,6 @@ REQUIRED_FILES = [
     "inventory",
     "dispatch",
     "sfda",
-    "packsize",
 ]
 
 
@@ -477,21 +476,12 @@ def process(
             in uploaded_files.items()
         }
 
-        reconciliation_engine = (
-            ReconciliationEngine(
-                asn_df=dataframes["asn"],
-                inventory_df=(
-                    dataframes["inventory"]
-                ),
-                dispatch_df=(
-                    dataframes["dispatch"]
-                ),
-                sfda_df=dataframes["sfda"],
-                packsize_df=(
-                    dataframes["packsize"]
-                )
-            )
-        )
+        reconciliation_engine = ReconciliationEngine(
+    asn_df=dataframes["asn"],
+    inventory_df=dataframes["inventory"],
+    dispatch_df=dataframes["dispatch"],
+    sfda_df=dataframes["sfda"]
+)
 
         result = (
             reconciliation_engine.run()
@@ -511,14 +501,10 @@ def process(
         )
 
         dispatch_files = (
-            Exporter.build_sfda_upload_files(
-                df=dispatch_output,
-                quantity_column=(
-                    "To Be Dispatch"
-                ),
-                file_prefix="Dispatch"
-            )
-        )
+    Exporter.build_dispatch_files_by_customer(
+        dispatch_df=dispatch_output
+    )
+)
 
         accept_details = (
             build_accept_details(
