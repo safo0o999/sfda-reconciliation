@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import traceback
+from pathlib import Path
 
 import azure.functions as func
 
@@ -12,6 +13,9 @@ app = func.FunctionApp(
     http_auth_level=func.AuthLevel.ANONYMOUS
 )
 
+
+APPLICATION_NAME = "SFDA Reconciliation"
+APPLICATION_VERSION = "1.3.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -34,7 +38,8 @@ def json_response(
             default=str
         ),
         status_code=status_code,
-        mimetype="application/json"
+        mimetype="application/json",
+        charset="utf-8"
     )
 
 
@@ -43,6 +48,12 @@ def read_excel_file(uploaded_file):
     import pandas as pd
 
     file_name = uploaded_file.filename or "uploaded.xlsx"
+
+    if "." not in file_name:
+        raise ValueError(
+            f"File extension is missing: {file_name}"
+        )
+
     extension = file_name.lower().rsplit(".", 1)[-1]
 
     if extension not in ["xls", "xlsx"]:
@@ -57,7 +68,7 @@ def read_excel_file(uploaded_file):
             f"Uploaded file is empty: {file_name}"
         )
 
-    engine = (
+    excel_engine = (
         "xlrd"
         if extension == "xls"
         else "openpyxl"
@@ -65,9 +76,73 @@ def read_excel_file(uploaded_file):
 
     return pd.read_excel(
         io.BytesIO(file_bytes),
-        engine=engine,
+        engine=excel_engine,
         dtype=object
     )
+
+
+@app.route(
+    route="",
+    methods=["GET"]
+)
+def home(
+    req: func.HttpRequest
+) -> func.HttpResponse:
+
+    return func.HttpResponse(
+        status_code=302,
+        headers={
+            "Location": "/api/ui"
+        }
+    )
+
+
+@app.route(
+    route="ui",
+    methods=["GET"]
+)
+def ui(
+    req: func.HttpRequest
+) -> func.HttpResponse:
+
+    try:
+        html_path = (
+            Path(__file__).resolve().parent
+            / "web"
+            / "index.html"
+        )
+
+        if not html_path.exists():
+            return func.HttpResponse(
+                body="UI file was not found.",
+                status_code=404,
+                mimetype="text/plain",
+                charset="utf-8"
+            )
+
+        html_content = html_path.read_text(
+            encoding="utf-8"
+        )
+
+        return func.HttpResponse(
+            body=html_content,
+            status_code=200,
+            mimetype="text/html",
+            charset="utf-8"
+        )
+
+    except Exception as ex:
+
+        logging.exception(
+            "Error while loading the user interface."
+        )
+
+        return func.HttpResponse(
+            body=f"Unable to load UI: {str(ex)}",
+            status_code=500,
+            mimetype="text/plain",
+            charset="utf-8"
+        )
 
 
 @app.route(
@@ -80,9 +155,9 @@ def health(
 
     return json_response({
         "status": "Healthy",
-        "application": "SFDA Reconciliation",
+        "application": APPLICATION_NAME,
         "azure_function": "Working",
-        "version": "1.2.0"
+        "version": APPLICATION_VERSION
     })
 
 
@@ -95,8 +170,8 @@ def version(
 ) -> func.HttpResponse:
 
     return json_response({
-        "application": "SFDA Reconciliation",
-        "version": "1.2.0"
+        "application": APPLICATION_NAME,
+        "version": APPLICATION_VERSION
     })
 
 
@@ -179,8 +254,8 @@ def process(
 
         return json_response({
             "status": "Reconciliation Engine Completed",
-            "application": "SFDA Reconciliation",
-            "version": "1.2.0",
+            "application": APPLICATION_NAME,
+            "version": APPLICATION_VERSION,
             "summary": {
                 "files_count": len(files_summary),
                 "total_input_rows": total_rows,
