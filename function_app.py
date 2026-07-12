@@ -229,6 +229,9 @@ def process(
         result = reconciliation_engine.run()
 
         master = result["master"]
+accept = result["accept"]
+dispatch = result["dispatch"]
+variance = result["variance"]
 
         files_summary = {}
 
