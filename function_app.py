@@ -15,7 +15,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "1.3.0"
+APPLICATION_VERSION = "1.4.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -229,9 +229,9 @@ def process(
         result = reconciliation_engine.run()
 
         master = result["master"]
-accept = result["accept"]
-dispatch = result["dispatch"]
-variance = result["variance"]
+        accept = result["accept"]
+        dispatch_output = result["dispatch"]
+        variance = result["variance"]
 
         files_summary = {}
 
@@ -263,18 +263,21 @@ variance = result["variance"]
                 "files_count": len(files_summary),
                 "total_input_rows": total_rows,
                 "master_rows": int(len(master)),
-                "master_columns": int(len(master.columns))
+                "master_columns": int(len(master.columns)),
+                "accept_rows": int(len(accept)),
+                "dispatch_rows": int(len(dispatch_output)),
+                "variance_rows": int(len(variance))
             },
             "files": files_summary,
             "master_headers": [
-    str(column)
-    for column in master.columns
-],
-"outputs": {
-    "accept": accept.to_csv(index=False),
-    "dispatch": dispatch.to_csv(index=False),
-    "variance": variance.to_csv(index=False)
-}
+                str(column)
+                for column in master.columns
+            ],
+            "outputs": {
+                "accept": accept.to_csv(index=False),
+                "dispatch": dispatch_output.to_csv(index=False),
+                "variance": variance.to_csv(index=False)
+            }
         })
 
     except Exception as ex:
