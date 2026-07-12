@@ -9,6 +9,8 @@
 
     <title>SFDA Reconciliation</title>
 
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
     <style>
         * {
             box-sizing: border-box;
@@ -110,7 +112,7 @@
         }
 
         #runButton {
-            background: #0f6CBD;
+            background: #0f6cbd;
             color: #ffffff;
         }
 
@@ -232,6 +234,7 @@
 
         .download-button {
             display: inline-block;
+            border: 0;
             padding: 11px 16px;
             border-radius: 9px;
             background: #15803d;
@@ -239,6 +242,7 @@
             text-decoration: none;
             font-weight: 700;
             font-size: 14px;
+            cursor: pointer;
         }
 
         .empty-message {
@@ -385,20 +389,22 @@
                     <h2>Download Results</h2>
 
                     <div class="download-groups">
+
                         <div class="download-group">
-                            <h3>Accept Files</h3>
-                            <div id="acceptFilesList" class="download-list"></div>
+                            <h3>SFDA Upload Files</h3>
+                            <div id="sfdaFilesList" class="download-list"></div>
                         </div>
 
                         <div class="download-group">
-                            <h3>Dispatch Files</h3>
-                            <div id="dispatchFilesList" class="download-list"></div>
+                            <h3>Details Files</h3>
+                            <div id="detailsFilesList" class="download-list"></div>
                         </div>
 
                         <div class="download-group">
                             <h3>Reports</h3>
                             <div id="reportsFilesList" class="download-list"></div>
                         </div>
+
                     </div>
                 </div>
 
@@ -473,104 +479,145 @@
         }
 
         function clearDownloadResults() {
-            document.getElementById("acceptFilesList").innerHTML = "";
-            document.getElementById("dispatchFilesList").innerHTML = "";
+            document.getElementById("sfdaFilesList").innerHTML = "";
+            document.getElementById("detailsFilesList").innerHTML = "";
             document.getElementById("reportsFilesList").innerHTML = "";
         }
 
-        function addDownloadLink(containerId, fileName, content) {
-            const container = document.getElementById(containerId);
-
-            if (!content) {
-                return;
-            }
-
-            const blob = new Blob(
-                [content],
-                {
-                    type: "text/csv;charset=utf-8"
-                }
-            );
-
+        function triggerBlobDownload(blob, fileName) {
             const url = URL.createObjectURL(blob);
-
             const link = document.createElement("a");
-            link.className = "download-button";
+
             link.href = url;
             link.download = fileName;
-            link.textContent = "Download " + fileName;
-
-            container.appendChild(link);
-        }
-
-        <script>
-    function downloadFilesAsZip(files, zipFileName) {
-        const entries = Object.entries(files || {});
-
-        if (!entries.length) {
-            return;
-        }
-
-        if (typeof JSZip === "undefined") {
-            throw new Error("ZIP library is not loaded.");
-        }
-
-        const zip = new JSZip();
-
-        entries.forEach(([fileName, content]) => {
-            zip.file(fileName, content);
-        });
-
-        zip.generateAsync({
-            type: "blob"
-        }).then((blob) => {
-            const url = URL.createObjectURL(blob);
-
-            const link = document.createElement("a");
-            link.href = url;
-            link.download = zipFileName;
 
             document.body.appendChild(link);
             link.click();
             link.remove();
 
-            URL.revokeObjectURL(url);
-        });
-    }
+            setTimeout(() => {
+                URL.revokeObjectURL(url);
+            }, 1000);
+        }
 
-    function addFilesToGroup(
-        containerId,
-        files,
-        buttonText,
-        zipFileName
-    ) {
-        const container = document.getElementById(containerId);
-        const entries = Object.entries(files || {});
+        async function downloadFilesAsZip(files, zipFileName) {
+            const entries = Object.entries(files || {});
 
-        if (!entries.length) {
+            if (!entries.length) {
+                return;
+            }
+
+            if (typeof JSZip === "undefined") {
+                throw new Error("ZIP library is not loaded.");
+            }
+
+            const zip = new JSZip();
+
+            entries.forEach(([fileName, content]) => {
+                zip.file(fileName, content);
+            });
+
+            const blob = await zip.generateAsync({
+                type: "blob"
+            });
+
+            triggerBlobDownload(blob, zipFileName);
+        }
+
+        function addZipButton(
+            containerId,
+            files,
+            buttonText,
+            zipFileName
+        ) {
+            const container = document.getElementById(containerId);
+            const entries = Object.entries(files || {});
+
+            if (!entries.length) {
+                return;
+            }
+
+            const button = document.createElement("button");
+
+            button.type = "button";
+            button.className = "download-button";
+            button.textContent = buttonText;
+
+            button.addEventListener("click", async () => {
+                button.disabled = true;
+
+                try {
+                    await downloadFilesAsZip(
+                        files,
+                        zipFileName
+                    );
+                } finally {
+                    button.disabled = false;
+                }
+            });
+
+            container.appendChild(button);
+        }
+
+        function addSingleFileButton(
+            containerId,
+            fileName,
+            content,
+            buttonText
+        ) {
+            if (!content) {
+                return;
+            }
+
+            const container = document.getElementById(containerId);
+            const button = document.createElement("button");
+
+            button.type = "button";
+            button.className = "download-button";
+            button.textContent = buttonText || ("Download " + fileName);
+
+            button.addEventListener("click", () => {
+                const blob = new Blob(
+                    [content],
+                    {
+                        type: "text/csv;charset=utf-8"
+                    }
+                );
+
+                triggerBlobDownload(blob, fileName);
+            });
+
+            container.appendChild(button);
+        }
+
+        function addFileObjectButtons(
+            containerId,
+            files
+        ) {
+            const entries = Object.entries(files || {});
+
+            entries.forEach(([fileName, content]) => {
+                addSingleFileButton(
+                    containerId,
+                    fileName,
+                    content
+                );
+            });
+        }
+
+        function showEmptyMessageIfNeeded(containerId) {
+            const container = document.getElementById(containerId);
+
+            if (container.children.length) {
+                return;
+            }
+
             const empty = document.createElement("div");
             empty.className = "empty-message";
             empty.textContent = "No files generated.";
+
             container.appendChild(empty);
-            return;
         }
-
-        const button = document.createElement("button");
-
-        button.type = "button";
-        button.className = "download-button";
-        button.textContent = buttonText;
-
-        button.addEventListener("click", () => {
-            downloadFilesAsZip(
-                files,
-                zipFileName
-            );
-        });
-
-        container.appendChild(button);
-    }
-</script>
 
         form.addEventListener("submit", async (event) => {
             event.preventDefault();
@@ -579,12 +626,12 @@
             clearDownloadResults();
             summaryBox.classList.remove("show");
             downloadsBox.classList.remove("show");
-            clearDownloadResults();
 
             try {
                 validateFiles();
 
                 runButton.disabled = true;
+
                 setStatus(
                     "processing",
                     "Processing files. Please wait..."
@@ -631,24 +678,52 @@
 
                 summaryBox.classList.add("show");
 
-                if (result.outputs) {
-                    addFilesToGroup(
-                        "acceptFilesList",
-                        result.outputs.accept_files
-                    );
+                const outputs = result.outputs || {};
 
-                    addFilesToGroup(
-                        "dispatchFilesList",
-                        result.outputs.dispatch_files
-                    );
+                addZipButton(
+                    "sfdaFilesList",
+                    outputs.accept_files,
+                    "Download All Accept",
+                    "SFDA_Accept_Files.zip"
+                );
 
-                    addFilesToGroup(
-                        "reportsFilesList",
-                        result.outputs.variance
-                    );
+                addZipButton(
+                    "sfdaFilesList",
+                    outputs.dispatch_files,
+                    "Download All Dispatch",
+                    "SFDA_Dispatch_Files.zip"
+                );
 
-                    downloadsBox.classList.add("show");
-                }
+                addFileObjectButtons(
+                    "detailsFilesList",
+                    outputs.accept_details
+                );
+
+                addFileObjectButtons(
+                    "detailsFilesList",
+                    outputs.dispatch_details
+                );
+
+                addFileObjectButtons(
+                    "detailsFilesList",
+                    outputs.details
+                );
+
+                addFileObjectButtons(
+                    "reportsFilesList",
+                    outputs.variance
+                );
+
+                addFileObjectButtons(
+                    "reportsFilesList",
+                    outputs.reports
+                );
+
+                showEmptyMessageIfNeeded("sfdaFilesList");
+                showEmptyMessageIfNeeded("detailsFilesList");
+                showEmptyMessageIfNeeded("reportsFilesList");
+
+                downloadsBox.classList.add("show");
 
                 setStatus(
                     "success",
