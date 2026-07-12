@@ -207,20 +207,42 @@
             font-size: 20px;
         }
 
-        .download-buttons {
+        .download-groups {
+            display: grid;
+            gap: 18px;
+        }
+
+        .download-group {
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 18px;
+            background: #f8fafc;
+        }
+
+        .download-group h3 {
+            margin: 0 0 12px;
+            font-size: 16px;
+        }
+
+        .download-list {
             display: flex;
             flex-wrap: wrap;
-            gap: 12px;
+            gap: 10px;
         }
 
         .download-button {
             display: inline-block;
-            padding: 12px 18px;
+            padding: 11px 16px;
             border-radius: 9px;
             background: #15803d;
             color: #ffffff;
             text-decoration: none;
             font-weight: 700;
+            font-size: 14px;
+        }
+
+        .empty-message {
+            color: #64748b;
             font-size: 14px;
         }
 
@@ -362,33 +384,21 @@
                 <div id="downloadsBox" class="downloads">
                     <h2>Download Results</h2>
 
-                    <div class="download-buttons">
-                        <a
-                            id="acceptDownload"
-                            class="download-button"
-                            href="#"
-                            download="Accept.csv"
-                        >
-                            Download Accept
-                        </a>
+                    <div class="download-groups">
+                        <div class="download-group">
+                            <h3>Accept Files</h3>
+                            <div id="acceptFilesList" class="download-list"></div>
+                        </div>
 
-                        <a
-                            id="dispatchDownload"
-                            class="download-button"
-                            href="#"
-                            download="Dispatch.csv"
-                        >
-                            Download Dispatch
-                        </a>
+                        <div class="download-group">
+                            <h3>Dispatch Files</h3>
+                            <div id="dispatchFilesList" class="download-list"></div>
+                        </div>
 
-                        <a
-                            id="varianceDownload"
-                            class="download-button"
-                            href="#"
-                            download="Variance.csv"
-                        >
-                            Download Variance
-                        </a>
+                        <div class="download-group">
+                            <h3>Reports</h3>
+                            <div id="reportsFilesList" class="download-list"></div>
+                        </div>
                     </div>
                 </div>
 
@@ -462,11 +472,16 @@
             }
         }
 
-        function createDownloadLink(elementId, content, fileName) {
-            const element = document.getElementById(elementId);
+        function clearDownloadResults() {
+            document.getElementById("acceptFilesList").innerHTML = "";
+            document.getElementById("dispatchFilesList").innerHTML = "";
+            document.getElementById("reportsFilesList").innerHTML = "";
+        }
+
+        function addDownloadLink(containerId, fileName, content) {
+            const container = document.getElementById(containerId);
 
             if (!content) {
-                element.style.display = "none";
                 return;
             }
 
@@ -479,17 +494,44 @@
 
             const url = URL.createObjectURL(blob);
 
-            element.href = url;
-            element.download = fileName;
-            element.style.display = "inline-block";
+            const link = document.createElement("a");
+            link.className = "download-button";
+            link.href = url;
+            link.download = fileName;
+            link.textContent = "Download " + fileName;
+
+            container.appendChild(link);
+        }
+
+        function addFilesToGroup(containerId, files) {
+            const container = document.getElementById(containerId);
+            const entries = Object.entries(files || {});
+
+            if (!entries.length) {
+                const empty = document.createElement("div");
+                empty.className = "empty-message";
+                empty.textContent = "No files generated.";
+                container.appendChild(empty);
+                return;
+            }
+
+            entries.forEach(([fileName, content]) => {
+                addDownloadLink(
+                    containerId,
+                    fileName,
+                    content
+                );
+            });
         }
 
         form.addEventListener("submit", async (event) => {
             event.preventDefault();
 
             clearStatus();
+            clearDownloadResults();
             summaryBox.classList.remove("show");
             downloadsBox.classList.remove("show");
+            clearDownloadResults();
 
             try {
                 validateFiles();
@@ -542,22 +584,19 @@
                 summaryBox.classList.add("show");
 
                 if (result.outputs) {
-                    createDownloadLink(
-                        "acceptDownload",
-                        result.outputs.accept,
-                        "Accept.csv"
+                    addFilesToGroup(
+                        "acceptFilesList",
+                        result.outputs.accept_files
                     );
 
-                    createDownloadLink(
-                        "dispatchDownload",
-                        result.outputs.dispatch,
-                        "Dispatch.csv"
+                    addFilesToGroup(
+                        "dispatchFilesList",
+                        result.outputs.dispatch_files
                     );
 
-                    createDownloadLink(
-                        "varianceDownload",
-                        result.outputs.variance,
-                        "Variance.csv"
+                    addFilesToGroup(
+                        "reportsFilesList",
+                        result.outputs.variance
                     );
 
                     downloadsBox.classList.add("show");
@@ -586,6 +625,7 @@
             });
 
             clearStatus();
+            clearDownloadResults();
             summaryBox.classList.remove("show");
             downloadsBox.classList.remove("show");
         });
