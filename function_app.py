@@ -16,7 +16,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "1.7.0"
+APPLICATION_VERSION = "2.0.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -164,7 +164,7 @@ def build_accept_details(
         accept_details[
             "PackageSize"
         ]
-        .fillna(0)
+        .fillna(1)
     )
 
     accept_details[
@@ -201,80 +201,50 @@ def build_accept_details(
 
 
 def build_dispatch_details(
-    reconciliation_engine,
-    master
+    dispatch_output
 ):
 
-    keys = [
-        "BN",
-        "Expiry Date"
-    ]
+    dispatch_details = (
+        dispatch_output.copy()
+    )
 
-    dispatch_lookup = (
-        master[
-            master["To Be Dispatch"] > 0
-        ][
-            [
-                "BN",
-                "Expiry Date",
+    if dispatch_details.empty:
+
+        dispatch_details = dispatch_details.reindex(
+            columns=[
+                "Customer Status",
+                "GLN",
+                "To Address",
+                "Original To Address",
+                "Trade Item Number",
                 "GTIN",
                 "Drug Name",
+                "BN",
+                "Expiry Date",
+                "Trade Name",
+                "Dispatched Quantity",
                 "PackageSize",
-                "To Be Dispatch"
+                "Actual Dispatch Packages",
+                "Calculated To Be Dispatch",
+                "Allocated To Be Dispatch",
+                "Remaining To Be Dispatch"
             ]
-        ]
-        .drop_duplicates(
-            subset=keys,
-            keep="first"
         )
-        .copy()
-    )
 
-    dispatch_details = (
-        reconciliation_engine.dispatch
-        .merge(
-            dispatch_lookup,
-            on=keys,
-            how="inner"
-        )
-    )
-
-    dispatch_details = (
+    if (
+        "Remaining To Be Dispatch"
+        not in dispatch_details.columns
+    ):
         dispatch_details[
+            "Remaining To Be Dispatch"
+        ] = (
             dispatch_details[
-                "Dispatched Quantity"
-            ] > 0
-        ]
-        .copy()
-    )
-
-    dispatch_details[
-        "Dispatched Quantity"
-    ] = (
-        dispatch_details[
-            "Dispatched Quantity"
-        ]
-        .fillna(0)
-    )
-
-    dispatch_details[
-        "PackageSize"
-    ] = (
-        dispatch_details[
-            "PackageSize"
-        ]
-        .fillna(0)
-    )
-
-    dispatch_details[
-        "To Be Dispatch"
-    ] = (
-        dispatch_details[
-            "To Be Dispatch"
-        ]
-        .fillna(0)
-        .astype(int)
-    )
+                "Calculated To Be Dispatch"
+            ]
+            - dispatch_details[
+                "Allocated To Be Dispatch"
+            ]
+        ).clip(lower=0)
 
     return Exporter.build_formatted_excel_file(
         df=dispatch_details,
@@ -282,9 +252,10 @@ def build_dispatch_details(
         sheet_name="Dispatch Details",
         title="SFDA Dispatch Details",
         columns=[
+            "Customer Status",
+            "GLN",
             "To Address",
-            "Sales Order Number",
-            "Order Line",
+            "Original To Address",
             "Trade Item Number",
             "GTIN",
             "Drug Name",
@@ -293,11 +264,14 @@ def build_dispatch_details(
             "Trade Name",
             "Dispatched Quantity",
             "PackageSize",
-            "To Be Dispatch"
+            "Actual Dispatch Packages",
+            "Calculated To Be Dispatch",
+            "Allocated To Be Dispatch",
+            "Remaining To Be Dispatch"
         ],
         sort_columns=[
+            "Customer Status",
             "To Address",
-            "Sales Order Number",
             "GTIN",
             "BN",
             "Expiry Date"
@@ -309,12 +283,44 @@ def build_variance_report(
     variance
 ):
 
+    variance_report = (
+        variance.copy()
+    )
+
+    preferred_columns = [
+        "Variance Type",
+        "Customer Status",
+        "GLN",
+        "To Address",
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "PackageSize",
+        "Quantity",
+        "Active",
+        "Inventory",
+        "Receiving",
+        "Dispatch",
+        "To Be Accept",
+        "Calculated To Be Dispatch",
+        "Allocated To Be Dispatch",
+        "Remaining To Be Dispatch",
+        "New Active",
+        "Active Variance",
+        "Receive Variance",
+        "Dispatch Variance"
+    ]
+
     return Exporter.build_formatted_excel_file(
-        df=variance,
+        df=variance_report,
         file_name="Variance_Report.xlsx",
         sheet_name="Variance Report",
         title="SFDA Variance Report",
+        columns=preferred_columns,
         sort_columns=[
+            "Variance Type",
+            "To Address",
             "GTIN",
             "BN",
             "Expiry Date"
@@ -364,8 +370,7 @@ def ui(
             )
 
         html_content = (
-            html_path
-            .read_text(
+            html_path.read_text(
                 encoding="utf-8"
             )
         )
@@ -437,7 +442,7 @@ def process(
         return json_response({
             "status": "Ready",
             "message": (
-                "Use POST with the five "
+                "Use POST with the four "
                 "required files."
             ),
             "required_files": REQUIRED_FILES
@@ -476,12 +481,18 @@ def process(
             in uploaded_files.items()
         }
 
-        reconciliation_engine = ReconciliationEngine(
-    asn_df=dataframes["asn"],
-    inventory_df=dataframes["inventory"],
-    dispatch_df=dataframes["dispatch"],
-    sfda_df=dataframes["sfda"]
-)
+        reconciliation_engine = (
+            ReconciliationEngine(
+                asn_df=dataframes["asn"],
+                inventory_df=(
+                    dataframes["inventory"]
+                ),
+                dispatch_df=(
+                    dataframes["dispatch"]
+                ),
+                sfda_df=dataframes["sfda"]
+            )
+        )
 
         result = (
             reconciliation_engine.run()
@@ -501,10 +512,10 @@ def process(
         )
 
         dispatch_files = (
-    Exporter.build_dispatch_files_by_customer(
-        dispatch_df=dispatch_output
-    )
-)
+            Exporter.build_dispatch_files_by_customer(
+                dispatch_df=dispatch_output
+            )
+        )
 
         accept_details = (
             build_accept_details(
@@ -517,10 +528,7 @@ def process(
 
         dispatch_details = (
             build_dispatch_details(
-                reconciliation_engine=(
-                    reconciliation_engine
-                ),
-                master=master
+                dispatch_output=dispatch_output
             )
         )
 
@@ -554,9 +562,7 @@ def process(
                     len(dataframe)
                 ),
                 "columns": int(
-                    len(
-                        dataframe.columns
-                    )
+                    len(dataframe.columns)
                 )
             }
 
@@ -565,6 +571,42 @@ def process(
             for file_info
             in files_summary.values()
         )
+
+        registered_dispatch_rows = 0
+        dummy_dispatch_rows = 0
+        allocated_dispatch_quantity = 0
+
+        if not dispatch_output.empty:
+
+            if (
+                "Customer Status"
+                in dispatch_output.columns
+            ):
+                registered_dispatch_rows = int(
+                    (
+                        dispatch_output[
+                            "Customer Status"
+                        ] == "REGISTERED"
+                    ).sum()
+                )
+
+                dummy_dispatch_rows = int(
+                    (
+                        dispatch_output[
+                            "Customer Status"
+                        ] == "DUMMY"
+                    ).sum()
+                )
+
+            if (
+                "Allocated To Be Dispatch"
+                in dispatch_output.columns
+            ):
+                allocated_dispatch_quantity = int(
+                    dispatch_output[
+                        "Allocated To Be Dispatch"
+                    ].sum()
+                )
 
         return json_response({
             "status": (
@@ -596,6 +638,15 @@ def process(
                 ),
                 "dispatch_files_count": len(
                     dispatch_files
+                ),
+                "registered_dispatch_rows": (
+                    registered_dispatch_rows
+                ),
+                "dummy_dispatch_rows": (
+                    dummy_dispatch_rows
+                ),
+                "allocated_dispatch_quantity": (
+                    allocated_dispatch_quantity
                 )
             },
             "files": files_summary,
