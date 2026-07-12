@@ -1,4 +1,6 @@
 import io
+import re
+from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 from math import floor
 
 import pandas as pd
@@ -8,31 +10,107 @@ class Exporter:
 
     MAX_ROWS_PER_FILE = 20
     MAX_QUANTITY_PER_FILE = 100000
+    GTIN_LENGTH = 14
 
     @staticmethod
-    def to_csv(df):
+    def to_csv(
+        df,
+        separator=",",
+        include_header=True
+    ):
 
         output = io.StringIO()
 
         df.to_csv(
             output,
-            index=False
+            index=False,
+            sep=separator,
+            header=include_header,
+            lineterminator="\r\n"
         )
 
         return output.getvalue()
 
     @staticmethod
-    def _normalize_gtin(value):
+    def _normalize_identifier(value):
 
         if pd.isna(value):
             return ""
 
-        value = str(value).strip()
+        if isinstance(value, bool):
+            return str(value)
 
-        if value.endswith(".0"):
-            value = value[:-2]
+        if isinstance(value, int):
+            return str(value)
 
-        return value
+        if isinstance(value, float):
+
+            if pd.isna(value):
+                return ""
+
+            if value.is_integer():
+                return format(value, ".0f")
+
+            return format(value, "f").rstrip("0").rstrip(".")
+
+        text = str(value).strip()
+
+        if not text:
+            return ""
+
+        if re.fullmatch(
+            r"[+-]?\d+(\.0+)?",
+            text
+        ):
+            text = re.sub(
+                r"\.0+$",
+                "",
+                text
+            )
+
+        if re.fullmatch(
+            r"[+-]?\d+(\.\d+)?[eE][+-]?\d+",
+            text
+        ):
+            try:
+                text = format(
+                    Decimal(text),
+                    "f"
+                )
+
+                if "." in text:
+                    text = (
+                        text
+                        .rstrip("0")
+                        .rstrip(".")
+                    )
+
+            except InvalidOperation:
+                pass
+
+        return text
+
+    @staticmethod
+    def _normalize_gtin(value):
+
+        gtin = Exporter._normalize_identifier(
+            value
+        )
+
+        if not gtin:
+            return ""
+
+        gtin = gtin.replace(
+            " ",
+            ""
+        )
+
+        if gtin.isdigit():
+            gtin = gtin.zfill(
+                Exporter.GTIN_LENGTH
+            )
+
+        return gtin
 
     @staticmethod
     def _normalize_batch(value):
@@ -54,16 +132,47 @@ class Exporter:
         if pd.isna(expiry):
             return ""
 
-        return expiry.strftime("%d-%m-%Y")
+        return expiry.strftime(
+            "%d-%m-%Y"
+        )
 
     @staticmethod
-    def _split_large_quantity(record, quantity_column):
+    def _normalize_quantity(value):
 
-        quantity = floor(
-            max(
-                0,
-                float(record[quantity_column])
+        quantity = pd.to_numeric(
+            value,
+            errors="coerce"
+        )
+
+        if pd.isna(quantity):
+            return 0
+
+        try:
+            quantity = Decimal(
+                str(quantity)
             )
+
+            quantity = quantity.to_integral_value(
+                rounding=ROUND_FLOOR
+            )
+
+            return max(
+                0,
+                int(quantity)
+            )
+
+        except (
+            InvalidOperation,
+            ValueError,
+            TypeError
+        ):
+            return 0
+
+    @staticmethod
+    def _split_large_quantity(record):
+
+        quantity = Exporter._normalize_quantity(
+            record.get("QUANTITY")
         )
 
         split_records = []
@@ -76,34 +185,62 @@ class Exporter:
             )
 
             split_record = record.copy()
-            split_record[quantity_column] = split_quantity
 
-            split_records.append(split_record)
+            split_record["QUANTITY"] = (
+                split_quantity
+            )
+
+            split_records.append(
+                split_record
+            )
 
             quantity -= split_quantity
 
         return split_records
 
     @staticmethod
-    def _prepare_records(df, quantity_column):
+    def _prepare_records(
+        df,
+        quantity_column
+    ):
+
+        required_columns = [
+            "GTIN",
+            "BN",
+            "Expiry Date",
+            quantity_column
+        ]
+
+        missing_columns = [
+            column
+            for column in required_columns
+            if column not in df.columns
+        ]
+
+        if missing_columns:
+            raise ValueError(
+                "Missing export columns: "
+                f"{missing_columns}"
+            )
 
         records = []
 
         for _, row in df.iterrows():
 
-            quantity = pd.to_numeric(
-                row.get(quantity_column),
-                errors="coerce"
+            quantity = (
+                Exporter._normalize_quantity(
+                    row.get(quantity_column)
+                )
             )
 
-            if pd.isna(quantity) or quantity <= 0:
+            if quantity <= 0:
                 continue
 
             base_record = {
                 "GTIN": Exporter._normalize_gtin(
                     row.get("GTIN")
                 ),
-                "QUANTITY": floor(float(quantity)),
+                "QUANTITY": quantity,
                 "BN": Exporter._normalize_batch(
                     row.get("BN")
                 ),
@@ -112,17 +249,18 @@ class Exporter:
                 )
             }
 
-            if (
-                not base_record["GTIN"]
-                or not base_record["BN"]
-                or not base_record["XD"]
-            ):
+            if not base_record["GTIN"]:
+                continue
+
+            if not base_record["BN"]:
+                continue
+
+            if not base_record["XD"]:
                 continue
 
             records.extend(
                 Exporter._split_large_quantity(
-                    base_record,
-                    "QUANTITY"
+                    base_record
                 )
             )
 
@@ -132,36 +270,78 @@ class Exporter:
     def _split_into_files(records):
 
         files = []
+
         current_file = []
-        current_quantity = 0
+        current_total_quantity = 0
 
         for record in records:
 
-            quantity = int(record["QUANTITY"])
-
-            exceeds_rows = (
-                len(current_file)
-                >= Exporter.MAX_ROWS_PER_FILE
+            remaining_quantity = int(
+                record["QUANTITY"]
             )
 
-            exceeds_quantity = (
-                current_file
-                and current_quantity + quantity
-                > Exporter.MAX_QUANTITY_PER_FILE
-            )
+            while remaining_quantity > 0:
 
-            if exceeds_rows or exceeds_quantity:
+                if (
+                    len(current_file)
+                    >= Exporter.MAX_ROWS_PER_FILE
+                    or current_total_quantity
+                    >= Exporter.MAX_QUANTITY_PER_FILE
+                ):
 
-                files.append(current_file)
+                    files.append(
+                        current_file
+                    )
 
-                current_file = []
-                current_quantity = 0
+                    current_file = []
+                    current_total_quantity = 0
 
-            current_file.append(record)
-            current_quantity += quantity
+                available_quantity = (
+                    Exporter.MAX_QUANTITY_PER_FILE
+                    - current_total_quantity
+                )
+
+                quantity_for_current_file = min(
+                    remaining_quantity,
+                    available_quantity
+                )
+
+                file_record = record.copy()
+
+                file_record["QUANTITY"] = (
+                    quantity_for_current_file
+                )
+
+                current_file.append(
+                    file_record
+                )
+
+                current_total_quantity += (
+                    quantity_for_current_file
+                )
+
+                remaining_quantity -= (
+                    quantity_for_current_file
+                )
+
+                if (
+                    len(current_file)
+                    >= Exporter.MAX_ROWS_PER_FILE
+                    or current_total_quantity
+                    >= Exporter.MAX_QUANTITY_PER_FILE
+                ):
+
+                    files.append(
+                        current_file
+                    )
+
+                    current_file = []
+                    current_total_quantity = 0
 
         if current_file:
-            files.append(current_file)
+            files.append(
+                current_file
+            )
 
         return files
 
@@ -169,7 +349,7 @@ class Exporter:
     def _build_sfda_content(records):
 
         lines = [
-            "GTIN,QUANTITY,BN,XD"
+            "GTIN;QUANTITY;BN;XD"
         ]
 
         for record in records:
@@ -183,7 +363,9 @@ class Exporter:
                 )
             )
 
-        return "\n".join(lines)
+        return "\r\n".join(
+            lines
+        )
 
     @staticmethod
     def build_sfda_upload_files(
@@ -193,8 +375,8 @@ class Exporter:
     ):
 
         records = Exporter._prepare_records(
-            df,
-            quantity_column
+            df=df,
+            quantity_column=quantity_column
         )
 
         file_groups = Exporter._split_into_files(
@@ -219,3 +401,72 @@ class Exporter:
             )
 
         return output_files
+
+    @staticmethod
+    def build_details_file(
+        df,
+        file_name,
+        columns=None,
+        sort_columns=None
+    ):
+
+        details = df.copy()
+
+        if columns:
+
+            available_columns = [
+                column
+                for column in columns
+                if column in details.columns
+            ]
+
+            details = details[
+                available_columns
+            ]
+
+        if sort_columns:
+
+            available_sort_columns = [
+                column
+                for column in sort_columns
+                if column in details.columns
+            ]
+
+            if available_sort_columns:
+
+                details = details.sort_values(
+                    by=available_sort_columns,
+                    kind="stable"
+                )
+
+        for column in details.columns:
+
+            if "Date" in str(column):
+
+                converted_date = pd.to_datetime(
+                    details[column],
+                    errors="coerce"
+                )
+
+                valid_dates = (
+                    converted_date.notna()
+                )
+
+                details.loc[
+                    valid_dates,
+                    column
+                ] = converted_date.loc[
+                    valid_dates
+                ].dt.strftime(
+                    "%d-%m-%Y"
+                )
+
+        content = Exporter.to_csv(
+            df=details,
+            separator=",",
+            include_header=True
+        )
+
+        return {
+            file_name: content
+        }
