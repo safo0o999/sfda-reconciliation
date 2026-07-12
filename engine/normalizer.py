@@ -73,6 +73,22 @@ class Normalizer:
             df["Trade Description"]
         )
 
+        df["Trade Item"] = Normalizer.identifier(
+            df["Trade Item"]
+        )
+
+        df["Inbound Shipment"] = Normalizer.identifier(
+            df["Inbound Shipment"]
+        )
+
+        df["ASN Line"] = Normalizer.identifier(
+            df["ASN Line"]
+        )
+
+        df["Supplier Name"] = Normalizer.text(
+            df["Supplier Name"]
+        )
+
         return df
 
     @staticmethod
@@ -119,12 +135,20 @@ class Normalizer:
             df["Trade Description"]
         )
 
+        df["Trade Item Number"] = Normalizer.identifier(
+            df["Trade Item Number"]
+        )
+
         df["To Address"] = Normalizer.text(
             df["To Address"]
         )
 
         df["Sales Order Number"] = Normalizer.identifier(
             df["Sales Order Number"]
+        )
+
+        df["Order Line"] = Normalizer.identifier(
+            df["order line"]
         )
 
         return df
@@ -183,3 +207,30 @@ class Normalizer:
         )
 
         return df
+
+    @staticmethod
+    def normalize_gln(df):
+
+        df = df.copy()
+
+        df["To Address"] = Normalizer.text(
+            df["To Address"]
+        )
+
+        df["GLN"] = Normalizer.identifier(
+            df["GLN"]
+        )
+
+        df = df[
+            (df["To Address"] != "")
+            & (df["GLN"] != "")
+        ].copy()
+
+        df = df.drop_duplicates(
+            subset=["To Address"],
+            keep="first"
+        )
+
+        return df.reset_index(
+            drop=True
+        )
