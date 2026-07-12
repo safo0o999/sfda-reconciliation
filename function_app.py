@@ -267,9 +267,14 @@ variance = result["variance"]
             },
             "files": files_summary,
             "master_headers": [
-                str(column)
-                for column in master.columns
-            ]
+    str(column)
+    for column in master.columns
+],
+"outputs": {
+    "accept": accept.to_csv(index=False),
+    "dispatch": dispatch.to_csv(index=False),
+    "variance": variance.to_csv(index=False)
+}
         })
 
     except Exception as ex:
