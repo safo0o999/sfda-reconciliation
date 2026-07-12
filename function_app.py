@@ -16,7 +16,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "1.5.0"
+APPLICATION_VERSION = "1.6.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -79,6 +79,147 @@ def read_excel_file(uploaded_file):
         io.BytesIO(file_bytes),
         engine=excel_engine,
         dtype=object
+    )
+
+
+def build_accept_details(
+    reconciliation_engine,
+    master
+):
+
+    keys = [
+        "BN",
+        "Expiry Date"
+    ]
+
+    lookup_columns = [
+        "BN",
+        "Expiry Date",
+        "GTIN",
+        "Drug Name",
+        "PackageSize",
+        "To Be Accept"
+    ]
+
+    accept_lookup = (
+        master[
+            master["To Be Accept"] > 0
+        ][lookup_columns]
+        .drop_duplicates(
+            subset=keys,
+            keep="first"
+        )
+    )
+
+    accept_details = (
+        reconciliation_engine.asn
+        .merge(
+            accept_lookup,
+            on=keys,
+            how="inner"
+        )
+    )
+
+    accept_details = accept_details[
+        accept_details["Received Quantity"] > 0
+    ].copy()
+
+    accept_columns = [
+        "Inbound Shipment",
+        "ASN Line",
+        "Supplier Name",
+        "Trade Item",
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "Trade Name",
+        "Received Quantity",
+        "PackageSize",
+        "To Be Accept"
+    ]
+
+    return Exporter.build_details_file(
+        df=accept_details,
+        file_name="Accept_Details.csv",
+        columns=accept_columns,
+        sort_columns=[
+            "Inbound Shipment",
+            "GTIN",
+            "BN",
+            "Expiry Date"
+        ]
+    )
+
+
+def build_dispatch_details(
+    reconciliation_engine,
+    master
+):
+
+    keys = [
+        "BN",
+        "Expiry Date"
+    ]
+
+    lookup_columns = [
+        "BN",
+        "Expiry Date",
+        "GTIN",
+        "Drug Name",
+        "PackageSize",
+        "To Be Dispatch"
+    ]
+
+    dispatch_lookup = (
+        master[
+            master["To Be Dispatch"] > 0
+        ][lookup_columns]
+        .drop_duplicates(
+            subset=keys,
+            keep="first"
+        )
+    )
+
+    dispatch_details = (
+        reconciliation_engine.dispatch
+        .merge(
+            dispatch_lookup,
+            on=keys,
+            how="inner"
+        )
+    )
+
+    dispatch_details = dispatch_details[
+        dispatch_details["Dispatched Quantity"] > 0
+    ].copy()
+
+    dispatch_columns = [
+        "To Address",
+        "Sales Order Number",
+        "Order Line",
+        "Trade Item Number",
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "Trade Name",
+        "Dispatched Quantity",
+        "PackageSize",
+        "To Be Dispatch"
+    ]
+
+    return Exporter.build_details_file(
+        df=dispatch_details,
+        file_name="Dispatch_Details.csv",
+        columns=dispatch_columns,
+        sort_columns=[
+            "To Address",
+            "Sales Order Number",
+            "GTIN",
+            "BN",
+            "Expiry Date"
+        ]
     )
 
 
@@ -246,6 +387,16 @@ def process(
             file_prefix="Dispatch"
         )
 
+        accept_details = build_accept_details(
+            reconciliation_engine=reconciliation_engine,
+            master=master
+        )
+
+        dispatch_details = build_dispatch_details(
+            reconciliation_engine=reconciliation_engine,
+            master=master
+        )
+
         files_summary = {}
 
         for file_key in REQUIRED_FILES:
@@ -287,6 +438,8 @@ def process(
             "outputs": {
                 "accept_files": accept_files,
                 "dispatch_files": dispatch_files,
+                "accept_details": accept_details,
+                "dispatch_details": dispatch_details,
                 "variance": {
                     "Variance.csv": variance_csv
                 }
