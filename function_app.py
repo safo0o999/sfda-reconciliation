@@ -5,6 +5,8 @@ import traceback
 
 import azure.functions as func
 
+from engine.reconciliation import ReconciliationEngine
+
 
 app = func.FunctionApp(
     http_auth_level=func.AuthLevel.ANONYMOUS
@@ -38,8 +40,6 @@ def json_response(
 
 def read_excel_file(uploaded_file):
 
-    # Import داخل الدالة حتى تعمل health حتى لو حصلت
-    # مشكلة مؤقتة في تحميل pandas.
     import pandas as pd
 
     file_name = uploaded_file.filename or "uploaded.xlsx"
@@ -57,15 +57,17 @@ def read_excel_file(uploaded_file):
             f"Uploaded file is empty: {file_name}"
         )
 
-    engine = "xlrd" if extension == "xls" else "openpyxl"
+    engine = (
+        "xlrd"
+        if extension == "xls"
+        else "openpyxl"
+    )
 
-    dataframe = pd.read_excel(
+    return pd.read_excel(
         io.BytesIO(file_bytes),
         engine=engine,
         dtype=object
     )
-
-    return dataframe
 
 
 @app.route(
@@ -80,7 +82,7 @@ def health(
         "status": "Healthy",
         "application": "SFDA Reconciliation",
         "azure_function": "Working",
-        "version": "1.1.0"
+        "version": "1.2.0"
     })
 
 
@@ -94,7 +96,7 @@ def version(
 
     return json_response({
         "application": "SFDA Reconciliation",
-        "version": "1.1.0"
+        "version": "1.2.0"
     })
 
 
@@ -137,8 +139,21 @@ def process(
 
         dataframes = {
             file_key: read_excel_file(uploaded_file)
-            for file_key, uploaded_file in uploaded_files.items()
+            for file_key, uploaded_file
+            in uploaded_files.items()
         }
+
+        reconciliation_engine = ReconciliationEngine(
+            asn_df=dataframes["asn"],
+            inventory_df=dataframes["inventory"],
+            dispatch_df=dataframes["dispatch"],
+            sfda_df=dataframes["sfda"],
+            packsize_df=dataframes["packsize"]
+        )
+
+        result = reconciliation_engine.run()
+
+        master = result["master"]
 
         files_summary = {}
 
@@ -163,14 +178,20 @@ def process(
         )
 
         return json_response({
-            "status": "Files Read Successfully",
+            "status": "Reconciliation Engine Completed",
             "application": "SFDA Reconciliation",
-            "version": "1.1.0",
+            "version": "1.2.0",
             "summary": {
                 "files_count": len(files_summary),
-                "total_rows": total_rows
+                "total_input_rows": total_rows,
+                "master_rows": int(len(master)),
+                "master_columns": int(len(master.columns))
             },
-            "files": files_summary
+            "files": files_summary,
+            "master_headers": [
+                str(column)
+                for column in master.columns
+            ]
         })
 
     except Exception as ex:
