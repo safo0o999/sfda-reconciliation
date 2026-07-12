@@ -1,3 +1,7 @@
+from pathlib import Path
+
+import pandas as pd
+
 from engine.validator import Validator
 from engine.normalizer import Normalizer
 from engine.calculator import Calculator
@@ -10,14 +14,28 @@ class ReconciliationEngine:
         asn_df,
         inventory_df,
         dispatch_df,
-        sfda_df,
-        packsize_df
+        sfda_df
     ):
+
         self.asn = asn_df.copy()
         self.inventory = inventory_df.copy()
         self.dispatch = dispatch_df.copy()
         self.sfda = sfda_df.copy()
-        self.packsize = packsize_df.copy()
+
+        config_path = (
+            Path(__file__).resolve().parent.parent
+            / "config"
+        )
+
+        self.packsize = pd.read_excel(
+            config_path / "pack_size.xlsx",
+            dtype=object
+        )
+
+        self.gln = pd.read_excel(
+            config_path / "gln.xlsx",
+            dtype=object
+        )
 
     def normalize(self):
 
@@ -42,7 +60,8 @@ class ReconciliationEngine:
             receiving_df=self.asn,
             inventory_df=self.inventory,
             dispatch_df=self.dispatch,
-            packsize_df=self.packsize
+            packsize_df=self.packsize,
+            gln_df=self.gln
         )
 
     def run(self):
