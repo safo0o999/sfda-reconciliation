@@ -6,6 +6,7 @@ from pathlib import Path
 
 import azure.functions as func
 
+from engine.exporter import Exporter
 from engine.reconciliation import ReconciliationEngine
 
 
@@ -15,7 +16,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "1.4.0"
+APPLICATION_VERSION = "1.5.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -233,6 +234,18 @@ def process(
         dispatch_output = result["dispatch"]
         variance = result["variance"]
 
+        accept_files = Exporter.build_sfda_upload_files(
+            df=accept,
+            quantity_column="To Be Accept",
+            file_prefix="Accept"
+        )
+
+        dispatch_files = Exporter.build_sfda_upload_files(
+            df=dispatch_output,
+            quantity_column="To Be Dispatch",
+            file_prefix="Dispatch"
+        )
+
         files_summary = {}
 
         for file_key in REQUIRED_FILES:
@@ -243,16 +256,17 @@ def process(
             files_summary[file_key] = {
                 "name": uploaded_file.filename,
                 "rows": int(len(dataframe)),
-                "columns": int(len(dataframe.columns)),
-                "headers": [
-                    str(column)
-                    for column in dataframe.columns
-                ]
+                "columns": int(len(dataframe.columns))
             }
 
         total_rows = sum(
             file_info["rows"]
             for file_info in files_summary.values()
+        )
+
+        variance_csv = variance.to_csv(
+            index=False,
+            encoding="utf-8-sig"
         )
 
         return json_response({
@@ -263,20 +277,19 @@ def process(
                 "files_count": len(files_summary),
                 "total_input_rows": total_rows,
                 "master_rows": int(len(master)),
-                "master_columns": int(len(master.columns)),
                 "accept_rows": int(len(accept)),
                 "dispatch_rows": int(len(dispatch_output)),
-                "variance_rows": int(len(variance))
+                "variance_rows": int(len(variance)),
+                "accept_files_count": len(accept_files),
+                "dispatch_files_count": len(dispatch_files)
             },
             "files": files_summary,
-            "master_headers": [
-                str(column)
-                for column in master.columns
-            ],
             "outputs": {
-                "accept": accept.to_csv(index=False),
-                "dispatch": dispatch_output.to_csv(index=False),
-                "variance": variance.to_csv(index=False)
+                "accept_files": accept_files,
+                "dispatch_files": dispatch_files,
+                "variance": {
+                    "Variance.csv": variance_csv
+                }
             }
         })
 
