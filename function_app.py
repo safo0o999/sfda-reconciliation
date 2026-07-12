@@ -92,59 +92,97 @@ def build_accept_details(
         "Expiry Date"
     ]
 
-    lookup_columns = [
-        "BN",
-        "Expiry Date",
-        "GTIN",
-        "Drug Name",
-        "PackageSize",
-        "To Be Accept"
-    ]
-
     accept_lookup = (
         master[
             master["To Be Accept"] > 0
-        ][lookup_columns]
+        ][
+            [
+                "GTIN",
+                "Drug Name",
+                "BN",
+                "Expiry Date",
+                "PackageSize",
+                "To Be Accept"
+            ]
+        ]
         .drop_duplicates(
             subset=keys,
             keep="first"
         )
+        .copy()
     )
 
-    accept_details = (
-        reconciliation_engine.asn
-        .merge(
-            accept_lookup,
-            on=keys,
-            how="inner"
+    asn_summary = (
+        reconciliation_engine.asn[
+            reconciliation_engine.asn[
+                "Received Quantity"
+            ] > 0
+        ]
+        .groupby(
+            keys,
+            as_index=False,
+            dropna=False
+        )
+        .agg(
+            {
+                "Trade Name": "first",
+                "Received Quantity": "sum"
+            }
         )
     )
 
-    accept_details = accept_details[
-        accept_details["Received Quantity"] > 0
-    ].copy()
+    accept_details = (
+        accept_lookup
+        .merge(
+            asn_summary,
+            on=keys,
+            how="left"
+        )
+    )
 
-    accept_columns = [
-        "Inbound Shipment",
-        "ASN Line",
-        "Supplier Name",
-        "Trade Item",
-        "GTIN",
-        "Drug Name",
-        "BN",
-        "Expiry Date",
-        "Trade Name",
-        "Received Quantity",
-        "PackageSize",
-        "To Be Accept"
+    accept_details["Received Quantity"] = (
+        accept_details["Received Quantity"]
+        .fillna(0)
+    )
+
+    accept_details["PackageSize"] = (
+        accept_details["PackageSize"]
+        .fillna(0)
+    )
+
+    accept_details["To Be Accept"] = (
+        accept_details["To Be Accept"]
+        .fillna(0)
+        .astype(int)
+    )
+
+    accept_details = accept_details[
+        [
+            "GTIN",
+            "Drug Name",
+            "BN",
+            "Expiry Date",
+            "Trade Name",
+            "Received Quantity",
+            "PackageSize",
+            "To Be Accept"
+        ]
     ]
 
     return Exporter.build_details_file(
         df=accept_details,
         file_name="Accept_Details.csv",
-        columns=accept_columns,
+        columns=[
+            "GTIN",
+            "Drug Name",
+            "BN",
+            "Expiry Date",
+            "Trade Name",
+            "Received Quantity",
+            "PackageSize",
+            "To Be Accept"
+        ],
         sort_columns=[
-            "Inbound Shipment",
             "GTIN",
             "BN",
             "Expiry Date"
