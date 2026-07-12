@@ -1,6 +1,8 @@
 from engine.reader import ExcelReader
 from engine.validator import Validator
 from engine.normalizer import Normalizer
+from engine.calculator import Calculator
+from engine.exporter import Exporter
 
 
 class ReconciliationEngine:
@@ -38,16 +40,28 @@ class ReconciliationEngine:
 
     def normalize(self):
 
-        pass
-
-    def merge(self):
-
-        pass
+        self.asn = Normalizer.normalize_asn(self.asn)
+        self.inventory = Normalizer.normalize_inventory(self.inventory)
+        self.dispatch = Normalizer.normalize_dispatch(self.dispatch)
+        self.sfda = Normalizer.normalize_sfda(self.sfda)
+        self.packsize = Normalizer.normalize_packsize(self.packsize)
 
     def calculate(self):
 
-        pass
+        return Calculator.calculate(
+            self.sfda,
+            self.asn,
+            self.inventory,
+            self.dispatch,
+            self.packsize
+        )
 
     def export(self):
 
-        pass
+        result = self.calculate()
+
+        return {
+            "accept": Exporter.to_csv(result["accept"]),
+            "dispatch": Exporter.to_csv(result["dispatch"]),
+            "variance": Exporter.to_csv(result["variance"])
+        }
