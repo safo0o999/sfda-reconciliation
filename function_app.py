@@ -1,102 +1,190 @@
 import io
 import json
+import logging
+import traceback
 
 import azure.functions as func
-import pandas as pd
 
-app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+
+app = func.FunctionApp(
+    http_auth_level=func.AuthLevel.ANONYMOUS
+)
+
+
+REQUIRED_FILES = [
+    "asn",
+    "inventory",
+    "dispatch",
+    "sfda",
+    "packsize",
+]
+
+
+def json_response(
+    data: dict,
+    status_code: int = 200
+) -> func.HttpResponse:
+
+    return func.HttpResponse(
+        body=json.dumps(
+            data,
+            ensure_ascii=False,
+            default=str
+        ),
+        status_code=status_code,
+        mimetype="application/json"
+    )
 
 
 def read_excel_file(uploaded_file):
+
+    # Import داخل الدالة حتى تعمل health حتى لو حصلت
+    # مشكلة مؤقتة في تحميل pandas.
+    import pandas as pd
+
     file_name = uploaded_file.filename or "uploaded.xlsx"
-    file_bytes = uploaded_file.stream.read()
+    extension = file_name.lower().rsplit(".", 1)[-1]
 
-    if file_name.lower().endswith(".xls"):
-        engine = "xlrd"
-    else:
-        engine = "openpyxl"
+    if extension not in ["xls", "xlsx"]:
+        raise ValueError(
+            f"Unsupported file type: {file_name}"
+        )
 
-    return pd.read_excel(
+    file_bytes = uploaded_file.read()
+
+    if not file_bytes:
+        raise ValueError(
+            f"Uploaded file is empty: {file_name}"
+        )
+
+    engine = "xlrd" if extension == "xls" else "openpyxl"
+
+    dataframe = pd.read_excel(
         io.BytesIO(file_bytes),
         engine=engine,
         dtype=object
     )
 
-
-@app.route(route="health", methods=["GET"])
-def health(req: func.HttpRequest) -> func.HttpResponse:
-    return func.HttpResponse(
-        "SFDA Reconciliation API is Running",
-        status_code=200
-    )
+    return dataframe
 
 
-@app.route(route="version", methods=["GET"])
-def version(req: func.HttpRequest) -> func.HttpResponse:
-    return func.HttpResponse(
-        "Version 1.0.0",
-        status_code=200
-    )
+@app.route(
+    route="health",
+    methods=["GET"]
+)
+def health(
+    req: func.HttpRequest
+) -> func.HttpResponse:
+
+    return json_response({
+        "status": "Healthy",
+        "application": "SFDA Reconciliation",
+        "azure_function": "Working",
+        "version": "1.1.0"
+    })
 
 
-@app.route(route="process", methods=["POST"])
-def process(req: func.HttpRequest) -> func.HttpResponse:
+@app.route(
+    route="version",
+    methods=["GET"]
+)
+def version(
+    req: func.HttpRequest
+) -> func.HttpResponse:
+
+    return json_response({
+        "application": "SFDA Reconciliation",
+        "version": "1.1.0"
+    })
+
+
+@app.route(
+    route="process",
+    methods=["GET", "POST"]
+)
+def process(
+    req: func.HttpRequest
+) -> func.HttpResponse:
+
+    if req.method == "GET":
+        return json_response({
+            "status": "Ready",
+            "message": "Use POST with the five required files.",
+            "required_files": REQUIRED_FILES
+        })
+
     try:
-        asn_file = req.files["asn"]
-        inventory_file = req.files["inventory"]
-        dispatch_file = req.files["dispatch"]
-        sfda_file = req.files["sfda"]
-        packsize_file = req.files["packsize"]
+        missing_files = [
+            file_key
+            for file_key in REQUIRED_FILES
+            if file_key not in req.files
+        ]
 
-        asn_df = read_excel_file(asn_file)
-        inventory_df = read_excel_file(inventory_file)
-        dispatch_df = read_excel_file(dispatch_file)
-        sfda_df = read_excel_file(sfda_file)
-        packsize_df = read_excel_file(packsize_file)
+        if missing_files:
+            return json_response(
+                {
+                    "status": "Failed",
+                    "message": "Required files are missing.",
+                    "missing_files": missing_files
+                },
+                status_code=400
+            )
 
-        result = {
-            "status": "Files Read Successfully",
-            "files": {
-                "asn": {
-                    "name": asn_file.filename,
-                    "rows": int(len(asn_df)),
-                    "columns": int(len(asn_df.columns))
-                },
-                "inventory": {
-                    "name": inventory_file.filename,
-                    "rows": int(len(inventory_df)),
-                    "columns": int(len(inventory_df.columns))
-                },
-                "dispatch": {
-                    "name": dispatch_file.filename,
-                    "rows": int(len(dispatch_df)),
-                    "columns": int(len(dispatch_df.columns))
-                },
-                "sfda": {
-                    "name": sfda_file.filename,
-                    "rows": int(len(sfda_df)),
-                    "columns": int(len(sfda_df.columns))
-                },
-                "packsize": {
-                    "name": packsize_file.filename,
-                    "rows": int(len(packsize_df)),
-                    "columns": int(len(packsize_df.columns))
-                }
-            }
+        uploaded_files = {
+            file_key: req.files[file_key]
+            for file_key in REQUIRED_FILES
         }
 
-        return func.HttpResponse(
-            json.dumps(result),
-            status_code=200,
-            mimetype="application/json"
+        dataframes = {
+            file_key: read_excel_file(uploaded_file)
+            for file_key, uploaded_file in uploaded_files.items()
+        }
+
+        files_summary = {}
+
+        for file_key in REQUIRED_FILES:
+
+            dataframe = dataframes[file_key]
+            uploaded_file = uploaded_files[file_key]
+
+            files_summary[file_key] = {
+                "name": uploaded_file.filename,
+                "rows": int(len(dataframe)),
+                "columns": int(len(dataframe.columns)),
+                "headers": [
+                    str(column)
+                    for column in dataframe.columns
+                ]
+            }
+
+        total_rows = sum(
+            file_info["rows"]
+            for file_info in files_summary.values()
         )
 
+        return json_response({
+            "status": "Files Read Successfully",
+            "application": "SFDA Reconciliation",
+            "version": "1.1.0",
+            "summary": {
+                "files_count": len(files_summary),
+                "total_rows": total_rows
+            },
+            "files": files_summary
+        })
+
     except Exception as ex:
-        return func.HttpResponse(
-            json.dumps({
+
+        logging.exception(
+            "Error while processing uploaded files."
+        )
+
+        return json_response(
+            {
                 "status": "Failed",
-                "error": str(ex)
-            }),
-            status_code=500,
-            mimetype="application/json"
+                "error": str(ex),
+                "error_type": type(ex).__name__,
+                "trace": traceback.format_exc()
+            },
+            status_code=500
         )
