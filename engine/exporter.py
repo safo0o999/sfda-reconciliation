@@ -355,7 +355,6 @@ class Exporter:
         return output
 
     @staticmethod
-        @staticmethod
     def build_formatted_excel_file(
         df,
         file_name,
@@ -364,10 +363,6 @@ class Exporter:
         columns=None,
         sort_columns=None
     ):
-
-        print("Exporter Version 2.0")
-
-        report = df.copy()
 
         report = df.copy()
 
@@ -621,13 +616,18 @@ class Exporter:
                 str(column_name)
             )
 
-            for value in report[
-                column_name
-            ].astype(str):
+            for value in report[column_name]:
+
+                if pd.isna(value):
+                    continue
+
+                value_length = len(
+                    str(value)
+                )
 
                 max_length = max(
                     max_length,
-                    len(value)
+                    value_length
                 )
 
             worksheet.column_dimensions[
