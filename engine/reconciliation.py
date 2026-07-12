@@ -27,31 +27,113 @@ class ReconciliationEngine:
             / "config"
         )
 
+        packsize_path = (
+            config_path
+            / "pack_size.xlsx"
+        )
+
+        gln_path = (
+            config_path
+            / "gln.xlsx"
+        )
+
+        if not packsize_path.exists():
+            raise FileNotFoundError(
+                "config/pack_size.xlsx was not found."
+            )
+
+        if not gln_path.exists():
+            raise FileNotFoundError(
+                "config/gln.xlsx was not found."
+            )
+
         self.packsize = pd.read_excel(
-            config_path / "pack_size.xlsx",
+            packsize_path,
+            engine="openpyxl",
             dtype=object
         )
 
         self.gln = pd.read_excel(
-            config_path / "gln.xlsx",
+            gln_path,
+            engine="openpyxl",
             dtype=object
         )
 
     def normalize(self):
 
-        self.asn = Normalizer.normalize_asn(self.asn)
-        self.inventory = Normalizer.normalize_inventory(self.inventory)
-        self.dispatch = Normalizer.normalize_dispatch(self.dispatch)
-        self.sfda = Normalizer.normalize_sfda(self.sfda)
-        self.packsize = Normalizer.normalize_packsize(self.packsize)
+        self.asn = Normalizer.normalize_asn(
+            self.asn
+        )
+
+        self.inventory = (
+            Normalizer.normalize_inventory(
+                self.inventory
+            )
+        )
+
+        self.dispatch = (
+            Normalizer.normalize_dispatch(
+                self.dispatch
+            )
+        )
+
+        self.sfda = Normalizer.normalize_sfda(
+            self.sfda
+        )
+
+        self.packsize = (
+            Normalizer.normalize_packsize(
+                self.packsize
+            )
+        )
+
+        self.gln = Normalizer.normalize_gln(
+            self.gln
+        )
 
     def validate(self):
 
-        Validator.validate(self.asn, "ASN")
-        Validator.validate(self.inventory, "INVENTORY")
-        Validator.validate(self.dispatch, "DISPATCH")
-        Validator.validate(self.sfda, "SFDA")
-        Validator.validate(self.packsize, "PACKSIZE")
+        Validator.validate(
+            self.asn,
+            "ASN"
+        )
+
+        Validator.validate(
+            self.inventory,
+            "INVENTORY"
+        )
+
+        Validator.validate(
+            self.dispatch,
+            "DISPATCH"
+        )
+
+        Validator.validate(
+            self.sfda,
+            "SFDA"
+        )
+
+        Validator.validate(
+            self.packsize,
+            "PACKSIZE"
+        )
+
+        required_gln_columns = [
+            "GLN",
+            "To Address"
+        ]
+
+        missing_gln_columns = [
+            column
+            for column in required_gln_columns
+            if column not in self.gln.columns
+        ]
+
+        if missing_gln_columns:
+            raise ValueError(
+                "GLN missing columns: "
+                f"{missing_gln_columns}"
+            )
 
     def calculate(self):
 
