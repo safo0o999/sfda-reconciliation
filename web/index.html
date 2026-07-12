@@ -2,382 +2,111 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta
-        name="viewport"
-        content="width=device-width, initial-scale=1.0"
-    >
-
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SFDA Reconciliation</title>
-
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-
     <style>
-        * {
-            box-sizing: border-box;
-        }
-
-        body {
-            margin: 0;
-            font-family: Arial, Helvetica, sans-serif;
-            background: #f4f7fb;
-            color: #1f2937;
-        }
-
-        .page {
-            min-height: 100vh;
-            padding: 40px 20px;
-        }
-
-        .container {
-            width: 100%;
-            max-width: 1100px;
-            margin: 0 auto;
-        }
-
-        .header {
-            margin-bottom: 28px;
-        }
-
-        .header h1 {
-            margin: 0 0 8px;
-            font-size: 30px;
-        }
-
-        .header p {
-            margin: 0;
-            color: #6b7280;
-            font-size: 15px;
-        }
-
-        .card {
-            background: #ffffff;
-            border-radius: 16px;
-            padding: 28px;
-            box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
-        }
-
-        .files-grid {
-            display: grid;
-            grid-template-columns: repeat(2, minmax(0, 1fr));
-            gap: 18px;
-        }
-
-        .file-box {
-            border: 1px solid #dbe3ee;
-            border-radius: 12px;
-            padding: 18px;
-            background: #fbfdff;
-        }
-
-        .file-box.full-width {
-            grid-column: 1 / -1;
-        }
-
-        .file-box label {
-            display: block;
-            margin-bottom: 10px;
-            font-size: 14px;
-            font-weight: 700;
-        }
-
-        .file-box input[type="file"] {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #cbd5e1;
-            border-radius: 8px;
-            background: #ffffff;
-        }
-
-        .file-name {
-            min-height: 20px;
-            margin-top: 9px;
-            font-size: 12px;
-            color: #64748b;
-            word-break: break-word;
-        }
-
-        .actions {
-            display: flex;
-            gap: 12px;
-            margin-top: 26px;
-        }
-
-        button {
-            border: 0;
-            border-radius: 10px;
-            padding: 13px 22px;
-            font-size: 15px;
-            font-weight: 700;
-            cursor: pointer;
-        }
-
-        #runButton {
-            background: #0f6cbd;
-            color: #ffffff;
-        }
-
-        #runButton:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-        }
-
-        #resetButton {
-            background: #e8eef5;
-            color: #334155;
-        }
-
-        .status {
-            display: none;
-            margin-top: 24px;
-            padding: 16px;
-            border-radius: 10px;
-            font-size: 14px;
-            white-space: pre-wrap;
-            word-break: break-word;
-        }
-
-        .status.processing {
-            display: block;
-            background: #fff7db;
-            color: #7c5c00;
-            border: 1px solid #f4d46a;
-        }
-
-        .status.success {
-            display: block;
-            background: #e7f8ed;
-            color: #166534;
-            border: 1px solid #86d49d;
-        }
-
-        .status.error {
-            display: block;
-            background: #fdecec;
-            color: #991b1b;
-            border: 1px solid #f0a4a4;
-        }
-
-        .summary {
-            display: none;
-            margin-top: 24px;
-        }
-
-        .summary.show {
-            display: block;
-        }
-
-        .summary h2 {
-            margin: 0 0 14px;
-            font-size: 20px;
-        }
-
-        .summary-grid {
-            display: grid;
-            grid-template-columns: repeat(3, minmax(0, 1fr));
-            gap: 14px;
-        }
-
-        .summary-item {
-            padding: 18px;
-            border-radius: 10px;
-            background: #f8fafc;
-            border: 1px solid #e2e8f0;
-        }
-
-        .summary-item .label {
-            font-size: 12px;
-            color: #64748b;
-            margin-bottom: 8px;
-        }
-
-        .summary-item .value {
-            font-size: 24px;
-            font-weight: 700;
-        }
-
-        .downloads {
-            display: none;
-            margin-top: 24px;
-        }
-
-        .downloads.show {
-            display: block;
-        }
-
-        .downloads h2 {
-            margin: 0 0 14px;
-            font-size: 20px;
-        }
-
-        .download-groups {
-            display: grid;
-            gap: 18px;
-        }
-
-        .download-group {
-            border: 1px solid #e2e8f0;
-            border-radius: 12px;
-            padding: 18px;
-            background: #f8fafc;
-        }
-
-        .download-group h3 {
-            margin: 0 0 12px;
-            font-size: 16px;
-        }
-
-        .download-list {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-
-        .download-button {
-            display: inline-block;
-            border: 0;
-            padding: 11px 16px;
-            border-radius: 9px;
-            background: #15803d;
-            color: #ffffff;
-            text-decoration: none;
-            font-weight: 700;
-            font-size: 14px;
-            cursor: pointer;
-        }
-
-        .empty-message {
-            color: #64748b;
-            font-size: 14px;
-        }
-
+        * { box-sizing: border-box; }
+        body { margin: 0; font-family: Arial, Helvetica, sans-serif; background: #f4f7fb; color: #1f2937; }
+        .page { min-height: 100vh; padding: 40px 20px; }
+        .container { width: 100%; max-width: 1100px; margin: 0 auto; }
+        .header { margin-bottom: 28px; }
+        .header h1 { margin: 0 0 8px; font-size: 30px; }
+        .header p { margin: 0; color: #6b7280; font-size: 15px; }
+        .card { background: #ffffff; border-radius: 16px; padding: 28px; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08); }
+        .files-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+        .file-box { border: 1px solid #dbe3ee; border-radius: 12px; padding: 18px; background: #fbfdff; }
+        .file-box label { display: block; margin-bottom: 10px; font-size: 14px; font-weight: 700; }
+        .file-box input[type="file"] { width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 8px; background: #ffffff; }
+        .file-name { min-height: 20px; margin-top: 9px; font-size: 12px; color: #64748b; word-break: break-word; }
+        .actions { display: flex; gap: 12px; margin-top: 26px; }
+        button { border: 0; border-radius: 10px; padding: 13px 22px; font-size: 15px; font-weight: 700; cursor: pointer; }
+        #runButton { background: #0f6cbd; color: #ffffff; }
+        #runButton:disabled { opacity: 0.6; cursor: not-allowed; }
+        #resetButton { background: #e8eef5; color: #334155; }
+        .status { display: none; margin-top: 24px; padding: 16px; border-radius: 10px; font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+        .status.processing { display: block; background: #fff7db; color: #7c5c00; border: 1px solid #f4d46a; }
+        .status.success { display: block; background: #e7f8ed; color: #166534; border: 1px solid #86d49d; }
+        .status.error { display: block; background: #fdecec; color: #991b1b; border: 1px solid #f0a4a4; }
+        .summary { display: none; margin-top: 24px; }
+        .summary.show { display: block; }
+        .summary h2 { margin: 0 0 14px; font-size: 20px; }
+        .summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+        .summary-item { padding: 18px; border-radius: 10px; background: #f8fafc; border: 1px solid #e2e8f0; }
+        .summary-item .label { font-size: 12px; color: #64748b; margin-bottom: 8px; }
+        .summary-item .value { font-size: 24px; font-weight: 700; }
+        .downloads { display: none; margin-top: 24px; }
+        .downloads.show { display: block; }
+        .downloads h2 { margin: 0 0 14px; font-size: 20px; }
+        .download-groups { display: grid; gap: 18px; }
+        .download-group { border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; background: #f8fafc; }
+        .download-group h3 { margin: 0 0 12px; font-size: 16px; }
+        .download-list { display: flex; flex-wrap: wrap; gap: 10px; }
+        .download-button { display: inline-block; border: 0; padding: 11px 16px; border-radius: 9px; background: #15803d; color: #ffffff; text-decoration: none; font-weight: 700; font-size: 14px; cursor: pointer; }
+        .download-button:disabled { opacity: 0.6; cursor: not-allowed; }
+        .empty-message { color: #64748b; font-size: 14px; }
         @media (max-width: 760px) {
-            .files-grid,
-            .summary-grid {
-                grid-template-columns: 1fr;
-            }
-
-            .file-box.full-width {
-                grid-column: auto;
-            }
-
-            .actions {
-                flex-direction: column;
-            }
-
-            button {
-                width: 100%;
-            }
+            .files-grid, .summary-grid { grid-template-columns: 1fr; }
+            .actions { flex-direction: column; }
+            button { width: 100%; }
         }
     </style>
 </head>
-
 <body>
     <div class="page">
         <div class="container">
-
             <div class="header">
                 <h1>SFDA Reconciliation</h1>
-                <p>
-                    Upload the five required Excel files and run the reconciliation.
-                </p>
+                <p>Upload the four required Excel files and run the reconciliation.</p>
             </div>
 
             <div class="card">
-
                 <form id="uploadForm">
-
                     <div class="files-grid">
-
                         <div class="file-box">
                             <label for="asn">ASN Receipt Detailed Report</label>
-                            <input
-                                id="asn"
-                                name="asn"
-                                type="file"
-                                accept=".xls,.xlsx"
-                                required
-                            >
+                            <input id="asn" name="asn" type="file" accept=".xls,.xlsx" required>
                             <div class="file-name" id="asnName"></div>
                         </div>
 
                         <div class="file-box">
                             <label for="inventory">Inventory Report</label>
-                            <input
-                                id="inventory"
-                                name="inventory"
-                                type="file"
-                                accept=".xls,.xlsx"
-                                required
-                            >
+                            <input id="inventory" name="inventory" type="file" accept=".xls,.xlsx" required>
                             <div class="file-name" id="inventoryName"></div>
                         </div>
 
                         <div class="file-box">
                             <label for="dispatch">Dispatch Report</label>
-                            <input
-                                id="dispatch"
-                                name="dispatch"
-                                type="file"
-                                accept=".xls,.xlsx"
-                                required
-                            >
+                            <input id="dispatch" name="dispatch" type="file" accept=".xls,.xlsx" required>
                             <div class="file-name" id="dispatchName"></div>
                         </div>
 
                         <div class="file-box">
                             <label for="sfda">SFDA Drug Count</label>
-                            <input
-                                id="sfda"
-                                name="sfda"
-                                type="file"
-                                accept=".xls,.xlsx"
-                                required
-                            >
+                            <input id="sfda" name="sfda" type="file" accept=".xls,.xlsx" required>
                             <div class="file-name" id="sfdaName"></div>
                         </div>
-
-                        <div class="file-box full-width">
-                            <label for="packsize">Pack Size</label>
-                            <input
-                                id="packsize"
-                                name="packsize"
-                                type="file"
-                                accept=".xls,.xlsx"
-                                required
-                            >
-                            <div class="file-name" id="packsizeName"></div>
-                        </div>
-
                     </div>
 
                     <div class="actions">
-                        <button id="runButton" type="submit">
-                            Run Reconciliation
-                        </button>
-
-                        <button id="resetButton" type="button">
-                            Reset
-                        </button>
+                        <button id="runButton" type="submit">Run Reconciliation</button>
+                        <button id="resetButton" type="button">Reset</button>
                     </div>
-
                 </form>
 
                 <div id="statusBox" class="status"></div>
 
                 <div id="summaryBox" class="summary">
                     <h2>Processing Summary</h2>
-
                     <div class="summary-grid">
                         <div class="summary-item">
                             <div class="label">Input Files</div>
                             <div class="value" id="filesCount">0</div>
                         </div>
-
                         <div class="summary-item">
                             <div class="label">Input Rows</div>
                             <div class="value" id="inputRows">0</div>
                         </div>
-
                         <div class="summary-item">
                             <div class="label">Master Rows</div>
                             <div class="value" id="masterRows">0</div>
@@ -387,34 +116,27 @@
 
                 <div id="downloadsBox" class="downloads">
                     <h2>Download Results</h2>
-
                     <div class="download-groups">
-
                         <div class="download-group">
                             <h3>SFDA Upload Files</h3>
                             <div id="sfdaFilesList" class="download-list"></div>
                         </div>
-
                         <div class="download-group">
                             <h3>Details Files</h3>
                             <div id="detailsFilesList" class="download-list"></div>
                         </div>
-
                         <div class="download-group">
                             <h3>Reports</h3>
                             <div id="reportsFilesList" class="download-list"></div>
                         </div>
-
                     </div>
                 </div>
-
             </div>
         </div>
     </div>
 
     <script>
         const API_URL = "/api/process";
-
         const form = document.getElementById("uploadForm");
         const runButton = document.getElementById("runButton");
         const resetButton = document.getElementById("resetButton");
@@ -422,13 +144,7 @@
         const summaryBox = document.getElementById("summaryBox");
         const downloadsBox = document.getElementById("downloadsBox");
 
-        const fileKeys = [
-            "asn",
-            "inventory",
-            "dispatch",
-            "sfda",
-            "packsize"
-        ];
+        const fileKeys = ["asn", "inventory", "dispatch", "sfda"];
 
         function setStatus(type, message) {
             statusBox.className = "status " + type;
@@ -443,37 +159,23 @@
         function updateFileName(key) {
             const input = document.getElementById(key);
             const nameBox = document.getElementById(key + "Name");
-
-            nameBox.textContent = input.files.length
-                ? input.files[0].name
-                : "";
+            nameBox.textContent = input.files.length ? input.files[0].name : "";
         }
 
         fileKeys.forEach((key) => {
-            document
-                .getElementById(key)
-                .addEventListener("change", () => updateFileName(key));
+            document.getElementById(key).addEventListener("change", () => updateFileName(key));
         });
 
         function validateFiles() {
             for (const key of fileKeys) {
                 const input = document.getElementById(key);
-
                 if (!input.files.length) {
-                    throw new Error(
-                        "Please select all five required files."
-                    );
+                    throw new Error("Please select all four required files.");
                 }
 
                 const fileName = input.files[0].name.toLowerCase();
-
-                if (
-                    !fileName.endsWith(".xls") &&
-                    !fileName.endsWith(".xlsx")
-                ) {
-                    throw new Error(
-                        "Only Excel files (.xls or .xlsx) are allowed."
-                    );
+                if (!fileName.endsWith(".xls") && !fileName.endsWith(".xlsx")) {
+                    throw new Error("Only Excel files (.xls or .xlsx) are allowed.");
                 }
             }
         }
@@ -487,25 +189,41 @@
         function triggerBlobDownload(blob, fileName) {
             const url = URL.createObjectURL(blob);
             const link = document.createElement("a");
-
             link.href = url;
             link.download = fileName;
-
             document.body.appendChild(link);
             link.click();
             link.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
 
-            setTimeout(() => {
-                URL.revokeObjectURL(url);
-            }, 1000);
+        function base64ToBlob(base64, mimeType) {
+            const binary = atob(base64);
+            const bytes = new Uint8Array(binary.length);
+            for (let index = 0; index < binary.length; index++) {
+                bytes[index] = binary.charCodeAt(index);
+            }
+            return new Blob([bytes], { type: mimeType || "application/octet-stream" });
+        }
+
+        function normalizeDownloadContent(content, defaultMimeType) {
+            if (
+                content &&
+                typeof content === "object" &&
+                content.encoding === "base64" &&
+                content.content
+            ) {
+                return base64ToBlob(content.content, content.mime_type);
+            }
+
+            return new Blob([content ?? ""], {
+                type: defaultMimeType || "text/plain;charset=utf-8"
+            });
         }
 
         async function downloadFilesAsZip(files, zipFileName) {
             const entries = Object.entries(files || {});
-
-            if (!entries.length) {
-                return;
-            }
+            if (!entries.length) return;
 
             if (typeof JSZip === "undefined") {
                 throw new Error("ZIP library is not loaded.");
@@ -514,43 +232,36 @@
             const zip = new JSZip();
 
             entries.forEach(([fileName, content]) => {
-                zip.file(fileName, content);
+                if (
+                    content &&
+                    typeof content === "object" &&
+                    content.encoding === "base64" &&
+                    content.content
+                ) {
+                    zip.file(fileName, content.content, { base64: true });
+                } else {
+                    zip.file(fileName, content ?? "");
+                }
             });
 
-            const blob = await zip.generateAsync({
-                type: "blob"
-            });
-
+            const blob = await zip.generateAsync({ type: "blob" });
             triggerBlobDownload(blob, zipFileName);
         }
 
-        function addZipButton(
-            containerId,
-            files,
-            buttonText,
-            zipFileName
-        ) {
+        function addZipButton(containerId, files, buttonText, zipFileName) {
             const container = document.getElementById(containerId);
             const entries = Object.entries(files || {});
-
-            if (!entries.length) {
-                return;
-            }
+            if (!entries.length) return;
 
             const button = document.createElement("button");
-
             button.type = "button";
             button.className = "download-button";
             button.textContent = buttonText;
 
             button.addEventListener("click", async () => {
                 button.disabled = true;
-
                 try {
-                    await downloadFilesAsZip(
-                        files,
-                        zipFileName
-                    );
+                    await downloadFilesAsZip(files, zipFileName);
                 } finally {
                     button.disabled = false;
                 }
@@ -559,69 +270,47 @@
             container.appendChild(button);
         }
 
-        function addSingleFileButton(
-            containerId,
-            fileName,
-            content,
-            buttonText
-        ) {
-            if (!content) {
-                return;
-            }
+        function addSingleFileButton(containerId, fileName, content, buttonText) {
+            if (!content) return;
 
             const container = document.getElementById(containerId);
             const button = document.createElement("button");
-
             button.type = "button";
             button.className = "download-button";
             button.textContent = buttonText || ("Download " + fileName);
 
             button.addEventListener("click", () => {
-                const blob = new Blob(
-                    [content],
-                    {
-                        type: "text/csv;charset=utf-8"
-                    }
+                const isExcel = fileName.toLowerCase().endsWith(".xlsx");
+                const blob = normalizeDownloadContent(
+                    content,
+                    isExcel
+                        ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        : "text/csv;charset=utf-8"
                 );
-
                 triggerBlobDownload(blob, fileName);
             });
 
             container.appendChild(button);
         }
 
-        function addFileObjectButtons(
-            containerId,
-            files
-        ) {
-            const entries = Object.entries(files || {});
-
-            entries.forEach(([fileName, content]) => {
-                addSingleFileButton(
-                    containerId,
-                    fileName,
-                    content
-                );
+        function addFileObjectButtons(containerId, files) {
+            Object.entries(files || {}).forEach(([fileName, content]) => {
+                addSingleFileButton(containerId, fileName, content);
             });
         }
 
         function showEmptyMessageIfNeeded(containerId) {
             const container = document.getElementById(containerId);
-
-            if (container.children.length) {
-                return;
-            }
+            if (container.children.length) return;
 
             const empty = document.createElement("div");
             empty.className = "empty-message";
             empty.textContent = "No files generated.";
-
             container.appendChild(empty);
         }
 
         form.addEventListener("submit", async (event) => {
             event.preventDefault();
-
             clearStatus();
             clearDownloadResults();
             summaryBox.classList.remove("show");
@@ -629,52 +318,31 @@
 
             try {
                 validateFiles();
-
                 runButton.disabled = true;
-
-                setStatus(
-                    "processing",
-                    "Processing files. Please wait..."
-                );
+                setStatus("processing", "Processing files. Please wait...");
 
                 const formData = new FormData();
-
                 fileKeys.forEach((key) => {
                     const input = document.getElementById(key);
-
-                    formData.append(
-                        key,
-                        input.files[0],
-                        input.files[0].name
-                    );
+                    formData.append(key, input.files[0], input.files[0].name);
                 });
 
-                const response = await fetch(
-                    API_URL,
-                    {
-                        method: "POST",
-                        body: formData
-                    }
-                );
+                const response = await fetch(API_URL, {
+                    method: "POST",
+                    body: formData
+                });
 
                 const result = await response.json();
 
                 if (!response.ok) {
                     throw new Error(
-                        result.error ||
-                        result.message ||
-                        "Processing failed."
+                        result.error || result.message || "Processing failed."
                     );
                 }
 
-                document.getElementById("filesCount").textContent =
-                    result.summary?.files_count ?? 0;
-
-                document.getElementById("inputRows").textContent =
-                    result.summary?.total_input_rows ?? 0;
-
-                document.getElementById("masterRows").textContent =
-                    result.summary?.master_rows ?? 0;
+                document.getElementById("filesCount").textContent = result.summary?.files_count ?? 0;
+                document.getElementById("inputRows").textContent = result.summary?.total_input_rows ?? 0;
+                document.getElementById("masterRows").textContent = result.summary?.master_rows ?? 0;
 
                 summaryBox.classList.add("show");
 
@@ -694,47 +362,21 @@
                     "SFDA_Dispatch_Files.zip"
                 );
 
-                addFileObjectButtons(
-                    "detailsFilesList",
-                    outputs.accept_details
-                );
-
-                addFileObjectButtons(
-                    "detailsFilesList",
-                    outputs.dispatch_details
-                );
-
-                addFileObjectButtons(
-                    "detailsFilesList",
-                    outputs.details
-                );
-
-                addFileObjectButtons(
-                    "reportsFilesList",
-                    outputs.variance
-                );
-
-                addFileObjectButtons(
-                    "reportsFilesList",
-                    outputs.reports
-                );
+                addFileObjectButtons("detailsFilesList", outputs.accept_details);
+                addFileObjectButtons("detailsFilesList", outputs.dispatch_details);
+                addFileObjectButtons("detailsFilesList", outputs.details);
+                addFileObjectButtons("reportsFilesList", outputs.variance);
+                addFileObjectButtons("reportsFilesList", outputs.reports);
 
                 showEmptyMessageIfNeeded("sfdaFilesList");
                 showEmptyMessageIfNeeded("detailsFilesList");
                 showEmptyMessageIfNeeded("reportsFilesList");
 
                 downloadsBox.classList.add("show");
-
-                setStatus(
-                    "success",
-                    "Reconciliation completed successfully."
-                );
+                setStatus("success", "Reconciliation completed successfully.");
 
             } catch (error) {
-                setStatus(
-                    "error",
-                    error.message || "Unexpected error."
-                );
+                setStatus("error", error.message || "Unexpected error.");
             } finally {
                 runButton.disabled = false;
             }
@@ -742,11 +384,9 @@
 
         resetButton.addEventListener("click", () => {
             form.reset();
-
             fileKeys.forEach((key) => {
                 document.getElementById(key + "Name").textContent = "";
             });
-
             clearStatus();
             clearDownloadResults();
             summaryBox.classList.remove("show");
