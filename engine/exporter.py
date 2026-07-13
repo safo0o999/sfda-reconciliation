@@ -15,6 +15,7 @@ class Exporter:
     MAX_ROWS_PER_FILE = 20
     MAX_QUANTITY_PER_FILE = 100000
     GTIN_LENGTH = 14
+    DUMMY_GLN = "9999999999999"
 
     @staticmethod
     def _normalize_identifier(value):
@@ -110,7 +111,7 @@ class Exporter:
             text
         )
 
-        return text.strip("_") or "DUMMY"
+        return text.strip("_") or Exporter.DUMMY_GLN
 
     @staticmethod
     def _prepare_records(
@@ -293,35 +294,59 @@ class Exporter:
             "To Address"
         ]
 
-        for (
-            customer_status,
-            gln,
-            to_address
-        ), customer_df in dispatch_df.groupby(
-            customer_columns,
+        available_customer_columns = [
+            column
+            for column in customer_columns
+            if column in dispatch_df.columns
+        ]
+
+        if not available_customer_columns:
+            return output
+
+        for group_values, customer_df in dispatch_df.groupby(
+            available_customer_columns,
             dropna=False,
             sort=True
         ):
 
+            if not isinstance(group_values, tuple):
+                group_values = (group_values,)
+
+            group_data = dict(
+                zip(
+                    available_customer_columns,
+                    group_values
+                )
+            )
+
+            customer_status = str(
+                group_data.get(
+                    "Customer Status",
+                    ""
+                )
+            ).strip().upper()
+
+            raw_gln = Exporter._normalize_identifier(
+                group_data.get(
+                    "GLN",
+                    ""
+                )
+            )
+
             is_dummy = (
-                str(customer_status).upper()
-                == "DUMMY"
+                customer_status == "DUMMY"
+                or not raw_gln
+                or raw_gln.upper() == "DUMMY"
             )
 
-            customer_code = (
-                "DUMMY"
+            customer_gln = (
+                Exporter.DUMMY_GLN
                 if is_dummy
-                else Exporter._safe_file_name(
-                    gln
-                )
+                else raw_gln
             )
 
-            customer_name = (
-                "DUMMY_CUSTOMER"
-                if is_dummy
-                else Exporter._safe_file_name(
-                    to_address
-                )
+            customer_gln = Exporter._safe_file_name(
+                customer_gln
             )
 
             records = Exporter._prepare_records(
@@ -340,9 +365,11 @@ class Exporter:
                 start=1
             ):
 
+                # Required naming rule:
+                # Registered customer: <GLN>_001.csv
+                # Dummy customer: 9999999999999_001.csv
                 file_name = (
-                    f"Dispatch_{customer_code}_"
-                    f"{customer_name}_"
+                    f"{customer_gln}_"
                     f"{index:03d}.csv"
                 )
 
@@ -508,9 +535,13 @@ class Exporter:
                     ).lower()
                     for identifier in [
                         "gtin",
+                        "generic item",
                         "trade item",
                         "sales order",
+                        "order number",
                         "order line",
+                        "inbound shipment",
+                        "trk",
                         "gln",
                         "bn"
                     ]
@@ -544,9 +575,13 @@ class Exporter:
                     identifier in column_text
                     for identifier in [
                         "gtin",
+                        "generic item",
                         "trade item",
                         "sales order",
+                        "order number",
                         "order line",
+                        "inbound shipment",
+                        "trk",
                         "gln",
                         "bn"
                     ]
