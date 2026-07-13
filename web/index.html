@@ -355,6 +355,35 @@
       .progress-steps { grid-template-columns:1fr 1fr; }
       .environment { display:none; }
     }
+
+
+    /* V2.1 dense operational dashboard */
+    .dashboard-filter-bar{display:grid;grid-template-columns:1.1fr 1.1fr 1fr 1fr auto;gap:12px;align-items:end;padding:14px 16px;margin-bottom:16px}
+    .filter-field label{display:block;font-size:10px;font-weight:800;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.35px}
+    .filter-field input,.filter-field select{width:100%;height:38px;border:1px solid var(--line);border-radius:8px;background:#fff;padding:0 10px;color:var(--text);font-size:11px}
+    .ops-kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:16px}
+    .ops-kpi{min-height:108px;padding:14px 14px 12px;position:relative;overflow:hidden}
+    .ops-kpi .label{font-size:10px;font-weight:800;color:var(--muted);padding-right:36px}
+    .ops-kpi .value{font-size:25px;font-weight:900;margin-top:16px;letter-spacing:-.4px}
+    .ops-kpi .unit{font-size:10px;color:var(--muted);margin-left:4px;font-weight:700}
+    .ops-kpi .mini-icon{position:absolute;right:12px;top:12px;width:32px;height:32px;display:grid;place-items:center;border-radius:9px;background:#eaf4ff;color:#0866bd;font-weight:900}
+    .ops-kpi.green{background:linear-gradient(135deg,#fff,#effaf3)} .ops-kpi.green .mini-icon{background:#e5f7eb;color:#14753f}
+    .ops-kpi.amber{background:linear-gradient(135deg,#fff,#fff7e9)} .ops-kpi.amber .mini-icon{background:#fff0d5;color:#bd6b00}
+    .ops-kpi.red{background:linear-gradient(135deg,#fff,#fff0f0)} .ops-kpi.red .mini-icon{background:#fde4e4;color:#c42d33}
+    .ops-kpi.purple{background:linear-gradient(135deg,#fff,#f7f1ff)} .ops-kpi.purple .mini-icon{background:#eee4ff;color:#7040bd}
+    .ops-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:14px}
+    .ops-main{display:grid;gap:14px}.ops-side{display:grid;gap:14px;align-content:start}
+    .compact-table table{min-width:980px;font-size:10px}.compact-table th,.compact-table td{padding:9px 10px}
+    .group-head{font-size:9px;text-align:center;color:#334155;border-bottom:0!important}.group-sfda{background:#eaf4ff!important}.group-receive{background:#ebf8ef!important}.group-inventory{background:#fff5df!important}.group-dispatch{background:#fdeceb!important}
+    .quick-actions{padding:12px;display:grid;gap:8px}.quick-actions .btn{width:100%;justify-content:flex-start}
+    .mini-donut-wrap{padding:16px;display:grid;grid-template-columns:110px 1fr;gap:14px;align-items:center}.mini-donut{width:100px;height:100px;border-radius:50%;background:conic-gradient(#239247 0 80%,#d94747 80% 90%,#c8ced8 90% 100%);position:relative}.mini-donut:after{content:"";position:absolute;inset:22px;background:#fff;border-radius:50%}.mini-donut-label{position:absolute;inset:0;display:grid;place-items:center;z-index:2;text-align:center;font-size:11px;font-weight:900}.mini-legend{display:grid;gap:8px;font-size:10px}.mini-legend-row{display:flex;justify-content:space-between;gap:8px}
+    .recent-upload-list{padding:8px 14px 14px}.recent-upload-row{display:grid;grid-template-columns:1fr auto;gap:8px;padding:9px 0;border-bottom:1px solid #edf1f6;font-size:10px}.recent-upload-row:last-child{border-bottom:0}.upload-type{font-weight:800}.upload-time{color:var(--muted);margin-top:3px}
+    .bottom-ops-grid{display:grid;grid-template-columns:1.05fr 1fr;gap:14px}.legend-footer{display:flex;flex-wrap:wrap;gap:24px;padding:13px 16px;margin-top:14px;font-size:10px}.legend-item{display:flex;align-items:center;gap:8px}.legend-symbol{width:21px;height:21px;border-radius:50%;display:grid;place-items:center;font-weight:900}
+    .inline-results{display:none;margin-top:24px;padding-top:20px;border-top:1px solid var(--line)}.inline-results.show{display:block}.result-anchor{scroll-margin-top:86px}
+    .result-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px}.result-head h2{margin:0;font-size:22px}.result-head p{margin:5px 0 0;color:var(--muted);font-size:11px}
+    @media(max-width:1250px){.ops-kpis{grid-template-columns:repeat(3,1fr)}.ops-layout{grid-template-columns:1fr}.dashboard-filter-bar{grid-template-columns:repeat(2,1fr)}.dashboard-filter-bar .btn{width:100%}}
+    @media(max-width:760px){.ops-kpis{grid-template-columns:1fr}.dashboard-filter-bar{grid-template-columns:1fr}.bottom-ops-grid{grid-template-columns:1fr}.result-head{flex-direction:column}.mini-donut-wrap{grid-template-columns:1fr}.mini-donut{margin:auto}}
+
   </style>
 </head>
 <body>
@@ -371,7 +400,6 @@
     <nav class="nav">
       <button class="nav-button active" data-page="home"><span class="nav-icon">⌂</span>Home</button>
       <button class="nav-button" data-page="upload"><span class="nav-icon">⇧</span>Upload & Run</button>
-      <button class="nav-button" data-page="results"><span class="nav-icon">▣</span>Results</button>
       <button class="nav-button" data-page="history"><span class="nav-icon">◷</span>History</button>
       <button class="nav-button" data-page="reports"><span class="nav-icon">▥</span>Reports</button>
       <button class="nav-button" data-page="intelligence"><span class="nav-icon">◆</span>Product Intelligence</button>
@@ -414,66 +442,64 @@
       <!-- HOME -->
       <section class="page active" id="page-home">
         <div class="page-head">
-          <div>
-            <h1>Operations Overview</h1>
-            <p>Monitor reconciliation activity, data quality, alerts, and platform health.</p>
-          </div>
-          <div class="actions">
-            <button class="btn btn-primary" data-go="upload">▶ New Reconciliation</button>
-            <button class="btn btn-secondary" data-go="history">Open History</button>
-          </div>
+          <div><h1>Dashboard</h1><p>Operational view of SFDA, receiving, inventory, dispatch, exceptions, and customer mapping.</p></div>
+          <div class="actions"><button class="btn btn-primary" data-go="upload">▶ Run Reconciliation</button></div>
         </div>
 
-        <div class="hero-strip">
-          <div class="hero-main">
-            <div class="hero-title">SFDA Drug Traceability & Reconciliation</div>
-            <div class="hero-sub">Upload warehouse reports, reconcile them against SFDA, generate compliant upload files, and build a searchable historical traceability database.</div>
-            <div class="hero-actions">
-              <button class="btn btn-secondary" data-go="upload">Start Reconciliation</button>
-              <button class="btn btn-secondary" data-go="results">View Latest Results</button>
+        <div class="card dashboard-filter-bar">
+          <div class="filter-field"><label>Snapshot Date</label><input type="date" id="dashboardDate"></div>
+          <div class="filter-field"><label>Trade Name</label><select><option>All</option></select></div>
+          <div class="filter-field"><label>Supplier</label><select><option>All</option></select></div>
+          <div class="filter-field"><label>Customer</label><select><option>All</option></select></div>
+          <button class="btn btn-primary" id="dashboardRefresh">↻ Refresh</button>
+        </div>
+
+        <div class="ops-kpis">
+          <div class="card ops-kpi"><div class="label">Total Items (SFDA)</div><div class="value" id="homeInputRows">—</div><div class="mini-icon">▣</div></div>
+          <div class="card ops-kpi green"><div class="label">Pending to Accept</div><div class="value" id="homeAccept">—<span class="unit">Packs</span></div><div class="mini-icon">✓</div></div>
+          <div class="card ops-kpi amber"><div class="label">Pending to Dispatch</div><div class="value" id="homeDispatch">—<span class="unit">Packs</span></div><div class="mini-icon">⇢</div></div>
+          <div class="card ops-kpi red"><div class="label">Exceptions</div><div class="value" id="homeVariance">—<span class="unit">Items</span></div><div class="mini-icon">!</div></div>
+          <div class="card ops-kpi purple"><div class="label">Customers with GLN</div><div class="value">—<span class="unit">Customers</span></div><div class="mini-icon">◎</div></div>
+          <div class="card ops-kpi"><div class="label">Dummy GLN Used</div><div class="value">—<span class="unit">Customers</span></div><div class="mini-icon">?</div></div>
+        </div>
+
+        <div class="ops-layout">
+          <div class="ops-main">
+            <div class="card table-card compact-table">
+              <div class="card-header"><div><div class="card-title">Reconciliation Overview</div><div class="card-subtitle">Latest completed run preview</div></div><button class="btn btn-secondary" data-go="upload">Open Current Run</button></div>
+              <div class="table-scroll"><table>
+                <thead>
+                  <tr><th colspan="5"></th><th colspan="3" class="group-head group-sfda">SFDA</th><th colspan="2" class="group-head group-receive">WMS Receive</th><th colspan="2" class="group-head group-inventory">WMS Inventory</th><th colspan="1" class="group-head group-dispatch">WMS Dispatch</th><th></th></tr>
+                  <tr><th>BN</th><th>Expiry Date</th><th>GTIN</th><th>Drug Name</th><th>PZ</th><th>Active</th><th>Qty Sent Pending</th><th>Qty Receive Pending</th><th>Received</th><th>To Be Accept</th><th>Inventory</th><th>Variance</th><th>To Be Dispatch</th><th>Status</th></tr>
+                </thead>
+                <tbody id="homeOverviewBody">
+                  <tr><td colspan="14"><div class="empty"><strong>No reconciliation data loaded</strong>Run a reconciliation to populate this operational table.</div></td></tr>
+                </tbody>
+              </table></div>
+            </div>
+
+            <div class="bottom-ops-grid">
+              <div class="card table-card compact-table">
+                <div class="card-header"><div><div class="card-title">Top Exceptions</div><div class="card-subtitle">Highest-priority reconciliation issues</div></div><button class="btn btn-secondary" data-go="variance">View All</button></div>
+                <div class="table-scroll"><table><thead><tr><th>BN</th><th>Expiry Date</th><th>Issue Type</th><th>Description</th><th>Variance</th><th>Action</th></tr></thead><tbody id="homeExceptionsBody"><tr><td colspan="6"><div class="empty"><strong>No exception details available</strong>Detailed records will be loaded from the database phase.</div></td></tr></tbody></table></div>
+              </div>
+              <div class="card table-card compact-table">
+                <div class="card-header"><div><div class="card-title">Dispatch by Customer</div><div class="card-subtitle">To Be Dispatch allocation</div></div><button class="btn btn-secondary" data-go="upload">View Current Results</button></div>
+                <div class="table-scroll"><table><thead><tr><th>Customer</th><th>GLN</th><th>Total Packs</th><th>Items</th><th>Status</th></tr></thead><tbody><tr><td colspan="5"><div class="empty"><strong>No customer allocation loaded</strong>Run a reconciliation to generate customer files.</div></td></tr></tbody></table></div>
+              </div>
             </div>
           </div>
-          <div class="card hero-status">
-            <div class="card-title">Platform Status</div>
-            <div class="status-line"><span>Azure Function</span><span class="status-ok" id="homeHealth">Checking...</span></div>
-            <div class="status-line"><span>Application Version</span><strong id="homeVersion">—</strong></div>
-            <div class="status-line"><span>Database</span><span class="badge warning">Future Phase</span></div>
-            <div class="status-line"><span>Blob Storage</span><span class="badge warning">Future Phase</span></div>
-          </div>
+
+          <aside class="ops-side">
+            <div class="card"><div class="card-header"><div class="card-title">Quick Actions</div></div><div class="quick-actions"><button class="btn btn-success" data-go="upload">▶ Run Reconciliation</button><button class="btn btn-primary" data-go="upload">⇩ Prepare Accept</button><button class="btn btn-warning" data-go="upload">⇢ Prepare Dispatch</button><button class="btn btn-purple" data-go="history">◷ Upload History</button></div></div>
+            <div class="card"><div class="card-header"><div class="card-title">Customer / GLN</div></div><div class="mini-donut-wrap"><div style="position:relative"><div class="mini-donut"></div><div class="mini-donut-label"><div><div style="font-size:18px">—</div><div>Total</div></div></div></div><div class="mini-legend"><div class="mini-legend-row"><span><i class="legend-dot" style="background:#239247"></i>With GLN</span><strong>—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#d94747"></i>Dummy GLN</span><strong>—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#c8ced8"></i>Not Mapped</span><strong>—</strong></div></div></div></div>
+            <div class="card"><div class="card-header"><div><div class="card-title">Recent Uploads</div><div class="card-subtitle">Latest locally selected report types</div></div></div><div class="recent-upload-list" id="recentUploads"><div class="empty"><strong>No uploads yet</strong>Selected files will appear after a run.</div></div></div>
+            <div class="card"><div class="card-header"><div class="card-title">System Status</div></div><div class="card-body"><div class="status-line"><span>Azure Function</span><span class="status-ok" id="homeHealth">Checking...</span></div><div class="status-line"><span>Version</span><strong id="homeVersion">—</strong></div><div class="status-line"><span>Total Local Runs</span><strong id="homeRuns">0</strong></div><div class="status-line"><span>Successful Runs</span><strong id="homeSuccess">0</strong></div><div class="status-line"><span>Generated Files</span><strong id="homeGenerated">—</strong></div></div></div>
+          </aside>
         </div>
 
-        <div class="grid kpi-grid">
-          <div class="card kpi"><div class="kpi-label">Last Input Rows</div><div class="kpi-value" id="homeInputRows">—</div><div class="kpi-foot">Latest successful run</div><div class="kpi-icon">≡</div></div>
-          <div class="card kpi"><div class="kpi-label">Accept Items</div><div class="kpi-value" id="homeAccept">—</div><div class="kpi-foot">Ready for SFDA receiving</div><div class="kpi-icon green">✓</div></div>
-          <div class="card kpi"><div class="kpi-label">Dispatch Items</div><div class="kpi-value" id="homeDispatch">—</div><div class="kpi-foot">Allocated to customers</div><div class="kpi-icon purple">⇢</div></div>
-          <div class="card kpi"><div class="kpi-label">Variance Items</div><div class="kpi-value" id="homeVariance">—</div><div class="kpi-foot">Require investigation</div><div class="kpi-icon red">!</div></div>
-        </div>
-
-        <div class="grid kpi-grid" style="margin-top:16px">
-          <div class="card kpi"><div class="kpi-label">Total Local Runs</div><div class="kpi-value" id="homeRuns">0</div><div class="kpi-foot">Stored in this browser</div><div class="kpi-icon">◷</div></div>
-          <div class="card kpi"><div class="kpi-label">Successful Runs</div><div class="kpi-value" id="homeSuccess">0</div><div class="kpi-foot">Completed without errors</div><div class="kpi-icon green">✓</div></div>
-          <div class="card kpi"><div class="kpi-label">Generated Files</div><div class="kpi-value" id="homeGenerated">—</div><div class="kpi-foot">SFDA upload and Excel files</div><div class="kpi-icon amber">⇩</div></div>
-          <div class="card kpi"><div class="kpi-label">Missing SFDA Registrations</div><div class="kpi-value">—</div><div class="kpi-foot">Available after database phase</div><div class="kpi-icon red">?</div></div>
-        </div>
-
-        <div class="grid two-col" style="margin-top:16px">
-          <div class="card">
-            <div class="card-header"><div><div class="card-title">Reconciliation Activity</div><div class="card-subtitle">Latest run trend stored in this browser</div></div></div>
-            <div class="chart-wrap">
-              <div class="chart-legend"><span><i class="legend-dot" style="background:#0f6cbd"></i>Accept</span><span><i class="legend-dot" style="background:#168a48"></i>Dispatch</span><span><i class="legend-dot" style="background:#d13438"></i>Variance</span></div>
-              <svg class="line-chart" viewBox="0 0 760 245" preserveAspectRatio="none">
-                <g stroke="#edf1f6" stroke-width="1"><line x1="35" y1="30" x2="735" y2="30"/><line x1="35" y1="80" x2="735" y2="80"/><line x1="35" y1="130" x2="735" y2="130"/><line x1="35" y1="180" x2="735" y2="180"/><line x1="35" y1="225" x2="735" y2="225"/></g>
-                <polyline fill="none" stroke="#0f6cbd" stroke-width="4" points="35,205 150,175 265,184 380,130 495,151 610,100 730,118"/>
-                <polyline fill="none" stroke="#168a48" stroke-width="4" points="35,215 150,195 265,174 380,170 495,136 610,148 730,127"/>
-                <polyline fill="none" stroke="#d13438" stroke-width="4" points="35,225 150,220 265,218 380,208 495,215 610,203 730,210"/>
-              </svg>
-            </div>
-          </div>
-          <div class="card">
-            <div class="card-header"><div><div class="card-title">Recent Activity</div><div class="card-subtitle">Latest locally stored events</div></div></div>
-            <div class="activity-list" id="recentActivity"></div>
-          </div>
-        </div>
+        <div class="card legend-footer"><div class="legend-item"><span class="legend-symbol" style="background:#e9f8ee;color:#178043">✓</span><span><strong>OK</strong><br>All good</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fff3db;color:#bd7400">◷</span><span><strong>Dispatch Pending</strong><br>Pending dispatch to SFDA</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fdeaea;color:#c63034">!</span><span><strong>Diff / Exception</strong><br>Needs attention</span></div><div class="legend-item"><span class="legend-symbol" style="background:#eaf4ff;color:#0866bd">?</span><span><strong>Dummy GLN</strong><br>Customer has no GLN</span></div></div>
+        <div id="recentActivity" hidden></div>
       </section>
 
       <!-- UPLOAD -->
@@ -527,7 +553,7 @@
         <div class="status-banner" id="statusBox"></div>
 
         <div class="summary-panel" id="summaryPanel">
-          <div class="page-head" style="margin:20px 0 12px"><div><h1 style="font-size:21px">Processing Summary</h1><p>Latest response from the Azure reconciliation engine.</p></div><button class="btn btn-primary" data-go="results">Open Results →</button></div>
+          <div class="page-head" style="margin:20px 0 12px"><div><h1 style="font-size:21px">Processing Summary</h1><p>Latest response from the Azure reconciliation engine.</p></div></div>
           <div class="grid kpi-grid-6">
             <div class="card kpi"><div class="kpi-label">Input Files</div><div class="kpi-value" id="sumFiles">0</div><div class="kpi-icon">▣</div></div>
             <div class="card kpi"><div class="kpi-label">Input Rows</div><div class="kpi-value" id="sumInputRows">0</div><div class="kpi-icon">≡</div></div>
@@ -537,42 +563,27 @@
             <div class="card kpi"><div class="kpi-label">Variance Items</div><div class="kpi-value" id="sumVariance">0</div><div class="kpi-icon red">!</div></div>
           </div>
         </div>
-      </section>
 
-      <!-- RESULTS -->
-      <section class="page" id="page-results">
-        <div class="page-head">
-          <div><h1>Reconciliation Results</h1><p>Review and download all files generated for the latest reconciliation run.</p></div>
-          <div class="actions"><button class="btn btn-purple" id="downloadAllButton" disabled>⇩ Download All Results</button><button class="btn btn-secondary" data-go="upload">← Back to Upload</button></div>
-        </div>
-
-        <div class="status-banner info show" id="resultsInfo"><span>ⓘ</span><div>No completed reconciliation is loaded in this browser yet.</div></div>
-
-        <div class="grid kpi-grid" style="margin-bottom:16px">
-          <div class="card kpi"><div class="kpi-label">Accept Items</div><div class="kpi-value" id="resultAccept">—</div><div class="kpi-icon green">✓</div></div>
-          <div class="card kpi"><div class="kpi-label">Dispatch Items</div><div class="kpi-value" id="resultDispatch">—</div><div class="kpi-icon purple">⇢</div></div>
-          <div class="card kpi"><div class="kpi-label">Variance Items</div><div class="kpi-value" id="resultVariance">—</div><div class="kpi-icon red">!</div></div>
-          <div class="card kpi"><div class="kpi-label">Generated Files</div><div class="kpi-value" id="resultFiles">—</div><div class="kpi-icon amber">⇩</div></div>
-        </div>
-
-        <div class="tabs">
-          <button class="tab-btn active" data-tab="summary">Overview</button>
-          <button class="tab-btn" data-tab="accept">Accept Files</button>
-          <button class="tab-btn" data-tab="dispatch">Dispatch Files</button>
-          <button class="tab-btn" data-tab="reports">Excel Reports</button>
-        </div>
-
-        <div class="tab-panel active" id="tab-summary">
-          <div class="grid download-grid">
-            <div class="card download-card"><h3>Accept Upload Files</h3><p>SFDA-ready CSV files split into 20 rows and a maximum total quantity of 100,000 per file.</p><button class="btn btn-primary" id="downloadAcceptZip" disabled>Download Accept ZIP</button></div>
-            <div class="card download-card"><h3>Dispatch Upload Files</h3><p>Customer-grouped files using GLN mapping, with unmatched customers classified as DUMMY.</p><button class="btn btn-success" id="downloadDispatchZip" disabled>Download Dispatch ZIP</button></div>
-            <div class="card download-card"><h3>Variance Report</h3><p>Unallocated dispatch quantities and reconciliation exceptions requiring investigation.</p><button class="btn btn-warning" id="downloadVariance" disabled>Download Variance Excel</button></div>
-            <div class="card download-card"><h3>All Excel Reports</h3><p>Accept Details, Dispatch Details, and Variance reports in a single archive.</p><button class="btn btn-purple" id="downloadReportsZip" disabled>Download Reports ZIP</button></div>
+        <div class="inline-results result-anchor" id="inlineResults">
+          <div class="result-head"><div><h2>Reconciliation Results</h2><p>Review and download all files generated for the current reconciliation run.</p></div><button class="btn btn-purple" id="downloadAllButton" disabled>⇩ Download All Results</button></div>
+          <div class="status-banner info show" id="resultsInfo"><span>ⓘ</span><div>No completed reconciliation is loaded in this browser yet.</div></div>
+          <div class="grid kpi-grid" style="margin-bottom:16px">
+            <div class="card kpi"><div class="kpi-label">Accept Items</div><div class="kpi-value" id="resultAccept">—</div><div class="kpi-icon green">✓</div></div>
+            <div class="card kpi"><div class="kpi-label">Dispatch Items</div><div class="kpi-value" id="resultDispatch">—</div><div class="kpi-icon purple">⇢</div></div>
+            <div class="card kpi"><div class="kpi-label">Variance Items</div><div class="kpi-value" id="resultVariance">—</div><div class="kpi-icon red">!</div></div>
+            <div class="card kpi"><div class="kpi-label">Generated Files</div><div class="kpi-value" id="resultFiles">—</div><div class="kpi-icon amber">⇩</div></div>
           </div>
+          <div class="tabs"><button class="tab-btn active" data-tab="summary">Overview</button><button class="tab-btn" data-tab="accept">Accept Files</button><button class="tab-btn" data-tab="dispatch">Dispatch Files</button><button class="tab-btn" data-tab="reports">Excel Reports</button></div>
+          <div class="tab-panel active" id="tab-summary"><div class="grid download-grid">
+            <div class="card download-card"><h3>Accept Upload Files</h3><p>SFDA-ready CSV files split into 20 rows and maximum total quantity of 100,000.</p><button class="btn btn-primary" id="downloadAcceptZip" disabled>Download Accept ZIP</button></div>
+            <div class="card download-card"><h3>Dispatch Upload Files</h3><p>Customer-grouped files using GLN mapping, with unmatched customers classified as DUMMY.</p><button class="btn btn-success" id="downloadDispatchZip" disabled>Download Dispatch ZIP</button></div>
+            <div class="card download-card"><h3>Variance Report</h3><p>Unallocated quantities and reconciliation exceptions requiring investigation.</p><button class="btn btn-warning" id="downloadVariance" disabled>Download Variance Excel</button></div>
+            <div class="card download-card"><h3>All Excel Reports</h3><p>Accept Details, Dispatch Details, and Variance reports in a single archive.</p><button class="btn btn-purple" id="downloadReportsZip" disabled>Download Reports ZIP</button></div>
+          </div></div>
+          <div class="tab-panel" id="tab-accept"><div class="file-list" id="acceptFilesList"><div class="empty"><strong>No Accept files loaded</strong>Run a reconciliation first.</div></div></div>
+          <div class="tab-panel" id="tab-dispatch"><div class="file-list" id="dispatchFilesList"><div class="empty"><strong>No Dispatch files loaded</strong>Run a reconciliation first.</div></div></div>
+          <div class="tab-panel" id="tab-reports"><div class="file-list" id="reportsFilesList"><div class="empty"><strong>No Excel reports loaded</strong>Run a reconciliation first.</div></div></div>
         </div>
-        <div class="tab-panel" id="tab-accept"><div class="file-list" id="acceptFilesList"><div class="empty"><strong>No Accept files loaded</strong>Run a reconciliation first.</div></div></div>
-        <div class="tab-panel" id="tab-dispatch"><div class="file-list" id="dispatchFilesList"><div class="empty"><strong>No Dispatch files loaded</strong>Run a reconciliation first.</div></div></div>
-        <div class="tab-panel" id="tab-reports"><div class="file-list" id="reportsFilesList"><div class="empty"><strong>No Excel reports loaded</strong>Run a reconciliation first.</div></div></div>
       </section>
 
       <!-- HISTORY -->
@@ -669,7 +680,7 @@
     document.querySelectorAll(".nav-button").forEach(x=>x.classList.toggle("active",x.dataset.page===page));
     const target=$(`page-${page}`);
     if(target) target.classList.add("active");
-    const labels={home:"Home",upload:"Upload & Run",results:"Results",history:"History",reports:"Reports",intelligence:"Product Intelligence",variance:"Variance Management",administration:"Administration"};
+    const labels={home:"Dashboard",upload:"Upload & Run",history:"History",reports:"Reports",intelligence:"Product Intelligence",variance:"Variance Management",administration:"Administration"};
     $("topbarTitle").textContent=labels[page]||"SFDA Platform";
     $("sidebar").classList.remove("open");
     if(page==="history") renderHistory();
@@ -766,7 +777,8 @@
       saveRun(result,"Completed");
       updateDashboard();
       renderReports();
-      navigate("results");
+      $("inlineResults").classList.add("show");
+      setTimeout(()=>$("inlineResults").scrollIntoView({behavior:"smooth",block:"start"}),120);
       toast("Reconciliation completed successfully.","success");
     }catch(error){
       finishProgress(false);
@@ -785,6 +797,8 @@
     clearStatus();
     $("progressCard").classList.remove("show");
     $("summaryPanel").classList.remove("show");
+    $("inlineResults").classList.remove("show");
+    currentResult=null;
   });
 
   function populateSummary(result){
@@ -927,6 +941,12 @@
     const list=$("recentActivity"); list.innerHTML="";
     history.slice(0,6).forEach(r=>{ const div=document.createElement("div"); div.className="activity"; div.innerHTML=`<div class="activity-icon" style="${r.status==="Failed"?"background:#fdecec;color:#d13438":""}">${r.status==="Failed"?"!":"✓"}</div><div><div class="activity-title">${r.status==="Failed"?"Reconciliation failed":"Reconciliation completed successfully"}</div><div class="activity-meta">${escapeHtml(r.runId)} · ${formatNumber(r.inputRows)} input rows</div></div><div class="activity-time">${new Date(r.timestamp).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})}</div>`; list.appendChild(div); });
     if(!history.length) list.innerHTML=`<div class="empty"><strong>No activity yet</strong>Run your first reconciliation to populate the dashboard.</div>`;
+    const uploads=$("recentUploads");
+    if(uploads){
+      if(latest){
+        uploads.innerHTML=["SFDA Drug Count","WMS ASN Receive","WMS Inventory","WMS Dispatch Report"].map((name,i)=>`<div class="recent-upload-row"><div><div class="upload-type">${name}</div><div class="upload-time">${new Date(latest.timestamp).toLocaleString()}</div></div><span class="badge success">Success</span></div>`).join("");
+      }else uploads.innerHTML=`<div class="empty"><strong>No uploads yet</strong>Selected files will appear after a run.</div>`;
+    }
   }
 
   function renderReports(){
@@ -961,6 +981,8 @@
   }
   $("healthButton").addEventListener("click",async()=>{ const ok=await checkHealth(); toast(ok?"Azure Function is healthy.":"Azure Function health check failed.",ok?"success":"error"); });
 
+  if($("dashboardDate")) $("dashboardDate").value=new Date().toISOString().slice(0,10);
+  if($("dashboardRefresh")) $("dashboardRefresh").addEventListener("click",()=>{updateDashboard();toast("Dashboard refreshed.","success");});
   updateDashboard();
   renderHistory();
   renderReports();
