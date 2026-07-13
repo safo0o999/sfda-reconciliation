@@ -5,6 +5,7 @@ import traceback
 from pathlib import Path
 
 import azure.functions as func
+import pandas as pd
 
 from engine.exporter import Exporter
 from engine.reconciliation import ReconciliationEngine
@@ -16,7 +17,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "2.0.0"
+APPLICATION_VERSION = "2.2.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -44,8 +45,6 @@ def json_response(
 
 
 def read_excel_file(uploaded_file):
-
-    import pandas as pd
 
     file_name = (
         uploaded_file.filename
@@ -91,6 +90,200 @@ def read_excel_file(uploaded_file):
     )
 
 
+def _find_column(
+    dataframe,
+    candidates
+):
+
+    normalized = {
+        str(column).strip().lower(): column
+        for column in dataframe.columns
+    }
+
+    for candidate in candidates:
+        match = normalized.get(
+            str(candidate).strip().lower()
+        )
+        if match is not None:
+            return match
+
+    return None
+
+
+def _series_or_blank(
+    dataframe,
+    candidates
+):
+
+    column = _find_column(
+        dataframe,
+        candidates
+    )
+
+    if column is None:
+        return pd.Series(
+            [""] * len(dataframe),
+            index=dataframe.index,
+            dtype=object
+        )
+
+    return dataframe[column]
+
+
+def _normalize_text(value):
+
+    if pd.isna(value):
+        return ""
+
+    text = str(value).strip()
+
+    if text.endswith(".0"):
+        text = text[:-2]
+
+    return text
+
+
+def _join_unique(values):
+
+    unique_values = []
+
+    for value in values:
+        text = _normalize_text(value)
+
+        if (
+            text
+            and text not in unique_values
+        ):
+            unique_values.append(text)
+
+    return " | ".join(unique_values)
+
+
+def _join_trk_first(values):
+
+    unique_values = []
+
+    for value in values:
+        text = _normalize_text(value)
+
+        if (
+            text
+            and text not in unique_values
+        ):
+            unique_values.append(text)
+
+    trk_values = [
+        value
+        for value in unique_values
+        if value.upper().startswith("TRK")
+    ]
+
+    other_values = [
+        value
+        for value in unique_values
+        if not value.upper().startswith("TRK")
+    ]
+
+    return " | ".join(
+        trk_values + other_values
+    )
+
+
+def _prepare_accept_asn_summary(
+    reconciliation_engine
+):
+
+    keys = [
+        "BN",
+        "Expiry Date"
+    ]
+
+    asn = reconciliation_engine.asn.copy()
+
+    asn["Trade Item Number"] = _series_or_blank(
+        asn,
+        [
+            "Trade Item Number",
+            "Trade Item",
+            "Trade Number",
+            "Item Number"
+        ]
+    )
+
+    asn["Generic Item Number"] = _series_or_blank(
+        asn,
+        [
+            "Generic Item Number",
+            "Generic Number",
+            "Generic Item"
+        ]
+    )
+
+    asn["Supplier Name"] = _series_or_blank(
+        asn,
+        [
+            "Supplier Name",
+            "Supplier",
+            "Vendor Name",
+            "Vendor"
+        ]
+    )
+
+    asn["Inbound Shipment Number"] = _series_or_blank(
+        asn,
+        [
+            "Inbound Shipment",
+            "Inbound Number",
+            "Inbound Shipment Number",
+            "TRK",
+            "TRK Number",
+            "Shipment Reference",
+            "Shipment Number"
+        ]
+    )
+
+    required_columns = [
+        "Received Quantity",
+        "Trade Name",
+        "Trade Item Number",
+        "Generic Item Number",
+        "Supplier Name",
+        "Inbound Shipment Number"
+    ]
+
+    for column in required_columns:
+        if column not in asn.columns:
+            asn[column] = ""
+
+    asn["Received Quantity"] = pd.to_numeric(
+        asn["Received Quantity"],
+        errors="coerce"
+    ).fillna(0)
+
+    asn = asn[
+        asn["Received Quantity"] > 0
+    ].copy()
+
+    return (
+        asn
+        .groupby(
+            keys,
+            as_index=False,
+            dropna=False
+        )
+        .agg(
+            {
+                "Trade Item Number": _join_unique,
+                "Generic Item Number": _join_unique,
+                "Trade Name": _join_unique,
+                "Supplier Name": _join_unique,
+                "Inbound Shipment Number": _join_trk_first,
+                "Received Quantity": "sum"
+            }
+        )
+    )
+
+
 def build_accept_details(
     reconciliation_engine,
     master
@@ -121,23 +314,8 @@ def build_accept_details(
         .copy()
     )
 
-    asn_summary = (
-        reconciliation_engine.asn[
-            reconciliation_engine.asn[
-                "Received Quantity"
-            ] > 0
-        ]
-        .groupby(
-            keys,
-            as_index=False,
-            dropna=False
-        )
-        .agg(
-            {
-                "Trade Name": "first",
-                "Received Quantity": "sum"
-            }
-        )
+    asn_summary = _prepare_accept_asn_summary(
+        reconciliation_engine
     )
 
     accept_details = (
@@ -151,31 +329,30 @@ def build_accept_details(
 
     accept_details[
         "Received Quantity"
-    ] = (
+    ] = pd.to_numeric(
         accept_details[
             "Received Quantity"
-        ]
-        .fillna(0)
-    )
+        ],
+        errors="coerce"
+    ).fillna(0)
 
     accept_details[
         "PackageSize"
-    ] = (
+    ] = pd.to_numeric(
         accept_details[
             "PackageSize"
-        ]
-        .fillna(1)
-    )
+        ],
+        errors="coerce"
+    ).fillna(0)
 
     accept_details[
         "To Be Accept"
-    ] = (
+    ] = pd.to_numeric(
         accept_details[
             "To Be Accept"
-        ]
-        .fillna(0)
-        .astype(int)
-    )
+        ],
+        errors="coerce"
+    ).fillna(0).astype(int)
 
     return Exporter.build_formatted_excel_file(
         df=accept_details,
@@ -185,14 +362,20 @@ def build_accept_details(
         columns=[
             "GTIN",
             "Drug Name",
+            "Generic Item Number",
+            "Trade Item Number",
+            "Trade Name",
             "BN",
             "Expiry Date",
-            "Trade Name",
+            "Supplier Name",
+            "Inbound Shipment Number",
             "Received Quantity",
             "PackageSize",
             "To Be Accept"
         ],
         sort_columns=[
+            "Generic Item Number",
+            "Trade Item Number",
             "GTIN",
             "BN",
             "Expiry Date"
@@ -200,51 +383,135 @@ def build_accept_details(
     )
 
 
-def build_dispatch_details(
-    dispatch_output
+def _prepare_dispatch_source(
+    reconciliation_engine
 ):
 
-    dispatch_details = (
-        dispatch_output.copy()
+    dispatch = reconciliation_engine.dispatch.copy()
+
+    dispatch["Order Number"] = _series_or_blank(
+        dispatch,
+        [
+            "Order Number",
+            "Sales Order Number",
+            "Sales Order",
+            "SO Number"
+        ]
     )
 
-    if dispatch_details.empty:
+    dispatch["Generic Item Number"] = _series_or_blank(
+        dispatch,
+        [
+            "Generic Item Number",
+            "Generic Number",
+            "Generic Item"
+        ]
+    )
 
-        dispatch_details = dispatch_details.reindex(
-            columns=[
-                "Customer Status",
-                "GLN",
-                "To Address",
-                "Original To Address",
-                "Trade Item Number",
-                "GTIN",
-                "Drug Name",
-                "BN",
-                "Expiry Date",
-                "Trade Name",
-                "Dispatched Quantity",
-                "PackageSize",
-                "Actual Dispatch Packages",
-                "Calculated To Be Dispatch",
-                "Allocated To Be Dispatch",
-                "Remaining To Be Dispatch"
+    dispatch["Trade Item Number"] = _series_or_blank(
+        dispatch,
+        [
+            "Trade Item Number",
+            "Trade Item",
+            "Trade Number",
+            "Item Number"
+        ]
+    )
+
+    if "Order Line" not in dispatch.columns:
+        dispatch["Order Line"] = _series_or_blank(
+            dispatch,
+            [
+                "Order Line",
+                "order line",
+                "Sales Order Line"
             ]
         )
 
-    if (
-        "Remaining To Be Dispatch"
-        not in dispatch_details.columns
-    ):
+    return dispatch
+
+
+def build_dispatch_details(
+    reconciliation_engine,
+    master
+):
+
+    keys = [
+        "BN",
+        "Expiry Date"
+    ]
+
+    dispatch_lookup = (
+        master[
+            master["To Be Dispatch"] > 0
+        ][
+            [
+                "BN",
+                "Expiry Date",
+                "GTIN",
+                "Drug Name",
+                "PackageSize",
+                "To Be Dispatch"
+            ]
+        ]
+        .drop_duplicates(
+            subset=keys,
+            keep="first"
+        )
+        .copy()
+    )
+
+    dispatch_source = _prepare_dispatch_source(
+        reconciliation_engine
+    )
+
+    dispatch_details = (
+        dispatch_source
+        .merge(
+            dispatch_lookup,
+            on=keys,
+            how="inner"
+        )
+    )
+
+    dispatch_details = (
         dispatch_details[
-            "Remaining To Be Dispatch"
-        ] = (
-            dispatch_details[
-                "Calculated To Be Dispatch"
-            ]
-            - dispatch_details[
-                "Allocated To Be Dispatch"
-            ]
-        ).clip(lower=0)
+            pd.to_numeric(
+                dispatch_details[
+                    "Dispatched Quantity"
+                ],
+                errors="coerce"
+            ).fillna(0) > 0
+        ]
+        .copy()
+    )
+
+    dispatch_details[
+        "Dispatched Quantity"
+    ] = pd.to_numeric(
+        dispatch_details[
+            "Dispatched Quantity"
+        ],
+        errors="coerce"
+    ).fillna(0)
+
+    dispatch_details[
+        "PackageSize"
+    ] = pd.to_numeric(
+        dispatch_details[
+            "PackageSize"
+        ],
+        errors="coerce"
+    ).fillna(0)
+
+    dispatch_details[
+        "To Be Dispatch"
+    ] = pd.to_numeric(
+        dispatch_details[
+            "To Be Dispatch"
+        ],
+        errors="coerce"
+    ).fillna(0).astype(int)
 
     return Exporter.build_formatted_excel_file(
         df=dispatch_details,
@@ -252,10 +519,10 @@ def build_dispatch_details(
         sheet_name="Dispatch Details",
         title="SFDA Dispatch Details",
         columns=[
-            "Customer Status",
-            "GLN",
             "To Address",
-            "Original To Address",
+            "Order Number",
+            "Order Line",
+            "Generic Item Number",
             "Trade Item Number",
             "GTIN",
             "Drug Name",
@@ -264,14 +531,13 @@ def build_dispatch_details(
             "Trade Name",
             "Dispatched Quantity",
             "PackageSize",
-            "Actual Dispatch Packages",
-            "Calculated To Be Dispatch",
-            "Allocated To Be Dispatch",
-            "Remaining To Be Dispatch"
+            "To Be Dispatch"
         ],
         sort_columns=[
-            "Customer Status",
             "To Address",
+            "Order Number",
+            "Generic Item Number",
+            "Trade Item Number",
             "GTIN",
             "BN",
             "Expiry Date"
@@ -283,44 +549,12 @@ def build_variance_report(
     variance
 ):
 
-    variance_report = (
-        variance.copy()
-    )
-
-    preferred_columns = [
-        "Variance Type",
-        "Customer Status",
-        "GLN",
-        "To Address",
-        "GTIN",
-        "Drug Name",
-        "BN",
-        "Expiry Date",
-        "PackageSize",
-        "Quantity",
-        "Active",
-        "Inventory",
-        "Receiving",
-        "Dispatch",
-        "To Be Accept",
-        "Calculated To Be Dispatch",
-        "Allocated To Be Dispatch",
-        "Remaining To Be Dispatch",
-        "New Active",
-        "Active Variance",
-        "Receive Variance",
-        "Dispatch Variance"
-    ]
-
     return Exporter.build_formatted_excel_file(
-        df=variance_report,
+        df=variance,
         file_name="Variance_Report.xlsx",
         sheet_name="Variance Report",
         title="SFDA Variance Report",
-        columns=preferred_columns,
         sort_columns=[
-            "Variance Type",
-            "To Address",
             "GTIN",
             "BN",
             "Expiry Date"
@@ -370,7 +604,8 @@ def ui(
             )
 
         html_content = (
-            html_path.read_text(
+            html_path
+            .read_text(
                 encoding="utf-8"
             )
         )
@@ -481,17 +716,11 @@ def process(
             in uploaded_files.items()
         }
 
-        reconciliation_engine = (
-            ReconciliationEngine(
-                asn_df=dataframes["asn"],
-                inventory_df=(
-                    dataframes["inventory"]
-                ),
-                dispatch_df=(
-                    dataframes["dispatch"]
-                ),
-                sfda_df=dataframes["sfda"]
-            )
+        reconciliation_engine = ReconciliationEngine(
+            asn_df=dataframes["asn"],
+            inventory_df=dataframes["inventory"],
+            dispatch_df=dataframes["dispatch"],
+            sfda_df=dataframes["sfda"]
         )
 
         result = (
@@ -528,7 +757,10 @@ def process(
 
         dispatch_details = (
             build_dispatch_details(
-                dispatch_output=dispatch_output
+                reconciliation_engine=(
+                    reconciliation_engine
+                ),
+                master=master
             )
         )
 
@@ -562,7 +794,9 @@ def process(
                     len(dataframe)
                 ),
                 "columns": int(
-                    len(dataframe.columns)
+                    len(
+                        dataframe.columns
+                    )
                 )
             }
 
@@ -571,42 +805,6 @@ def process(
             for file_info
             in files_summary.values()
         )
-
-        registered_dispatch_rows = 0
-        dummy_dispatch_rows = 0
-        allocated_dispatch_quantity = 0
-
-        if not dispatch_output.empty:
-
-            if (
-                "Customer Status"
-                in dispatch_output.columns
-            ):
-                registered_dispatch_rows = int(
-                    (
-                        dispatch_output[
-                            "Customer Status"
-                        ] == "REGISTERED"
-                    ).sum()
-                )
-
-                dummy_dispatch_rows = int(
-                    (
-                        dispatch_output[
-                            "Customer Status"
-                        ] == "DUMMY"
-                    ).sum()
-                )
-
-            if (
-                "Allocated To Be Dispatch"
-                in dispatch_output.columns
-            ):
-                allocated_dispatch_quantity = int(
-                    dispatch_output[
-                        "Allocated To Be Dispatch"
-                    ].sum()
-                )
 
         return json_response({
             "status": (
@@ -638,15 +836,6 @@ def process(
                 ),
                 "dispatch_files_count": len(
                     dispatch_files
-                ),
-                "registered_dispatch_rows": (
-                    registered_dispatch_rows
-                ),
-                "dummy_dispatch_rows": (
-                    dummy_dispatch_rows
-                ),
-                "allocated_dispatch_quantity": (
-                    allocated_dispatch_quantity
                 )
             },
             "files": files_summary,
