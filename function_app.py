@@ -17,7 +17,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "2.2.0"
+APPLICATION_VERSION = "2.2.1"
 
 REQUIRED_FILES = [
     "asn",
@@ -433,85 +433,152 @@ def _prepare_dispatch_source(
 
 def build_dispatch_details(
     reconciliation_engine,
-    master
+    dispatch_output
 ):
+
+    dispatch_details = dispatch_output.copy()
+
+    dispatch_source = _prepare_dispatch_source(
+        reconciliation_engine
+    )
 
     keys = [
         "BN",
         "Expiry Date"
     ]
 
-    dispatch_lookup = (
-        master[
-            master["To Be Dispatch"] > 0
-        ][
-            [
-                "BN",
-                "Expiry Date",
-                "GTIN",
-                "Drug Name",
-                "PackageSize",
-                "To Be Dispatch"
-            ]
-        ]
-        .drop_duplicates(
-            subset=keys,
-            keep="first"
-        )
-        .copy()
-    )
-
-    dispatch_source = _prepare_dispatch_source(
-        reconciliation_engine
-    )
-
-    dispatch_details = (
-        dispatch_source
-        .merge(
-            dispatch_lookup,
-            on=keys,
-            how="inner"
-        )
-    )
-
-    dispatch_details = (
-        dispatch_details[
-            pd.to_numeric(
-                dispatch_details[
-                    "Dispatched Quantity"
-                ],
-                errors="coerce"
-            ).fillna(0) > 0
-        ]
-        .copy()
-    )
-
-    dispatch_details[
-        "Dispatched Quantity"
-    ] = pd.to_numeric(
-        dispatch_details[
+    source_columns = [
+        column
+        for column in [
+            "BN",
+            "Expiry Date",
+            "Order Number",
+            "Order Line",
+            "Generic Item Number",
+            "Trade Item Number",
+            "Trade Name",
             "Dispatched Quantity"
-        ],
-        errors="coerce"
-    ).fillna(0)
+        ]
+        if column in dispatch_source.columns
+    ]
 
-    dispatch_details[
-        "PackageSize"
-    ] = pd.to_numeric(
-        dispatch_details[
-            "PackageSize"
-        ],
-        errors="coerce"
-    ).fillna(0)
+    if source_columns:
+        source_details = (
+            dispatch_source[source_columns]
+            .drop_duplicates()
+            .copy()
+        )
 
-    dispatch_details[
+        merge_keys = [
+            key
+            for key in keys
+            if (
+                key in dispatch_details.columns
+                and key in source_details.columns
+            )
+        ]
+
+        if merge_keys:
+            dispatch_details = dispatch_details.merge(
+                source_details,
+                on=merge_keys,
+                how="left",
+                suffixes=("", "_Source")
+            )
+
+    for target_column in [
+        "Order Number",
+        "Order Line",
+        "Generic Item Number",
+        "Trade Item Number",
+        "Trade Name",
+        "Dispatched Quantity"
+    ]:
+        source_column = f"{target_column}_Source"
+
+        if target_column not in dispatch_details.columns:
+            dispatch_details[target_column] = ""
+
+        if source_column in dispatch_details.columns:
+            dispatch_details[target_column] = (
+                dispatch_details[target_column]
+                .where(
+                    dispatch_details[target_column]
+                    .notna()
+                    & (
+                        dispatch_details[target_column]
+                        .astype(str)
+                        .str.strip()
+                        != ""
+                    ),
+                    dispatch_details[source_column]
+                )
+            )
+
+    quantity_candidates = [
+        "Allocated To Be Dispatch",
+        "Calculated To Be Dispatch",
         "To Be Dispatch"
-    ] = pd.to_numeric(
-        dispatch_details[
-            "To Be Dispatch"
-        ],
+    ]
+
+    quantity_column = next(
+        (
+            column
+            for column in quantity_candidates
+            if column in dispatch_details.columns
+        ),
+        None
+    )
+
+    if quantity_column is None:
+        dispatch_details["To Be Dispatch"] = 0
+    else:
+        dispatch_details["To Be Dispatch"] = pd.to_numeric(
+            dispatch_details[quantity_column],
+            errors="coerce"
+        ).fillna(0)
+
+    if "Dispatched Quantity" not in dispatch_details.columns:
+        dispatch_details["Dispatched Quantity"] = 0
+
+    dispatch_details["Dispatched Quantity"] = pd.to_numeric(
+        dispatch_details["Dispatched Quantity"],
         errors="coerce"
-    ).fillna(0).astype(int)
+    ).fillna(0)
+
+    if "PackageSize" not in dispatch_details.columns:
+        dispatch_details["PackageSize"] = 0
+
+    dispatch_details["PackageSize"] = pd.to_numeric(
+        dispatch_details["PackageSize"],
+        errors="coerce"
+    ).fillna(0)
+
+    dispatch_details = dispatch_details[
+        (dispatch_details["To Be Dispatch"] > 0)
+        | (dispatch_details["Dispatched Quantity"] > 0)
+    ].copy()
+
+    dispatch_details["To Be Dispatch"] = (
+        dispatch_details["To Be Dispatch"]
+        .round(0)
+        .astype(int)
+    )
+
+    for column in [
+        "To Address",
+        "Order Number",
+        "Order Line",
+        "Generic Item Number",
+        "Trade Item Number",
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "Trade Name"
+    ]:
+        if column not in dispatch_details.columns:
+            dispatch_details[column] = ""
 
     return Exporter.build_formatted_excel_file(
         df=dispatch_details,
@@ -760,7 +827,7 @@ def process(
                 reconciliation_engine=(
                     reconciliation_engine
                 ),
-                master=master
+                dispatch_output=dispatch_output
             )
         )
 
