@@ -592,7 +592,7 @@
 
       <!-- HISTORY -->
       <section class="page" id="page-history">
-        <div class="page-head"><div><h1>Reconciliation History</h1><p>Persistent reconciliation runs stored in Azure SQL Database.</p></div><div class="actions"><button class="btn btn-secondary" id="refreshHistoryButton">↻ Refresh History</button></div></div>
+        <div class="page-head"><div><h1>Reconciliation History</h1><p>Persistent reconciliation runs stored in Azure SQL Database.</p></div><div class="actions"><button class="btn btn-secondary" id="clearHistoryButton">↻ Refresh History</button></div></div>
         <div class="card table-card">
           <div class="table-toolbar"><div class="card-title">Previous Reconciliation Runs</div><div class="filters"><input class="control search" id="historySearch" placeholder="Search run ID or user..."><select class="control" id="historyStatus"><option value="">All statuses</option><option>Completed</option><option>Failed</option></select></div></div>
           <div class="table-scroll"><table><thead><tr><th>Run ID</th><th>Date & Time</th><th>User</th><th>Status</th><th>Files</th><th>Input Rows</th><th>Accept</th><th>Dispatch</th><th>Variance</th><th>Version</th></tr></thead><tbody id="historyBody"></tbody></table></div>
@@ -602,7 +602,7 @@
 
       <!-- REPORTS -->
       <section class="page" id="page-reports">
-        <div class="page-head"><div><h1>Reports & Analytics</h1><p>Operational analytics based on persistent reconciliation history in Azure SQL.</p></div><div class="actions"><button class="btn btn-secondary" id="exportHistoryButton">⇩ Export History JSON</button></div></div>
+        <div class="page-head"><div><h1>Reports & Analytics</h1><p>Operational analytics based on persistent reconciliation history stored in Azure SQL.</p></div><div class="actions"><button class="btn btn-secondary" id="exportHistoryButton">⇩ Export History JSON</button></div></div>
         <div class="grid kpi-grid">
           <div class="card kpi"><div class="kpi-label">Total Runs</div><div class="kpi-value" id="reportRuns">0</div><div class="kpi-icon">◷</div></div>
           <div class="card kpi"><div class="kpi-label">Success Rate</div><div class="kpi-value" id="reportSuccessRate">0%</div><div class="kpi-icon green">✓</div></div>
@@ -662,13 +662,14 @@
   const API_URL = "/api/process";
   const HEALTH_URL = "/api/health";
   const VERSION_URL = "/api/version";
-  const HISTORY_URL = "/api/history";
   const FILE_KEYS = ["asn","inventory","dispatch","sfda"];
+  const HISTORY_URL = "/api/history";
   const DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v1";
   let currentResult = null;
   let progressTimer = null;
   let historyCache = [];
   let historyLoaded = false;
+  let historyLoading = false;
 
   const $ = id => document.getElementById(id);
   const formatNumber = value => Number(value || 0).toLocaleString("en-US");
@@ -690,8 +691,8 @@
     const labels={home:"Dashboard",upload:"Upload & Run",history:"History",reports:"Reports",intelligence:"Product Intelligence",variance:"Variance Management",administration:"Administration"};
     $("topbarTitle").textContent=labels[page]||"SFDA Platform";
     $("sidebar").classList.remove("open");
-    if(page==="history") loadHistory({showToast:false});
-    if(page==="reports") loadHistory({showToast:false});
+    if(page==="history") refreshAzureHistory();
+    if(page==="reports") refreshAzureHistory();
     window.scrollTo({top:0,behavior:"smooth"});
   }
   document.querySelectorAll("[data-page]").forEach(btn=>btn.addEventListener("click",()=>navigate(btn.dataset.page)));
@@ -789,14 +790,14 @@
       setStatus("success","Reconciliation completed successfully. Results are ready for review and download.");
       populateSummary(result);
       populateResults(result);
-      await loadHistory({showToast:false});
+      await refreshAzureHistory({silent:true});
       $("inlineResults").classList.add("show");
       setTimeout(()=>$("inlineResults").scrollIntoView({behavior:"smooth",block:"start"}),120);
       toast("Reconciliation completed successfully.","success");
     }catch(error){
       finishProgress(false);
       setStatus("error",error.message||String(error));
-      await loadHistory({showToast:false});
+      await refreshAzureHistory({silent:true});
       toast(error.message||String(error),"error");
     }finally{
       $("runButton").disabled=FILE_KEYS.some(k=>!$(k).files.length);
@@ -922,9 +923,9 @@
 
   function normalizeHistoryRecord(row){
     return {
-      runId: row.RunNumber || String(row.RunID || "—"),
+      runId: row.RunNumber || `RUN-${row.RunID ?? "—"}`,
       runNumber: row.RunNumber || "—",
-      databaseId: row.RunID ?? null,
+      databaseRunId: row.RunID ?? null,
       timestamp: row.StartedAt || row.RunDate || null,
       completedAt: row.CompletedAt || null,
       user: row.SubmittedBy || "Web User",
@@ -937,75 +938,92 @@
       variance: Number(row.ExceptionRecords || 0),
       generated: Number(row.GeneratedFiles || 0),
       version: row.ApplicationVersion || "—",
-      error: row.ErrorMessage || null
+      error: row.ErrorMessage || "",
+      durationSeconds: calculateRunDuration(row.StartedAt, row.CompletedAt)
     };
+  }
+
+  function calculateRunDuration(startedAt, completedAt){
+    if(!startedAt || !completedAt) return null;
+    const start = new Date(startedAt);
+    const end = new Date(completedAt);
+    if(Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+    return Math.max(0, (end.getTime() - start.getTime()) / 1000);
   }
 
   function getHistory(){
     return historyCache;
   }
 
-  async function loadHistory({showToast=false}={}){
+  async function refreshAzureHistory(options={}){
+    const {silent=false} = options;
+    if(historyLoading) return historyCache;
+    historyLoading = true;
+    if(!silent) toast("Refreshing Azure SQL history...","info");
     try{
-      const response=await fetch(`${HISTORY_URL}?limit=500`,{headers:{"Accept":"application/json"}});
+      const response = await fetch(`${HISTORY_URL}?limit=500`, {cache:"no-store"});
       let payload;
-      try{ payload=await response.json(); }
-      catch{ throw new Error(`History API returned HTTP ${response.status} without valid JSON.`); }
-      if(!response.ok || payload.status==="Failed"){
+      try{
+        payload = await response.json();
+      }catch{
+        throw new Error(`History endpoint returned HTTP ${response.status} without valid JSON.`);
+      }
+      if(!response.ok || payload.status === "Failed"){
         throw new Error(payload.error || payload.message || `History request failed with HTTP ${response.status}.`);
       }
-      const source=Array.isArray(payload.history)?payload.history:[];
-      historyCache=source.map(normalizeHistoryRecord);
-      historyLoaded=true;
+      const sourceRows = Array.isArray(payload.history) ? payload.history : [];
+      historyCache = sourceRows.map(normalizeHistoryRecord);
+      historyLoaded = true;
       renderHistory();
       updateDashboard();
       renderReports();
-      if(showToast) toast("History refreshed from Azure SQL.","success");
+      if(!silent) toast(`History refreshed: ${historyCache.length} run${historyCache.length===1?"":"s"}.`,"success");
       return historyCache;
     }catch(error){
-      historyLoaded=true;
-      renderHistory(error.message || String(error));
+      console.error("Unable to load Azure SQL history.", error);
+      historyLoaded = true;
+      renderHistory(error);
       updateDashboard();
       renderReports();
-      if(showToast) toast(error.message || String(error),"error");
-      console.error("Unable to load reconciliation history.",error);
+      if(!silent) toast(error.message || String(error),"error");
       return historyCache;
+    }finally{
+      historyLoading = false;
     }
   }
 
-  function renderHistory(loadError=""){
-    const q=$("historySearch").value.trim().toLowerCase();
-    const status=$("historyStatus").value;
-    const rows=getHistory().filter(r=>(!q||String(r.runId).toLowerCase().includes(q)||String(r.user).toLowerCase().includes(q))&&(!status||r.status===status));
-    const body=$("historyBody");
+  function renderHistory(loadError=null){
+    const q=$('historySearch').value.trim().toLowerCase();
+    const status=$('historyStatus').value;
+    const rows=getHistory().filter(r=>(!q||r.runId.toLowerCase().includes(q)||r.user.toLowerCase().includes(q))&&(!status||r.status===status));
+    const body=$('historyBody');
     body.innerHTML="";
 
-    if(loadError && !rows.length){
-      body.innerHTML=`<tr><td colspan="10"><div class="empty"><strong>Unable to load database history</strong>${escapeHtml(loadError)}</div></td></tr>`;
-      $("historyCount").textContent="History unavailable";
+    if(loadError && !historyCache.length){
+      body.innerHTML=`<tr><td colspan="10"><div class="empty"><strong>Unable to load Azure SQL history</strong>${escapeHtml(loadError.message || String(loadError))}</div></td></tr>`;
+      $('historyCount').textContent="History unavailable";
       return;
     }
 
     rows.forEach(r=>{
-      const tr=document.createElement("tr");
-      const dateText=r.timestamp?new Date(r.timestamp).toLocaleString():"—";
+      const tr=document.createElement('tr');
+      const dateText=r.timestamp ? new Date(r.timestamp).toLocaleString() : "—";
       const statusClass=r.status==="Completed"?"success":r.status==="Failed"?"failed":"warning";
-      const title=r.error?` title="${escapeHtml(r.error)}"`:"";
-      tr.innerHTML=`<td><strong style="color:#075fc8">${escapeHtml(r.runId)}</strong></td><td>${escapeHtml(dateText)}</td><td>${escapeHtml(r.user)}</td><td><span class="badge ${statusClass}"${title}>${escapeHtml(r.status)}</span></td><td>${formatNumber(r.files)}</td><td>${formatNumber(r.inputRows)}</td><td>${formatNumber(r.accept)}</td><td>${formatNumber(r.dispatch)}</td><td>${formatNumber(r.variance)}</td><td>${escapeHtml(r.version||"—")}</td>`;
+      const errorTitle=r.error?` title="${escapeHtml(r.error)}"`:"";
+      tr.innerHTML=`<td><strong style="color:#075fc8"${errorTitle}>${escapeHtml(r.runId)}</strong></td><td>${escapeHtml(dateText)}</td><td>${escapeHtml(r.user)}</td><td><span class="badge ${statusClass}"${errorTitle}>${escapeHtml(r.status)}</span></td><td>${formatNumber(r.files)}</td><td>${formatNumber(r.inputRows)}</td><td>${formatNumber(r.accept)}</td><td>${formatNumber(r.dispatch)}</td><td>${formatNumber(r.variance)}</td><td>${escapeHtml(r.version||"—")}</td>`;
       body.appendChild(tr);
     });
 
     if(!rows.length){
-      const message=historyLoaded?"No reconciliation runs match the current filters.":"Loading reconciliation history from Azure SQL...";
+      const message=historyLoaded?"No matching database runs were found.":"Loading reconciliation history from Azure SQL...";
       body.innerHTML=`<tr><td colspan="10"><div class="empty"><strong>${historyLoaded?"No history found":"Loading history"}</strong>${message}</div></td></tr>`;
     }
-    $("historyCount").textContent=`${rows.length} database run${rows.length===1?"":"s"}`;
+    $('historyCount').textContent=`${rows.length} database run${rows.length===1?"":"s"}`;
   }
 
-  $("historySearch").addEventListener("input",()=>renderHistory());
-  $("historyStatus").addEventListener("change",()=>renderHistory());
-  $("refreshHistoryButton").addEventListener("click",()=>loadHistory({showToast:true}));
-
+  $('historySearch').addEventListener('input',()=>renderHistory());
+  $('historyStatus').addEventListener('change',()=>renderHistory());
+  $('clearHistoryButton').addEventListener('click',()=>refreshAzureHistory());
 
   function getDashboardPreview(){
     try{
@@ -1080,10 +1098,7 @@
     const total=Number(latest.accept||0)+Number(latest.dispatch||0)+Number(latest.variance||0);
     $("compositionContent").innerHTML=total?`<div class="status-line"><span>Accept Items</span><strong>${formatNumber(latest.accept)}</strong></div><div class="status-line"><span>Dispatch Items</span><strong>${formatNumber(latest.dispatch)}</strong></div><div class="status-line"><span>Variance Items</span><strong>${formatNumber(latest.variance)}</strong></div><div class="status-line"><span>Total Result Items</span><strong>${formatNumber(total)}</strong></div>`:`<div class="empty"><strong>No report data yet</strong>Run a reconciliation first.</div>`;
   }
-  $("exportHistoryButton").addEventListener("click",async()=>{
-    if(!historyLoaded) await loadHistory({showToast:false});
-    downloadText("SFDA_Reconciliation_Azure_SQL_History.json",JSON.stringify(getHistory(),null,2),"application/json;charset=utf-8");
-  });
+  $("exportHistoryButton").addEventListener("click",()=>downloadText("SFDA_Reconciliation_Azure_SQL_History.json",JSON.stringify(getHistory(),null,2),"application/json;charset=utf-8"));
 
   async function checkHealth(){
     try{
@@ -1107,16 +1122,12 @@
   $("healthButton").addEventListener("click",async()=>{ const ok=await checkHealth(); toast(ok?"Azure Function is healthy.":"Azure Function health check failed.",ok?"success":"error"); });
 
   if($("dashboardDate")) $("dashboardDate").value=new Date().toISOString().slice(0,10);
-  if($("dashboardRefresh")) $("dashboardRefresh").addEventListener("click",async()=>{
-    await loadHistory({showToast:false});
-    renderDashboardOverview();
-    toast("Dashboard refreshed.","success");
-  });
-  renderDashboardOverview();
+  if($("dashboardRefresh")) $("dashboardRefresh").addEventListener("click",()=>refreshAzureHistory());
   renderHistory();
+  updateDashboard();
   renderReports();
   checkHealth();
-  loadHistory({showToast:false});
+  refreshAzureHistory({silent:true});
 </script>
 </body>
 </html>
