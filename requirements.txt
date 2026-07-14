@@ -3,3 +3,4 @@ pandas
 openpyxl
 xlrd
 pymssql
+azure-storage-blob
