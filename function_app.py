@@ -17,7 +17,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "3.1.0"
+APPLICATION_VERSION = "3.1.1"
 
 REQUIRED_FILES = [
     "asn",
@@ -297,7 +297,6 @@ def build_dashboard_preview(master, limit=100):
         "Expiry Date": ["Expiry Date", "Expiration Date", "Best Before Date"],
         "GTIN": ["GTIN"],
         "Drug Name": ["Drug Name", "Trade Name"],
-        "PackageSize": ["PackageSize", "Package Size", "PZ"],
         "Active": ["Active"],
         "Quantity Sent Pending": ["Quantity Sent Pending", "Quantity sent pending", "Qty Sent Pending"],
         "Quantity Receive Pending": ["Quantity Receive Pending", "Quantity Receive Pending ", "Qty Receive Pending"],
@@ -309,23 +308,49 @@ def build_dashboard_preview(master, limit=100):
     }
     selected = {canonical: _first_existing_column(master, candidates) for canonical, candidates in aliases.items()}
     rows = []
-    for _, source_row in master.head(limit).iterrows():
+    for _, source_row in master.iterrows():
         record = {}
         for canonical, source_column in selected.items():
-            record[canonical] = _json_safe_value(source_row[source_column]) if source_column else None
-        to_accept = pd.to_numeric(pd.Series([record.get("To Be Accept")]), errors="coerce").fillna(0).iloc[0]
-        to_dispatch = pd.to_numeric(pd.Series([record.get("To Be Dispatch")]), errors="coerce").fillna(0).iloc[0]
-        variance = pd.to_numeric(pd.Series([record.get("Variance")]), errors="coerce").fillna(0).iloc[0]
+            record[canonical] = (
+                _json_safe_value(source_row[source_column])
+                if source_column
+                else None
+            )
+
+        to_accept = pd.to_numeric(
+            pd.Series([record.get("To Be Accept")]),
+            errors="coerce"
+        ).fillna(0).iloc[0]
+
+        to_dispatch = pd.to_numeric(
+            pd.Series([record.get("To Be Dispatch")]),
+            errors="coerce"
+        ).fillna(0).iloc[0]
+
+        # Dashboard is an action table: hide batches with no reconciliation action.
+        if to_accept <= 0 and to_dispatch <= 0:
+            continue
+
+        variance = pd.to_numeric(
+            pd.Series([record.get("Variance")]),
+            errors="coerce"
+        ).fillna(0).iloc[0]
+
         if variance != 0:
             status = "DIFF"
+        elif to_accept > 0 and to_dispatch > 0:
+            status = "ACCEPT & DISPATCH"
         elif to_accept > 0:
             status = "ACCEPT PENDING"
-        elif to_dispatch > 0:
-            status = "DISPATCH PENDING"
         else:
-            status = "OK"
+            status = "DISPATCH PENDING"
+
         record["Status"] = status
         rows.append(record)
+
+        if len(rows) >= limit:
+            break
+
     return rows
 
 
