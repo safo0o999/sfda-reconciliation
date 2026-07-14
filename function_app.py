@@ -17,7 +17,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "3.0.0"
+APPLICATION_VERSION = "3.1.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -256,6 +256,77 @@ def _prepare_inventory_lookup(inventory_df):
     inventory["_BN_KEY"] = inventory["BN"].map(_normalize_key_text)
     inventory["_EXPIRY_KEY"] = inventory["Expiry Date"].map(_normalize_date_key)
     return inventory
+
+
+
+def _first_existing_column(dataframe, candidates):
+    for column in candidates:
+        if column in dataframe.columns:
+            return column
+    return None
+
+
+def _json_safe_value(value):
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%d-%m-%Y")
+    if hasattr(value, "isoformat") and not isinstance(value, str):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return value
+
+
+def build_dashboard_preview(master, limit=100):
+    if master is None or master.empty:
+        return []
+    aliases = {
+        "BN": ["BN", "Batch Number", "Batch/Lot"],
+        "Expiry Date": ["Expiry Date", "Expiration Date", "Best Before Date"],
+        "GTIN": ["GTIN"],
+        "Drug Name": ["Drug Name", "Trade Name"],
+        "PackageSize": ["PackageSize", "Package Size", "PZ"],
+        "Active": ["Active"],
+        "Quantity Sent Pending": ["Quantity Sent Pending", "Quantity sent pending", "Qty Sent Pending"],
+        "Quantity Receive Pending": ["Quantity Receive Pending", "Quantity Receive Pending ", "Qty Receive Pending"],
+        "Receiving": ["Receiving", "Receiving Packages", "Received Packages", "Received"],
+        "To Be Accept": ["To Be Accept"],
+        "Inventory": ["Inventory", "Inventory Packages", "Inventory Packs"],
+        "Variance": ["Variance", "Inventory Variance", "Variance (Inv - Active)"],
+        "To Be Dispatch": ["To Be Dispatch", "Calculated To Be Dispatch", "Remaining To Be Dispatch"]
+    }
+    selected = {canonical: _first_existing_column(master, candidates) for canonical, candidates in aliases.items()}
+    rows = []
+    for _, source_row in master.head(limit).iterrows():
+        record = {}
+        for canonical, source_column in selected.items():
+            record[canonical] = _json_safe_value(source_row[source_column]) if source_column else None
+        to_accept = pd.to_numeric(pd.Series([record.get("To Be Accept")]), errors="coerce").fillna(0).iloc[0]
+        to_dispatch = pd.to_numeric(pd.Series([record.get("To Be Dispatch")]), errors="coerce").fillna(0).iloc[0]
+        variance = pd.to_numeric(pd.Series([record.get("Variance")]), errors="coerce").fillna(0).iloc[0]
+        if variance != 0:
+            status = "DIFF"
+        elif to_accept > 0:
+            status = "ACCEPT PENDING"
+        elif to_dispatch > 0:
+            status = "DISPATCH PENDING"
+        else:
+            status = "OK"
+        record["Status"] = status
+        rows.append(record)
+    return rows
 
 
 def build_accept_details(asn_df, inventory_df, master):
@@ -624,6 +695,11 @@ def process(
         dispatch_output = result["dispatch"]
         variance = result["variance"]
 
+        dashboard_preview = build_dashboard_preview(
+            master=master,
+            limit=100
+        )
+
         accept_files = (
             Exporter.build_sfda_upload_files(
                 df=accept,
@@ -727,6 +803,7 @@ def process(
                     dispatch_files
                 )
             },
+            "dashboard_preview": dashboard_preview,
             "files": files_summary,
             "outputs": {
                 "accept_files": (
