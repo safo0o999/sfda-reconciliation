@@ -660,6 +660,7 @@
   const VERSION_URL = "/api/version";
   const FILE_KEYS = ["asn","inventory","dispatch","sfda"];
   const STORAGE_KEY = "sfda_reconciliation_history_v2";
+  const DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v1";
   let currentResult = null;
   let progressTimer = null;
 
@@ -770,6 +771,14 @@
       try{ result=await response.json(); }catch{ throw new Error(`The server returned HTTP ${response.status} without a valid JSON response.`); }
       if(!response.ok||result.status==="Failed") throw new Error(result.error||result.message||`Request failed with HTTP ${response.status}.`);
       currentResult=result;
+      try{
+        localStorage.setItem(
+          DASHBOARD_PREVIEW_KEY,
+          JSON.stringify(result.dashboard_preview || [])
+        );
+      }catch(storageError){
+        console.warn("Unable to save dashboard preview.",storageError);
+      }
       finishProgress(true);
       setStatus("success","Reconciliation completed successfully. Results are ready for review and download.");
       populateSummary(result);
@@ -929,7 +938,53 @@
   $("historyStatus").addEventListener("change",renderHistory);
   $("clearHistoryButton").addEventListener("click",()=>{ if(confirm("Clear all locally stored reconciliation history from this browser?")){ setHistory([]);renderHistory();updateDashboard();renderReports();toast("Local history cleared.","info"); } });
 
+
+  function getDashboardPreview(){
+    try{
+      const rows=JSON.parse(localStorage.getItem(DASHBOARD_PREVIEW_KEY) || "[]");
+      return Array.isArray(rows) ? rows : [];
+    }catch{
+      return [];
+    }
+  }
+
+  function dashboardCell(value,numeric=false){
+    if(value===null || value===undefined || value==="") return "—";
+    return numeric ? formatNumber(value) : escapeHtml(value);
+  }
+
+  function renderDashboardOverview(){
+    const body=$("homeOverviewBody");
+    if(!body) return;
+    const rows=getDashboardPreview();
+    if(!rows.length){
+      body.innerHTML=`<tr><td colspan="14"><div class="empty"><strong>No reconciliation data loaded</strong>Run a reconciliation to populate this operational table.</div></td></tr>`;
+      return;
+    }
+    body.innerHTML=rows.slice(0,100).map(row=>{
+      const status=String(row.Status||"OK");
+      const badgeClass=status==="OK"?"success":status==="DIFF"?"failed":"warning";
+      return `<tr>
+        <td><strong>${dashboardCell(row.BN)}</strong></td>
+        <td>${dashboardCell(row["Expiry Date"])}</td>
+        <td>${dashboardCell(row.GTIN)}</td>
+        <td>${dashboardCell(row["Drug Name"])}</td>
+        <td>${dashboardCell(row.PackageSize,true)}</td>
+        <td>${dashboardCell(row.Active,true)}</td>
+        <td>${dashboardCell(row["Quantity Sent Pending"],true)}</td>
+        <td>${dashboardCell(row["Quantity Receive Pending"],true)}</td>
+        <td>${dashboardCell(row.Receiving,true)}</td>
+        <td>${dashboardCell(row["To Be Accept"],true)}</td>
+        <td>${dashboardCell(row.Inventory,true)}</td>
+        <td>${dashboardCell(row.Variance,true)}</td>
+        <td>${dashboardCell(row["To Be Dispatch"],true)}</td>
+        <td><span class="badge ${badgeClass}">${escapeHtml(status)}</span></td>
+      </tr>`;
+    }).join("");
+  }
+
   function updateDashboard(){
+    renderDashboardOverview();
     const history=getHistory(),latest=history.find(x=>x.status==="Completed");
     $("homeRuns").textContent=formatNumber(history.length);
     $("homeSuccess").textContent=formatNumber(history.filter(x=>x.status==="Completed").length);
