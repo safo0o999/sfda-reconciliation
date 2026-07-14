@@ -7,6 +7,11 @@ from pathlib import Path
 import azure.functions as func
 import pandas as pd
 
+from engine.database import (
+    initialize_database,
+    test_database_connection,
+)
+
 from engine.exporter import Exporter
 from engine.reconciliation import ReconciliationEngine
 
@@ -17,7 +22,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "3.1.1"
+APPLICATION_VERSION = "3.2.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -625,6 +630,41 @@ def ui(
 @app.route(
     route="health",
     methods=["GET"]
+)
+def health(
+    req: func.HttpRequest
+) -> func.HttpResponse:
+
+    try:
+        initialize_database()
+
+        database_result = (
+            test_database_connection()
+        )
+
+        return json_response({
+            "status": "Healthy",
+            "application": APPLICATION_NAME,
+            "azure_function": "Working",
+            "version": APPLICATION_VERSION,
+            "database": database_result,
+        })
+
+    except Exception as ex:
+        logging.exception(
+            "Database health check failed."
+        )
+
+        return json_response(
+            {
+                "status": "Failed",
+                "application": APPLICATION_NAME,
+                "version": APPLICATION_VERSION,
+                "error": str(ex),
+                "error_type": type(ex).__name__,
+            },
+            status_code=500,
+        )
 )
 def health(
     req: func.HttpRequest
