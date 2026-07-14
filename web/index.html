@@ -373,7 +373,11 @@
     .ops-kpi.purple{background:linear-gradient(135deg,#fff,#f7f1ff)} .ops-kpi.purple .mini-icon{background:#eee4ff;color:#7040bd}
     .ops-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:14px}
     .ops-main{display:grid;gap:14px}.ops-side{display:grid;gap:14px;align-content:start}
-    .compact-table table{min-width:980px;font-size:10px}.compact-table th,.compact-table td{padding:9px 10px}
+    .compact-table table{min-width:900px;font-size:10px}.compact-table th,.compact-table td{padding:9px 10px}
+    .compact-table .table-scroll{max-height:430px;overflow-y:auto;overflow-x:auto}
+    .compact-table thead th{position:sticky;top:0;z-index:3}
+    .compact-table thead tr:first-child th{top:0}
+    .compact-table thead tr:nth-child(2) th{top:33px}
     .group-head{font-size:9px;text-align:center;color:#334155;border-bottom:0!important}.group-sfda{background:#eaf4ff!important}.group-receive{background:#ebf8ef!important}.group-inventory{background:#fff5df!important}.group-dispatch{background:#fdeceb!important}
     .quick-actions{padding:12px;display:grid;gap:8px}.quick-actions .btn{width:100%;justify-content:flex-start}
     .mini-donut-wrap{padding:16px;display:grid;grid-template-columns:110px 1fr;gap:14px;align-items:center}.mini-donut{width:100px;height:100px;border-radius:50%;background:conic-gradient(#239247 0 80%,#d94747 80% 90%,#c8ced8 90% 100%);position:relative}.mini-donut:after{content:"";position:absolute;inset:22px;background:#fff;border-radius:50%}.mini-donut-label{position:absolute;inset:0;display:grid;place-items:center;z-index:2;text-align:center;font-size:11px;font-weight:900}.mini-legend{display:grid;gap:8px;font-size:10px}.mini-legend-row{display:flex;justify-content:space-between;gap:8px}
@@ -469,11 +473,11 @@
               <div class="card-header"><div><div class="card-title">Reconciliation Overview</div><div class="card-subtitle">Latest completed run preview</div></div><button class="btn btn-secondary" data-go="upload">Open Current Run</button></div>
               <div class="table-scroll"><table>
                 <thead>
-                  <tr><th colspan="5"></th><th colspan="3" class="group-head group-sfda">SFDA</th><th colspan="2" class="group-head group-receive">WMS Receive</th><th colspan="2" class="group-head group-inventory">WMS Inventory</th><th colspan="1" class="group-head group-dispatch">WMS Dispatch</th><th></th></tr>
-                  <tr><th>BN</th><th>Expiry Date</th><th>GTIN</th><th>Drug Name</th><th>PZ</th><th>Active</th><th>Qty Sent Pending</th><th>Qty Receive Pending</th><th>Received</th><th>To Be Accept</th><th>Inventory</th><th>Variance</th><th>To Be Dispatch</th><th>Status</th></tr>
+                  <tr><th colspan="4"></th><th colspan="3" class="group-head group-sfda">SFDA</th><th colspan="2" class="group-head group-receive">WMS Receive</th><th colspan="2" class="group-head group-inventory">WMS Inventory</th><th colspan="1" class="group-head group-dispatch">WMS Dispatch</th><th></th></tr>
+                  <tr><th>BN</th><th>Expiry Date</th><th>GTIN</th><th>Drug Name</th><th>Active</th><th>Qty Sent Pending</th><th>Qty Receive Pending</th><th>Received</th><th>To Be Accept</th><th>Inventory</th><th>Variance</th><th>To Be Dispatch</th><th>Status</th></tr>
                 </thead>
                 <tbody id="homeOverviewBody">
-                  <tr><td colspan="14"><div class="empty"><strong>No reconciliation data loaded</strong>Run a reconciliation to populate this operational table.</div></td></tr>
+                  <tr><td colspan="13"><div class="empty"><strong>No reconciliation data loaded</strong>Run a reconciliation to populate this operational table.</div></td></tr>
                 </tbody>
               </table></div>
             </div>
@@ -958,10 +962,10 @@
     if(!body) return;
     const rows=getDashboardPreview();
     if(!rows.length){
-      body.innerHTML=`<tr><td colspan="14"><div class="empty"><strong>No reconciliation data loaded</strong>Run a reconciliation to populate this operational table.</div></td></tr>`;
+      body.innerHTML=`<tr><td colspan="13"><div class="empty"><strong>No reconciliation data loaded</strong>Run a reconciliation to populate this operational table.</div></td></tr>`;
       return;
     }
-    body.innerHTML=rows.slice(0,100).map(row=>{
+    body.innerHTML=rows.map(row=>{
       const status=String(row.Status||"OK");
       const badgeClass=status==="OK"?"success":status==="DIFF"?"failed":"warning";
       return `<tr>
@@ -969,7 +973,6 @@
         <td>${dashboardCell(row["Expiry Date"])}</td>
         <td>${dashboardCell(row.GTIN)}</td>
         <td>${dashboardCell(row["Drug Name"])}</td>
-        <td>${dashboardCell(row.PackageSize,true)}</td>
         <td>${dashboardCell(row.Active,true)}</td>
         <td>${dashboardCell(row["Quantity Sent Pending"],true)}</td>
         <td>${dashboardCell(row["Quantity Receive Pending"],true)}</td>
