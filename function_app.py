@@ -8,6 +8,10 @@ import azure.functions as func
 import pandas as pd
 
 from engine.database import (
+    complete_reconciliation_run,
+    create_reconciliation_run,
+    fail_reconciliation_run,
+    get_reconciliation_history,
     initialize_database,
     test_database_connection,
 )
@@ -22,7 +26,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "3.2.0"
+APPLICATION_VERSION = "3.3.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -666,16 +670,53 @@ def health(
             status_code=500,
         )
 
-def health(
+@app.route(
+    route="history",
+    methods=["GET"]
+)
+def history(
     req: func.HttpRequest
 ) -> func.HttpResponse:
 
-    return json_response({
-        "status": "Healthy",
-        "application": APPLICATION_NAME,
-        "azure_function": "Working",
-        "version": APPLICATION_VERSION
-    })
+    try:
+        raw_limit = req.params.get("limit", "100")
+
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return json_response(
+                {
+                    "status": "Failed",
+                    "message": "The limit query parameter must be an integer.",
+                },
+                status_code=400,
+            )
+
+        history_rows = get_reconciliation_history(limit=limit)
+
+        return json_response({
+            "status": "Success",
+            "application": APPLICATION_NAME,
+            "version": APPLICATION_VERSION,
+            "count": len(history_rows),
+            "history": history_rows,
+        })
+
+    except Exception as ex:
+        logging.exception(
+            "Error while loading reconciliation history."
+        )
+
+        return json_response(
+            {
+                "status": "Failed",
+                "application": APPLICATION_NAME,
+                "version": APPLICATION_VERSION,
+                "error": str(ex),
+                "error_type": type(ex).__name__,
+            },
+            status_code=500,
+        )
 
 
 @app.route(
@@ -711,6 +752,8 @@ def process(
             "required_files": REQUIRED_FILES
         })
 
+    run_record = None
+
     try:
         missing_files = [
             file_key
@@ -730,6 +773,21 @@ def process(
                 },
                 status_code=400
             )
+
+        submitted_by = (
+            req.headers.get("x-ms-client-principal-name")
+            or req.headers.get("x-submitted-by")
+            or "Web User"
+        )
+
+        run_record = create_reconciliation_run(
+            submitted_by=submitted_by,
+            application_version=APPLICATION_VERSION,
+            asn_files=1,
+            inventory_files=1,
+            dispatch_files=1,
+            sfda_files=1,
+        )
 
         uploaded_files = {
             file_key: req.files[file_key]
@@ -836,10 +894,28 @@ def process(
             in files_summary.values()
         )
 
+        generated_files_count = (
+            len(accept_files)
+            + len(dispatch_files)
+            + 3
+        )
+
+        complete_reconciliation_run(
+            run_id=run_record["run_id"],
+            total_input_rows=total_rows,
+            master_records=int(len(master)),
+            accept_records=int(len(accept)),
+            dispatch_records=int(len(dispatch_output)),
+            exception_records=int(len(variance)),
+            generated_files=generated_files_count,
+        )
+
         return json_response({
             "status": (
                 "Reconciliation Engine Completed"
             ),
+            "run_id": run_record["run_id"],
+            "run_number": run_record["run_number"],
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
             "summary": {
@@ -895,9 +971,30 @@ def process(
             "Error while processing uploaded files."
         )
 
+        if run_record is not None:
+            try:
+                fail_reconciliation_run(
+                    run_id=run_record["run_id"],
+                    error_message=str(ex),
+                )
+            except Exception:
+                logging.exception(
+                    "Unable to mark reconciliation run as Failed."
+                )
+
         return json_response(
             {
                 "status": "Failed",
+                "run_id": (
+                    run_record.get("run_id")
+                    if run_record
+                    else None
+                ),
+                "run_number": (
+                    run_record.get("run_number")
+                    if run_record
+                    else None
+                ),
                 "error": str(ex),
                 "error_type": (
                     type(ex).__name__
