@@ -665,7 +665,7 @@ def health(
             },
             status_code=500,
         )
-)
+
 def health(
     req: func.HttpRequest
 ) -> func.HttpResponse:
