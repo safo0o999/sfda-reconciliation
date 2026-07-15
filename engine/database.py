@@ -104,6 +104,31 @@ class Database:
         finally:
             connection.close()
 
+
+    def execute_many(
+        self,
+        sql: str,
+        parameters_list: List[tuple],
+    ) -> None:
+
+        if not parameters_list:
+            return
+
+        connection = self.connect()
+
+        try:
+            cursor = connection.cursor()
+            cursor.executemany(sql, parameters_list)
+            connection.commit()
+
+        except Exception:
+            connection.rollback()
+            raise
+
+        finally:
+            connection.close()
+
+
     def execute_scalar(
         self,
         sql: str,
@@ -393,6 +418,93 @@ def initialize_database() -> None:
         BEGIN
             CREATE INDEX IX_ReconciliationRunFiles_RunID
             ON dbo.ReconciliationRunFiles (RunID, FileCategory, CreatedAt);
+        END;
+        """
+    )
+
+
+    database.execute(
+        """
+        IF OBJECT_ID(
+            N'dbo.BatchEvents',
+            N'U'
+        ) IS NULL
+        BEGIN
+            CREATE TABLE dbo.BatchEvents
+            (
+                BatchEventID BIGINT IDENTITY(1,1) NOT NULL
+                    CONSTRAINT PK_BatchEvents PRIMARY KEY,
+
+                RunID BIGINT NOT NULL,
+                EventKey NVARCHAR(200) NOT NULL,
+                BN NVARCHAR(200) NOT NULL,
+                ExpiryDate DATE NOT NULL,
+                EventType NVARCHAR(50) NOT NULL,
+                EventDate DATETIME2(3) NULL,
+                Quantity DECIMAL(19,4) NOT NULL
+                    CONSTRAINT DF_BatchEvents_Quantity DEFAULT 0,
+                SourceSystem NVARCHAR(50) NOT NULL,
+                SourceReference NVARCHAR(500) NULL,
+                GenericItemNumber NVARCHAR(200) NULL,
+                TradeItemNumber NVARCHAR(200) NULL,
+                TradeName NVARCHAR(500) NULL,
+                GTIN NVARCHAR(100) NULL,
+                SupplierName NVARCHAR(500) NULL,
+                CustomerName NVARCHAR(500) NULL,
+                CreatedAt DATETIME2(3) NOT NULL
+                    CONSTRAINT DF_BatchEvents_CreatedAt
+                    DEFAULT SYSUTCDATETIME(),
+
+                CONSTRAINT FK_BatchEvents_Run
+                    FOREIGN KEY (RunID)
+                    REFERENCES dbo.ReconciliationRuns(RunID),
+
+                CONSTRAINT UQ_BatchEvents_EventKey
+                    UNIQUE (EventKey)
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF NOT EXISTS
+        (
+            SELECT 1
+            FROM sys.indexes
+            WHERE name = N'IX_BatchEvents_BatchExpiry'
+              AND object_id = OBJECT_ID(N'dbo.BatchEvents')
+        )
+        BEGIN
+            CREATE INDEX IX_BatchEvents_BatchExpiry
+            ON dbo.BatchEvents
+            (
+                BN,
+                ExpiryDate,
+                EventDate,
+                BatchEventID
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF NOT EXISTS
+        (
+            SELECT 1
+            FROM sys.indexes
+            WHERE name = N'IX_BatchEvents_RunID'
+              AND object_id = OBJECT_ID(N'dbo.BatchEvents')
+        )
+        BEGIN
+            CREATE INDEX IX_BatchEvents_RunID
+            ON dbo.BatchEvents
+            (
+                RunID,
+                EventType,
+                CreatedAt
+            );
         END;
         """
     )
@@ -700,3 +812,149 @@ def get_reconciliation_run_files(
         """,
         (run_id,),
     )
+
+
+def record_batch_events(
+    run_id: int,
+    events: List[Dict[str, Any]],
+) -> int:
+
+    if not events:
+        return 0
+
+    database = Database()
+    rows = []
+
+    for event in events:
+        event_key = str(event.get("event_key") or "").strip()
+        batch_number = str(event.get("bn") or "").strip()
+        expiry_date = event.get("expiry_date")
+        event_type = str(event.get("event_type") or "").strip().upper()
+        source_system = str(event.get("source_system") or "").strip().upper()
+
+        if not event_key:
+            raise ValueError("Batch event is missing event_key.")
+        if not batch_number:
+            raise ValueError("Batch event is missing BN.")
+        if expiry_date is None:
+            raise ValueError("Batch event is missing expiry_date.")
+        if not event_type:
+            raise ValueError("Batch event is missing event_type.")
+        if not source_system:
+            raise ValueError("Batch event is missing source_system.")
+
+        row = (
+            int(run_id),
+            event_key,
+            batch_number,
+            expiry_date,
+            event_type,
+            event.get("event_date"),
+            float(event.get("quantity") or 0),
+            source_system,
+            event.get("source_reference"),
+            event.get("generic_item_number"),
+            event.get("trade_item_number"),
+            event.get("trade_name"),
+            event.get("gtin"),
+            event.get("supplier_name"),
+            event.get("customer_name"),
+        )
+        rows.append((event_key,) + row)
+
+    database.execute_many(
+        """
+        IF NOT EXISTS
+        (
+            SELECT 1
+            FROM dbo.BatchEvents
+            WHERE EventKey = %s
+        )
+        BEGIN
+            INSERT INTO dbo.BatchEvents
+            (
+                RunID, EventKey, BN, ExpiryDate, EventType,
+                EventDate, Quantity, SourceSystem, SourceReference,
+                GenericItemNumber, TradeItemNumber, TradeName, GTIN,
+                SupplierName, CustomerName
+            )
+            VALUES
+            (
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s
+            );
+        END;
+        """,
+        rows,
+    )
+
+    return len(events)
+
+
+def get_batch_events(
+    batch_number: str,
+    expiry_date: Optional[Any] = None,
+    limit: int = 1000,
+) -> List[Dict[str, Any]]:
+
+    database = Database()
+    safe_limit = max(1, min(int(limit), 5000))
+
+    if expiry_date is None:
+        return database.fetch_all(
+            f"""
+            SELECT TOP ({safe_limit})
+                BatchEventID, RunID, EventKey, BN, ExpiryDate,
+                EventType, EventDate, Quantity, SourceSystem,
+                SourceReference, GenericItemNumber, TradeItemNumber,
+                TradeName, GTIN, SupplierName, CustomerName, CreatedAt
+            FROM dbo.BatchEvents
+            WHERE BN = %s
+            ORDER BY COALESCE(EventDate, CreatedAt), BatchEventID;
+            """,
+            (batch_number,),
+        )
+
+    return database.fetch_all(
+        f"""
+        SELECT TOP ({safe_limit})
+            BatchEventID, RunID, EventKey, BN, ExpiryDate,
+            EventType, EventDate, Quantity, SourceSystem,
+            SourceReference, GenericItemNumber, TradeItemNumber,
+            TradeName, GTIN, SupplierName, CustomerName, CreatedAt
+        FROM dbo.BatchEvents
+        WHERE BN = %s AND ExpiryDate = %s
+        ORDER BY COALESCE(EventDate, CreatedAt), BatchEventID;
+        """,
+        (batch_number, expiry_date),
+    )
+
+
+def get_batch_event_totals(
+    batch_number: str,
+    expiry_date: Any,
+) -> Dict[str, Any]:
+
+    database = Database()
+    rows = database.fetch_all(
+        """
+        SELECT
+            EventType,
+            SUM(Quantity) AS TotalQuantity,
+            COUNT_BIG(*) AS EventCount,
+            MIN(EventDate) AS FirstEventDate,
+            MAX(EventDate) AS LastEventDate
+        FROM dbo.BatchEvents
+        WHERE BN = %s AND ExpiryDate = %s
+        GROUP BY EventType
+        ORDER BY EventType;
+        """,
+        (batch_number, expiry_date),
+    )
+
+    return {
+        "batch_number": batch_number,
+        "expiry_date": expiry_date,
+        "events": rows,
+    }
