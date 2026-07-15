@@ -4,6 +4,7 @@ import json
 import mimetypes
 import logging
 import traceback
+import time
 from pathlib import Path
 
 import azure.functions as func
@@ -35,7 +36,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "3.7.0"
+APPLICATION_VERSION = "3.7.1"
 
 REQUIRED_FILES = [
     "asn",
@@ -909,6 +910,11 @@ def history_details(
         logging.exception("Error while loading run details.")
         return json_response({
             "status": "Failed",
+            "failed_step": current_step,
+            "total_seconds": round(
+                total_elapsed,
+                3,
+            ),
             "error": str(ex),
             "error_type": type(ex).__name__,
         }, 500)
@@ -1032,11 +1038,40 @@ def process(
             "run_lifecycle": RUN_LIFECYCLE_STATUSES,
         })
 
+    process_started_at = time.perf_counter()
+    current_step = "STEP 01 - Process request received"
+
     run_record = None
     storage = None
     stored_files = []
 
+    def log_process_step(step_name: str, **details) -> None:
+        nonlocal current_step
+        current_step = step_name
+
+        detail_text = " ".join(
+            f"{key}={value}"
+            for key, value in details.items()
+        )
+
+        logging.info(
+            "[SFDA PROCESS] %s | total_seconds=%.3f%s",
+            step_name,
+            time.perf_counter() - process_started_at,
+            f" | {detail_text}" if detail_text else "",
+        )
+
+    logging.info(
+        "[SFDA PROCESS] STEP 01 - Process request received "
+        "| method=%s | content_length=%s",
+        req.method,
+        req.headers.get("content-length"),
+    )
+
     try:
+        log_process_step(
+            "STEP 02 - Validating required files"
+        )
         missing_files = [
             file_key
             for file_key in REQUIRED_FILES
@@ -1054,6 +1089,12 @@ def process(
             or req.headers.get("x-submitted-by")
             or "Web User"
         )
+
+        log_process_step(
+            "STEP 03 - Creating reconciliation run",
+            submitted_by=submitted_by,
+        )
+
         run_record = create_reconciliation_run(
             submitted_by=submitted_by,
             application_version=APPLICATION_VERSION,
@@ -1062,7 +1103,18 @@ def process(
             dispatch_files=1,
             sfda_files=1,
         )
+
+        log_process_step(
+            "STEP 04 - Reconciliation run created",
+            run_id=run_record["run_id"],
+            run_number=run_record["run_number"],
+        )
+
         storage = get_blob_storage()
+
+        log_process_step(
+            "STEP 05 - Blob Storage initialized"
+        )
 
         uploaded_files = {
             key: req.files[key]
@@ -1072,7 +1124,13 @@ def process(
         dataframes = {}
         files_summary = {}
 
+        log_process_step(
+            "STEP 06 - Reading input files",
+            file_count=len(uploaded_files),
+        )
+
         for file_key, uploaded_file in uploaded_files.items():
+            file_started_at = time.perf_counter()
             file_name = _safe_file_name(
                 uploaded_file.filename,
                 f"{file_key}.xlsx",
@@ -1109,13 +1167,48 @@ def process(
                 "size_bytes": len(file_bytes),
             }
 
+            logging.info(
+                "[SFDA PROCESS] Input file completed "
+                "| type=%s | name=%s | rows=%s "
+                "| size_bytes=%s | seconds=%.3f",
+                file_key,
+                file_name,
+                len(dataframe),
+                len(file_bytes),
+                time.perf_counter() - file_started_at,
+            )
+
+        log_process_step(
+            "STEP 07 - All input files loaded",
+            total_input_rows=sum(
+                len(frame)
+                for frame in dataframes.values()
+            ),
+        )
+
         reconciliation_engine = ReconciliationEngine(
             asn_df=dataframes["asn"],
             inventory_df=dataframes["inventory"],
             dispatch_df=dataframes["dispatch"],
             sfda_df=dataframes["sfda"],
         )
+        log_process_step(
+            "STEP 08 - Starting reconciliation engine"
+        )
+        reconciliation_started_at = time.perf_counter()
+
         result = reconciliation_engine.run()
+
+        logging.info(
+            "[SFDA PROCESS] Reconciliation engine completed "
+            "| seconds=%.3f",
+            time.perf_counter() - reconciliation_started_at,
+        )
+
+        log_process_step(
+            "STEP 09 - Building batch history events"
+        )
+        batch_build_started_at = time.perf_counter()
 
         batch_events = BatchHistoryEngine.build(
             asn_df=reconciliation_engine.asn,
@@ -1128,16 +1221,51 @@ def process(
                 in input_payloads.items()
             },
         )
+        logging.info(
+            "[SFDA PROCESS] Batch history events built "
+            "| event_count=%s | seconds=%.3f",
+            len(batch_events),
+            time.perf_counter() - batch_build_started_at,
+        )
+
+        log_process_step(
+            "STEP 10 - Saving batch history events to SQL",
+            event_count=len(batch_events),
+        )
+        batch_save_started_at = time.perf_counter()
+
         batch_events_saved = record_batch_events(
             run_id=run_record["run_id"],
             events=batch_events,
+        )
+
+        logging.info(
+            "[SFDA PROCESS] Batch history events saved "
+            "| saved_count=%s | seconds=%.3f",
+            batch_events_saved,
+            time.perf_counter() - batch_save_started_at,
         )
 
         master = result["master"]
         accept = result["accept"]
         dispatch_output = result["dispatch"]
         variance = result["variance"]
-        dashboard_preview = build_dashboard_preview(master=master, limit=100)
+        log_process_step(
+            "STEP 11 - Building dashboard preview"
+        )
+        dashboard_preview = build_dashboard_preview(
+            master=master,
+            limit=100,
+        )
+
+        log_process_step(
+            "STEP 12 - Generating output files",
+            master_rows=len(master),
+            accept_rows=len(accept),
+            dispatch_rows=len(dispatch_output),
+            variance_rows=len(variance),
+        )
+        output_generation_started_at = time.perf_counter()
 
         accept_files = Exporter.build_sfda_upload_files(
             df=accept,
@@ -1156,7 +1284,18 @@ def process(
             dispatch_df=dataframes["dispatch"],
             dispatch_output=dispatch_output,
         )
-        variance_report = build_variance_report(variance=variance)
+        variance_report = build_variance_report(
+            variance=variance
+        )
+
+        logging.info(
+            "[SFDA PROCESS] Output files generated "
+            "| accept_files=%s | dispatch_files=%s "
+            "| seconds=%.3f",
+            len(accept_files),
+            len(dispatch_files),
+            time.perf_counter() - output_generation_started_at,
+        )
 
         output_groups = [
             (accept_files, "Accept.csv", "accept"),
@@ -1167,6 +1306,11 @@ def process(
         ]
         generated_files_count = 0
         output_manifest = []
+
+        log_process_step(
+            "STEP 13 - Uploading output files to Blob Storage"
+        )
+        output_upload_started_at = time.perf_counter()
 
         for group, fallback_name, file_type in output_groups:
             for file_name, file_bytes, content_type, normalized_type in _iter_output_files(
@@ -1198,6 +1342,21 @@ def process(
                 })
                 generated_files_count += 1
 
+                logging.info(
+                    "[SFDA PROCESS] Output file saved "
+                    "| number=%s | type=%s | name=%s",
+                    generated_files_count,
+                    normalized_type,
+                    file_name,
+                )
+
+        logging.info(
+            "[SFDA PROCESS] Output upload completed "
+            "| generated_files=%s | seconds=%.3f",
+            generated_files_count,
+            time.perf_counter() - output_upload_started_at,
+        )
+
         total_rows = sum(
             file_info["rows"]
             for file_info in files_summary.values()
@@ -1227,12 +1386,18 @@ def process(
             "inputs": files_summary,
             "outputs": output_manifest,
         }
+        log_process_step(
+            "STEP 14 - Creating run metadata"
+        )
+
         metadata_bytes = json.dumps(
             run_metadata,
             ensure_ascii=False,
             indent=2,
             default=str,
         ).encode("utf-8")
+        metadata_upload_started_at = time.perf_counter()
+
         metadata_blob = storage.upload_metadata(
             run_record["run_number"],
             metadata_bytes,
@@ -1246,6 +1411,17 @@ def process(
         )
         stored_files.append(metadata_blob)
 
+        logging.info(
+            "[SFDA PROCESS] Run metadata saved "
+            "| seconds=%.3f",
+            time.perf_counter() - metadata_upload_started_at,
+        )
+
+        log_process_step(
+            "STEP 15 - Completing reconciliation run"
+        )
+        completion_started_at = time.perf_counter()
+
         complete_reconciliation_run(
             run_id=run_record["run_id"],
             total_input_rows=total_rows,
@@ -1255,9 +1431,27 @@ def process(
             exception_records=int(len(variance)),
             generated_files=generated_files_count,
         )
+        logging.info(
+            "[SFDA PROCESS] Reconciliation run completed "
+            "| seconds=%.3f",
+            time.perf_counter() - completion_started_at,
+        )
+
+        log_process_step(
+            "STEP 16 - Setting Pending Upload status"
+        )
+
         lifecycle_status_persisted = _set_run_lifecycle_status(
             run_id=run_record["run_id"],
             status=RUN_STATUS_PENDING_UPLOAD,
+        )
+
+        log_process_step(
+            "STEP 17 - Returning successful response",
+            total_seconds=round(
+                time.perf_counter() - process_started_at,
+                3,
+            ),
         )
 
         return json_response({
@@ -1267,6 +1461,13 @@ def process(
             "run_number": run_record["run_number"],
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
+            "timing": {
+                "total_process_seconds": round(
+                    time.perf_counter()
+                    - process_started_at,
+                    3,
+                ),
+            },
             "lifecycle": {
                 "current_status": RUN_STATUS_PENDING_UPLOAD,
                 "next_status": RUN_STATUS_PENDING_VERIFICATION,
@@ -1304,12 +1505,27 @@ def process(
         })
 
     except Exception as ex:
-        logging.exception("Error while processing uploaded files.")
+        total_elapsed = (
+            time.perf_counter()
+            - process_started_at
+        )
+
+        logging.exception(
+            "[SFDA PROCESS] FAILED "
+            "| current_step=%s | total_seconds=%.3f "
+            "| error_type=%s | error=%s",
+            current_step,
+            total_elapsed,
+            type(ex).__name__,
+            str(ex),
+        )
         if run_record is not None:
             try:
                 fail_reconciliation_run(
                     run_id=run_record["run_id"],
-                    error_message=str(ex),
+                    error_message=(
+                        f"{current_step}: {str(ex)}"
+                    ),
                 )
             except Exception:
                 logging.exception("Unable to mark reconciliation run as Failed.")
