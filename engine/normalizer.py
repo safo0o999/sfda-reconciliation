@@ -4,6 +4,42 @@ import pandas as pd
 class Normalizer:
 
     @staticmethod
+    def _find_column(df, candidates):
+        normalized = {
+            str(column).strip().lower(): column
+            for column in df.columns
+        }
+
+        for candidate in candidates:
+            match = normalized.get(
+                str(candidate).strip().lower()
+            )
+            if match is not None:
+                return match
+
+        return None
+
+    @staticmethod
+    def _optional_series(
+        df,
+        candidates,
+        default=""
+    ):
+        column = Normalizer._find_column(
+            df,
+            candidates
+        )
+
+        if column is None:
+            return pd.Series(
+                [default] * len(df),
+                index=df.index,
+                dtype=object
+            )
+
+        return df[column]
+
+    @staticmethod
     def text(series):
 
         return (
@@ -39,6 +75,15 @@ class Normalizer:
                 dayfirst=True
             )
             .dt.normalize()
+        )
+
+    @staticmethod
+    def datetime(series):
+
+        return pd.to_datetime(
+            series,
+            errors="coerce",
+            dayfirst=True
         )
 
     @staticmethod
@@ -89,6 +134,63 @@ class Normalizer:
             df["Supplier Name"]
         )
 
+        df["Received Date"] = Normalizer.datetime(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Received Date",
+                    "Receipt Date",
+                    "Actual Receipt Date",
+                    "Date Received",
+                    "ASN Closed Date",
+                    "Closed Date",
+                    "Transaction Date"
+                ]
+            )
+        )
+
+        df["Generic Item Number"] = Normalizer.identifier(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Generic Item Number",
+                    "Item Number",
+                    "Generic Number"
+                ]
+            )
+        )
+
+        df["Supplier Code"] = Normalizer.identifier(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Supplier Code",
+                    "Vendor Code"
+                ]
+            )
+        )
+
+        df["PO Number"] = Normalizer.identifier(
+            Normalizer._optional_series(
+                df,
+                [
+                    "PO Number",
+                    "Purchase Order Number",
+                    "NUPCO PO"
+                ]
+            )
+        )
+
+        df["Invoice Number"] = Normalizer.identifier(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Invoice Number",
+                    "Invoice"
+                ]
+            )
+        )
+
         return df
 
     @staticmethod
@@ -110,6 +212,40 @@ class Normalizer:
 
         df["Trade Name"] = Normalizer.text(
             df["Trade Item Description"]
+        )
+
+        df["Inventory Snapshot Date"] = Normalizer.datetime(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Snapshot Date",
+                    "Report Date",
+                    "Inventory Date",
+                    "Date Created",
+                    "Created Date",
+                    "As Of Date"
+                ]
+            )
+        )
+
+        df["Generic Item Number"] = Normalizer.identifier(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Generic Item Number",
+                    "Item Number"
+                ]
+            )
+        )
+
+        df["Trade Item Number"] = Normalizer.identifier(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Trade Item Number",
+                    "Trade Item"
+                ]
+            )
         )
 
         return df
@@ -151,6 +287,52 @@ class Normalizer:
             df["order line"]
         )
 
+        df["Dispatch Date"] = Normalizer.datetime(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Dispatched Date",
+                    "Dispatch Date",
+                    "Actual Dispatch Date",
+                    "Ship Date",
+                    "Shipment Date",
+                    "Date Dispatched",
+                    "Transaction Date"
+                ]
+            )
+        )
+
+        df["Generic Item Number"] = Normalizer.identifier(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Generic Item Number",
+                    "Item Number"
+                ]
+            )
+        )
+
+        df["Reference Order Number"] = Normalizer.identifier(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Reference order #",
+                    "Reference Order Number",
+                    "Reference Order"
+                ]
+            )
+        )
+
+        df["Ship To Customer"] = Normalizer.identifier(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Ship To Customer",
+                    "Customer Code"
+                ]
+            )
+        )
+
         return df
 
     @staticmethod
@@ -189,6 +371,20 @@ class Normalizer:
 
         df["Quantity sent pending"] = Normalizer.number(
             df["Quantity sent pending"]
+        )
+
+        df["SFDA Snapshot Date"] = Normalizer.datetime(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Snapshot Date",
+                    "Report Date",
+                    "Drug Count Date",
+                    "Date Created",
+                    "Created Date",
+                    "As Of Date"
+                ]
+            )
         )
 
         return df
