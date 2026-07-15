@@ -19,11 +19,13 @@ from engine.database import (
     get_reconciliation_run_by_number,
     get_reconciliation_run_files,
     record_reconciliation_file,
+    record_batch_events,
     initialize_database,
     test_database_connection,
 )
 
 from engine.exporter import Exporter
+from engine.batch_history import BatchHistoryEngine
 from engine.reconciliation import ReconciliationEngine
 
 
@@ -33,7 +35,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "3.6.0"
+APPLICATION_VERSION = "3.7.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -1115,6 +1117,22 @@ def process(
         )
         result = reconciliation_engine.run()
 
+        batch_events = BatchHistoryEngine.build(
+            asn_df=reconciliation_engine.asn,
+            inventory_df=reconciliation_engine.inventory,
+            dispatch_df=reconciliation_engine.dispatch,
+            sfda_df=reconciliation_engine.sfda,
+            source_files={
+                file_key: payload["name"]
+                for file_key, payload
+                in input_payloads.items()
+            },
+        )
+        batch_events_saved = record_batch_events(
+            run_id=run_record["run_id"],
+            events=batch_events,
+        )
+
         master = result["master"]
         accept = result["accept"]
         dispatch_output = result["dispatch"]
@@ -1204,6 +1222,7 @@ def process(
                 "dispatch_rows": int(len(dispatch_output)),
                 "variance_rows": int(len(variance)),
                 "generated_files": generated_files_count,
+                "batch_events_saved": batch_events_saved,
             },
             "inputs": files_summary,
             "outputs": output_manifest,
@@ -1265,6 +1284,7 @@ def process(
                 "accept_files_count": len(accept_files),
                 "dispatch_files_count": len(dispatch_files),
                 "generated_files_count": generated_files_count,
+                "batch_events_saved": batch_events_saved,
             },
             "dashboard_preview": dashboard_preview,
             "files": files_summary,
@@ -1272,6 +1292,7 @@ def process(
                 "inputs_saved": len(files_summary),
                 "outputs_saved": generated_files_count,
                 "metadata_saved": True,
+                "batch_history_saved": batch_events_saved,
             },
             "outputs": {
                 "accept_files": accept_files,
