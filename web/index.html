@@ -637,7 +637,7 @@
                 <div><label for="verificationRun">Run</label><select class="control" id="verificationRun" required><option value="">Select a Pending Upload run...</option></select></div>
                 <div><label for="verificationSfda">Latest SFDA Drug Count Report</label><div class="verification-file-box"><input id="verificationSfda" type="file" accept=".xls,.xlsx" required><div class="file-meta" id="verificationSfdaName">No file selected</div></div></div>
                 <div><label for="notificationFiles">Notification Result Files</label><div class="verification-file-box"><input id="notificationFiles" type="file" accept=".xls,.xlsx,.csv" multiple required><div class="file-meta" id="notificationFilesName">No files selected</div></div></div>
-                <div class="status-banner info show" id="verificationStatus"><span>ⓘ</span><div>The Verification API will be connected in the next development phase. This page is ready for the required run and file inputs.</div></div>
+                <div class="status-banner info show" id="verificationStatus"><span>ⓘ</span><div>Select the run, latest SFDA report, and all Notification Result files, then click Verify Upload.</div></div>
                 <button class="btn btn-success" id="verifyUploadButton" type="submit" disabled>✓ Verify Upload</button>
               </form>
             </div>
@@ -733,6 +733,7 @@
 
 <script>
   const API_URL = "/api/process";
+  const VERIFY_URL = "/api/verify";
   const HEALTH_URL = "/api/health";
   const VERSION_URL = "/api/version";
   const FILE_KEYS = ["asn","inventory","dispatch","sfda"];
@@ -1236,13 +1237,108 @@
   $("verificationRun").addEventListener("change",updateVerificationFileState);
   $("verificationSfda").addEventListener("change",updateVerificationFileState);
   $("notificationFiles").addEventListener("change",updateVerificationFileState);
-  $("verificationForm").addEventListener("submit",event=>{
+
+  $("verificationForm").addEventListener("submit",async event=>{
     event.preventDefault();
     updateVerificationFileState();
+
+    const runNumber=$("verificationRun").value;
+    const sfdaFile=$("verificationSfda").files[0];
+    const notifications=Array.from($("notificationFiles").files||[]);
+    const button=$("verifyUploadButton");
     const box=$("verificationStatus");
+
+    if(!runNumber||!sfdaFile||!notifications.length){
+      box.className="status-banner error show";
+      box.innerHTML='<span>!</span><div>Select a run, the latest SFDA report, and at least one Notification Result file.</div>';
+      toast("Verification files are incomplete.","error");
+      updateVerificationFileState();
+      return;
+    }
+
+    const formData=new FormData();
+    formData.append("run_number",runNumber);
+    formData.append("latest_sfda",sfdaFile,sfdaFile.name);
+
+    notifications.forEach(file=>{
+      formData.append("notification_files",file,file.name);
+    });
+
+    button.disabled=true;
+    button.textContent="◷ Verifying Upload...";
     box.className="status-banner info show";
-    box.innerHTML='<span>ⓘ</span><div>Files are selected and ready. Verification API connection is the next development step.</div>';
-    toast("Verification inputs are ready for the Verification API.","info");
+    box.innerHTML=`<span>◷</span><div>Uploading ${notifications.length} Notification Result file${notifications.length===1?"":"s"} and running SFDA verification. Keep this page open until processing is complete.</div>`;
+
+    try{
+      const response=await fetch(VERIFY_URL,{
+        method:"POST",
+        body:formData,
+        cache:"no-store"
+      });
+
+      let payload;
+      try{
+        payload=await response.json();
+      }catch{
+        throw new Error(`Verification endpoint returned HTTP ${response.status} without valid JSON.`);
+      }
+
+      if(!response.ok||payload.status==="Failed"){
+        const failedStep=payload.failed_step?` (${payload.failed_step})`:"";
+        throw new Error(
+          (payload.error||payload.message||`Verification failed with HTTP ${response.status}.`)
+          + failedStep
+        );
+      }
+
+      const summary=payload.summary||{};
+      const overallStatus=payload.status||"Verification Completed";
+      const isVerified=overallStatus==="Verified";
+      const statusClass=isVerified?"success":"error";
+      const statusIcon=isVerified?"✓":"!";
+      const expected=Number(summary.expected_rows||0).toLocaleString();
+      const notificationsCount=Number(summary.notification_rows||0).toLocaleString();
+      const verified=Number(summary.verified_rows||0).toLocaleString();
+      const rejected=Number(summary.rejected_rows||0).toLocaleString();
+      const unclassified=Number(summary.unclassified_rows||0).toLocaleString();
+      const mismatches=Number(summary.mismatch_rows||0).toLocaleString();
+      const missing=Number(summary.missing_expected_rows||0).toLocaleString();
+
+      box.className=`status-banner ${statusClass} show`;
+      box.innerHTML=`
+        <span>${statusIcon}</span>
+        <div>
+          <strong>${escapeHtml(overallStatus)}</strong><br>
+          Expected: ${expected} · Notification rows: ${notificationsCount} ·
+          Verified: ${verified} · Rejected: ${rejected} ·
+          Unclassified: ${unclassified} · Mismatches: ${mismatches} ·
+          Missing results: ${missing}
+        </div>`;
+
+      toast(
+        isVerified
+          ? "SFDA upload verified successfully."
+          : "Verification completed and requires investigation.",
+        isVerified?"success":"error"
+      );
+
+      await refreshAzureHistory({silent:true});
+      refreshVerificationRuns();
+
+      if(isVerified){
+        $("verificationSfda").value="";
+        $("notificationFiles").value="";
+        updateVerificationFileState();
+      }
+    }catch(error){
+      console.error("SFDA Verification failed.",error);
+      box.className="status-banner error show";
+      box.innerHTML=`<span>!</span><div><strong>Verification failed.</strong><br>${escapeHtml(error.message||String(error))}</div>`;
+      toast(error.message||String(error),"error");
+    }finally{
+      button.textContent="✓ Verify Upload";
+      updateVerificationFileState();
+    }
   });
 
   $('historySearch').addEventListener('input',()=>renderHistory());
