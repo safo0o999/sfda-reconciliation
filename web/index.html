@@ -405,6 +405,18 @@
     @media(max-width:1250px){.ops-kpis{grid-template-columns:repeat(3,1fr)}.ops-layout{grid-template-columns:1fr}.dashboard-filter-bar{grid-template-columns:repeat(2,1fr)}.dashboard-filter-bar .btn{width:100%}}
     @media(max-width:760px){.ops-kpis{grid-template-columns:1fr}.dashboard-filter-bar{grid-template-columns:1fr}.bottom-ops-grid{grid-template-columns:1fr}.result-head{flex-direction:column}.mini-donut-wrap{grid-template-columns:1fr}.mini-donut{margin:auto}}
 
+
+    .verification-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,.72fr);gap:16px}
+    .verification-step{padding:18px;border:1px solid var(--line);border-radius:12px;background:#fff}
+    .verification-step-number{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;background:#eaf4ff;color:var(--blue-700);font-weight:900;font-size:11px;margin-bottom:12px}
+    .verification-step h3{margin:0;font-size:14px}.verification-step p{margin:6px 0 0;color:var(--muted);font-size:10px;line-height:1.55}
+    .verification-form{display:grid;gap:14px}.verification-form label{display:block;font-size:10px;font-weight:800;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.35px}
+    .verification-form select,.verification-form input[type=file]{width:100%}
+    .verification-file-box{padding:13px;border:1px dashed #98b8dc;border-radius:10px;background:#f8fbff}
+    .lifecycle-list{display:grid;gap:10px}.lifecycle-row{display:grid;grid-template-columns:28px 1fr auto;gap:10px;align-items:center;padding:11px;border:1px solid var(--line);border-radius:10px}
+    .lifecycle-dot{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;background:#eaf4ff;color:var(--blue-700);font-size:10px;font-weight:900}
+    @media(max-width:1000px){.verification-grid{grid-template-columns:1fr}}
+
   </style>
 </head>
 <body>
@@ -421,6 +433,7 @@
     <nav class="nav">
       <button class="nav-button active" data-page="home"><span class="nav-icon">⌂</span>Home</button>
       <button class="nav-button" data-page="upload"><span class="nav-icon">⇧</span>Upload & Run</button>
+      <button class="nav-button" data-page="verification"><span class="nav-icon">✓</span>SFDA Verification</button>
       <button class="nav-button" data-page="history"><span class="nav-icon">◷</span>History</button>
       <button class="nav-button" data-page="reports"><span class="nav-icon">▥</span>Reports</button>
       <button class="nav-button" data-page="intelligence"><span class="nav-icon">◆</span>Product Intelligence</button>
@@ -607,11 +620,42 @@
         </div>
       </section>
 
+
+      <!-- SFDA VERIFICATION -->
+      <section class="page" id="page-verification">
+        <div class="page-head">
+          <div><h1>SFDA Verification</h1><p>Verify the generated upload files against the latest SFDA Drug Count and portal notification results.</p></div>
+        </div>
+        <div class="verification-grid">
+          <div class="card">
+            <div class="card-header"><div><div class="card-title">Verification Upload</div><div class="card-subtitle">Select a reconciliation run and upload the post-portal evidence files.</div></div></div>
+            <div class="card-body">
+              <form id="verificationForm" class="verification-form">
+                <div><label for="verificationRun">Run</label><select class="control" id="verificationRun" required><option value="">Select a Pending Upload run...</option></select></div>
+                <div><label for="verificationSfda">Latest SFDA Drug Count Report</label><div class="verification-file-box"><input id="verificationSfda" type="file" accept=".xls,.xlsx" required><div class="file-meta" id="verificationSfdaName">No file selected</div></div></div>
+                <div><label for="notificationFiles">Notification Result Files</label><div class="verification-file-box"><input id="notificationFiles" type="file" accept=".xls,.xlsx,.csv" multiple required><div class="file-meta" id="notificationFilesName">No files selected</div></div></div>
+                <div class="status-banner info show" id="verificationStatus"><span>ⓘ</span><div>The Verification API will be connected in the next development phase. This page is ready for the required run and file inputs.</div></div>
+                <button class="btn btn-success" id="verifyUploadButton" type="submit" disabled>✓ Verify Upload</button>
+              </form>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><div><div class="card-title">Run Lifecycle</div><div class="card-subtitle">Controlled status flow after reconciliation.</div></div></div>
+            <div class="card-body lifecycle-list">
+              <div class="lifecycle-row"><div class="lifecycle-dot">1</div><div><strong>Pending Upload</strong><div class="file-info">Upload files generated and awaiting SFDA Portal submission.</div></div><span class="badge warning">Current</span></div>
+              <div class="lifecycle-row"><div class="lifecycle-dot">2</div><div><strong>Pending Verification</strong><div class="file-info">Latest SFDA report and notification results received.</div></div><span class="badge info">Next</span></div>
+              <div class="lifecycle-row"><div class="lifecycle-dot">3</div><div><strong>Verified</strong><div class="file-info">Portal result matches the expected reconciliation outcome.</div></div><span class="badge success">Outcome</span></div>
+              <div class="lifecycle-row"><div class="lifecycle-dot">4</div><div><strong>Investigation Required</strong><div class="file-info">Mismatch or unresolved notification requires investigation.</div></div><span class="badge failed">Exception</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- HISTORY -->
       <section class="page" id="page-history">
         <div class="page-head"><div><h1>Reconciliation History</h1><p>Persistent reconciliation runs stored in Azure SQL Database.</p></div><div class="actions"><button class="btn btn-secondary" id="clearHistoryButton">↻ Refresh History</button></div></div>
         <div class="card table-card">
-          <div class="table-toolbar"><div class="card-title">Previous Reconciliation Runs</div><div class="filters"><input class="control search" id="historySearch" placeholder="Search run ID or user..."><select class="control" id="historyStatus"><option value="">All statuses</option><option>Completed</option><option>Failed</option></select></div></div>
+          <div class="table-toolbar"><div class="card-title">Previous Reconciliation Runs</div><div class="filters"><input class="control search" id="historySearch" placeholder="Search run ID or user..."><select class="control" id="historyStatus"><option value="">All statuses</option><option>Pending Upload</option><option>Pending Verification</option><option>Verified</option><option>Investigation Required</option><option>Completed</option><option>Failed</option></select></div></div>
           <div class="table-scroll"><table><thead><tr><th>Run ID</th><th>Date & Time</th><th>User</th><th>Status</th><th>Files</th><th>Input Rows</th><th>Accept</th><th>Dispatch</th><th>Variance</th><th>Version</th><th>Actions</th></tr></thead><tbody id="historyBody"></tbody></table></div>
           <div class="table-footer"><span id="historyCount">0 database runs</span><span>Source: Azure SQL · ReconciliationRuns</span></div>
         </div>
@@ -714,9 +758,10 @@
     document.querySelectorAll(".nav-button").forEach(x=>x.classList.toggle("active",x.dataset.page===page));
     const target=$(`page-${page}`);
     if(target) target.classList.add("active");
-    const labels={home:"Dashboard",upload:"Upload & Run",history:"History",reports:"Reports",intelligence:"Product Intelligence",variance:"Variance Management",administration:"Administration"};
+    const labels={home:"Dashboard",upload:"Upload & Run",verification:"SFDA Verification",history:"History",reports:"Reports",intelligence:"Product Intelligence",variance:"Variance Management",administration:"Administration"};
     $("topbarTitle").textContent=labels[page]||"SFDA Platform";
     $("sidebar").classList.remove("open");
+    if(page==="verification") refreshVerificationRuns();
     if(page==="history") refreshAzureHistory();
     if(page==="reports") refreshAzureHistory();
     window.scrollTo({top:0,behavior:"smooth"});
@@ -813,13 +858,13 @@
         console.warn("Unable to save dashboard preview.",storageError);
       }
       finishProgress(true);
-      setStatus("success","Reconciliation completed successfully. Results are ready for review and download.");
+      setStatus("success","Upload files generated successfully. Run status: Pending Upload.");
       populateSummary(result);
       populateResults(result);
       await refreshAzureHistory({silent:true});
       $("inlineResults").classList.add("show");
       setTimeout(()=>$("inlineResults").scrollIntoView({behavior:"smooth",block:"start"}),120);
-      toast("Reconciliation completed successfully.","success");
+      toast("Upload files generated. Run is Pending Upload.","success");
     }catch(error){
       finishProgress(false);
       setStatus("error",error.message||String(error));
@@ -871,7 +916,7 @@
     $("varianceLatest").textContent=formatNumber(s.variance_rows);
     $("resultFiles").textContent=formatNumber((s.accept_files_count||0)+(s.dispatch_files_count||0)+countReports(outputs));
     $("resultsInfo").className="status-banner success show";
-    $("resultsInfo").innerHTML=`<span>✓</span><div><strong>Reconciliation completed successfully.</strong><br>Version ${escapeHtml(result.version||"—")} · ${formatNumber(s.total_input_rows)} input rows processed.</div>`;
+    $("resultsInfo").innerHTML=`<span>✓</span><div><strong>Upload files generated successfully.</strong><br>Run ${escapeHtml(result.run_number||"—")} is now <strong>Pending Upload</strong> · Version ${escapeHtml(result.version||"—")} · ${formatNumber(s.total_input_rows)} input rows processed.</div>`;
     renderCsvFiles("acceptFilesList",outputs.accept_files||{},"Accept");
     renderCsvFiles("dispatchFilesList",outputs.dispatch_files||{},"Dispatch");
     renderReportsFiles(outputs);
@@ -1001,6 +1046,7 @@
       historyCache = sourceRows.map(normalizeHistoryRecord);
       historyLoaded = true;
       renderHistory();
+      refreshVerificationRuns();
       updateDashboard();
       renderReports();
       if(!silent) toast(`History refreshed: ${historyCache.length} run${historyCache.length===1?"":"s"}.`,"success");
@@ -1034,7 +1080,7 @@
     rows.forEach(r=>{
       const tr=document.createElement('tr');
       const dateText=r.timestamp ? new Date(r.timestamp).toLocaleString() : "—";
-      const statusClass=r.status==="Completed"?"success":r.status==="Failed"?"failed":"warning";
+      const statusClass=["Verified","Completed"].includes(r.status)?"success":["Failed","Investigation Required"].includes(r.status)?"failed":r.status==="Pending Verification"?"info":"warning";
       const errorTitle=r.error?` title="${escapeHtml(r.error)}"`:"";
       tr.innerHTML=`<td><strong style="color:#075fc8"${errorTitle}>${escapeHtml(r.runId)}</strong></td><td>${escapeHtml(dateText)}</td><td>${escapeHtml(r.user)}</td><td><span class="badge ${statusClass}"${errorTitle}>${escapeHtml(r.status)}</span></td><td>${formatNumber(r.files)}</td><td>${formatNumber(r.inputRows)}</td><td>${formatNumber(r.accept)}</td><td>${formatNumber(r.dispatch)}</td><td>${formatNumber(r.variance)}</td><td>${escapeHtml(r.version||"—")}</td><td><button class="btn btn-secondary view-run-btn" type="button">View</button></td>`;
       tr.querySelector(".view-run-btn").addEventListener("click",()=>openRunDetails(r.runNumber));
@@ -1115,6 +1161,37 @@
   $('runDetailsModal').addEventListener('click',event=>{if(event.target===$('runDetailsModal')) closeRunDetails();});
   document.addEventListener('keydown',event=>{if(event.key==='Escape') closeRunDetails();});
 
+  function updateVerificationFileState(){
+    const sfdaFile=$("verificationSfda").files[0];
+    const notifications=Array.from($("notificationFiles").files||[]);
+    $("verificationSfdaName").textContent=sfdaFile?`✓ ${sfdaFile.name}`:"No file selected";
+    $("notificationFilesName").textContent=notifications.length?`✓ ${notifications.length} notification result file${notifications.length===1?"":"s"} selected`:"No files selected";
+    const ready=Boolean($("verificationRun").value&&sfdaFile&&notifications.length);
+    $("verifyUploadButton").disabled=!ready;
+  }
+
+  function refreshVerificationRuns(){
+    const selector=$("verificationRun");
+    if(!selector) return;
+    const selected=selector.value;
+    const eligible=getHistory().filter(run=>["Pending Upload","Pending Verification"].includes(run.status));
+    selector.innerHTML='<option value="">Select a Pending Upload run...</option>'+eligible.map(run=>`<option value="${escapeHtml(run.runNumber)}">${escapeHtml(run.runNumber)} · ${escapeHtml(run.status)}</option>`).join("");
+    if(eligible.some(run=>run.runNumber===selected)) selector.value=selected;
+    updateVerificationFileState();
+  }
+
+  $("verificationRun").addEventListener("change",updateVerificationFileState);
+  $("verificationSfda").addEventListener("change",updateVerificationFileState);
+  $("notificationFiles").addEventListener("change",updateVerificationFileState);
+  $("verificationForm").addEventListener("submit",event=>{
+    event.preventDefault();
+    updateVerificationFileState();
+    const box=$("verificationStatus");
+    box.className="status-banner info show";
+    box.innerHTML='<span>ⓘ</span><div>Files are selected and ready. Verification API connection is the next development step.</div>';
+    toast("Verification inputs are ready for the Verification API.","info");
+  });
+
   $('historySearch').addEventListener('input',()=>renderHistory());
   $('historyStatus').addEventListener('change',()=>renderHistory());
   $('clearHistoryButton').addEventListener('click',()=>refreshAzureHistory());
@@ -1164,9 +1241,9 @@
 
   function updateDashboard(){
     renderDashboardOverview();
-    const history=getHistory(),latest=history.find(x=>x.status==="Completed");
+    const history=getHistory(),latest=history.find(x=>["Pending Upload","Pending Verification","Verified","Completed"].includes(x.status));
     $("homeRuns").textContent=formatNumber(history.length);
-    $("homeSuccess").textContent=formatNumber(history.filter(x=>x.status==="Completed").length);
+    $("homeSuccess").textContent=formatNumber(history.filter(x=>["Verified","Completed"].includes(x.status)).length);
     $("homeInputRows").textContent=latest?formatNumber(latest.inputRows):"—";
     $("homeAccept").textContent=latest?formatNumber(latest.accept):"—";
     $("homeDispatch").textContent=latest?formatNumber(latest.dispatch):"—";
@@ -1184,7 +1261,7 @@
   }
 
   function renderReports(){
-    const history=getHistory(),completed=history.filter(x=>x.status==="Completed"),latest=completed[0]||{};
+    const history=getHistory(),completed=history.filter(x=>["Verified","Completed"].includes(x.status)),latest=completed[0]||history.find(x=>x.status==="Pending Upload")||{};
     $("reportRuns").textContent=formatNumber(history.length);
     $("reportSuccessRate").textContent=`${history.length?(completed.length/history.length*100).toFixed(1):0}%`;
     $("reportProcessed").textContent=formatNumber(completed.reduce((s,x)=>s+Number(x.masterRows||0),0));
@@ -1218,6 +1295,7 @@
   if($("dashboardDate")) $("dashboardDate").value=new Date().toISOString().slice(0,10);
   if($("dashboardRefresh")) $("dashboardRefresh").addEventListener("click",()=>refreshAzureHistory());
   renderHistory();
+  refreshVerificationRuns();
   updateDashboard();
   renderReports();
   checkHealth();
