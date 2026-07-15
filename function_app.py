@@ -41,7 +41,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "3.9.0"
+APPLICATION_VERSION = "4.0.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -1204,6 +1204,255 @@ def build_variance_report(
     )
 
 
+
+def _process_reconciliation_stage(
+    req: func.HttpRequest,
+    mode: str,
+) -> func.HttpResponse:
+    """Run one evidence-based reconciliation stage."""
+    started_at = time.perf_counter()
+    mode = str(mode or "").strip().lower()
+
+    required_by_mode = {
+        "accept": ["asn", "inventory", "sfda"],
+        "dispatch": ["dispatch", "inventory", "sfda"],
+    }
+    required_files = required_by_mode.get(mode)
+    if required_files is None:
+        return json_response({
+            "status": "Failed",
+            "message": f"Unsupported reconciliation mode: {mode}",
+        }, 400)
+
+    missing = [key for key in required_files if key not in req.files]
+    if missing:
+        return json_response({
+            "status": "Failed",
+            "message": "Required files are missing.",
+            "mode": mode,
+            "missing_files": missing,
+        }, 400)
+
+    run_record = None
+    storage = None
+    try:
+        submitted_by = (
+            req.headers.get("x-ms-client-principal-name")
+            or req.headers.get("x-submitted-by")
+            or "Web User"
+        )
+
+        run_record = create_reconciliation_run(
+            submitted_by=submitted_by,
+            application_version=APPLICATION_VERSION,
+            asn_files=1 if mode == "accept" else 0,
+            inventory_files=1,
+            dispatch_files=1 if mode == "dispatch" else 0,
+            sfda_files=1,
+        )
+
+        storage = get_blob_storage()
+        dataframes = {}
+        files_summary = {}
+        stored_files = []
+
+        for file_key in required_files:
+            uploaded = req.files[file_key]
+            file_name = _safe_file_name(uploaded.filename, f"{file_key}.xlsx")
+            file_bytes = uploaded.read()
+            if not file_bytes:
+                raise ValueError(f"Uploaded file is empty: {file_name}")
+
+            blob_info = storage.upload_input(
+                run_number=run_record["run_number"],
+                file_name=file_name,
+                file_bytes=file_bytes,
+                content_type=_content_type_for(file_name),
+            )
+            _record_blob_file(
+                run_record["run_id"], "input", file_key, file_name, blob_info
+            )
+            stored_files.append(blob_info)
+            dataframe = read_excel_bytes(file_name, file_bytes)
+            dataframes[file_key] = dataframe
+            files_summary[file_key] = {
+                "name": file_name,
+                "rows": int(len(dataframe)),
+                "columns": int(len(dataframe.columns)),
+                "size_bytes": len(file_bytes),
+            }
+
+        engine = ReconciliationEngine(
+            asn_df=dataframes.get("asn"),
+            inventory_df=dataframes.get("inventory"),
+            dispatch_df=dataframes.get("dispatch"),
+            sfda_df=dataframes.get("sfda"),
+            mode=mode,
+        )
+        result = engine.run()
+        master = result["master"]
+        accept = result["accept"]
+        dispatch_output = result["dispatch"]
+        variance = result["variance"]
+
+        accept_files = {}
+        dispatch_files = {}
+        accept_details = None
+        dispatch_details = None
+
+        if mode == "accept":
+            accept_files = Exporter.build_sfda_upload_files(
+                df=accept,
+                quantity_column="To Be Accept",
+                file_prefix="Accept",
+            )
+            accept_details = build_accept_details(
+                asn_df=dataframes["asn"],
+                inventory_df=dataframes["inventory"],
+                master=master,
+            )
+        else:
+            dispatch_files = Exporter.build_dispatch_files_by_customer(
+                dispatch_df=dispatch_output
+            )
+            dispatch_details = build_dispatch_details(
+                dispatch_df=dataframes["dispatch"],
+                dispatch_output=dispatch_output,
+            )
+
+        variance_report = build_variance_report(variance=variance)
+        output_groups = []
+        if mode == "accept":
+            output_groups.extend([
+                (accept_files, "Accept.csv", "accept"),
+                (accept_details, "Accept_Details.xlsx", "accept_details"),
+            ])
+        else:
+            output_groups.extend([
+                (dispatch_files, "Dispatch.csv", "dispatch"),
+                (dispatch_details, "Dispatch_Details.xlsx", "dispatch_details"),
+            ])
+        output_groups.append((variance_report, "Variance_Report.xlsx", "variance"))
+
+        output_manifest = []
+        generated_files_count = 0
+        for group, fallback_name, file_type in output_groups:
+            for file_name, file_bytes, content_type, normalized_type in _iter_output_files(
+                group, fallback_name, file_type
+            ):
+                blob_info = storage.upload_output(
+                    run_number=run_record["run_number"],
+                    file_name=file_name,
+                    file_bytes=file_bytes,
+                    content_type=content_type or _content_type_for(file_name),
+                )
+                _record_blob_file(
+                    run_record["run_id"], "output", normalized_type, file_name, blob_info
+                )
+                output_manifest.append({
+                    "file_name": file_name,
+                    "file_type": normalized_type,
+                    "container": blob_info["container"],
+                    "blob_name": blob_info["blob_name"],
+                    "size_bytes": blob_info["size_bytes"],
+                    "content_type": blob_info["content_type"],
+                })
+                generated_files_count += 1
+
+        total_rows = sum(item["rows"] for item in files_summary.values())
+        complete_reconciliation_run(
+            run_id=run_record["run_id"],
+            total_input_rows=total_rows,
+            master_records=int(len(master)),
+            accept_records=int(len(accept)),
+            dispatch_records=int(len(dispatch_output)),
+            exception_records=int(len(variance)),
+            generated_files=generated_files_count,
+        )
+        lifecycle_status_persisted = _set_run_lifecycle_status(
+            run_id=run_record["run_id"], status=RUN_STATUS_PENDING_UPLOAD
+        )
+
+        return json_response({
+            "status": RUN_STATUS_PENDING_UPLOAD,
+            "message": f"{mode.title()} files generated successfully.",
+            "mode": mode,
+            "run_id": run_record["run_id"],
+            "run_number": run_record["run_number"],
+            "application": APPLICATION_NAME,
+            "version": APPLICATION_VERSION,
+            "timing": {
+                "total_process_seconds": round(time.perf_counter() - started_at, 3)
+            },
+            "lifecycle": {
+                "current_status": RUN_STATUS_PENDING_UPLOAD,
+                "next_status": RUN_STATUS_PENDING_VERIFICATION,
+                "allowed_statuses": RUN_LIFECYCLE_STATUSES,
+                "status_persisted": lifecycle_status_persisted,
+            },
+            "summary": {
+                "files_count": len(files_summary),
+                "total_input_rows": total_rows,
+                "master_rows": int(len(master)),
+                "accept_rows": int(len(accept)),
+                "dispatch_rows": int(len(dispatch_output)),
+                "variance_rows": int(len(variance)),
+                "accept_files_count": len(accept_files),
+                "dispatch_files_count": len(dispatch_files),
+                "generated_files_count": generated_files_count,
+            },
+            "dashboard_preview": build_dashboard_preview(master=master, limit=100),
+            "files": files_summary,
+            "outputs": {
+                "accept_files": accept_files,
+                "dispatch_files": dispatch_files,
+                "accept_details": accept_details,
+                "dispatch_details": dispatch_details,
+                "variance": variance_report,
+            },
+            "output_manifest": output_manifest,
+        })
+
+    except Exception as ex:
+        logging.exception("%s reconciliation failed", mode)
+        if run_record is not None:
+            try:
+                fail_reconciliation_run(
+                    run_id=run_record["run_id"],
+                    error_message=f"{mode}: {str(ex)}",
+                )
+            except Exception:
+                logging.exception("Unable to mark reconciliation run as failed.")
+        return json_response({
+            "status": "Failed",
+            "mode": mode,
+            "error": str(ex),
+            "error_type": type(ex).__name__,
+        }, 500)
+
+
+@app.route(route="process-accept", methods=["GET", "POST"])
+def process_accept(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "GET":
+        return json_response({
+            "status": "Ready",
+            "mode": "accept",
+            "required_files": ["asn", "inventory", "sfda"],
+        })
+    return _process_reconciliation_stage(req, "accept")
+
+
+@app.route(route="process-dispatch", methods=["GET", "POST"])
+def process_dispatch(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "GET":
+        return json_response({
+            "status": "Ready",
+            "mode": "dispatch",
+            "required_files": ["dispatch", "inventory", "sfda"],
+        })
+    return _process_reconciliation_stage(req, "dispatch")
+
+
 @app.route(
     route="",
     methods=["GET"]
@@ -1523,7 +1772,7 @@ def process(
     if req.method == "GET":
         return json_response({
             "status": "Ready",
-            "message": "Use POST with ASN, Inventory, Full Dispatch, and SFDA files. Accept and Dispatch are limited to actual WMS evidence.",
+            "message": "Use POST with the four required files.",
             "required_files": REQUIRED_FILES,
             "run_lifecycle": RUN_LIFECYCLE_STATUSES,
         })
