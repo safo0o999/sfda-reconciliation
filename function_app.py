@@ -790,34 +790,10 @@ def process(
         )
 
         uploaded_files = {
-    file_key: req.files[file_key]
-    for file_key in REQUIRED_FILES
-}
+            file_key: req.files[file_key]
+            for file_key in REQUIRED_FILES
+        }
 
-# --------------------------------------------------------
-# Save all uploaded input files to Azure Blob Storage
-# --------------------------------------------------------
-
-input_files = {}
-
-for file_key, uploaded_file in uploaded_files.items():
-
-    file_name = uploaded_file.filename
-
-    file_bytes = uploaded_file.read()
-
-    input_files[file_key] = {
-        "filename": file_name,
-        "bytes": file_bytes
-    }
-
-    blob_storage.upload_input(
-        run_number=run_record["run_number"],
-        file_name=file_name,
-        file_bytes=file_bytes
-    )
-
-    uploaded_file.seek(0)
         dataframes = {
             file_key: read_excel_file(
                 uploaded_file
