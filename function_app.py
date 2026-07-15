@@ -702,400 +702,490 @@ def build_dispatch_details(
     dispatch_df,
     dispatch_output,
 ):
-    source = _prepare_dispatch_transactions(
-        dispatch_df
-    )
-    allocated = dispatch_output.copy()
+    """
+    Build Dispatch_Details.xlsx as an operational view of Full Dispatch.
 
-    quantity_candidates = [
-        "Allocated To Be Dispatch",
-        "Calculated To Be Dispatch",
+    Full Dispatch remains the transaction source of truth.
+    This function does not rebuild transactions, perform fallback matching,
+    redistribute quantities, or recalculate the dispatch allocation.
+    """
+
+    output_columns = [
+        "Run Date",
+        "GTIN",
+        "Generic Item Number",
+        "Trade Item Number",
+        "Trade Description",
+        "Sales Order Number",
+        "Pick Qty",
+        "Qty / Pack",
+        "QU",
+        "Batch/Lot",
+        "Confirm Date",
+        "To Address",
+        "GLN",
+        "Custody",
+        "Order Line Status",
         "To Be Dispatch",
     ]
-    quantity_column = next(
-        (
-            column
-            for column in quantity_candidates
-            if column in allocated.columns
-        ),
-        None,
+
+    def build_empty_output():
+        return Exporter.build_formatted_excel_file(
+            df=pd.DataFrame(columns=output_columns),
+            file_name="Dispatch_Details.xlsx",
+            sheet_name="Dispatch Details",
+            title="SFDA Dispatch Details",
+            columns=output_columns,
+        )
+
+    if dispatch_df is None or dispatch_df.empty:
+        return build_empty_output()
+
+    if dispatch_output is None or dispatch_output.empty:
+        return build_empty_output()
+
+    source = dispatch_df.copy()
+    allocated = dispatch_output.copy()
+
+    source["_SOURCE_ROW_ORDER"] = range(
+        len(source)
+    )
+
+    def source_column(
+        candidates,
+        default="",
+    ):
+        column = _find_column(
+            source,
+            candidates,
+        )
+
+        if column is None:
+            return pd.Series(
+                [default] * len(source),
+                index=source.index,
+                dtype=object,
+            )
+
+        return source[column].copy()
+
+    def allocated_column(
+        candidates,
+        default="",
+    ):
+        column = _find_column(
+            allocated,
+            candidates,
+        )
+
+        if column is None:
+            return pd.Series(
+                [default] * len(allocated),
+                index=allocated.index,
+                dtype=object,
+            )
+
+        return allocated[column].copy()
+
+    # ---------------------------------------------------------
+    # Full Dispatch transaction fields
+    # ---------------------------------------------------------
+    source["_BN_VALUE"] = source_column([
+        "BN",
+        "Batch/Lot",
+        "Batch Number",
+        "Lot No/Batch",
+    ])
+
+    source["_EXPIRY_VALUE"] = source_column([
+        "Expiry Date",
+        "Best Before Date",
+        "Expiration Date",
+    ])
+
+    source["_GENERIC_ITEM_VALUE"] = source_column([
+        "Generic Item Number",
+        "Item Number",
+        "Generic Number",
+    ])
+
+    source["_TRADE_ITEM_VALUE"] = source_column([
+        "Trade Item Number",
+        "Trade Item",
+        "Trade Number",
+    ])
+
+    source["_TRADE_DESCRIPTION_VALUE"] = source_column([
+        "Trade Description",
+        "Trade Name",
+        "Trade Item Description",
+        "Description",
+    ])
+
+    source["_SALES_ORDER_VALUE"] = source_column([
+        "Sales Order Number",
+        "Order Number",
+        "Sales Order",
+        "SO Number",
+    ])
+
+    source["_PICK_QTY_VALUE"] = source_column(
+        [
+            "Pick Qty",
+            "Dispatched Quantity",
+            "Picked Quantity",
+        ],
+        default=0,
+    )
+
+    source["_QU_VALUE"] = source_column([
+        "QU",
+        "Quantity Unit",
+        "Unit",
+        "UOM",
+    ])
+
+    source["_CONFIRM_DATE_VALUE"] = source_column([
+        "Confirm Date",
+        "Confirmation Date",
+        "Dispatch Confirm Date",
+        "Dispatched Date",
+    ])
+
+    source["_TO_ADDRESS_VALUE"] = source_column([
+        "To Address",
+        "Customer Name",
+    ])
+
+    source["_ORDER_LINE_STATUS_VALUE"] = source_column([
+        "Order Line Status",
+        "Line Status",
+        "Status",
+    ])
+
+    source["_BN_KEY"] = source[
+        "_BN_VALUE"
+    ].map(
+        _normalize_key_text
+    )
+
+    source["_EXPIRY_KEY"] = source[
+        "_EXPIRY_VALUE"
+    ].map(
+        _normalize_date_key
+    )
+
+    source["_CUSTOMER_KEY"] = source[
+        "_TO_ADDRESS_VALUE"
+    ].map(
+        _normalize_key_text
+    )
+
+    # ---------------------------------------------------------
+    # Existing dispatch_output fields
+    # ---------------------------------------------------------
+    allocated["_BN_VALUE"] = allocated_column([
+        "BN",
+        "Batch/Lot",
+        "Batch Number",
+        "Lot No/Batch",
+    ])
+
+    allocated["_EXPIRY_VALUE"] = allocated_column([
+        "Expiry Date",
+        "Best Before Date",
+        "Expiration Date",
+    ])
+
+    allocated["_TO_ADDRESS_VALUE"] = allocated_column([
+        "To Address",
+        "Customer Name",
+    ])
+
+    allocated["_GTIN_VALUE"] = allocated_column([
+        "GTIN",
+    ])
+
+    allocated["_GLN_VALUE"] = allocated_column([
+        "GLN",
+    ])
+
+    allocated["_CUSTOMER_STATUS_VALUE"] = allocated_column([
+        "Customer Status",
+        "Custody",
+    ])
+
+    allocated["_DRUG_NAME_VALUE"] = allocated_column([
+        "Drug Name",
+        "Trade Name",
+    ])
+
+    allocated["_PACKAGE_SIZE_VALUE"] = allocated_column(
+        [
+            "PackageSize",
+            "Package Size",
+            "Pack Size",
+        ],
+        default=0,
+    )
+
+    quantity_column = _find_column(
+        allocated,
+        [
+            "Allocated To Be Dispatch",
+            "Calculated To Be Dispatch",
+            "To Be Dispatch",
+        ],
     )
 
     if quantity_column is None:
-        allocated["_ALLOC_QTY"] = 0
-    else:
-        allocated["_ALLOC_QTY"] = pd.to_numeric(
-            allocated[quantity_column],
-            errors="coerce",
-        ).fillna(0)
+        raise ValueError(
+            "dispatch_output does not contain the existing "
+            "dispatch allocation quantity column."
+        )
+
+    allocated["_ALLOC_QTY"] = pd.to_numeric(
+        allocated[quantity_column],
+        errors="coerce",
+    ).fillna(0)
 
     allocated = allocated[
         allocated["_ALLOC_QTY"] > 0
     ].copy()
 
-    allocated["_BN_KEY"] = allocated["BN"].map(
+    if allocated.empty:
+        return build_empty_output()
+
+    allocated["_BN_KEY"] = allocated[
+        "_BN_VALUE"
+    ].map(
         _normalize_key_text
     )
+
     allocated["_EXPIRY_KEY"] = allocated[
-        "Expiry Date"
+        "_EXPIRY_VALUE"
     ].map(
         _normalize_date_key
     )
 
-    if "To Address" not in allocated.columns:
-        allocated["To Address"] = ""
-
     allocated["_CUSTOMER_KEY"] = allocated[
-        "To Address"
+        "_TO_ADDRESS_VALUE"
     ].map(
         _normalize_key_text
     )
 
-    source["_REMAINING_BASE_QTY"] = (
-        source["Dispatched Quantity"]
-        .fillna(0)
-        .astype(float)
+    # ---------------------------------------------------------
+    # Keep Full Dispatch rows only when BN + Expiry exist in
+    # dispatch_output. No transaction reconstruction is performed.
+    # ---------------------------------------------------------
+    dispatch_batch_keys = (
+        allocated[
+            [
+                "_BN_KEY",
+                "_EXPIRY_KEY",
+            ]
+        ]
+        .drop_duplicates()
+        .copy()
     )
 
-    source = source.sort_values(
-        [
+    source = source.merge(
+        dispatch_batch_keys.assign(
+            _IN_DISPATCH_OUTPUT=True
+        ),
+        on=[
+            "_BN_KEY",
+            "_EXPIRY_KEY",
+        ],
+        how="left",
+        sort=False,
+        validate="many_to_one",
+    )
+
+    source = source[
+        source["_IN_DISPATCH_OUTPUT"].fillna(False)
+    ].copy()
+
+    if source.empty:
+        return build_empty_output()
+
+    # ---------------------------------------------------------
+    # Build a direct enrichment lookup from the already calculated
+    # dispatch allocation.
+    #
+    # This is a direct BN + Expiry + To Address join only.
+    # There is no fallback customer matching and no redistribution.
+    # ---------------------------------------------------------
+    allocation_lookup = (
+        allocated.groupby(
+            [
+                "_BN_KEY",
+                "_EXPIRY_KEY",
+                "_CUSTOMER_KEY",
+            ],
+            as_index=False,
+            sort=False,
+            dropna=False,
+        )
+        .agg({
+            "_GTIN_VALUE": _join_unique,
+            "_GLN_VALUE": _join_unique,
+            "_CUSTOMER_STATUS_VALUE": _join_unique,
+            "_DRUG_NAME_VALUE": _join_unique,
+            "_PACKAGE_SIZE_VALUE": "first",
+            "_ALLOC_QTY": "sum",
+        })
+    )
+
+    source = source.merge(
+        allocation_lookup,
+        on=[
             "_BN_KEY",
             "_EXPIRY_KEY",
             "_CUSTOMER_KEY",
-            "Order Number",
-            "Order Line",
-            "_SOURCE_ROW_ID",
         ],
-        na_position="last",
+        how="left",
+        sort=False,
+        validate="many_to_one",
+    )
+
+    source = source.sort_values(
+        "_SOURCE_ROW_ORDER",
         kind="stable",
     ).reset_index(drop=True)
 
-    rows = []
+    # ---------------------------------------------------------
+    # Qty / Pack
+    # ---------------------------------------------------------
+    numeric_pick_qty = pd.to_numeric(
+        source["_PICK_QTY_VALUE"],
+        errors="coerce",
+    ).fillna(0)
 
-    for _, item in allocated.iterrows():
-        quantity_left = max(
-            0,
-            int(
-                round(
-                    float(
-                        item["_ALLOC_QTY"]
-                    )
-                )
-            ),
-        )
+    numeric_package_size = pd.to_numeric(
+        source["_PACKAGE_SIZE_VALUE"],
+        errors="coerce",
+    ).fillna(0)
 
-        if quantity_left <= 0:
-            continue
+    source["_QTY_PER_PACK"] = 0.0
 
-        package_size = pd.to_numeric(
-            pd.Series(
-                [
-                    item.get(
-                        "PackageSize",
-                        1,
-                    )
-                ]
-            ),
-            errors="coerce",
-        ).fillna(1).iloc[0]
-
-        try:
-            package_size = float(
-                package_size
-            )
-        except (
-            TypeError,
-            ValueError,
-        ):
-            package_size = 1
-
-        if package_size <= 0:
-            package_size = 1
-
-        exact_mask = (
-            (
-                source["_BN_KEY"]
-                == item["_BN_KEY"]
-            )
-            & (
-                source["_EXPIRY_KEY"]
-                == item["_EXPIRY_KEY"]
-            )
-            & (
-                source["_CUSTOMER_KEY"]
-                == item["_CUSTOMER_KEY"]
-            )
-            & (
-                source[
-                    "_REMAINING_BASE_QTY"
-                ] > 0
-            )
-        )
-
-        fallback_mask = (
-            (
-                source["_BN_KEY"]
-                == item["_BN_KEY"]
-            )
-            & (
-                source["_EXPIRY_KEY"]
-                == item["_EXPIRY_KEY"]
-            )
-            & (
-                source[
-                    "_REMAINING_BASE_QTY"
-                ] > 0
-            )
-            & ~exact_mask
-        )
-
-        exact_indexes = list(
-            source.index[
-                exact_mask
-            ]
-        )
-        fallback_indexes = list(
-            source.index[
-                fallback_mask
-            ]
-        )
-
-        candidate_groups = [
-            (
-                exact_indexes,
-                "Matched by customer + batch + expiry",
-            ),
-            (
-                fallback_indexes,
-                "Fallback: matched by batch + expiry only",
-            ),
-        ]
-
-        for (
-            candidate_indexes,
-            detail_status,
-        ) in candidate_groups:
-            if quantity_left <= 0:
-                break
-
-            for source_index in candidate_indexes:
-                if quantity_left <= 0:
-                    break
-
-                remaining_base_quantity = max(
-                    0.0,
-                    float(
-                        source.at[
-                            source_index,
-                            "_REMAINING_BASE_QTY",
-                        ]
-                    ),
-                )
-
-                if remaining_base_quantity <= 0:
-                    continue
-
-                available_packages = int(
-                    remaining_base_quantity
-                    // package_size
-                )
-
-                if available_packages <= 0:
-                    continue
-
-                allocated_packages = min(
-                    quantity_left,
-                    available_packages,
-                )
-
-                if allocated_packages <= 0:
-                    continue
-
-                consumed_base_quantity = (
-                    allocated_packages
-                    * package_size
-                )
-
-                source.at[
-                    source_index,
-                    "_REMAINING_BASE_QTY",
-                ] = max(
-                    0.0,
-                    remaining_base_quantity
-                    - consumed_base_quantity,
-                )
-
-                transaction = source.loc[
-                    source_index
-                ]
-
-                output_address = (
-                    _normalize_text(
-                        transaction.get(
-                            "To Address",
-                            "",
-                        )
-                    )
-                    or _normalize_text(
-                        item.get(
-                            "To Address",
-                            "",
-                        )
-                    )
-                )
-
-                rows.append({
-                    "To Address": output_address,
-                    "GLN": item.get(
-                        "GLN",
-                        "",
-                    ),
-                    "Customer Status": item.get(
-                        "Customer Status",
-                        "",
-                    ),
-                    "Order Number": transaction.get(
-                        "Order Number",
-                        "",
-                    ),
-                    "Order Line": transaction.get(
-                        "Order Line",
-                        "",
-                    ),
-                    "Reference Order Number": transaction.get(
-                        "Reference Order Number",
-                        "",
-                    ),
-                    "Ship To Customer": transaction.get(
-                        "Ship To Customer",
-                        "",
-                    ),
-                    "Generic Item Number": transaction.get(
-                        "Generic Item Number",
-                        "",
-                    ),
-                    "Trade Item Number": transaction.get(
-                        "Trade Item Number",
-                        "",
-                    ),
-                    "Trade Name": transaction.get(
-                        "Trade Name",
-                        "",
-                    ),
-                    "GTIN": item.get(
-                        "GTIN",
-                        "",
-                    ),
-                    "Drug Name": item.get(
-                        "Drug Name",
-                        "",
-                    ),
-                    "BN": item.get(
-                        "BN",
-                        "",
-                    ),
-                    "Expiry Date": item.get(
-                        "Expiry Date",
-                        "",
-                    ),
-                    "Dispatched Quantity": transaction.get(
-                        "Dispatched Quantity",
-                        0,
-                    ),
-                    "PackageSize": package_size,
-                    "To Be Dispatch": allocated_packages,
-                    "Detail Status": detail_status,
-                })
-
-                quantity_left -= (
-                    allocated_packages
-                )
-
-        if quantity_left > 0:
-            rows.append({
-                "To Address": item.get(
-                    "To Address",
-                    "",
-                ),
-                "GLN": item.get(
-                    "GLN",
-                    "",
-                ),
-                "Customer Status": item.get(
-                    "Customer Status",
-                    "",
-                ),
-                "Order Number": "",
-                "Order Line": "",
-                "Reference Order Number": "",
-                "Ship To Customer": "",
-                "Generic Item Number": "",
-                "Trade Item Number": "",
-                "Trade Name": "",
-                "GTIN": item.get(
-                    "GTIN",
-                    "",
-                ),
-                "Drug Name": item.get(
-                    "Drug Name",
-                    "",
-                ),
-                "BN": item.get(
-                    "BN",
-                    "",
-                ),
-                "Expiry Date": item.get(
-                    "Expiry Date",
-                    "",
-                ),
-                "Dispatched Quantity": 0,
-                "PackageSize": package_size,
-                "To Be Dispatch": quantity_left,
-                "Detail Status": (
-                    "Allocated quantity exceeds "
-                    "unused matching dispatch quantity"
-                ),
-            })
-
-    details = pd.DataFrame(
-        rows
+    valid_package_size = (
+        numeric_package_size > 0
     )
+
+    source.loc[
+        valid_package_size,
+        "_QTY_PER_PACK",
+    ] = (
+        numeric_pick_qty.loc[
+            valid_package_size
+        ]
+        / numeric_package_size.loc[
+            valid_package_size
+        ]
+    )
+
+    # ---------------------------------------------------------
+    # Preserve the locked allocation total.
+    #
+    # If Full Dispatch contains multiple rows for the same
+    # BN + Expiry + To Address, the existing allocation is shown
+    # once on the first original row so it is not duplicated.
+    # No allocation quantity is recalculated or redistributed.
+    # ---------------------------------------------------------
+    source["_ALLOCATION_ROW_NUMBER"] = (
+        source.groupby(
+            [
+                "_BN_KEY",
+                "_EXPIRY_KEY",
+                "_CUSTOMER_KEY",
+            ],
+            sort=False,
+            dropna=False,
+        )
+        .cumcount()
+    )
+
+    source["_TO_BE_DISPATCH_VALUE"] = 0.0
+
+    allocation_first_row = (
+        source["_ALLOCATION_ROW_NUMBER"].eq(0)
+        & source["_ALLOC_QTY"].notna()
+    )
+
+    source.loc[
+        allocation_first_row,
+        "_TO_BE_DISPATCH_VALUE",
+    ] = source.loc[
+        allocation_first_row,
+        "_ALLOC_QTY",
+    ]
+
+    # ---------------------------------------------------------
+    # Final operational output
+    # ---------------------------------------------------------
+    run_date = pd.Timestamp.now().normalize()
+
+    details = pd.DataFrame({
+        "Run Date": pd.Series(
+            [run_date] * len(source),
+            index=source.index,
+        ),
+        "GTIN": source[
+            "_GTIN_VALUE"
+        ].fillna(""),
+        "Generic Item Number": source[
+            "_GENERIC_ITEM_VALUE"
+        ],
+        "Trade Item Number": source[
+            "_TRADE_ITEM_VALUE"
+        ],
+        "Trade Description": source[
+            "_TRADE_DESCRIPTION_VALUE"
+        ],
+        "Sales Order Number": source[
+            "_SALES_ORDER_VALUE"
+        ],
+        "Pick Qty": source[
+            "_PICK_QTY_VALUE"
+        ],
+        "Qty / Pack": source[
+            "_QTY_PER_PACK"
+        ],
+        "QU": source[
+            "_QU_VALUE"
+        ],
+        "Batch/Lot": source[
+            "_BN_VALUE"
+        ],
+        "Confirm Date": source[
+            "_CONFIRM_DATE_VALUE"
+        ],
+        "To Address": source[
+            "_TO_ADDRESS_VALUE"
+        ],
+        "GLN": source[
+            "_GLN_VALUE"
+        ].fillna(""),
+        "Custody": source[
+            "_CUSTOMER_STATUS_VALUE"
+        ].fillna(""),
+        "Order Line Status": source[
+            "_ORDER_LINE_STATUS_VALUE"
+        ],
+        "To Be Dispatch": source[
+            "_TO_BE_DISPATCH_VALUE"
+        ],
+    })
 
     return Exporter.build_formatted_excel_file(
         df=details,
         file_name="Dispatch_Details.xlsx",
         sheet_name="Dispatch Details",
         title="SFDA Dispatch Details",
-        columns=[
-            "To Address",
-            "GLN",
-            "Customer Status",
-            "Order Number",
-            "Order Line",
-            "Reference Order Number",
-            "Ship To Customer",
-            "Generic Item Number",
-            "Trade Item Number",
-            "Trade Name",
-            "GTIN",
-            "Drug Name",
-            "BN",
-            "Expiry Date",
-            "Dispatched Quantity",
-            "PackageSize",
-            "To Be Dispatch",
-            "Detail Status",
-        ],
-        sort_columns=[
-            "To Address",
-            "Order Number",
-            "Order Line",
-            "Generic Item Number",
-            "Trade Item Number",
-            "BN",
-            "Expiry Date",
-        ],
+        columns=output_columns,
     )
+
 
 def build_variance_report(
     variance
