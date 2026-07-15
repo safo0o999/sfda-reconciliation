@@ -1,4 +1,6 @@
 import os
+import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -830,10 +832,24 @@ def get_reconciliation_run_files(
 def record_batch_events(
     run_id: int,
     events: List[Dict[str, Any]],
+    batch_size: int = 500,
 ) -> int:
 
     if not events:
+        logging.info(
+            "[BATCH EVENTS] No events to save "
+            "| run_id=%s",
+            run_id,
+        )
         return 0
+
+    safe_batch_size = max(
+        100,
+        min(
+            int(batch_size),
+            2000,
+        ),
+    )
 
     database = Database()
     rows = []
@@ -857,18 +873,22 @@ def record_batch_events(
             raise ValueError(
                 "Batch event is missing event_key."
             )
+
         if not batch_number:
             raise ValueError(
                 "Batch event is missing BN."
             )
+
         if expiry_date is None:
             raise ValueError(
                 "Batch event is missing expiry_date."
             )
+
         if not event_type:
             raise ValueError(
                 "Batch event is missing event_type."
             )
+
         if not source_system:
             raise ValueError(
                 "Batch event is missing source_system."
@@ -907,8 +927,7 @@ def record_batch_events(
             event.get("customer_name"),
         ))
 
-    database.execute_many(
-        """
+    merge_sql = """
         MERGE dbo.BatchEvents WITH (HOLDLOCK) AS target
         USING
         (
@@ -988,11 +1007,94 @@ def record_batch_events(
                 %s,
                 SYSUTCDATETIME()
             );
-        """,
-        rows,
+    """
+
+    total_rows = len(rows)
+    total_batches = (
+        total_rows
+        + safe_batch_size
+        - 1
+    ) // safe_batch_size
+    saved_rows = 0
+    operation_started_at = time.perf_counter()
+
+    logging.info(
+        "[BATCH EVENTS] Starting batched SQL save "
+        "| run_id=%s | total_rows=%s "
+        "| batch_size=%s | total_batches=%s",
+        run_id,
+        total_rows,
+        safe_batch_size,
+        total_batches,
     )
 
-    return len(events)
+    for batch_number_index, start_index in enumerate(
+        range(
+            0,
+            total_rows,
+            safe_batch_size,
+        ),
+        start=1,
+    ):
+        batch_started_at = time.perf_counter()
+        batch_rows = rows[
+            start_index:
+            start_index + safe_batch_size
+        ]
+
+        logging.info(
+            "[BATCH EVENTS] Saving batch "
+            "| run_id=%s | batch=%s/%s "
+            "| rows=%s | saved_before=%s",
+            run_id,
+            batch_number_index,
+            total_batches,
+            len(batch_rows),
+            saved_rows,
+        )
+
+        try:
+            database.execute_many(
+                merge_sql,
+                batch_rows,
+            )
+        except Exception:
+            logging.exception(
+                "[BATCH EVENTS] Batch save failed "
+                "| run_id=%s | batch=%s/%s "
+                "| start_row=%s | batch_rows=%s",
+                run_id,
+                batch_number_index,
+                total_batches,
+                start_index + 1,
+                len(batch_rows),
+            )
+            raise
+
+        saved_rows += len(batch_rows)
+
+        logging.info(
+            "[BATCH EVENTS] Batch saved "
+            "| run_id=%s | batch=%s/%s "
+            "| saved_rows=%s/%s | seconds=%.3f",
+            run_id,
+            batch_number_index,
+            total_batches,
+            saved_rows,
+            total_rows,
+            time.perf_counter() - batch_started_at,
+        )
+
+    logging.info(
+        "[BATCH EVENTS] All events saved "
+        "| run_id=%s | saved_rows=%s "
+        "| total_seconds=%.3f",
+        run_id,
+        saved_rows,
+        time.perf_counter() - operation_started_at,
+    )
+
+    return saved_rows
 
 def get_batch_events(
     batch_number: str,
