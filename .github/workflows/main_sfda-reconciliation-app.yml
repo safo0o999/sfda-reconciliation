@@ -10,6 +10,7 @@ env:
   AZURE_FUNCTIONAPP_NAME: sfda-reconciliation-app
   AZURE_FUNCTIONAPP_PACKAGE_PATH: .
   PYTHON_VERSION: "3.12"
+  PYTHONPATH: ${{ github.workspace }}
 
 jobs:
   validate-and-deploy:
@@ -18,6 +19,11 @@ jobs:
     permissions:
       contents: read
       id-token: write
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ github.workspace }}
 
     steps:
       - name: Checkout repository
@@ -28,21 +34,32 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      - name: Show checked-out revision
+        run: |
+          set -euo pipefail
+          echo "Workspace: $GITHUB_WORKSPACE"
+          echo "Commit: $GITHUB_SHA"
+          git status --short
+          git log -1 --oneline
+
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
       - name: Install dependencies for validation
-        run: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
 
       - name: Validate required Azure Functions files
-        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           required_files=(
             "function_app.py"
             "host.json"
             "requirements.txt"
+            "engine/__init__.py"
+            "engine/batch_history.py"
+            "engine/database.py"
+            "engine/normalizer.py"
           )
 
           for file in "${required_files[@]}"; do
@@ -54,25 +71,118 @@ jobs:
 
           echo "Required project files are present."
 
+      - name: Show engine package contents
+        run: |
+          set -euo pipefail
+          echo "Engine package contents:"
+          find engine -maxdepth 1 -type f -printf "%f\n" | sort
+
       - name: Validate Python syntax
         run: |
-          python -m compileall \
-            function_app.py \
-            engine \
-            config
+          set -euo pipefail
+          python -m compileall             function_app.py             engine             config
+
+      - name: Verify local engine package
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import importlib.util
+          import pathlib
+          import sys
+
+          workspace = pathlib.Path.cwd().resolve()
+          engine_directory = workspace / "engine"
+          batch_history_file = engine_directory / "batch_history.py"
+
+          if str(workspace) not in sys.path:
+              sys.path.insert(0, str(workspace))
+
+          print("Current working directory:", workspace)
+          print("Python executable:", sys.executable)
+          print("Python path:")
+          for entry in sys.path:
+              print(" -", entry)
+
+          if not engine_directory.is_dir():
+              raise RuntimeError(
+                  f"Engine directory was not found: {engine_directory}"
+              )
+
+          if not batch_history_file.is_file():
+              raise RuntimeError(
+                  f"batch_history.py was not found: {batch_history_file}"
+              )
+
+          engine_spec = importlib.util.find_spec("engine")
+
+          if engine_spec is None:
+              raise RuntimeError(
+                  "Python could not resolve the local engine package."
+              )
+
+          print("Resolved engine origin:", engine_spec.origin)
+          print(
+              "Resolved engine search locations:",
+              list(engine_spec.submodule_search_locations or [])
+          )
+
+          resolved_locations = [
+              pathlib.Path(location).resolve()
+              for location in (
+                  engine_spec.submodule_search_locations
+                  or []
+              )
+          ]
+
+          if engine_directory.resolve() not in resolved_locations:
+              raise RuntimeError(
+                  "Python resolved a different 'engine' package instead "
+                  f"of the repository package. Expected: {engine_directory}"
+              )
+
+          from engine.batch_history import BatchHistoryEngine
+
+          if not hasattr(BatchHistoryEngine, "build"):
+              raise RuntimeError(
+                  "BatchHistoryEngine imported, but build() was not found."
+              )
+
+          print("Local engine.batch_history imported successfully.")
+          print("BatchHistoryEngine.build found.")
+          PY
 
       - name: Verify function_app import
         run: |
+          set -euo pipefail
+
           python - <<'PY'
+          import pathlib
+          import sys
+
+          workspace = pathlib.Path.cwd().resolve()
+
+          if str(workspace) not in sys.path:
+              sys.path.insert(0, str(workspace))
+
           import function_app
 
           if not hasattr(function_app, "app"):
               raise RuntimeError(
-                  "function_app.py was imported, but no variable named 'app' was found."
+                  "function_app.py was imported, but no variable named "
+                  "'app' was found."
               )
 
           print("function_app.py imported successfully.")
           print("Azure Functions app object found.")
+          print(
+              "Application version:",
+              getattr(
+                  function_app,
+                  "APPLICATION_VERSION",
+                  "Unknown"
+              )
+          )
           PY
 
       - name: Login to Azure
