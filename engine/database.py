@@ -525,6 +525,161 @@ def initialize_database() -> None:
     )
 
 
+
+    database.execute(
+        """
+        IF OBJECT_ID(
+            N'dbo.VerificationRuns',
+            N'U'
+        ) IS NULL
+        BEGIN
+            CREATE TABLE dbo.VerificationRuns
+            (
+                VerificationID BIGINT
+                    IDENTITY(1,1)
+                    NOT NULL
+                    CONSTRAINT
+                        PK_VerificationRuns
+                    PRIMARY KEY,
+                RunID BIGINT NOT NULL,
+                Status NVARCHAR(50) NOT NULL,
+                LatestSFDAFileName
+                    NVARCHAR(500) NULL,
+                NotificationFiles INT
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationRuns_Files
+                    DEFAULT 0,
+                ExpectedRows BIGINT
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationRuns_Expected
+                    DEFAULT 0,
+                NotificationRows BIGINT
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationRuns_Notification
+                    DEFAULT 0,
+                VerifiedRows BIGINT
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationRuns_Verified
+                    DEFAULT 0,
+                RejectedRows BIGINT
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationRuns_Rejected
+                    DEFAULT 0,
+                UnclassifiedRows BIGINT
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationRuns_Unclassified
+                    DEFAULT 0,
+                MismatchRows BIGINT
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationRuns_Mismatch
+                    DEFAULT 0,
+                MissingExpectedRows BIGINT
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationRuns_Missing
+                    DEFAULT 0,
+                ErrorMessage NVARCHAR(MAX) NULL,
+                CreatedAt DATETIME2(3)
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationRuns_Created
+                    DEFAULT SYSUTCDATETIME(),
+                CompletedAt DATETIME2(3) NULL,
+                CONSTRAINT
+                    FK_VerificationRuns_Run
+                FOREIGN KEY (RunID)
+                REFERENCES
+                    dbo.ReconciliationRuns(RunID)
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF OBJECT_ID(
+            N'dbo.VerificationResults',
+            N'U'
+        ) IS NULL
+        BEGIN
+            CREATE TABLE dbo.VerificationResults
+            (
+                VerificationResultID BIGINT
+                    IDENTITY(1,1)
+                    NOT NULL
+                    CONSTRAINT
+                        PK_VerificationResults
+                    PRIMARY KEY,
+                VerificationID BIGINT
+                    NOT NULL,
+                NotificationFile
+                    NVARCHAR(500) NULL,
+                NotificationRow INT NULL,
+                NotificationType
+                    NVARCHAR(30) NULL,
+                ClassificationStatus
+                    NVARCHAR(100) NULL,
+                GTIN NVARCHAR(100) NULL,
+                BN NVARCHAR(200) NULL,
+                ExpiryDate DATE NULL,
+                Quantity DECIMAL(19,4)
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationResults_Qty
+                    DEFAULT 0,
+                ResultCode NVARCHAR(50) NULL,
+                Description NVARCHAR(2000) NULL,
+                PortalSuccess BIT
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationResults_Success
+                    DEFAULT 0,
+                OriginalActive DECIMAL(19,4)
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationResults_Original
+                    DEFAULT 0,
+                LatestActive DECIMAL(19,4)
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationResults_Latest
+                    DEFAULT 0,
+                ExpectedActive DECIMAL(19,4)
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationResults_Expected
+                    DEFAULT 0,
+                ActiveMatches BIT
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationResults_Matches
+                    DEFAULT 0,
+                VerificationStatus
+                    NVARCHAR(100) NULL,
+                CreatedAt DATETIME2(3)
+                    NOT NULL
+                    CONSTRAINT
+                        DF_VerificationResults_Created
+                    DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT
+                    FK_VerificationResults_Run
+                FOREIGN KEY (VerificationID)
+                REFERENCES
+                    dbo.VerificationRuns(
+                        VerificationID
+                    )
+            );
+        END;
+        """
+    )
+
 def _generate_run_number() -> str:
     now = datetime.now(
         timezone.utc
@@ -658,6 +813,38 @@ def fail_reconciliation_run(
             run_id,
         ),
     )
+
+
+def update_reconciliation_run_status(
+    run_id: int,
+    status: str,
+) -> None:
+    database = Database()
+    database.execute(
+        """
+        UPDATE dbo.ReconciliationRuns
+        SET
+            Status = %s,
+            ErrorMessage = NULL,
+            CompletedAt =
+                CASE
+                    WHEN %s IN
+                    (
+                        N'Verified',
+                        N'Investigation Required'
+                    )
+                    THEN SYSUTCDATETIME()
+                    ELSE CompletedAt
+                END
+        WHERE RunID = %s;
+        """,
+        (
+            status,
+            status,
+            run_id,
+        ),
+    )
+
 
 
 def get_reconciliation_history(
@@ -1208,3 +1395,183 @@ def get_batch_event_totals(
         "expiry_date": expiry_date,
         "events": rows,
     }
+
+def create_verification_run(
+    run_id: int,
+    latest_sfda_file_name: str,
+    notification_files: int,
+) -> int:
+    initialize_database()
+    database = Database()
+
+    verification_id = database.execute_scalar(
+        """
+        INSERT INTO dbo.VerificationRuns
+        (
+            RunID,
+            Status,
+            LatestSFDAFileName,
+            NotificationFiles
+        )
+        OUTPUT INSERTED.VerificationID
+        VALUES
+        (
+            %s,
+            N'Processing',
+            %s,
+            %s
+        );
+        """,
+        (
+            run_id,
+            latest_sfda_file_name,
+            notification_files,
+        ),
+    )
+
+    return int(verification_id)
+
+
+def complete_verification_run(
+    verification_id: int,
+    status: str,
+    summary: Dict[str, Any],
+) -> None:
+    database = Database()
+    database.execute(
+        """
+        UPDATE dbo.VerificationRuns
+        SET
+            Status = %s,
+            ExpectedRows = %s,
+            NotificationRows = %s,
+            VerifiedRows = %s,
+            RejectedRows = %s,
+            UnclassifiedRows = %s,
+            MismatchRows = %s,
+            MissingExpectedRows = %s,
+            ErrorMessage = NULL,
+            CompletedAt = SYSUTCDATETIME()
+        WHERE VerificationID = %s;
+        """,
+        (
+            status,
+            int(summary.get(
+                "expected_rows",
+                0,
+            )),
+            int(summary.get(
+                "notification_rows",
+                0,
+            )),
+            int(summary.get(
+                "verified_rows",
+                0,
+            )),
+            int(summary.get(
+                "rejected_rows",
+                0,
+            )),
+            int(summary.get(
+                "unclassified_rows",
+                0,
+            )),
+            int(summary.get(
+                "mismatch_rows",
+                0,
+            )),
+            int(summary.get(
+                "missing_expected_rows",
+                0,
+            )),
+            verification_id,
+        ),
+    )
+
+
+def fail_verification_run(
+    verification_id: int,
+    error_message: str,
+) -> None:
+    database = Database()
+    database.execute(
+        """
+        UPDATE dbo.VerificationRuns
+        SET
+            Status = N'Failed',
+            ErrorMessage = %s,
+            CompletedAt = SYSUTCDATETIME()
+        WHERE VerificationID = %s;
+        """,
+        (
+            str(error_message)[:4000],
+            verification_id,
+        ),
+    )
+
+
+def record_verification_results(
+    verification_id: int,
+    rows: List[Dict[str, Any]],
+) -> int:
+    if not rows:
+        return 0
+
+    database = Database()
+    parameters = []
+
+    for row in rows:
+        parameters.append((
+            verification_id,
+            row.get("notification_file"),
+            row.get("notification_row"),
+            row.get("notification_type"),
+            row.get("classification_status"),
+            row.get("gtin"),
+            row.get("bn"),
+            row.get("expiry_date"),
+            float(row.get("quantity") or 0),
+            row.get("result_code"),
+            row.get("description"),
+            1 if row.get("portal_success") else 0,
+            float(row.get("original_active") or 0),
+            float(row.get("latest_active") or 0),
+            float(row.get("expected_active") or 0),
+            1 if row.get("active_matches") else 0,
+            row.get("verification_status"),
+        ))
+
+    database.execute_many(
+        """
+        INSERT INTO dbo.VerificationResults
+        (
+            VerificationID,
+            NotificationFile,
+            NotificationRow,
+            NotificationType,
+            ClassificationStatus,
+            GTIN,
+            BN,
+            ExpiryDate,
+            Quantity,
+            ResultCode,
+            Description,
+            PortalSuccess,
+            OriginalActive,
+            LatestActive,
+            ExpectedActive,
+            ActiveMatches,
+            VerificationStatus
+        )
+        VALUES
+        (
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s,
+            %s, %s
+        );
+        """,
+        parameters,
+    )
+
+    return len(rows)
