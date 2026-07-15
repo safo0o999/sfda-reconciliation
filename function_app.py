@@ -10,6 +10,7 @@ import azure.functions as func
 import pandas as pd
 
 from engine.blob_storage import BlobStorage
+import engine.database as database_module
 from engine.database import (
     complete_reconciliation_run,
     create_reconciliation_run,
@@ -32,13 +33,24 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "3.5.0"
+APPLICATION_VERSION = "3.6.0"
 
 REQUIRED_FILES = [
     "asn",
     "inventory",
     "dispatch",
     "sfda",
+]
+
+RUN_STATUS_PENDING_UPLOAD = "Pending Upload"
+RUN_STATUS_PENDING_VERIFICATION = "Pending Verification"
+RUN_STATUS_VERIFIED = "Verified"
+RUN_STATUS_INVESTIGATION = "Investigation Required"
+RUN_LIFECYCLE_STATUSES = [
+    RUN_STATUS_PENDING_UPLOAD,
+    RUN_STATUS_PENDING_VERIFICATION,
+    RUN_STATUS_VERIFIED,
+    RUN_STATUS_INVESTIGATION,
 ]
 
 
@@ -109,6 +121,48 @@ def get_blob_storage() -> BlobStorage:
     storage = BlobStorage()
     storage.initialize_containers()
     return storage
+
+
+def _set_run_lifecycle_status(run_id: int, status: str) -> bool:
+    if status not in RUN_LIFECYCLE_STATUSES:
+        raise ValueError(f"Unsupported run lifecycle status: {status}")
+
+    candidate_names = (
+        "update_reconciliation_run_status",
+        "set_reconciliation_run_status",
+        "update_run_status",
+    )
+    for function_name in candidate_names:
+        status_function = getattr(database_module, function_name, None)
+        if not callable(status_function):
+            continue
+        try:
+            status_function(run_id=run_id, status=status)
+        except TypeError:
+            status_function(run_id, status)
+        return True
+
+    logging.warning(
+        "No database lifecycle status updater is available. "
+        "Run %s remains stored with the completion status created by the existing database layer.",
+        run_id,
+    )
+    return False
+
+
+def _verification_readiness(run: dict) -> dict:
+    current_status = str(run.get("Status") or run.get("status") or "").strip()
+    return {
+        "run_number": run.get("RunNumber") or run.get("run_number"),
+        "current_status": current_status,
+        "allowed_statuses": RUN_LIFECYCLE_STATUSES,
+        "can_upload_verification_files": current_status in {
+            RUN_STATUS_PENDING_UPLOAD,
+            RUN_STATUS_PENDING_VERIFICATION,
+        },
+        "required_latest_sfda_files": 1,
+        "notification_result_files": "multiple",
+    }
 
 
 def read_excel_bytes(file_name: str, file_bytes: bytes):
@@ -912,6 +966,41 @@ def history_file(
 
 
 @app.route(
+    route="verification-readiness/{run_number}",
+    methods=["GET"]
+)
+def verification_readiness(
+    req: func.HttpRequest
+) -> func.HttpResponse:
+    try:
+        run_number = str(req.route_params.get("run_number") or "").strip()
+        if not run_number:
+            return json_response({
+                "status": "Failed",
+                "message": "Run number is required.",
+            }, 400)
+
+        run = get_reconciliation_run_by_number(run_number)
+        if not run:
+            return json_response({
+                "status": "Failed",
+                "message": "Run was not found.",
+            }, 404)
+
+        return json_response({
+            "status": "Success",
+            "verification": _verification_readiness(run),
+        })
+    except Exception as ex:
+        logging.exception("Error while loading verification readiness.")
+        return json_response({
+            "status": "Failed",
+            "error": str(ex),
+            "error_type": type(ex).__name__,
+        }, 500)
+
+
+@app.route(
     route="version",
     methods=["GET"]
 )
@@ -938,6 +1027,7 @@ def process(
             "status": "Ready",
             "message": "Use POST with the four required files.",
             "required_files": REQUIRED_FILES,
+            "run_lifecycle": RUN_LIFECYCLE_STATUSES,
         })
 
     run_record = None
@@ -1099,7 +1189,12 @@ def process(
             "version": APPLICATION_VERSION,
             "run_id": run_record["run_id"],
             "run_number": run_record["run_number"],
-            "status": "Completed",
+            "status": RUN_STATUS_PENDING_UPLOAD,
+            "lifecycle": {
+                "current_status": RUN_STATUS_PENDING_UPLOAD,
+                "allowed_statuses": RUN_LIFECYCLE_STATUSES,
+                "next_status": RUN_STATUS_PENDING_VERIFICATION,
+            },
             "submitted_by": submitted_by,
             "summary": {
                 "files_count": len(files_summary),
@@ -1141,13 +1236,25 @@ def process(
             exception_records=int(len(variance)),
             generated_files=generated_files_count,
         )
+        lifecycle_status_persisted = _set_run_lifecycle_status(
+            run_id=run_record["run_id"],
+            status=RUN_STATUS_PENDING_UPLOAD,
+        )
 
         return json_response({
-            "status": "Reconciliation Engine Completed",
+            "status": RUN_STATUS_PENDING_UPLOAD,
+            "message": "Upload files generated. Upload them to the SFDA Portal, then return for verification.",
             "run_id": run_record["run_id"],
             "run_number": run_record["run_number"],
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
+            "lifecycle": {
+                "current_status": RUN_STATUS_PENDING_UPLOAD,
+                "next_status": RUN_STATUS_PENDING_VERIFICATION,
+                "allowed_statuses": RUN_LIFECYCLE_STATUSES,
+                "status_persisted": lifecycle_status_persisted,
+                "verification_readiness_url": f"/api/verification-readiness/{run_record['run_number']}",
+            },
             "summary": {
                 "files_count": len(files_summary),
                 "total_input_rows": total_rows,
