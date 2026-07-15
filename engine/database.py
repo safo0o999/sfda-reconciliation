@@ -468,6 +468,19 @@ def initialize_database() -> None:
 
     database.execute(
         """
+        IF COL_LENGTH(
+            N'dbo.BatchEvents',
+            N'UpdatedAt'
+        ) IS NULL
+        BEGIN
+            ALTER TABLE dbo.BatchEvents
+            ADD UpdatedAt DATETIME2(3) NULL;
+        END;
+        """
+    )
+
+    database.execute(
+        """
         IF NOT EXISTS
         (
             SELECT 1
@@ -826,24 +839,57 @@ def record_batch_events(
     rows = []
 
     for event in events:
-        event_key = str(event.get("event_key") or "").strip()
-        batch_number = str(event.get("bn") or "").strip()
+        event_key = str(
+            event.get("event_key") or ""
+        ).strip()
+        batch_number = str(
+            event.get("bn") or ""
+        ).strip()
         expiry_date = event.get("expiry_date")
-        event_type = str(event.get("event_type") or "").strip().upper()
-        source_system = str(event.get("source_system") or "").strip().upper()
+        event_type = str(
+            event.get("event_type") or ""
+        ).strip().upper()
+        source_system = str(
+            event.get("source_system") or ""
+        ).strip().upper()
 
         if not event_key:
-            raise ValueError("Batch event is missing event_key.")
+            raise ValueError(
+                "Batch event is missing event_key."
+            )
         if not batch_number:
-            raise ValueError("Batch event is missing BN.")
+            raise ValueError(
+                "Batch event is missing BN."
+            )
         if expiry_date is None:
-            raise ValueError("Batch event is missing expiry_date.")
+            raise ValueError(
+                "Batch event is missing expiry_date."
+            )
         if not event_type:
-            raise ValueError("Batch event is missing event_type.")
+            raise ValueError(
+                "Batch event is missing event_type."
+            )
         if not source_system:
-            raise ValueError("Batch event is missing source_system.")
+            raise ValueError(
+                "Batch event is missing source_system."
+            )
 
-        row = (
+        rows.append((
+            event_key,
+            int(run_id),
+            batch_number,
+            expiry_date,
+            event_type,
+            event.get("event_date"),
+            float(event.get("quantity") or 0),
+            source_system,
+            event.get("source_reference"),
+            event.get("generic_item_number"),
+            event.get("trade_item_number"),
+            event.get("trade_name"),
+            event.get("gtin"),
+            event.get("supplier_name"),
+            event.get("customer_name"),
             int(run_id),
             event_key,
             batch_number,
@@ -859,38 +905,94 @@ def record_batch_events(
             event.get("gtin"),
             event.get("supplier_name"),
             event.get("customer_name"),
-        )
-        rows.append((event_key,) + row)
+        ))
 
     database.execute_many(
         """
-        IF NOT EXISTS
+        MERGE dbo.BatchEvents WITH (HOLDLOCK) AS target
+        USING
         (
-            SELECT 1
-            FROM dbo.BatchEvents
-            WHERE EventKey = %s
-        )
-        BEGIN
-            INSERT INTO dbo.BatchEvents
+            SELECT
+                %s AS EventKey,
+                %s AS RunID,
+                %s AS BN,
+                %s AS ExpiryDate,
+                %s AS EventType,
+                %s AS EventDate,
+                %s AS Quantity,
+                %s AS SourceSystem,
+                %s AS SourceReference,
+                %s AS GenericItemNumber,
+                %s AS TradeItemNumber,
+                %s AS TradeName,
+                %s AS GTIN,
+                %s AS SupplierName,
+                %s AS CustomerName
+        ) AS source
+        ON target.EventKey = source.EventKey
+
+        WHEN MATCHED THEN
+            UPDATE SET
+                RunID = source.RunID,
+                BN = source.BN,
+                ExpiryDate = source.ExpiryDate,
+                EventType = source.EventType,
+                EventDate = source.EventDate,
+                Quantity = source.Quantity,
+                SourceSystem = source.SourceSystem,
+                SourceReference = source.SourceReference,
+                GenericItemNumber = source.GenericItemNumber,
+                TradeItemNumber = source.TradeItemNumber,
+                TradeName = source.TradeName,
+                GTIN = source.GTIN,
+                SupplierName = source.SupplierName,
+                CustomerName = source.CustomerName,
+                UpdatedAt = SYSUTCDATETIME()
+
+        WHEN NOT MATCHED THEN
+            INSERT
             (
-                RunID, EventKey, BN, ExpiryDate, EventType,
-                EventDate, Quantity, SourceSystem, SourceReference,
-                GenericItemNumber, TradeItemNumber, TradeName, GTIN,
-                SupplierName, CustomerName
+                RunID,
+                EventKey,
+                BN,
+                ExpiryDate,
+                EventType,
+                EventDate,
+                Quantity,
+                SourceSystem,
+                SourceReference,
+                GenericItemNumber,
+                TradeItemNumber,
+                TradeName,
+                GTIN,
+                SupplierName,
+                CustomerName,
+                UpdatedAt
             )
             VALUES
             (
-                %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                %s,
+                SYSUTCDATETIME()
             );
-        END;
         """,
         rows,
     )
 
     return len(events)
-
 
 def get_batch_events(
     batch_number: str,
@@ -908,7 +1010,7 @@ def get_batch_events(
                 BatchEventID, RunID, EventKey, BN, ExpiryDate,
                 EventType, EventDate, Quantity, SourceSystem,
                 SourceReference, GenericItemNumber, TradeItemNumber,
-                TradeName, GTIN, SupplierName, CustomerName, CreatedAt
+                TradeName, GTIN, SupplierName, CustomerName, CreatedAt, UpdatedAt
             FROM dbo.BatchEvents
             WHERE BN = %s
             ORDER BY COALESCE(EventDate, CreatedAt), BatchEventID;
@@ -922,7 +1024,7 @@ def get_batch_events(
             BatchEventID, RunID, EventKey, BN, ExpiryDate,
             EventType, EventDate, Quantity, SourceSystem,
             SourceReference, GenericItemNumber, TradeItemNumber,
-            TradeName, GTIN, SupplierName, CustomerName, CreatedAt
+            TradeName, GTIN, SupplierName, CustomerName, CreatedAt, UpdatedAt
         FROM dbo.BatchEvents
         WHERE BN = %s AND ExpiryDate = %s
         ORDER BY COALESCE(EventDate, CreatedAt), BatchEventID;
