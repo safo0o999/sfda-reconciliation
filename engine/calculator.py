@@ -114,41 +114,29 @@ class Calculator:
 
         to_be_accept = BusinessRules.to_be_accept(
             receiving=row["Receiving"],
-            qty_receive_pending=row[
-                "Quantity Receive Pending"
-            ],
+            qty_receive_pending=row["Quantity Receive Pending"]
         )
 
-        dispatch_requirement = (
-            BusinessRules.dispatch_requirement(
-                inventory=row["Inventory"],
-                active=row["Active"],
+        dispatch_gap = BusinessRules.dispatch_gap(
+            inventory=row["Inventory"],
+            active=row["Active"]
+        )
+
+        calculated_to_be_dispatch = BusinessRules.to_be_dispatch(
+            inventory=row["Inventory"],
+            active=row["Active"],
+            dispatch_evidence=row["Dispatch"]
+        )
+
+        return pd.Series({
+            "To Be Accept": to_be_accept,
+            "Dispatch Gap": dispatch_gap,
+            "Calculated To Be Dispatch": calculated_to_be_dispatch,
+            "Unexplained Dispatch Variance": max(
+                0,
+                dispatch_gap - calculated_to_be_dispatch
             )
-        )
-
-        calculated_to_be_dispatch = (
-            BusinessRules.to_be_dispatch(
-                inventory=row["Inventory"],
-                active=row["Active"],
-                dispatch_evidence=row["Dispatch"],
-            )
-        )
-
-        return pd.Series(
-            {
-                "To Be Accept": to_be_accept,
-                "Dispatch Requirement":
-                    dispatch_requirement,
-                "Calculated To Be Dispatch":
-                    calculated_to_be_dispatch,
-                "Unexplained Dispatch Variance":
-                    max(
-                        0,
-                        dispatch_requirement
-                        - calculated_to_be_dispatch,
-                    ),
-            }
-        )
+        })
 
     @staticmethod
     def _build_accept(master):
@@ -524,10 +512,7 @@ class Calculator:
 
         variance["New Active"] = (
             variance["Active"]
-            + variance["To Be Accept"]
-            - variance[
-                "Allocated To Be Dispatch"
-            ]
+            - variance["Allocated To Be Dispatch"]
         )
 
         variance[
@@ -566,23 +551,8 @@ class Calculator:
         )
 
         variance["Dispatch Variance"] = (
-            variance[
-                "Dispatch Requirement"
-            ]
-            - variance[
-                "Allocated To Be Dispatch"
-            ]
-        ).clip(lower=0)
-
-        variance[
-            "Missing Full Dispatch Evidence"
-        ] = (
-            variance[
-                "Dispatch Requirement"
-            ]
-            - variance[
-                "Calculated To Be Dispatch"
-            ]
+            variance["Dispatch Gap"]
+            - variance["Allocated To Be Dispatch"]
         ).clip(lower=0)
 
         variance = variance[
@@ -715,22 +685,6 @@ class Calculator:
         ] = (
             master[
                 "Calculated To Be Dispatch"
-            ]
-            .fillna(0)
-            .astype(int)
-        )
-
-        master["Dispatch Requirement"] = (
-            master["Dispatch Requirement"]
-            .fillna(0)
-            .astype(int)
-        )
-
-        master[
-            "Unexplained Dispatch Variance"
-        ] = (
-            master[
-                "Unexplained Dispatch Variance"
             ]
             .fillna(0)
             .astype(int)
