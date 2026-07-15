@@ -1,5 +1,7 @@
+import base64
 import io
 import json
+import mimetypes
 import logging
 import traceback
 from pathlib import Path
@@ -7,11 +9,15 @@ from pathlib import Path
 import azure.functions as func
 import pandas as pd
 
+from engine.blob_storage import BlobStorage
 from engine.database import (
     complete_reconciliation_run,
     create_reconciliation_run,
     fail_reconciliation_run,
     get_reconciliation_history,
+    get_reconciliation_run_by_number,
+    get_reconciliation_run_files,
+    record_reconciliation_file,
     initialize_database,
     test_database_connection,
 )
@@ -26,7 +32,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "3.3.0"
+APPLICATION_VERSION = "3.5.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -96,6 +102,98 @@ def read_excel_file(uploaded_file):
         io.BytesIO(file_bytes),
         engine=excel_engine,
         dtype=object
+    )
+
+
+def get_blob_storage() -> BlobStorage:
+    storage = BlobStorage()
+    storage.initialize_containers()
+    return storage
+
+
+def read_excel_bytes(file_name: str, file_bytes: bytes):
+    class UploadedBytes:
+        filename = file_name
+
+        def read(self):
+            return file_bytes
+
+    return read_excel_file(UploadedBytes())
+
+
+def _safe_file_name(value: str, fallback: str) -> str:
+    cleaned = Path(str(value or fallback)).name.strip()
+    return cleaned or fallback
+
+
+def _content_type_for(file_name: str, fallback: str = "application/octet-stream") -> str:
+    guessed, _ = mimetypes.guess_type(file_name)
+    return guessed or fallback
+
+
+def _payload_to_bytes(value):
+    if isinstance(value, bytes):
+        return value, "application/octet-stream"
+
+    if isinstance(value, str):
+        return value.encode("utf-8-sig"), "text/csv; charset=utf-8"
+
+    if isinstance(value, dict):
+        content = value.get("content", value.get("data", ""))
+        encoding = str(value.get("encoding", "base64")).lower()
+        content_type = (
+            value.get("mime_type")
+            or value.get("mime")
+            or "application/octet-stream"
+        )
+        if isinstance(content, bytes):
+            return content, content_type
+        if encoding == "base64":
+            cleaned = str(content or "")
+            if ";base64," in cleaned:
+                cleaned = cleaned.split(";base64,", 1)[1]
+            return base64.b64decode(cleaned), content_type
+        return str(content or "").encode("utf-8"), content_type
+
+    return str(value or "").encode("utf-8"), "application/octet-stream"
+
+
+def _iter_output_files(group, fallback_name: str, file_type: str):
+    if group is None:
+        return []
+
+    if isinstance(group, dict) and any(
+        key in group for key in ("content", "data", "encoding", "mime_type", "mime")
+    ):
+        name = _safe_file_name(
+            group.get("file_name") or group.get("name"),
+            fallback_name,
+        )
+        data, content_type = _payload_to_bytes(group)
+        return [(name, data, content_type, file_type)]
+
+    if isinstance(group, dict):
+        rows = []
+        for name, value in group.items():
+            safe_name = _safe_file_name(name, fallback_name)
+            data, content_type = _payload_to_bytes(value)
+            rows.append((safe_name, data, content_type, file_type))
+        return rows
+
+    data, content_type = _payload_to_bytes(group)
+    return [(fallback_name, data, content_type, file_type)]
+
+
+def _record_blob_file(run_id: int, category: str, file_type: str, file_name: str, blob_info: dict) -> None:
+    record_reconciliation_file(
+        run_id=run_id,
+        file_category=category,
+        file_type=file_type,
+        file_name=file_name,
+        container_name=blob_info["container"],
+        blob_name=blob_info["blob_name"],
+        content_type=blob_info.get("content_type") or "application/octet-stream",
+        size_bytes=int(blob_info.get("size_bytes") or 0),
     )
 
 
@@ -642,9 +740,8 @@ def health(
     try:
         initialize_database()
 
-        database_result = (
-            test_database_connection()
-        )
+        database_result = test_database_connection()
+        storage_result = get_blob_storage().health()
 
         return json_response({
             "status": "Healthy",
@@ -652,6 +749,7 @@ def health(
             "azure_function": "Working",
             "version": APPLICATION_VERSION,
             "database": database_result,
+            "storage": storage_result,
         })
 
     except Exception as ex:
@@ -720,6 +818,100 @@ def history(
 
 
 @app.route(
+    route="history/{run_number}",
+    methods=["GET"]
+)
+def history_details(
+    req: func.HttpRequest
+) -> func.HttpResponse:
+    try:
+        run_number = str(req.route_params.get("run_number") or "").strip()
+        if not run_number:
+            return json_response({"status": "Failed", "message": "Run number is required."}, 400)
+
+        run = get_reconciliation_run_by_number(run_number)
+        if run is None:
+            return json_response({"status": "Failed", "message": "Run was not found."}, 404)
+
+        files = get_reconciliation_run_files(int(run["RunID"]))
+        for row in files:
+            row["download_url"] = (
+                "/api/history-file?run_number="
+                + run_number
+                + "&file_id="
+                + str(row["RunFileID"])
+            )
+
+        return json_response({
+            "status": "Success",
+            "application": APPLICATION_NAME,
+            "version": APPLICATION_VERSION,
+            "run": run,
+            "files": files,
+        })
+    except Exception as ex:
+        logging.exception("Error while loading run details.")
+        return json_response({
+            "status": "Failed",
+            "error": str(ex),
+            "error_type": type(ex).__name__,
+        }, 500)
+
+
+@app.route(
+    route="history-file",
+    methods=["GET"]
+)
+def history_file(
+    req: func.HttpRequest
+) -> func.HttpResponse:
+    try:
+        run_number = str(req.params.get("run_number") or "").strip()
+        raw_file_id = req.params.get("file_id")
+        if not run_number or not raw_file_id:
+            return json_response({
+                "status": "Failed",
+                "message": "run_number and file_id are required.",
+            }, 400)
+
+        run = get_reconciliation_run_by_number(run_number)
+        if run is None:
+            return json_response({"status": "Failed", "message": "Run was not found."}, 404)
+
+        files = get_reconciliation_run_files(int(run["RunID"]))
+        target = next(
+            (row for row in files if int(row["RunFileID"]) == int(raw_file_id)),
+            None,
+        )
+        if target is None:
+            return json_response({"status": "Failed", "message": "File was not found."}, 404)
+
+        blob = get_blob_storage().download_blob(
+            target["ContainerName"],
+            target["BlobName"],
+        )
+        safe_name = _safe_file_name(target["FileName"], "download.bin")
+        return func.HttpResponse(
+            body=blob["data"],
+            status_code=200,
+            mimetype=target.get("ContentType") or blob["content_type"],
+            headers={
+                "Content-Disposition": f'attachment; filename="{safe_name}"',
+                "Cache-Control": "no-store",
+            },
+        )
+    except FileNotFoundError as ex:
+        return json_response({"status": "Failed", "message": str(ex)}, 404)
+    except Exception as ex:
+        logging.exception("Error while downloading run file.")
+        return json_response({
+            "status": "Failed",
+            "error": str(ex),
+            "error_type": type(ex).__name__,
+        }, 500)
+
+
+@app.route(
     route="version",
     methods=["GET"]
 )
@@ -742,17 +934,15 @@ def process(
 ) -> func.HttpResponse:
 
     if req.method == "GET":
-
         return json_response({
             "status": "Ready",
-            "message": (
-                "Use POST with the four "
-                "required files."
-            ),
-            "required_files": REQUIRED_FILES
+            "message": "Use POST with the four required files.",
+            "required_files": REQUIRED_FILES,
         })
 
     run_record = None
+    storage = None
+    stored_files = []
 
     try:
         missing_files = [
@@ -760,26 +950,18 @@ def process(
             for file_key in REQUIRED_FILES
             if file_key not in req.files
         ]
-
         if missing_files:
-
-            return json_response(
-                {
-                    "status": "Failed",
-                    "message": (
-                        "Required files are missing."
-                    ),
-                    "missing_files": missing_files
-                },
-                status_code=400
-            )
+            return json_response({
+                "status": "Failed",
+                "message": "Required files are missing.",
+                "missing_files": missing_files,
+            }, 400)
 
         submitted_by = (
             req.headers.get("x-ms-client-principal-name")
             or req.headers.get("x-submitted-by")
             or "Web User"
         )
-
         run_record = create_reconciliation_run(
             submitted_by=submitted_by,
             application_version=APPLICATION_VERSION,
@@ -788,117 +970,167 @@ def process(
             dispatch_files=1,
             sfda_files=1,
         )
+        storage = get_blob_storage()
 
         uploaded_files = {
-            file_key: req.files[file_key]
-            for file_key in REQUIRED_FILES
+            key: req.files[key]
+            for key in REQUIRED_FILES
         }
+        input_payloads = {}
+        dataframes = {}
+        files_summary = {}
 
-        dataframes = {
-            file_key: read_excel_file(
-                uploaded_file
+        for file_key, uploaded_file in uploaded_files.items():
+            file_name = _safe_file_name(
+                uploaded_file.filename,
+                f"{file_key}.xlsx",
             )
-            for file_key, uploaded_file
-            in uploaded_files.items()
-        }
+            file_bytes = uploaded_file.read()
+            if not file_bytes:
+                raise ValueError(f"Uploaded file is empty: {file_name}")
+
+            content_type = _content_type_for(file_name)
+            blob_info = storage.upload_input(
+                run_number=run_record["run_number"],
+                file_name=file_name,
+                file_bytes=file_bytes,
+                content_type=content_type,
+            )
+            _record_blob_file(
+                run_record["run_id"],
+                "input",
+                file_key,
+                file_name,
+                blob_info,
+            )
+            stored_files.append(blob_info)
+            input_payloads[file_key] = {
+                "name": file_name,
+                "bytes": file_bytes,
+            }
+            dataframe = read_excel_bytes(file_name, file_bytes)
+            dataframes[file_key] = dataframe
+            files_summary[file_key] = {
+                "name": file_name,
+                "rows": int(len(dataframe)),
+                "columns": int(len(dataframe.columns)),
+                "size_bytes": len(file_bytes),
+            }
 
         reconciliation_engine = ReconciliationEngine(
             asn_df=dataframes["asn"],
             inventory_df=dataframes["inventory"],
             dispatch_df=dataframes["dispatch"],
-            sfda_df=dataframes["sfda"]
+            sfda_df=dataframes["sfda"],
         )
-
-        result = (
-            reconciliation_engine.run()
-        )
+        result = reconciliation_engine.run()
 
         master = result["master"]
         accept = result["accept"]
         dispatch_output = result["dispatch"]
         variance = result["variance"]
+        dashboard_preview = build_dashboard_preview(master=master, limit=100)
 
-        dashboard_preview = build_dashboard_preview(
+        accept_files = Exporter.build_sfda_upload_files(
+            df=accept,
+            quantity_column="To Be Accept",
+            file_prefix="Accept",
+        )
+        dispatch_files = Exporter.build_dispatch_files_by_customer(
+            dispatch_df=dispatch_output
+        )
+        accept_details = build_accept_details(
+            asn_df=dataframes["asn"],
+            inventory_df=dataframes["inventory"],
             master=master,
-            limit=100
         )
-
-        accept_files = (
-            Exporter.build_sfda_upload_files(
-                df=accept,
-                quantity_column="To Be Accept",
-                file_prefix="Accept"
-            )
+        dispatch_details = build_dispatch_details(
+            dispatch_df=dataframes["dispatch"],
+            dispatch_output=dispatch_output,
         )
+        variance_report = build_variance_report(variance=variance)
 
-        dispatch_files = (
-            Exporter.build_dispatch_files_by_customer(
-                dispatch_df=dispatch_output
-            )
-        )
+        output_groups = [
+            (accept_files, "Accept.csv", "accept"),
+            (dispatch_files, "Dispatch.csv", "dispatch"),
+            (accept_details, "Accept_Details.xlsx", "accept_details"),
+            (dispatch_details, "Dispatch_Details.xlsx", "dispatch_details"),
+            (variance_report, "Variance_Report.xlsx", "variance"),
+        ]
+        generated_files_count = 0
+        output_manifest = []
 
-        accept_details = (
-            build_accept_details(
-                asn_df=dataframes["asn"],
-                inventory_df=dataframes["inventory"],
-                master=master
-            )
-        )
-
-        dispatch_details = (
-            build_dispatch_details(
-                dispatch_df=dataframes["dispatch"],
-                dispatch_output=dispatch_output
-            )
-        )
-
-        variance_report = (
-            build_variance_report(
-                variance=variance
-            )
-        )
-
-        files_summary = {}
-
-        for file_key in REQUIRED_FILES:
-
-            dataframe = dataframes[
-                file_key
-            ]
-
-            uploaded_file = (
-                uploaded_files[
-                    file_key
-                ]
-            )
-
-            files_summary[
-                file_key
-            ] = {
-                "name": (
-                    uploaded_file.filename
-                ),
-                "rows": int(
-                    len(dataframe)
-                ),
-                "columns": int(
-                    len(
-                        dataframe.columns
-                    )
+        for group, fallback_name, file_type in output_groups:
+            for file_name, file_bytes, content_type, normalized_type in _iter_output_files(
+                group,
+                fallback_name,
+                file_type,
+            ):
+                blob_info = storage.upload_output(
+                    run_number=run_record["run_number"],
+                    file_name=file_name,
+                    file_bytes=file_bytes,
+                    content_type=content_type or _content_type_for(file_name),
                 )
-            }
+                _record_blob_file(
+                    run_record["run_id"],
+                    "output",
+                    normalized_type,
+                    file_name,
+                    blob_info,
+                )
+                stored_files.append(blob_info)
+                output_manifest.append({
+                    "file_name": file_name,
+                    "file_type": normalized_type,
+                    "container": blob_info["container"],
+                    "blob_name": blob_info["blob_name"],
+                    "size_bytes": blob_info["size_bytes"],
+                    "content_type": blob_info["content_type"],
+                })
+                generated_files_count += 1
 
         total_rows = sum(
             file_info["rows"]
-            for file_info
-            in files_summary.values()
+            for file_info in files_summary.values()
         )
-
-        generated_files_count = (
-            len(accept_files)
-            + len(dispatch_files)
-            + 3
+        run_metadata = {
+            "application": APPLICATION_NAME,
+            "version": APPLICATION_VERSION,
+            "run_id": run_record["run_id"],
+            "run_number": run_record["run_number"],
+            "status": "Completed",
+            "submitted_by": submitted_by,
+            "summary": {
+                "files_count": len(files_summary),
+                "total_input_rows": total_rows,
+                "master_rows": int(len(master)),
+                "accept_rows": int(len(accept)),
+                "dispatch_rows": int(len(dispatch_output)),
+                "variance_rows": int(len(variance)),
+                "generated_files": generated_files_count,
+            },
+            "inputs": files_summary,
+            "outputs": output_manifest,
+        }
+        metadata_bytes = json.dumps(
+            run_metadata,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        ).encode("utf-8")
+        metadata_blob = storage.upload_metadata(
+            run_record["run_number"],
+            metadata_bytes,
         )
+        _record_blob_file(
+            run_record["run_id"],
+            "metadata",
+            "run_json",
+            "run.json",
+            metadata_blob,
+        )
+        stored_files.append(metadata_blob)
 
         complete_reconciliation_run(
             run_id=run_record["run_id"],
@@ -911,66 +1143,40 @@ def process(
         )
 
         return json_response({
-            "status": (
-                "Reconciliation Engine Completed"
-            ),
+            "status": "Reconciliation Engine Completed",
             "run_id": run_record["run_id"],
             "run_number": run_record["run_number"],
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
             "summary": {
-                "files_count": len(
-                    files_summary
-                ),
-                "total_input_rows": (
-                    total_rows
-                ),
-                "master_rows": int(
-                    len(master)
-                ),
-                "accept_rows": int(
-                    len(accept)
-                ),
-                "dispatch_rows": int(
-                    len(dispatch_output)
-                ),
-                "variance_rows": int(
-                    len(variance)
-                ),
-                "accept_files_count": len(
-                    accept_files
-                ),
-                "dispatch_files_count": len(
-                    dispatch_files
-                )
+                "files_count": len(files_summary),
+                "total_input_rows": total_rows,
+                "master_rows": int(len(master)),
+                "accept_rows": int(len(accept)),
+                "dispatch_rows": int(len(dispatch_output)),
+                "variance_rows": int(len(variance)),
+                "accept_files_count": len(accept_files),
+                "dispatch_files_count": len(dispatch_files),
+                "generated_files_count": generated_files_count,
             },
             "dashboard_preview": dashboard_preview,
             "files": files_summary,
+            "storage": {
+                "inputs_saved": len(files_summary),
+                "outputs_saved": generated_files_count,
+                "metadata_saved": True,
+            },
             "outputs": {
-                "accept_files": (
-                    accept_files
-                ),
-                "dispatch_files": (
-                    dispatch_files
-                ),
-                "accept_details": (
-                    accept_details
-                ),
-                "dispatch_details": (
-                    dispatch_details
-                ),
-                "variance": (
-                    variance_report
-                )
-            }
+                "accept_files": accept_files,
+                "dispatch_files": dispatch_files,
+                "accept_details": accept_details,
+                "dispatch_details": dispatch_details,
+                "variance": variance_report,
+            },
         })
 
     except Exception as ex:
-
-        logging.exception(
-            "Error while processing uploaded files."
-        )
-
+        logging.exception("Error while processing uploaded files.")
         if run_record is not None:
             try:
                 fail_reconciliation_run(
@@ -978,30 +1184,43 @@ def process(
                     error_message=str(ex),
                 )
             except Exception:
-                logging.exception(
-                    "Unable to mark reconciliation run as Failed."
-                )
+                logging.exception("Unable to mark reconciliation run as Failed.")
 
-        return json_response(
-            {
-                "status": "Failed",
-                "run_id": (
-                    run_record.get("run_id")
-                    if run_record
-                    else None
-                ),
-                "run_number": (
-                    run_record.get("run_number")
-                    if run_record
-                    else None
-                ),
-                "error": str(ex),
-                "error_type": (
-                    type(ex).__name__
-                ),
-                "trace": (
-                    traceback.format_exc()
-                )
-            },
-            status_code=500
-        )
+            if storage is not None:
+                try:
+                    failure_metadata = {
+                        "application": APPLICATION_NAME,
+                        "version": APPLICATION_VERSION,
+                        "run_id": run_record["run_id"],
+                        "run_number": run_record["run_number"],
+                        "status": "Failed",
+                        "error": str(ex),
+                        "error_type": type(ex).__name__,
+                    }
+                    metadata_blob = storage.upload_metadata(
+                        run_record["run_number"],
+                        json.dumps(
+                            failure_metadata,
+                            ensure_ascii=False,
+                            indent=2,
+                            default=str,
+                        ).encode("utf-8"),
+                    )
+                    _record_blob_file(
+                        run_record["run_id"],
+                        "metadata",
+                        "run_json",
+                        "run.json",
+                        metadata_blob,
+                    )
+                except Exception:
+                    logging.exception("Unable to save failed run metadata.")
+
+        return json_response({
+            "status": "Failed",
+            "run_id": run_record.get("run_id") if run_record else None,
+            "run_number": run_record.get("run_number") if run_record else None,
+            "error": str(ex),
+            "error_type": type(ex).__name__,
+            "trace": traceback.format_exc(),
+        }, 500)
