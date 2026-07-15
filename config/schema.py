@@ -4,14 +4,14 @@ REQUIRED_COLUMNS = {
         "BN",
         "Expiry Date",
         "Trade Name",
-        "Received Quantity"
+        "Received Quantity",
     ],
 
     "INVENTORY": [
         "BN",
         "Expiry Date",
         "Trade Name",
-        "Available Quantity"
+        "Available Quantity",
     ],
 
     "DISPATCH": [
@@ -20,7 +20,7 @@ REQUIRED_COLUMNS = {
         "Trade Name",
         "Dispatched Quantity",
         "To Address",
-        "Sales Order Number"
+        "Sales Order Number",
     ],
 
     "SFDA": [
@@ -31,12 +31,11 @@ REQUIRED_COLUMNS = {
         "Quantity",
         "Active",
         "Quantity Receive Pending",
-        "Quantity sent pending"
+        "Quantity sent pending",
     ],
 
     "PACKSIZE": [
         "Trade Name",
-        "PackageSize"
-    ]
-
+        "PackageSize",
+    ],
 }
