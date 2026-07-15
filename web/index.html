@@ -3,6 +3,9 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
   <title>SFDA Drug Traceability & Reconciliation Platform</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <style>
@@ -433,7 +436,7 @@
     <nav class="nav">
       <button class="nav-button active" data-page="home"><span class="nav-icon">⌂</span>Home</button>
       <button class="nav-button" data-page="upload"><span class="nav-icon">⇧</span>Upload & Run</button>
-      <button class="nav-button" data-page="verification"><span class="nav-icon">✓</span>SFDA Verification</button>
+      <button class="nav-button" data-page="verification" id="verificationNavButton" title="Open SFDA Verification"><span class="nav-icon">✓</span>SFDA Verification</button>
       <button class="nav-button" data-page="history"><span class="nav-icon">◷</span>History</button>
       <button class="nav-button" data-page="reports"><span class="nav-icon">▥</span>Reports</button>
       <button class="nav-button" data-page="intelligence"><span class="nav-icon">◆</span>Product Intelligence</button>
@@ -525,7 +528,7 @@
           </div>
 
           <aside class="ops-side">
-            <div class="card"><div class="card-header"><div class="card-title">Quick Actions</div></div><div class="quick-actions"><button class="btn btn-success" data-go="upload">▶ Run Reconciliation</button><button class="btn btn-primary" data-go="upload">⇩ Prepare Accept</button><button class="btn btn-warning" data-go="upload">⇢ Prepare Dispatch</button><button class="btn btn-purple" data-go="history">◷ Upload History</button></div></div>
+            <div class="card"><div class="card-header"><div class="card-title">Quick Actions</div></div><div class="quick-actions"><button class="btn btn-success" data-go="upload">▶ Run Reconciliation</button><button class="btn btn-primary" data-go="upload">⇩ Prepare Accept</button><button class="btn btn-warning" data-go="upload">⇢ Prepare Dispatch</button><button class="btn btn-purple" data-go="history">◷ Upload History</button><button class="btn btn-secondary" data-go="verification">✓ SFDA Verification</button></div></div>
             <div class="card"><div class="card-header"><div class="card-title">Customer / GLN</div></div><div class="mini-donut-wrap"><div style="position:relative"><div class="mini-donut"></div><div class="mini-donut-label"><div><div style="font-size:18px">—</div><div>Total</div></div></div></div><div class="mini-legend"><div class="mini-legend-row"><span><i class="legend-dot" style="background:#239247"></i>With GLN</span><strong>—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#d94747"></i>Dummy GLN</span><strong>—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#c8ced8"></i>Not Mapped</span><strong>—</strong></div></div></div></div>
             <div class="card"><div class="card-header"><div><div class="card-title">Recent Uploads</div><div class="card-subtitle">Latest locally selected report types</div></div></div><div class="recent-upload-list" id="recentUploads"><div class="empty"><strong>No uploads yet</strong>Selected files will appear after a run.</div></div></div>
             <div class="card"><div class="card-header"><div class="card-title">System Status</div></div><div class="card-body"><div class="status-line"><span>Azure Function</span><span class="status-ok" id="homeHealth">Checking...</span></div><div class="status-line"><span>Version</span><strong id="homeVersion">—</strong></div><div class="status-line"><span>Total Local Runs</span><strong id="homeRuns">0</strong></div><div class="status-line"><span>Successful Runs</span><strong id="homeSuccess">0</strong></div><div class="status-line"><span>Generated Files</span><strong id="homeGenerated">—</strong></div></div></div>
@@ -753,21 +756,71 @@
     setTimeout(()=>el.remove(),4200);
   }
 
-  function navigate(page) {
-    document.querySelectorAll(".page").forEach(x=>x.classList.remove("active"));
-    document.querySelectorAll(".nav-button").forEach(x=>x.classList.toggle("active",x.dataset.page===page));
-    const target=$(`page-${page}`);
-    if(target) target.classList.add("active");
-    const labels={home:"Dashboard",upload:"Upload & Run",verification:"SFDA Verification",history:"History",reports:"Reports",intelligence:"Product Intelligence",variance:"Variance Management",administration:"Administration"};
-    $("topbarTitle").textContent=labels[page]||"SFDA Platform";
+  const PAGE_LABELS = {
+    home:"Dashboard",
+    upload:"Upload & Run",
+    verification:"SFDA Verification",
+    history:"History",
+    reports:"Reports",
+    intelligence:"Product Intelligence",
+    variance:"Variance Management",
+    administration:"Administration"
+  };
+
+  function navigate(page, options={}) {
+    const requestedPage = String(page || "home").trim();
+    const target = $(`page-${requestedPage}`);
+
+    if (!target) {
+      console.error(`Page not found: page-${requestedPage}`);
+      toast("The requested page is unavailable.","error");
+      return false;
+    }
+
+    document.querySelectorAll(".page").forEach(element=>{
+      element.classList.toggle("active", element === target);
+    });
+
+    document.querySelectorAll(".nav-button").forEach(button=>{
+      button.classList.toggle("active", button.dataset.page === requestedPage);
+    });
+
+    $("topbarTitle").textContent = PAGE_LABELS[requestedPage] || "SFDA Platform";
     $("sidebar").classList.remove("open");
-    if(page==="verification") refreshVerificationRuns();
-    if(page==="history") refreshAzureHistory();
-    if(page==="reports") refreshAzureHistory();
-    window.scrollTo({top:0,behavior:"smooth"});
+
+    if (!options.skipHash && window.location.hash !== `#${requestedPage}`) {
+      history.replaceState(null, "", `#${requestedPage}`);
+    }
+
+    if (requestedPage === "verification") {
+      Promise.resolve(refreshVerificationRuns()).catch(error=>{
+        console.error("Unable to refresh verification runs.", error);
+        toast("SFDA Verification opened, but the run list could not be refreshed.","error");
+      });
+    }
+
+    if (requestedPage === "history" || requestedPage === "reports") {
+      Promise.resolve(refreshAzureHistory()).catch(error=>{
+        console.error("Unable to refresh reconciliation history.", error);
+      });
+    }
+
+    window.scrollTo({top:0, behavior: options.instant ? "auto" : "smooth"});
+    return true;
   }
-  document.querySelectorAll("[data-page]").forEach(btn=>btn.addEventListener("click",()=>navigate(btn.dataset.page)));
-  document.querySelectorAll("[data-go]").forEach(btn=>btn.addEventListener("click",()=>navigate(btn.dataset.go)));
+
+  document.querySelectorAll("[data-page]").forEach(button=>{
+    button.addEventListener("click",()=>navigate(button.dataset.page));
+  });
+
+  document.querySelectorAll("[data-go]").forEach(button=>{
+    button.addEventListener("click",()=>navigate(button.dataset.go));
+  });
+
+  window.addEventListener("hashchange",()=>{
+    const page = window.location.hash.replace(/^#/, "") || "home";
+    navigate(page, {skipHash:true});
+  });
   $("mobileToggle").addEventListener("click",()=>$("sidebar").classList.toggle("open"));
 
   function updateFileName(key) {
@@ -1295,11 +1348,13 @@
   if($("dashboardDate")) $("dashboardDate").value=new Date().toISOString().slice(0,10);
   if($("dashboardRefresh")) $("dashboardRefresh").addEventListener("click",()=>refreshAzureHistory());
   renderHistory();
-  refreshVerificationRuns();
   updateDashboard();
   renderReports();
   checkHealth();
   refreshAzureHistory({silent:true});
+
+  const initialPage = window.location.hash.replace(/^#/, "") || "home";
+  navigate(initialPage, {skipHash:true, instant:true});
 </script>
 </body>
 </html>
