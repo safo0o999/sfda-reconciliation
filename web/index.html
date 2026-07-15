@@ -479,7 +479,7 @@
       <!-- HOME -->
       <section class="page active" id="page-home">
         <div class="page-head">
-          <div><h1>Dashboard</h1><p>Operational view of SFDA, receiving, inventory, dispatch, exceptions, and customer mapping.</p></div>
+          <div><h1>Dashboard</h1><p>Evidence-controlled view of SFDA, ASN receipts, inventory, Full Dispatch, exceptions, and customer allocation.</p></div>
           <div class="actions"><button class="btn btn-primary" data-go="upload">▶ Run Reconciliation</button></div>
         </div>
 
@@ -535,7 +535,7 @@
           </aside>
         </div>
 
-        <div class="card legend-footer"><div class="legend-item"><span class="legend-symbol" style="background:#e9f8ee;color:#178043">✓</span><span><strong>OK</strong><br>All good</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fff3db;color:#bd7400">◷</span><span><strong>Dispatch Pending</strong><br>Pending dispatch to SFDA</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fdeaea;color:#c63034">!</span><span><strong>Diff / Exception</strong><br>Needs attention</span></div><div class="legend-item"><span class="legend-symbol" style="background:#eaf4ff;color:#0866bd">?</span><span><strong>Dummy GLN</strong><br>Customer has no GLN</span></div></div>
+        <div class="card legend-footer"><div class="legend-item"><span class="legend-symbol" style="background:#e9f8ee;color:#178043">✓</span><span><strong>OK</strong><br>All good</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fff3db;color:#bd7400">◷</span><span><strong>Dispatch Pending</strong><br>Dispatch supported by Full Dispatch evidence</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fdeaea;color:#c63034">!</span><span><strong>Diff / Exception</strong><br>Needs attention</span></div><div class="legend-item"><span class="legend-symbol" style="background:#eaf4ff;color:#0866bd">?</span><span><strong>Dummy GLN</strong><br>Customer has no GLN</span></div></div>
         <div id="recentActivity" hidden></div>
       </section>
 
@@ -559,7 +559,7 @@
               <div class="file-meta" id="inventoryName">No file selected</div>
             </div>
             <div class="card file-card">
-              <div class="file-card-top"><div><div class="file-title">③ Full Dispatch Report</div><div class="file-sub">Actual customer dispatch transactions, order details, and receiving addresses.</div></div><span class="badge info">Required</span></div>
+              <div class="file-card-top"><div><div class="file-title">③ Full Dispatch Report</div><div class="file-sub">Source of truth for dispatch quantity, customer distribution, order details, and receiving addresses.</div></div><span class="badge info">Required</span></div>
               <div class="file-row"><input id="dispatch" name="dispatch" type="file" accept=".xls,.xlsx" required></div>
               <div class="file-meta" id="dispatchName">No file selected</div>
             </div>
@@ -698,7 +698,7 @@
         <div class="grid kpi-grid">
           <div class="card kpi"><div class="kpi-label">Receiving Variance</div><div class="kpi-value">—</div><div class="kpi-foot">Under / over delivery</div><div class="kpi-icon amber">R</div></div>
           <div class="card kpi"><div class="kpi-label">Missing Registration</div><div class="kpi-value">—</div><div class="kpi-foot">Received but absent from SFDA</div><div class="kpi-icon red">M</div></div>
-          <div class="card kpi"><div class="kpi-label">Dispatch Variance</div><div class="kpi-value" id="varianceLatest">—</div><div class="kpi-foot">Missing dispatch evidence</div><div class="kpi-icon purple">D</div></div>
+          <div class="card kpi"><div class="kpi-label">Dispatch Variance</div><div class="kpi-value" id="varianceLatest">—</div><div class="kpi-foot">Active/Inventory gap not supported by Full Dispatch</div><div class="kpi-icon purple">D</div></div>
           <div class="card kpi"><div class="kpi-label">Unmapped Customers</div><div class="kpi-value">—</div><div class="kpi-foot">Missing GLN mapping</div><div class="kpi-icon red">C</div></div>
         </div>
         <div class="card table-card" style="margin-top:16px">
