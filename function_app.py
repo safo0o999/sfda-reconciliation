@@ -41,7 +41,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "3.8.0"
+APPLICATION_VERSION = "3.8.1"
 
 REQUIRED_FILES = [
     "asn",
@@ -931,13 +931,13 @@ def build_dispatch_details(
 
                 output_address = (
                     _normalize_text(
-                        item.get(
+                        transaction.get(
                             "To Address",
                             "",
                         )
                     )
                     or _normalize_text(
-                        transaction.get(
+                        item.get(
                             "To Address",
                             "",
                         )
