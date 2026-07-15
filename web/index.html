@@ -634,7 +634,7 @@
             <div class="card-header"><div><div class="card-title">Verification Upload</div><div class="card-subtitle">Select a reconciliation run and upload the post-portal evidence files.</div></div></div>
             <div class="card-body">
               <form id="verificationForm" class="verification-form">
-                <div><label for="verificationRun">Run</label><select class="control" id="verificationRun" required><option value="">Select a Pending Upload run...</option></select></div>
+                <div><label for="verificationRun">Run</label><select class="control" id="verificationRun" required><option value="">Select a reconciliation run...</option></select></div>
                 <div><label for="verificationSfda">Latest SFDA Drug Count Report</label><div class="verification-file-box"><input id="verificationSfda" type="file" accept=".xls,.xlsx" required><div class="file-meta" id="verificationSfdaName">No file selected</div></div></div>
                 <div><label for="notificationFiles">Notification Result Files</label><div class="verification-file-box"><input id="notificationFiles" type="file" accept=".xls,.xlsx,.csv" multiple required><div class="file-meta" id="notificationFilesName">No files selected</div></div></div>
                 <div class="status-banner info show" id="verificationStatus"><span>ⓘ</span><div>Select the run, latest SFDA report, and all Notification Result files, then click Verify Upload.</div></div>
@@ -1227,10 +1227,44 @@
   function refreshVerificationRuns(){
     const selector=$("verificationRun");
     if(!selector) return;
+
     const selected=selector.value;
-    const eligible=getHistory().filter(run=>["Pending Upload","Pending Verification"].includes(run.status));
-    selector.innerHTML='<option value="">Select a Pending Upload run...</option>'+eligible.map(run=>`<option value="${escapeHtml(run.runNumber)}">${escapeHtml(run.runNumber)} · ${escapeHtml(run.status)}</option>`).join("");
-    if(eligible.some(run=>run.runNumber===selected)) selector.value=selected;
+    const eligibleStatuses=[
+      "Pending Upload",
+      "Pending Verification",
+      "Completed"
+    ];
+
+    const eligible=getHistory()
+      .filter(run=>eligibleStatuses.includes(run.status))
+      .sort((a,b)=>{
+        const aTime=new Date(a.startedAt||a.runDate||0).getTime()||0;
+        const bTime=new Date(b.startedAt||b.runDate||0).getTime()||0;
+        return bTime-aTime;
+      });
+
+    selector.innerHTML=
+      '<option value="">Select a reconciliation run...</option>'+
+      eligible.map(run=>
+        `<option value="${escapeHtml(run.runNumber)}">${escapeHtml(run.runNumber)} · ${escapeHtml(run.status)}</option>`
+      ).join("");
+
+    if(eligible.some(run=>run.runNumber===selected)){
+      selector.value=selected;
+    }else if(eligible.length===1){
+      selector.value=eligible[0].runNumber;
+    }
+
+    const box=$("verificationStatus");
+
+    if(!eligible.length){
+      box.className="status-banner error show";
+      box.innerHTML='<span>!</span><div>No eligible reconciliation run was found. Complete a reconciliation run, refresh History, then return to SFDA Verification.</div>';
+    }else if(!selector.value){
+      box.className="status-banner info show";
+      box.innerHTML=`<span>ⓘ</span><div>${eligible.length} eligible run${eligible.length===1?"":"s"} found. Select the correct run to enable Verify Upload.</div>`;
+    }
+
     updateVerificationFileState();
   }
 
