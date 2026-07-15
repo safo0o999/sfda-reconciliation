@@ -113,29 +113,40 @@ class Calculator:
     def _apply_business_rules(row):
 
         to_be_accept = BusinessRules.to_be_accept(
-            inventory=row["Inventory"],
             receiving=row["Receiving"],
-            active=row["Active"],
-            qty_sent_pending=row[
-                "Quantity sent pending"
-            ],
             qty_receive_pending=row[
                 "Quantity Receive Pending"
-            ]
+            ],
+        )
+
+        dispatch_requirement = (
+            BusinessRules.dispatch_requirement(
+                inventory=row["Inventory"],
+                active=row["Active"],
+            )
         )
 
         calculated_to_be_dispatch = (
             BusinessRules.to_be_dispatch(
                 inventory=row["Inventory"],
-                active=row["Active"]
+                active=row["Active"],
+                dispatch_evidence=row["Dispatch"],
             )
         )
 
         return pd.Series(
             {
                 "To Be Accept": to_be_accept,
+                "Dispatch Requirement":
+                    dispatch_requirement,
                 "Calculated To Be Dispatch":
-                    calculated_to_be_dispatch
+                    calculated_to_be_dispatch,
+                "Unexplained Dispatch Variance":
+                    max(
+                        0,
+                        dispatch_requirement
+                        - calculated_to_be_dispatch,
+                    ),
             }
         )
 
@@ -556,12 +567,23 @@ class Calculator:
 
         variance["Dispatch Variance"] = (
             variance[
-                "Calculated To Be Dispatch"
+                "Dispatch Requirement"
             ]
             - variance[
                 "Allocated To Be Dispatch"
             ]
-        )
+        ).clip(lower=0)
+
+        variance[
+            "Missing Full Dispatch Evidence"
+        ] = (
+            variance[
+                "Dispatch Requirement"
+            ]
+            - variance[
+                "Calculated To Be Dispatch"
+            ]
+        ).clip(lower=0)
 
         variance = variance[
             (variance["Active Variance"] != 0)
@@ -693,6 +715,22 @@ class Calculator:
         ] = (
             master[
                 "Calculated To Be Dispatch"
+            ]
+            .fillna(0)
+            .astype(int)
+        )
+
+        master["Dispatch Requirement"] = (
+            master["Dispatch Requirement"]
+            .fillna(0)
+            .astype(int)
+        )
+
+        master[
+            "Unexplained Dispatch Variance"
+        ] = (
+            master[
+                "Unexplained Dispatch Variance"
             ]
             .fillna(0)
             .astype(int)
