@@ -350,6 +350,54 @@ def initialize_database() -> None:
     )
 
 
+    database.execute(
+        """
+        IF OBJECT_ID(
+            N'dbo.ReconciliationRunFiles',
+            N'U'
+        ) IS NULL
+        BEGIN
+            CREATE TABLE dbo.ReconciliationRunFiles
+            (
+                RunFileID BIGINT IDENTITY(1,1) NOT NULL
+                    CONSTRAINT PK_ReconciliationRunFiles PRIMARY KEY,
+                RunID BIGINT NOT NULL,
+                FileCategory NVARCHAR(30) NOT NULL,
+                FileType NVARCHAR(50) NULL,
+                FileName NVARCHAR(500) NOT NULL,
+                ContainerName NVARCHAR(100) NOT NULL,
+                BlobName NVARCHAR(1000) NOT NULL,
+                ContentType NVARCHAR(200) NULL,
+                SizeBytes BIGINT NOT NULL
+                    CONSTRAINT DF_ReconciliationRunFiles_SizeBytes DEFAULT 0,
+                CreatedAt DATETIME2(3) NOT NULL
+                    CONSTRAINT DF_ReconciliationRunFiles_CreatedAt DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT FK_ReconciliationRunFiles_Run
+                    FOREIGN KEY (RunID) REFERENCES dbo.ReconciliationRuns(RunID),
+                CONSTRAINT UQ_ReconciliationRunFiles_Blob
+                    UNIQUE (RunID, ContainerName, BlobName)
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF NOT EXISTS
+        (
+            SELECT 1
+            FROM sys.indexes
+            WHERE name = N'IX_ReconciliationRunFiles_RunID'
+              AND object_id = OBJECT_ID(N'dbo.ReconciliationRunFiles')
+        )
+        BEGIN
+            CREATE INDEX IX_ReconciliationRunFiles_RunID
+            ON dbo.ReconciliationRunFiles (RunID, FileCategory, CreatedAt);
+        END;
+        """
+    )
+
+
 def _generate_run_number() -> str:
     now = datetime.now(
         timezone.utc
@@ -558,3 +606,97 @@ def test_database_connection() -> Dict[str, Any]:
             "ServerUtcTime"
         ),
     }
+
+def record_reconciliation_file(
+    run_id: int,
+    file_category: str,
+    file_type: str,
+    file_name: str,
+    container_name: str,
+    blob_name: str,
+    content_type: str,
+    size_bytes: int,
+) -> None:
+    database = Database()
+    database.execute(
+        """
+        MERGE dbo.ReconciliationRunFiles AS target
+        USING
+        (
+            SELECT
+                %s AS RunID,
+                %s AS ContainerName,
+                %s AS BlobName
+        ) AS source
+        ON target.RunID = source.RunID
+           AND target.ContainerName = source.ContainerName
+           AND target.BlobName = source.BlobName
+        WHEN MATCHED THEN
+            UPDATE SET
+                FileCategory = %s,
+                FileType = %s,
+                FileName = %s,
+                ContentType = %s,
+                SizeBytes = %s
+        WHEN NOT MATCHED THEN
+            INSERT
+            (
+                RunID, FileCategory, FileType, FileName,
+                ContainerName, BlobName, ContentType, SizeBytes
+            )
+            VALUES
+            (
+                %s, %s, %s, %s, %s, %s, %s, %s
+            );
+        """,
+        (
+            run_id, container_name, blob_name,
+            file_category, file_type, file_name, content_type, size_bytes,
+            run_id, file_category, file_type, file_name,
+            container_name, blob_name, content_type, size_bytes,
+        ),
+    )
+
+
+def get_reconciliation_run_by_number(
+    run_number: str,
+) -> Optional[Dict[str, Any]]:
+    database = Database()
+    return database.fetch_one(
+        """
+        SELECT
+            RunID, RunNumber, RunDate, SubmittedBy,
+            ASNFiles, DispatchFiles, InventoryFiles, SFDAFiles,
+            TotalInputRows, MasterRecords, AcceptRecords,
+            DispatchRecords, ExceptionRecords, GeneratedFiles,
+            ApplicationVersion, Status, ErrorMessage,
+            StartedAt, CompletedAt
+        FROM dbo.ReconciliationRuns
+        WHERE RunNumber = %s;
+        """,
+        (run_number,),
+    )
+
+
+def get_reconciliation_run_files(
+    run_id: int,
+) -> List[Dict[str, Any]]:
+    database = Database()
+    return database.fetch_all(
+        """
+        SELECT
+            RunFileID, RunID, FileCategory, FileType, FileName,
+            ContainerName, BlobName, ContentType, SizeBytes, CreatedAt
+        FROM dbo.ReconciliationRunFiles
+        WHERE RunID = %s
+        ORDER BY
+            CASE FileCategory
+                WHEN N'input' THEN 1
+                WHEN N'output' THEN 2
+                WHEN N'metadata' THEN 3
+                ELSE 4
+            END,
+            FileName;
+        """,
+        (run_id,),
+    )
