@@ -23,11 +23,16 @@ from engine.database import (
     record_batch_events,
     initialize_database,
     test_database_connection,
+    create_verification_run,
+    complete_verification_run,
+    fail_verification_run,
+    record_verification_results,
 )
 
 from engine.exporter import Exporter
 from engine.batch_history import BatchHistoryEngine
 from engine.reconciliation import ReconciliationEngine
+from engine.verification import VerificationEngine
 
 
 app = func.FunctionApp(
@@ -36,7 +41,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "3.7.2"
+APPLICATION_VERSION = "3.8.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -1962,4 +1967,350 @@ def process(
             "error": str(ex),
             "error_type": type(ex).__name__,
             "trace": traceback.format_exc(),
+        }, 500)
+
+@app.route(
+    route="verify",
+    methods=["POST"],
+)
+def verify_upload(
+    req: func.HttpRequest,
+) -> func.HttpResponse:
+    verification_id = None
+
+    try:
+        run_number = str(
+            req.form.get("run_number")
+            or req.form.get("run")
+            or ""
+        ).strip()
+
+        if not run_number:
+            return json_response({
+                "status": "Failed",
+                "message": "run_number is required.",
+            }, 400)
+
+        run = get_reconciliation_run_by_number(
+            run_number
+        )
+
+        if run is None:
+            return json_response({
+                "status": "Failed",
+                "message": "Run was not found.",
+            }, 404)
+
+        latest_sfda_file = (
+            req.files.get("latest_sfda")
+            or req.files.get(
+                "verification_sfda"
+            )
+        )
+
+        if latest_sfda_file is None:
+            return json_response({
+                "status": "Failed",
+                "message": (
+                    "Latest SFDA Drug Count "
+                    "report is required."
+                ),
+            }, 400)
+
+        notification_files = list(
+            req.files.getlist(
+                "notification_files"
+            )
+        )
+
+        if not notification_files:
+            notification_files = list(
+                req.files.getlist(
+                    "notifications"
+                )
+            )
+
+        if not notification_files:
+            return json_response({
+                "status": "Failed",
+                "message": (
+                    "At least one Notification "
+                    "Result file is required."
+                ),
+            }, 400)
+
+        verification_id = (
+            create_verification_run(
+                run_id=int(run["RunID"]),
+                latest_sfda_file_name=(
+                    latest_sfda_file.filename
+                    or "latest_sfda.xlsx"
+                ),
+                notification_files=len(
+                    notification_files
+                ),
+            )
+        )
+
+        storage = get_blob_storage()
+        run_files = get_reconciliation_run_files(
+            int(run["RunID"])
+        )
+
+        expected_rows = []
+        original_sfda_dataframe = None
+
+        for file_record in run_files:
+            category = str(
+                file_record.get(
+                    "FileCategory"
+                )
+                or ""
+            ).lower()
+            file_type = str(
+                file_record.get("FileType")
+                or ""
+            ).lower()
+
+            if (
+                category == "output"
+                and file_type
+                in {"accept", "dispatch"}
+            ):
+                blob = storage.download_blob(
+                    file_record[
+                        "ContainerName"
+                    ],
+                    file_record["BlobName"],
+                )
+                expected_rows.extend(
+                    VerificationEngine
+                    .parse_generated_upload_file(
+                        file_record["FileName"],
+                        blob["data"],
+                        file_type.upper(),
+                    )
+                )
+
+            elif (
+                category == "input"
+                and file_type == "sfda"
+            ):
+                blob = storage.download_blob(
+                    file_record[
+                        "ContainerName"
+                    ],
+                    file_record["BlobName"],
+                )
+                original_sfda_dataframe = (
+                    VerificationEngine
+                    .read_tabular_bytes(
+                        file_record["FileName"],
+                        blob["data"],
+                    )
+                )
+
+        if not expected_rows:
+            raise ValueError(
+                "No generated Accept or Dispatch "
+                "upload files were found for this run."
+            )
+
+        if original_sfda_dataframe is None:
+            raise ValueError(
+                "The original SFDA input report "
+                "was not found for this run."
+            )
+
+        latest_sfda_name = _safe_file_name(
+            latest_sfda_file.filename,
+            "latest_sfda.xlsx",
+        )
+        latest_sfda_bytes = (
+            latest_sfda_file.read()
+        )
+        latest_sfda_dataframe = (
+            VerificationEngine
+            .read_tabular_bytes(
+                latest_sfda_name,
+                latest_sfda_bytes,
+            )
+        )
+
+        latest_blob = storage.upload_input(
+            run_number=run_number,
+            file_name=(
+                "verification/"
+                + latest_sfda_name
+            ),
+            file_bytes=latest_sfda_bytes,
+            content_type=(
+                _content_type_for(
+                    latest_sfda_name
+                )
+            ),
+        )
+        _record_blob_file(
+            int(run["RunID"]),
+            "verification",
+            "latest_sfda",
+            latest_sfda_name,
+            latest_blob,
+        )
+
+        notification_rows = []
+
+        for notification_file in (
+            notification_files
+        ):
+            notification_name = (
+                _safe_file_name(
+                    notification_file.filename,
+                    "notification.xlsx",
+                )
+            )
+            notification_bytes = (
+                notification_file.read()
+            )
+
+            notification_rows.extend(
+                VerificationEngine
+                .parse_notification_file(
+                    notification_name,
+                    notification_bytes,
+                )
+            )
+
+            notification_blob = (
+                storage.upload_input(
+                    run_number=run_number,
+                    file_name=(
+                        "verification/"
+                        + notification_name
+                    ),
+                    file_bytes=(
+                        notification_bytes
+                    ),
+                    content_type=(
+                        _content_type_for(
+                            notification_name
+                        )
+                    ),
+                )
+            )
+            _record_blob_file(
+                int(run["RunID"]),
+                "verification",
+                "notification_result",
+                notification_name,
+                notification_blob,
+            )
+
+        verification_result = (
+            VerificationEngine.verify(
+                expected_rows=expected_rows,
+                notification_rows=(
+                    notification_rows
+                ),
+                original_sfda=(
+                    original_sfda_dataframe
+                ),
+                latest_sfda=(
+                    latest_sfda_dataframe
+                ),
+            )
+        )
+
+        saved_rows = (
+            record_verification_results(
+                verification_id=(
+                    verification_id
+                ),
+                rows=verification_result[
+                    "rows"
+                ],
+            )
+        )
+
+        complete_verification_run(
+            verification_id=verification_id,
+            status=verification_result[
+                "status"
+            ],
+            summary=verification_result[
+                "summary"
+            ],
+        )
+
+        _set_run_lifecycle_status(
+            run_id=int(run["RunID"]),
+            status=verification_result[
+                "status"
+            ],
+        )
+
+        response_rows = []
+
+        for row in verification_result[
+            "rows"
+        ][:500]:
+            response_rows.append({
+                key: value
+                for key, value
+                in row.items()
+                if key not in {
+                    "key",
+                    "identity_key",
+                }
+            })
+
+        return json_response({
+            "status": verification_result[
+                "status"
+            ],
+            "verification_id":
+                verification_id,
+            "run_number": run_number,
+            "summary":
+                verification_result[
+                    "summary"
+                ],
+            "saved_result_rows":
+                saved_rows,
+            "results": response_rows,
+            "results_truncated": (
+                len(
+                    verification_result[
+                        "rows"
+                    ]
+                ) > 500
+            ),
+        })
+
+    except Exception as ex:
+        logging.exception(
+            "Verification upload failed."
+        )
+
+        if verification_id is not None:
+            try:
+                fail_verification_run(
+                    verification_id,
+                    str(ex),
+                )
+            except Exception:
+                logging.exception(
+                    "Unable to mark verification "
+                    "run as failed."
+                )
+
+        return json_response({
+            "status": "Failed",
+            "verification_id":
+                verification_id,
+            "error": str(ex),
+            "error_type":
+                type(ex).__name__,
+            "trace":
+                traceback.format_exc(),
         }, 500)
