@@ -41,7 +41,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "3.8.1"
+APPLICATION_VERSION = "3.9.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -1523,7 +1523,7 @@ def process(
     if req.method == "GET":
         return json_response({
             "status": "Ready",
-            "message": "Use POST with the four required files.",
+            "message": "Use POST with ASN, Inventory, Full Dispatch, and SFDA files. Accept and Dispatch are limited to actual WMS evidence.",
             "required_files": REQUIRED_FILES,
             "run_lifecycle": RUN_LIFECYCLE_STATUSES,
         })
