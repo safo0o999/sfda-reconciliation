@@ -510,6 +510,409 @@ def initialize_database() -> None:
     )
 
 
+
+    # ---------------------------------------------------------
+    # SFDA upload verification lifecycle
+    # ---------------------------------------------------------
+
+    database.execute(
+        """
+        IF COL_LENGTH(
+            N'dbo.ReconciliationRuns',
+            N'VerificationStatus'
+        ) IS NULL
+        BEGIN
+            ALTER TABLE dbo.ReconciliationRuns
+            ADD VerificationStatus NVARCHAR(50) NOT NULL
+                CONSTRAINT DF_ReconciliationRuns_VerificationStatus
+                DEFAULT N'Not Started';
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF COL_LENGTH(
+            N'dbo.ReconciliationRuns',
+            N'VerificationStartedAt'
+        ) IS NULL
+        BEGIN
+            ALTER TABLE dbo.ReconciliationRuns
+            ADD VerificationStartedAt DATETIME2(3) NULL;
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF COL_LENGTH(
+            N'dbo.ReconciliationRuns',
+            N'VerifiedAt'
+        ) IS NULL
+        BEGIN
+            ALTER TABLE dbo.ReconciliationRuns
+            ADD VerifiedAt DATETIME2(3) NULL;
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF OBJECT_ID(
+            N'dbo.ReconciliationActions',
+            N'U'
+        ) IS NULL
+        BEGIN
+            CREATE TABLE dbo.ReconciliationActions
+            (
+                ActionID BIGINT IDENTITY(1,1) NOT NULL
+                    CONSTRAINT PK_ReconciliationActions PRIMARY KEY,
+                RunID BIGINT NOT NULL,
+                ActionKey NVARCHAR(500) NOT NULL,
+                ActionType NVARCHAR(20) NOT NULL,
+                GeneratedFileName NVARCHAR(500) NULL,
+                GeneratedRowNumber INT NULL,
+                GTIN NVARCHAR(50) NOT NULL,
+                BN NVARCHAR(150) NOT NULL,
+                ExpiryDate DATE NOT NULL,
+                Quantity DECIMAL(18,3) NOT NULL,
+                Status NVARCHAR(50) NOT NULL
+                    CONSTRAINT DF_ReconciliationActions_Status
+                    DEFAULT N'PENDING',
+                ResultCode NVARCHAR(50) NULL,
+                ResultDescription NVARCHAR(2000) NULL,
+                NotificationResultID BIGINT NULL,
+                VerifiedAt DATETIME2(3) NULL,
+                CreatedAt DATETIME2(3) NOT NULL
+                    CONSTRAINT DF_ReconciliationActions_CreatedAt
+                    DEFAULT SYSUTCDATETIME(),
+                UpdatedAt DATETIME2(3) NOT NULL
+                    CONSTRAINT DF_ReconciliationActions_UpdatedAt
+                    DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT FK_ReconciliationActions_Run
+                    FOREIGN KEY (RunID)
+                    REFERENCES dbo.ReconciliationRuns(RunID),
+                CONSTRAINT UQ_ReconciliationActions_ActionKey
+                    UNIQUE (ActionKey),
+                CONSTRAINT CK_ReconciliationActions_ActionType
+                    CHECK (ActionType IN (N'ACCEPT', N'DISPATCH')),
+                CONSTRAINT CK_ReconciliationActions_Status
+                    CHECK (Status IN
+                    (
+                        N'PENDING',
+                        N'SUCCESS',
+                        N'FAILED',
+                        N'CONFLICT',
+                        N'UNMATCHED'
+                    ))
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF NOT EXISTS
+        (
+            SELECT 1
+            FROM sys.indexes
+            WHERE name = N'IX_ReconciliationActions_RunStatus'
+              AND object_id = OBJECT_ID(N'dbo.ReconciliationActions')
+        )
+        BEGIN
+            CREATE INDEX IX_ReconciliationActions_RunStatus
+            ON dbo.ReconciliationActions
+            (
+                RunID,
+                ActionType,
+                Status,
+                BN,
+                ExpiryDate
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF OBJECT_ID(
+            N'dbo.SFDAVerifications',
+            N'U'
+        ) IS NULL
+        BEGIN
+            CREATE TABLE dbo.SFDAVerifications
+            (
+                VerificationID BIGINT IDENTITY(1,1) NOT NULL
+                    CONSTRAINT PK_SFDAVerifications PRIMARY KEY,
+                RunID BIGINT NOT NULL,
+                VerificationNumber NVARCHAR(60) NOT NULL,
+                SubmittedBy NVARCHAR(200) NULL,
+                Status NVARCHAR(50) NOT NULL
+                    CONSTRAINT DF_SFDAVerifications_Status
+                    DEFAULT N'Processing',
+                NotificationFiles INT NOT NULL
+                    CONSTRAINT DF_SFDAVerifications_NotificationFiles
+                    DEFAULT 0,
+                NotificationRows BIGINT NOT NULL
+                    CONSTRAINT DF_SFDAVerifications_NotificationRows
+                    DEFAULT 0,
+                SuccessRows BIGINT NOT NULL
+                    CONSTRAINT DF_SFDAVerifications_SuccessRows
+                    DEFAULT 0,
+                FailedRows BIGINT NOT NULL
+                    CONSTRAINT DF_SFDAVerifications_FailedRows
+                    DEFAULT 0,
+                ConflictRows BIGINT NOT NULL
+                    CONSTRAINT DF_SFDAVerifications_ConflictRows
+                    DEFAULT 0,
+                UnmatchedRows BIGINT NOT NULL
+                    CONSTRAINT DF_SFDAVerifications_UnmatchedRows
+                    DEFAULT 0,
+                ErrorMessage NVARCHAR(MAX) NULL,
+                StartedAt DATETIME2(3) NOT NULL
+                    CONSTRAINT DF_SFDAVerifications_StartedAt
+                    DEFAULT SYSUTCDATETIME(),
+                CompletedAt DATETIME2(3) NULL,
+                CONSTRAINT FK_SFDAVerifications_Run
+                    FOREIGN KEY (RunID)
+                    REFERENCES dbo.ReconciliationRuns(RunID),
+                CONSTRAINT UQ_SFDAVerifications_Number
+                    UNIQUE (VerificationNumber),
+                CONSTRAINT CK_SFDAVerifications_Status
+                    CHECK (Status IN
+                    (
+                        N'Processing',
+                        N'Completed',
+                        N'Failed'
+                    ))
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF OBJECT_ID(
+            N'dbo.SFDANotificationFiles',
+            N'U'
+        ) IS NULL
+        BEGIN
+            CREATE TABLE dbo.SFDANotificationFiles
+            (
+                NotificationFileID BIGINT IDENTITY(1,1) NOT NULL
+                    CONSTRAINT PK_SFDANotificationFiles PRIMARY KEY,
+                VerificationID BIGINT NOT NULL,
+                RunID BIGINT NOT NULL,
+                FileName NVARCHAR(500) NOT NULL,
+                ContainerName NVARCHAR(100) NULL,
+                BlobName NVARCHAR(1000) NULL,
+                ContentType NVARCHAR(200) NULL,
+                SizeBytes BIGINT NOT NULL
+                    CONSTRAINT DF_SFDANotificationFiles_SizeBytes
+                    DEFAULT 0,
+                FileHash NVARCHAR(128) NULL,
+                RowCount BIGINT NOT NULL
+                    CONSTRAINT DF_SFDANotificationFiles_RowCount
+                    DEFAULT 0,
+                CreatedAt DATETIME2(3) NOT NULL
+                    CONSTRAINT DF_SFDANotificationFiles_CreatedAt
+                    DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT FK_SFDANotificationFiles_Verification
+                    FOREIGN KEY (VerificationID)
+                    REFERENCES dbo.SFDAVerifications(VerificationID),
+                CONSTRAINT FK_SFDANotificationFiles_Run
+                    FOREIGN KEY (RunID)
+                    REFERENCES dbo.ReconciliationRuns(RunID),
+                CONSTRAINT UQ_SFDANotificationFiles_Hash
+                    UNIQUE (RunID, FileHash)
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF OBJECT_ID(
+            N'dbo.SFDANotificationResults',
+            N'U'
+        ) IS NULL
+        BEGIN
+            CREATE TABLE dbo.SFDANotificationResults
+            (
+                NotificationResultID BIGINT IDENTITY(1,1) NOT NULL
+                    CONSTRAINT PK_SFDANotificationResults PRIMARY KEY,
+                NotificationFileID BIGINT NOT NULL,
+                VerificationID BIGINT NOT NULL,
+                RunID BIGINT NOT NULL,
+                RowNumber INT NOT NULL,
+                GTIN NVARCHAR(50) NOT NULL,
+                Quantity DECIMAL(18,3) NOT NULL,
+                BN NVARCHAR(150) NOT NULL,
+                ExpiryDate DATE NOT NULL,
+                ResultCode NVARCHAR(50) NULL,
+                Description NVARCHAR(2000) NULL,
+                InterpretedStatus NVARCHAR(50) NOT NULL,
+                MatchedActionID BIGINT NULL,
+                CreatedAt DATETIME2(3) NOT NULL
+                    CONSTRAINT DF_SFDANotificationResults_CreatedAt
+                    DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT FK_SFDANotificationResults_File
+                    FOREIGN KEY (NotificationFileID)
+                    REFERENCES dbo.SFDANotificationFiles(NotificationFileID),
+                CONSTRAINT FK_SFDANotificationResults_Verification
+                    FOREIGN KEY (VerificationID)
+                    REFERENCES dbo.SFDAVerifications(VerificationID),
+                CONSTRAINT FK_SFDANotificationResults_Run
+                    FOREIGN KEY (RunID)
+                    REFERENCES dbo.ReconciliationRuns(RunID),
+                CONSTRAINT FK_SFDANotificationResults_Action
+                    FOREIGN KEY (MatchedActionID)
+                    REFERENCES dbo.ReconciliationActions(ActionID),
+                CONSTRAINT UQ_SFDANotificationResults_Row
+                    UNIQUE (NotificationFileID, RowNumber),
+                CONSTRAINT CK_SFDANotificationResults_Status
+                    CHECK (InterpretedStatus IN
+                    (
+                        N'SUCCESS',
+                        N'FAILED',
+                        N'CONFLICT',
+                        N'UNMATCHED'
+                    ))
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF OBJECT_ID(
+            N'dbo.SFDAReportSnapshots',
+            N'U'
+        ) IS NULL
+        BEGIN
+            CREATE TABLE dbo.SFDAReportSnapshots
+            (
+                SnapshotID BIGINT IDENTITY(1,1) NOT NULL
+                    CONSTRAINT PK_SFDAReportSnapshots PRIMARY KEY,
+                VerificationID BIGINT NOT NULL,
+                RunID BIGINT NOT NULL,
+                FileName NVARCHAR(500) NOT NULL,
+                ContainerName NVARCHAR(100) NULL,
+                BlobName NVARCHAR(1000) NULL,
+                ContentType NVARCHAR(200) NULL,
+                SizeBytes BIGINT NOT NULL
+                    CONSTRAINT DF_SFDAReportSnapshots_SizeBytes
+                    DEFAULT 0,
+                FileHash NVARCHAR(128) NULL,
+                RowCount BIGINT NOT NULL
+                    CONSTRAINT DF_SFDAReportSnapshots_RowCount
+                    DEFAULT 0,
+                CreatedAt DATETIME2(3) NOT NULL
+                    CONSTRAINT DF_SFDAReportSnapshots_CreatedAt
+                    DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT FK_SFDAReportSnapshots_Verification
+                    FOREIGN KEY (VerificationID)
+                    REFERENCES dbo.SFDAVerifications(VerificationID),
+                CONSTRAINT FK_SFDAReportSnapshots_Run
+                    FOREIGN KEY (RunID)
+                    REFERENCES dbo.ReconciliationRuns(RunID),
+                CONSTRAINT UQ_SFDAReportSnapshots_Hash
+                    UNIQUE (RunID, FileHash)
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF OBJECT_ID(
+            N'dbo.SFDAReportSnapshotRows',
+            N'U'
+        ) IS NULL
+        BEGIN
+            CREATE TABLE dbo.SFDAReportSnapshotRows
+            (
+                SnapshotRowID BIGINT IDENTITY(1,1) NOT NULL
+                    CONSTRAINT PK_SFDAReportSnapshotRows PRIMARY KEY,
+                SnapshotID BIGINT NOT NULL,
+                RunID BIGINT NOT NULL,
+                GTIN NVARCHAR(50) NOT NULL,
+                DrugName NVARCHAR(500) NULL,
+                BN NVARCHAR(150) NOT NULL,
+                ExpiryDate DATE NOT NULL,
+                Quantity DECIMAL(18,3) NOT NULL
+                    CONSTRAINT DF_SFDAReportSnapshotRows_Quantity
+                    DEFAULT 0,
+                Active DECIMAL(18,3) NOT NULL
+                    CONSTRAINT DF_SFDAReportSnapshotRows_Active
+                    DEFAULT 0,
+                QuantitySentPending DECIMAL(18,3) NOT NULL
+                    CONSTRAINT DF_SFDAReportSnapshotRows_SentPending
+                    DEFAULT 0,
+                QuantityReceivePending DECIMAL(18,3) NOT NULL
+                    CONSTRAINT DF_SFDAReportSnapshotRows_ReceivePending
+                    DEFAULT 0,
+                CreatedAt DATETIME2(3) NOT NULL
+                    CONSTRAINT DF_SFDAReportSnapshotRows_CreatedAt
+                    DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT FK_SFDAReportSnapshotRows_Snapshot
+                    FOREIGN KEY (SnapshotID)
+                    REFERENCES dbo.SFDAReportSnapshots(SnapshotID),
+                CONSTRAINT FK_SFDAReportSnapshotRows_Run
+                    FOREIGN KEY (RunID)
+                    REFERENCES dbo.ReconciliationRuns(RunID),
+                CONSTRAINT UQ_SFDAReportSnapshotRows_Key
+                    UNIQUE (SnapshotID, GTIN, BN, ExpiryDate)
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF NOT EXISTS
+        (
+            SELECT 1
+            FROM sys.indexes
+            WHERE name = N'IX_SFDANotificationResults_RunKey'
+              AND object_id = OBJECT_ID(N'dbo.SFDANotificationResults')
+        )
+        BEGIN
+            CREATE INDEX IX_SFDANotificationResults_RunKey
+            ON dbo.SFDANotificationResults
+            (
+                RunID,
+                GTIN,
+                BN,
+                ExpiryDate,
+                InterpretedStatus
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF NOT EXISTS
+        (
+            SELECT 1
+            FROM sys.indexes
+            WHERE name = N'IX_SFDAReportSnapshotRows_RunKey'
+              AND object_id = OBJECT_ID(N'dbo.SFDAReportSnapshotRows')
+        )
+        BEGIN
+            CREATE INDEX IX_SFDAReportSnapshotRows_RunKey
+            ON dbo.SFDAReportSnapshotRows
+            (
+                RunID,
+                GTIN,
+                BN,
+                ExpiryDate
+            );
+        END;
+        """
+    )
+
 def _generate_run_number() -> str:
     now = datetime.now(
         timezone.utc
@@ -680,7 +1083,10 @@ def get_reconciliation_history(
             Status,
             ErrorMessage,
             StartedAt,
-            CompletedAt
+            CompletedAt,
+            VerificationStatus,
+            VerificationStartedAt,
+            VerifiedAt
         FROM dbo.ReconciliationRuns
         ORDER BY RunID DESC;
         """
@@ -782,7 +1188,8 @@ def get_reconciliation_run_by_number(
             TotalInputRows, MasterRecords, AcceptRecords,
             DispatchRecords, ExceptionRecords, GeneratedFiles,
             ApplicationVersion, Status, ErrorMessage,
-            StartedAt, CompletedAt
+            StartedAt, CompletedAt, VerificationStatus,
+            VerificationStartedAt, VerifiedAt
         FROM dbo.ReconciliationRuns
         WHERE RunNumber = %s;
         """,
