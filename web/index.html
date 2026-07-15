@@ -479,7 +479,7 @@
       <!-- HOME -->
       <section class="page active" id="page-home">
         <div class="page-head">
-          <div><h1>Dashboard</h1><p>Evidence-controlled view of SFDA, ASN receipts, inventory, Full Dispatch, exceptions, and customer allocation.</p></div>
+          <div><h1>Dashboard</h1><p>Operational view of SFDA, receiving, inventory, dispatch, exceptions, and customer mapping.</p></div>
           <div class="actions"><button class="btn btn-primary" data-go="upload">▶ Run Reconciliation</button></div>
         </div>
 
@@ -535,7 +535,7 @@
           </aside>
         </div>
 
-        <div class="card legend-footer"><div class="legend-item"><span class="legend-symbol" style="background:#e9f8ee;color:#178043">✓</span><span><strong>OK</strong><br>All good</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fff3db;color:#bd7400">◷</span><span><strong>Dispatch Pending</strong><br>Dispatch supported by Full Dispatch evidence</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fdeaea;color:#c63034">!</span><span><strong>Diff / Exception</strong><br>Needs attention</span></div><div class="legend-item"><span class="legend-symbol" style="background:#eaf4ff;color:#0866bd">?</span><span><strong>Dummy GLN</strong><br>Customer has no GLN</span></div></div>
+        <div class="card legend-footer"><div class="legend-item"><span class="legend-symbol" style="background:#e9f8ee;color:#178043">✓</span><span><strong>OK</strong><br>All good</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fff3db;color:#bd7400">◷</span><span><strong>Dispatch Pending</strong><br>Pending dispatch to SFDA</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fdeaea;color:#c63034">!</span><span><strong>Diff / Exception</strong><br>Needs attention</span></div><div class="legend-item"><span class="legend-symbol" style="background:#eaf4ff;color:#0866bd">?</span><span><strong>Dummy GLN</strong><br>Customer has no GLN</span></div></div>
         <div id="recentActivity" hidden></div>
       </section>
 
@@ -546,35 +546,33 @@
           <div class="actions"><button class="btn btn-secondary" id="resetButton">↻ Reset</button></div>
         </div>
 
-        <form id="uploadForm">
-          <div class="grid file-grid">
-            <div class="card file-card">
-              <div class="file-card-top"><div><div class="file-title">① ASN Receipt Detailed Report</div><div class="file-sub">Inbound receiving transactions, suppliers, batches, expiry dates, and received quantities.</div></div><span class="badge info">Required</span></div>
-              <div class="file-row"><input id="asn" name="asn" type="file" accept=".xls,.xlsx" required></div>
-              <div class="file-meta" id="asnName">No file selected</div>
+        <div class="grid two-equal">
+          <form id="acceptForm" class="card" style="padding:20px">
+            <div class="card-title" style="font-size:18px;color:#107c41">Step 1 — Accept Reconciliation</div>
+            <div class="card-subtitle" style="margin:6px 0 18px">Generate Accept files from actual ASN receipts and current SFDA receive pending quantities.</div>
+            <div class="grid">
+              <div class="file-card"><div class="file-title">① ASN Receipt Detailed Report</div><div class="file-row"><input id="acceptAsn" name="asn" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="acceptAsnName">No file selected</div></div>
+              <div class="file-card"><div class="file-title">② Inventory Status Report</div><div class="file-row"><input id="acceptInventory" name="inventory" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="acceptInventoryName">No file selected</div></div>
+              <div class="file-card"><div class="file-title">③ SFDA Drug Count — Before Accept</div><div class="file-row"><input id="acceptSfda" name="sfda" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="acceptSfdaName">No file selected</div></div>
             </div>
-            <div class="card file-card">
-              <div class="file-card-top"><div><div class="file-title">② Inventory Status Report</div><div class="file-sub">Current warehouse stock by batch and expiry date.</div></div><span class="badge info">Required</span></div>
-              <div class="file-row"><input id="inventory" name="inventory" type="file" accept=".xls,.xlsx" required></div>
-              <div class="file-meta" id="inventoryName">No file selected</div>
-            </div>
-            <div class="card file-card">
-              <div class="file-card-top"><div><div class="file-title">③ Full Dispatch Report</div><div class="file-sub">Source of truth for dispatch quantity, customer distribution, order details, and receiving addresses.</div></div><span class="badge info">Required</span></div>
-              <div class="file-row"><input id="dispatch" name="dispatch" type="file" accept=".xls,.xlsx" required></div>
-              <div class="file-meta" id="dispatchName">No file selected</div>
-            </div>
-            <div class="card file-card">
-              <div class="file-card-top"><div><div class="file-title">④ SFDA Drug Count</div><div class="file-sub">Current SFDA batch quantities, active stock, and pending movements.</div></div><span class="badge info">Required</span></div>
-              <div class="file-row"><input id="sfda" name="sfda" type="file" accept=".xls,.xlsx" required></div>
-              <div class="file-meta" id="sfdaName">No file selected</div>
-            </div>
-          </div>
+            <button class="btn btn-success" id="acceptRunButton" type="submit" disabled style="margin-top:16px;width:100%">▶ Generate Accept Files</button>
+          </form>
 
-          <div class="card run-panel">
-            <div><div class="run-title">Reconciliation Readiness</div><div class="run-sub" id="runMessage">Select all four reports. Pack Size and GLN mappings are maintained internally.</div></div>
-            <button class="btn btn-primary" id="runButton" type="submit" disabled>▶ Run Reconciliation</button>
-          </div>
-        </form>
+          <form id="dispatchForm" class="card" style="padding:20px">
+            <div class="card-title" style="font-size:18px;color:#6b4eff">Step 2 — Dispatch Reconciliation</div>
+            <div class="card-subtitle" style="margin:6px 0 18px">Run only after the Accept upload is completed and a refreshed SFDA report is downloaded.</div>
+            <div class="grid">
+              <div class="file-card"><div class="file-title">① Full Dispatch Report</div><div class="file-row"><input id="dispatchReport" name="dispatch" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="dispatchReportName">No file selected</div></div>
+              <div class="file-card"><div class="file-title">② Inventory Status Report</div><div class="file-row"><input id="dispatchInventory" name="inventory" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="dispatchInventoryName">No file selected</div></div>
+              <div class="file-card"><div class="file-title">③ Updated SFDA Drug Count — After Accept</div><div class="file-row"><input id="dispatchSfda" name="sfda" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="dispatchSfdaName">No file selected</div></div>
+            </div>
+            <button class="btn btn-purple" id="dispatchRunButton" type="submit" disabled style="margin-top:16px;width:100%">▶ Generate Dispatch Files</button>
+          </form>
+        </div>
+
+        <div class="card run-panel">
+          <div><div class="run-title">Two-Step Reconciliation Workflow</div><div class="run-sub">Complete Accept first, upload it to SFDA, download the refreshed Drug Count, then run Dispatch.</div></div>
+        </div>
 
         <div class="card progress-card" id="progressCard">
           <div class="progress-head"><span id="progressLabel">Preparing files...</span><span id="progressPercent">0%</span></div>
@@ -698,7 +696,7 @@
         <div class="grid kpi-grid">
           <div class="card kpi"><div class="kpi-label">Receiving Variance</div><div class="kpi-value">—</div><div class="kpi-foot">Under / over delivery</div><div class="kpi-icon amber">R</div></div>
           <div class="card kpi"><div class="kpi-label">Missing Registration</div><div class="kpi-value">—</div><div class="kpi-foot">Received but absent from SFDA</div><div class="kpi-icon red">M</div></div>
-          <div class="card kpi"><div class="kpi-label">Dispatch Variance</div><div class="kpi-value" id="varianceLatest">—</div><div class="kpi-foot">Active/Inventory gap not supported by Full Dispatch</div><div class="kpi-icon purple">D</div></div>
+          <div class="card kpi"><div class="kpi-label">Dispatch Variance</div><div class="kpi-value" id="varianceLatest">—</div><div class="kpi-foot">Missing dispatch evidence</div><div class="kpi-icon purple">D</div></div>
           <div class="card kpi"><div class="kpi-label">Unmapped Customers</div><div class="kpi-value">—</div><div class="kpi-foot">Missing GLN mapping</div><div class="kpi-icon red">C</div></div>
         </div>
         <div class="card table-card" style="margin-top:16px">
@@ -715,7 +713,7 @@
           <div class="card intelligence-card"><h3>Pack Size Mapping</h3><p>Converts warehouse units into SFDA packages using controlled internal Package Size references.</p><div class="intelligence-metric"><span class="badge success">Internal File Active</span><strong>✓</strong></div></div>
           <div class="card intelligence-card"><h3>Business Rules</h3><p>Controls Accept, Dispatch, Variance allocation, maximum rows, quantity limits, and file generation.</p><div class="intelligence-metric"><span class="badge success">Python Rules Active</span><strong>✓</strong></div></div>
         </div>
-        <div class="card" style="margin-top:16px"><div class="card-header"><div><div class="card-title">System Information</div><div class="card-subtitle">Current Azure Function environment</div></div></div><div class="card-body"><div class="grid two-equal"><div><div class="card-subtitle">API Endpoint</div><div style="margin-top:6px;font-size:11px;font-weight:800;word-break:break-all" id="apiEndpoint">/api/process</div></div><div><div class="card-subtitle">Health Status</div><div style="margin-top:6px;font-size:11px;font-weight:800;color:#107c41" id="adminHealth">Checking...</div></div><div><div class="card-subtitle">Application Version</div><div style="margin-top:6px;font-size:11px;font-weight:800" id="adminVersion">—</div></div><div><div class="card-subtitle">Authentication</div><div style="margin-top:6px;font-size:11px;font-weight:800;color:#d97706">Anonymous prototype</div></div></div></div></div>
+        <div class="card" style="margin-top:16px"><div class="card-header"><div><div class="card-title">System Information</div><div class="card-subtitle">Current Azure Function environment</div></div></div><div class="card-body"><div class="grid two-equal"><div><div class="card-subtitle">API Endpoint</div><div style="margin-top:6px;font-size:11px;font-weight:800;word-break:break-all" id="apiEndpoint">/api/process-accept · /api/process-dispatch</div></div><div><div class="card-subtitle">Health Status</div><div style="margin-top:6px;font-size:11px;font-weight:800;color:#107c41" id="adminHealth">Checking...</div></div><div><div class="card-subtitle">Application Version</div><div style="margin-top:6px;font-size:11px;font-weight:800" id="adminVersion">—</div></div><div><div class="card-subtitle">Authentication</div><div style="margin-top:6px;font-size:11px;font-weight:800;color:#d97706">Anonymous prototype</div></div></div></div></div>
       </section>
     </div>
   </main>
@@ -732,11 +730,13 @@
 <div class="toast-wrap" id="toastWrap"></div>
 
 <script>
-  const API_URL = "/api/process";
+  const ACCEPT_API_URL = "/api/process-accept";
+  const DISPATCH_API_URL = "/api/process-dispatch";
   const VERIFY_URL = "/api/verify";
   const HEALTH_URL = "/api/health";
   const VERSION_URL = "/api/version";
-  const FILE_KEYS = ["asn","inventory","dispatch","sfda"];
+  const ACCEPT_FILE_KEYS = ["acceptAsn","acceptInventory","acceptSfda"];
+  const DISPATCH_FILE_KEYS = ["dispatchReport","dispatchInventory","dispatchSfda"];
   const HISTORY_URL = "/api/history";
   const DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v1";
   let currentResult = null;
@@ -824,8 +824,8 @@
   });
   $("mobileToggle").addEventListener("click",()=>$("sidebar").classList.toggle("open"));
 
-  function updateFileName(key) {
-    const input=$(key), box=$(`${key}Name`);
+  function updateStageFileName(inputId, metaId, stageKeys, buttonId) {
+    const input=$(inputId), box=$(metaId);
     if(input.files.length){
       const file=input.files[0];
       box.textContent=`✓ ${file.name} · ${(file.size/1024/1024).toFixed(2)} MB`;
@@ -834,16 +834,27 @@
       box.textContent="No file selected";
       box.classList.remove("ready");
     }
-    const count=FILE_KEYS.filter(k=>$(k).files.length).length;
-    $("runButton").disabled=count!==FILE_KEYS.length;
-    $("runMessage").textContent=count===FILE_KEYS.length?"All files are selected. The reconciliation is ready to run.":`${count} of ${FILE_KEYS.length} required files selected.`;
+    $(buttonId).disabled=stageKeys.some(item=>!$(item.input).files.length);
   }
-  FILE_KEYS.forEach(k=>$(k).addEventListener("change",()=>updateFileName(k)));
 
-  function validateFiles(){
-    for(const key of FILE_KEYS){
-      const input=$(key);
-      if(!input.files.length) throw new Error("Please select all four required Excel files.");
+  const ACCEPT_INPUTS=[
+    {input:"acceptAsn",meta:"acceptAsnName",field:"asn"},
+    {input:"acceptInventory",meta:"acceptInventoryName",field:"inventory"},
+    {input:"acceptSfda",meta:"acceptSfdaName",field:"sfda"}
+  ];
+  const DISPATCH_INPUTS=[
+    {input:"dispatchReport",meta:"dispatchReportName",field:"dispatch"},
+    {input:"dispatchInventory",meta:"dispatchInventoryName",field:"inventory"},
+    {input:"dispatchSfda",meta:"dispatchSfdaName",field:"sfda"}
+  ];
+
+  ACCEPT_INPUTS.forEach(item=>$(item.input).addEventListener("change",()=>updateStageFileName(item.input,item.meta,ACCEPT_INPUTS,"acceptRunButton")));
+  DISPATCH_INPUTS.forEach(item=>$(item.input).addEventListener("change",()=>updateStageFileName(item.input,item.meta,DISPATCH_INPUTS,"dispatchRunButton")));
+
+  function validateStageFiles(items){
+    for(const item of items){
+      const input=$(item.input);
+      if(!input.files.length) throw new Error("Please select all three required Excel files.");
       const name=input.files[0].name.toLowerCase();
       if(!name.endsWith(".xls")&&!name.endsWith(".xlsx")) throw new Error(`${input.files[0].name}: only .xls and .xlsx files are allowed.`);
     }
@@ -857,87 +868,50 @@
   function clearStatus(){ $("statusBox").className="status-banner"; $("statusBox").textContent=""; }
 
   function startProgress(){
-    clearInterval(progressTimer);
-    $("progressCard").classList.add("show");
-    const stages=[
-      {p:12,label:"Reading uploaded files...",step:"stepRead"},
-      {p:34,label:"Validating required columns...",step:"stepValidate"},
-      {p:62,label:"Calculating reconciliation...",step:"stepCalculate"},
-      {p:84,label:"Generating output files...",step:"stepGenerate"}
-    ];
-    ["stepRead","stepValidate","stepCalculate","stepGenerate"].forEach(id=>{ $(id).className="progress-step"; $(id).textContent="○ "+$(id).textContent.replace(/^○ |^✓ /,""); });
-    let i=0;
-    const apply=()=>{
-      const stage=stages[i];
-      $("progressBar").style.width=`${stage.p}%`;
-      $("progressPercent").textContent=`${stage.p}%`;
-      $("progressLabel").textContent=stage.label;
-      $(stage.step).classList.add("done");
-      $(stage.step).textContent="✓ "+$(stage.step).textContent.replace(/^○ |^✓ /,"");
-      i=Math.min(i+1,stages.length-1);
-    };
-    apply();
-    progressTimer=setInterval(apply,3500);
+    clearInterval(progressTimer); $("progressCard").classList.add("show");
+    $("progressBar").style.width="20%"; $("progressPercent").textContent="20%"; $("progressLabel").textContent="Reading and validating files...";
+    progressTimer=setInterval(()=>{
+      const current=parseInt($("progressPercent").textContent)||20;
+      const next=Math.min(90,current+10);
+      $("progressBar").style.width=`${next}%`; $("progressPercent").textContent=`${next}%`;
+    },1200);
   }
   function finishProgress(success){
-    clearInterval(progressTimer);
-    $("progressBar").style.width="100%";
+    clearInterval(progressTimer); $("progressBar").style.width="100%";
     $("progressPercent").textContent=success?"100%":"Failed";
     $("progressLabel").textContent=success?"Reconciliation completed successfully.":"Reconciliation failed.";
-    if(success){ ["stepRead","stepValidate","stepCalculate","stepGenerate"].forEach(id=>{ $(id).classList.add("done"); $(id).textContent="✓ "+$(id).textContent.replace(/^○ |^✓ /,""); }); }
   }
 
-  $("uploadForm").addEventListener("submit",async event=>{
-    event.preventDefault();
-    clearStatus();
-    $("summaryPanel").classList.remove("show");
+  async function runStage({formId,items,buttonId,url,label}){
+    clearStatus(); $("summaryPanel").classList.remove("show");
+    const button=$(buttonId);
     try{
-      validateFiles();
-      $("runButton").disabled=true;
-      $("runButton").textContent="Processing...";
-      startProgress();
+      validateStageFiles(items); button.disabled=true; button.textContent="Processing..."; startProgress();
       const formData=new FormData();
-      FILE_KEYS.forEach(k=>formData.append(k,$(k).files[0],$(k).files[0].name));
-      const response=await fetch(API_URL,{method:"POST",body:formData});
-      let result;
-      try{ result=await response.json(); }catch{ throw new Error(`The server returned HTTP ${response.status} without a valid JSON response.`); }
+      items.forEach(item=>formData.append(item.field,$(item.input).files[0],$(item.input).files[0].name));
+      const response=await fetch(url,{method:"POST",body:formData});
+      let result; try{ result=await response.json(); }catch{ throw new Error(`The server returned HTTP ${response.status} without valid JSON.`); }
       if(!response.ok||result.status==="Failed") throw new Error(result.error||result.message||`Request failed with HTTP ${response.status}.`);
-      currentResult=result;
-      try{
-        localStorage.setItem(
-          DASHBOARD_PREVIEW_KEY,
-          JSON.stringify(result.dashboard_preview || [])
-        );
-      }catch(storageError){
-        console.warn("Unable to save dashboard preview.",storageError);
-      }
-      finishProgress(true);
-      setStatus("success","Upload files generated successfully. Run status: Pending Upload.");
-      populateSummary(result);
-      populateResults(result);
-      await refreshAzureHistory({silent:true});
-      $("inlineResults").classList.add("show");
-      setTimeout(()=>$("inlineResults").scrollIntoView({behavior:"smooth",block:"start"}),120);
-      toast("Upload files generated. Run is Pending Upload.","success");
+      currentResult=result; finishProgress(true); setStatus("success",`${label} files generated successfully.`);
+      populateSummary(result); populateResults(result); await refreshAzureHistory({silent:true});
+      $("inlineResults").classList.add("show"); setTimeout(()=>$("inlineResults").scrollIntoView({behavior:"smooth",block:"start"}),120);
+      toast(`${label} files generated successfully.`,"success");
     }catch(error){
-      finishProgress(false);
-      setStatus("error",error.message||String(error));
-      await refreshAzureHistory({silent:true});
-      toast(error.message||String(error),"error");
+      finishProgress(false); setStatus("error",error.message||String(error)); toast(error.message||String(error),"error");
     }finally{
-      $("runButton").disabled=FILE_KEYS.some(k=>!$(k).files.length);
-      $("runButton").textContent="▶ Run Reconciliation";
+      button.disabled=items.some(item=>!$(item.input).files.length);
+      button.textContent=label==="Accept"?"▶ Generate Accept Files":"▶ Generate Dispatch Files";
     }
-  });
+  }
+
+  $("acceptForm").addEventListener("submit",event=>{event.preventDefault();runStage({formId:"acceptForm",items:ACCEPT_INPUTS,buttonId:"acceptRunButton",url:ACCEPT_API_URL,label:"Accept"});});
+  $("dispatchForm").addEventListener("submit",event=>{event.preventDefault();runStage({formId:"dispatchForm",items:DISPATCH_INPUTS,buttonId:"dispatchRunButton",url:DISPATCH_API_URL,label:"Dispatch"});});
 
   $("resetButton").addEventListener("click",()=>{
-    $("uploadForm").reset();
-    FILE_KEYS.forEach(updateFileName);
-    clearStatus();
-    $("progressCard").classList.remove("show");
-    $("summaryPanel").classList.remove("show");
-    $("inlineResults").classList.remove("show");
-    currentResult=null;
+    $("acceptForm").reset(); $("dispatchForm").reset();
+    ACCEPT_INPUTS.forEach(item=>updateStageFileName(item.input,item.meta,ACCEPT_INPUTS,"acceptRunButton"));
+    DISPATCH_INPUTS.forEach(item=>updateStageFileName(item.input,item.meta,DISPATCH_INPUTS,"dispatchRunButton"));
+    clearStatus(); $("progressCard").classList.remove("show"); $("summaryPanel").classList.remove("show"); $("inlineResults").classList.remove("show"); currentResult=null;
   });
 
   function populateSummary(result){
@@ -1463,7 +1437,7 @@
       $("homeVersion").textContent=version;
       $("adminHealth").textContent=h.status||"Healthy";
       $("adminVersion").textContent=version;
-      $("apiEndpoint").textContent=new URL(API_URL,window.location.href).href;
+      $("apiEndpoint").textContent=new URL(ACCEPT_API_URL,window.location.href).href + " · " + new URL(DISPATCH_API_URL,window.location.href).href;
       return true;
     }catch{
       $("homeHealth").textContent="Unavailable";
