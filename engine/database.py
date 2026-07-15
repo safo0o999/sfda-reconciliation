@@ -832,7 +832,7 @@ def get_reconciliation_run_files(
 def record_batch_events(
     run_id: int,
     events: List[Dict[str, Any]],
-    batch_size: int = 500,
+    batch_size: int = 1000,
 ) -> int:
 
     if not events:
@@ -844,14 +844,13 @@ def record_batch_events(
         return 0
 
     safe_batch_size = max(
-        100,
+        250,
         min(
             int(batch_size),
-            2000,
+            5000,
         ),
     )
 
-    database = Database()
     rows = []
 
     for event in events:
@@ -910,45 +909,75 @@ def record_batch_events(
             event.get("gtin"),
             event.get("supplier_name"),
             event.get("customer_name"),
-            int(run_id),
-            event_key,
-            batch_number,
-            expiry_date,
-            event_type,
-            event.get("event_date"),
-            float(event.get("quantity") or 0),
-            source_system,
-            event.get("source_reference"),
-            event.get("generic_item_number"),
-            event.get("trade_item_number"),
-            event.get("trade_name"),
-            event.get("gtin"),
-            event.get("supplier_name"),
-            event.get("customer_name"),
         ))
+
+    total_rows = len(rows)
+    total_batches = (
+        total_rows
+        + safe_batch_size
+        - 1
+    ) // safe_batch_size
+    operation_started_at = time.perf_counter()
+
+    database = Database()
+    connection = database.connect()
+
+    create_stage_sql = """
+        CREATE TABLE #BatchEventsStage
+        (
+            EventKey NVARCHAR(200) NOT NULL,
+            RunID BIGINT NOT NULL,
+            BN NVARCHAR(200) NOT NULL,
+            ExpiryDate DATE NOT NULL,
+            EventType NVARCHAR(50) NOT NULL,
+            EventDate DATETIME2(3) NULL,
+            Quantity DECIMAL(19,4) NOT NULL,
+            SourceSystem NVARCHAR(50) NOT NULL,
+            SourceReference NVARCHAR(500) NULL,
+            GenericItemNumber NVARCHAR(200) NULL,
+            TradeItemNumber NVARCHAR(200) NULL,
+            TradeName NVARCHAR(500) NULL,
+            GTIN NVARCHAR(100) NULL,
+            SupplierName NVARCHAR(500) NULL,
+            CustomerName NVARCHAR(500) NULL
+        );
+
+        CREATE UNIQUE CLUSTERED INDEX
+            IX_BatchEventsStage_EventKey
+        ON #BatchEventsStage (EventKey);
+    """
+
+    insert_stage_sql = """
+        INSERT INTO #BatchEventsStage
+        (
+            EventKey,
+            RunID,
+            BN,
+            ExpiryDate,
+            EventType,
+            EventDate,
+            Quantity,
+            SourceSystem,
+            SourceReference,
+            GenericItemNumber,
+            TradeItemNumber,
+            TradeName,
+            GTIN,
+            SupplierName,
+            CustomerName
+        )
+        VALUES
+        (
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s
+        );
+    """
 
     merge_sql = """
         MERGE dbo.BatchEvents WITH (HOLDLOCK) AS target
-        USING
-        (
-            SELECT
-                %s AS EventKey,
-                %s AS RunID,
-                %s AS BN,
-                %s AS ExpiryDate,
-                %s AS EventType,
-                %s AS EventDate,
-                %s AS Quantity,
-                %s AS SourceSystem,
-                %s AS SourceReference,
-                %s AS GenericItemNumber,
-                %s AS TradeItemNumber,
-                %s AS TradeName,
-                %s AS GTIN,
-                %s AS SupplierName,
-                %s AS CustomerName
-        ) AS source
-        ON target.EventKey = source.EventKey
+        USING #BatchEventsStage AS source
+            ON target.EventKey = source.EventKey
 
         WHEN MATCHED THEN
             UPDATE SET
@@ -990,36 +1019,27 @@ def record_batch_events(
             )
             VALUES
             (
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
-                %s,
+                source.RunID,
+                source.EventKey,
+                source.BN,
+                source.ExpiryDate,
+                source.EventType,
+                source.EventDate,
+                source.Quantity,
+                source.SourceSystem,
+                source.SourceReference,
+                source.GenericItemNumber,
+                source.TradeItemNumber,
+                source.TradeName,
+                source.GTIN,
+                source.SupplierName,
+                source.CustomerName,
                 SYSUTCDATETIME()
             );
     """
 
-    total_rows = len(rows)
-    total_batches = (
-        total_rows
-        + safe_batch_size
-        - 1
-    ) // safe_batch_size
-    saved_rows = 0
-    operation_started_at = time.perf_counter()
-
     logging.info(
-        "[BATCH EVENTS] Starting batched SQL save "
+        "[BATCH EVENTS] Starting optimized bulk upsert "
         "| run_id=%s | total_rows=%s "
         "| batch_size=%s | total_batches=%s",
         run_id,
@@ -1028,73 +1048,99 @@ def record_batch_events(
         total_batches,
     )
 
-    for batch_number_index, start_index in enumerate(
-        range(
-            0,
-            total_rows,
-            safe_batch_size,
-        ),
-        start=1,
-    ):
-        batch_started_at = time.perf_counter()
-        batch_rows = rows[
-            start_index:
-            start_index + safe_batch_size
-        ]
+    try:
+        cursor = connection.cursor()
+
+        stage_started_at = time.perf_counter()
+        cursor.execute(create_stage_sql)
 
         logging.info(
-            "[BATCH EVENTS] Saving batch "
-            "| run_id=%s | batch=%s/%s "
-            "| rows=%s | saved_before=%s",
+            "[BATCH EVENTS] Temporary staging table created "
+            "| run_id=%s | seconds=%.3f",
             run_id,
-            batch_number_index,
-            total_batches,
-            len(batch_rows),
-            saved_rows,
+            time.perf_counter() - stage_started_at,
         )
 
-        try:
-            database.execute_many(
-                merge_sql,
+        inserted_rows = 0
+
+        for batch_number_index, start_index in enumerate(
+            range(
+                0,
+                total_rows,
+                safe_batch_size,
+            ),
+            start=1,
+        ):
+            batch_started_at = time.perf_counter()
+            batch_rows = rows[
+                start_index:
+                start_index + safe_batch_size
+            ]
+
+            cursor.executemany(
+                insert_stage_sql,
                 batch_rows,
             )
-        except Exception:
-            logging.exception(
-                "[BATCH EVENTS] Batch save failed "
+
+            inserted_rows += len(batch_rows)
+
+            logging.info(
+                "[BATCH EVENTS] Staging batch inserted "
                 "| run_id=%s | batch=%s/%s "
-                "| start_row=%s | batch_rows=%s",
+                "| inserted_rows=%s/%s | seconds=%.3f",
                 run_id,
                 batch_number_index,
                 total_batches,
-                start_index + 1,
-                len(batch_rows),
+                inserted_rows,
+                total_rows,
+                time.perf_counter() - batch_started_at,
             )
-            raise
 
-        saved_rows += len(batch_rows)
+        merge_started_at = time.perf_counter()
 
         logging.info(
-            "[BATCH EVENTS] Batch saved "
-            "| run_id=%s | batch=%s/%s "
-            "| saved_rows=%s/%s | seconds=%.3f",
+            "[BATCH EVENTS] Starting single SQL MERGE "
+            "| run_id=%s | staged_rows=%s",
             run_id,
-            batch_number_index,
-            total_batches,
-            saved_rows,
-            total_rows,
-            time.perf_counter() - batch_started_at,
+            inserted_rows,
         )
+
+        cursor.execute(merge_sql)
+        connection.commit()
+
+        logging.info(
+            "[BATCH EVENTS] Single SQL MERGE completed "
+            "| run_id=%s | rows=%s | seconds=%.3f",
+            run_id,
+            inserted_rows,
+            time.perf_counter() - merge_started_at,
+        )
+
+    except Exception:
+        connection.rollback()
+
+        logging.exception(
+            "[BATCH EVENTS] Optimized bulk upsert failed "
+            "| run_id=%s | total_rows=%s",
+            run_id,
+            total_rows,
+        )
+
+        raise
+
+    finally:
+        connection.close()
 
     logging.info(
         "[BATCH EVENTS] All events saved "
         "| run_id=%s | saved_rows=%s "
         "| total_seconds=%.3f",
         run_id,
-        saved_rows,
+        total_rows,
         time.perf_counter() - operation_started_at,
     )
 
-    return saved_rows
+    return total_rows
 
 def get_batch_events(
     batch_number: str,
