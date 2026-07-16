@@ -169,15 +169,23 @@ class Calculator:
             "Dispatched Quantity"
         )
 
-        receiving = Calculator._normalize_merge_keys(
-            receiving
-        )
-        inventory = Calculator._normalize_merge_keys(
-            inventory
-        )
-        dispatch = Calculator._normalize_merge_keys(
-            dispatch
-        )
+        # These summaries already contain the normalized matching keys.
+        # Keep only keys + quantity so no full Expiry Date column can
+        # collide with the SFDA master Expiry Date during merge.
+        receiving = receiving[
+            Calculator.KEYS
+            + ["Received Quantity"]
+        ].copy()
+
+        inventory = inventory[
+            Calculator.KEYS
+            + ["Available Quantity"]
+        ].copy()
+
+        dispatch = dispatch[
+            Calculator.KEYS
+            + ["Dispatched Quantity"]
+        ].copy()
 
         return (
             receiving,
@@ -720,16 +728,8 @@ class Calculator:
             sfda_df
         )
 
-        receiving = Calculator._normalize_merge_keys(
-            receiving
-        )
-        inventory = Calculator._normalize_merge_keys(
-            inventory
-        )
-        dispatch_summary = Calculator._normalize_merge_keys(
-            dispatch_summary
-        )
-
+        # Source summaries already have BN + expiry-month keys and do not
+        # contain a full Expiry Date column.
         master = master.merge(
             packsize,
             left_on="Drug Name",
@@ -849,11 +849,11 @@ class Calculator:
             .sum()
         )
 
-        allocated_summary = (
-            Calculator._normalize_merge_keys(
-                allocated_summary
-            )
-        )
+        allocated_summary = allocated_summary[
+            Calculator.KEYS
+            + ["Allocated To Be Dispatch"]
+        ].copy()
+
         master = Calculator._normalize_merge_keys(
             master
         )
