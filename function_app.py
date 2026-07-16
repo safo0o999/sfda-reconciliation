@@ -41,7 +41,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "4.0.3"
+APPLICATION_VERSION = "4.0.4"
 
 REQUIRED_FILES = [
     "asn",
