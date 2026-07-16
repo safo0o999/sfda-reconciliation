@@ -27,11 +27,17 @@ from engine.database import (
     complete_verification_run,
     fail_verification_run,
     record_verification_results,
+    create_full_reconciliation_run,
+    save_full_reconciliation_data,
+    complete_full_reconciliation_run,
+    fail_full_reconciliation_run,
+    get_batch_master,
 )
 
 from engine.exporter import Exporter
 from engine.batch_history import BatchHistoryEngine
 from engine.reconciliation import ReconciliationEngine
+from engine.full_reconciliation import FullReconciliationEngine
 from engine.verification import VerificationEngine
 
 
@@ -41,7 +47,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "4.0.6"
+APPLICATION_VERSION = "4.1.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -1368,6 +1374,403 @@ def process_dispatch(req: func.HttpRequest) -> func.HttpResponse:
             "required_files": ["dispatch", "inventory", "sfda"],
         })
     return _process_reconciliation_stage(req, "dispatch")
+
+
+
+def _full_excel_payload(
+    dataframe: pd.DataFrame,
+    file_name: str,
+    sheet_name: str,
+) -> dict:
+    output = io.BytesIO()
+
+    with pd.ExcelWriter(
+        output,
+        engine="openpyxl",
+    ) as writer:
+        dataframe.to_excel(
+            writer,
+            index=False,
+            sheet_name=sheet_name,
+        )
+
+        worksheet = writer.book[sheet_name]
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = (
+            worksheet.dimensions
+        )
+
+        for column_cells in worksheet.columns:
+            width = min(
+                45,
+                max(
+                    12,
+                    max(
+                        len(str(cell.value or ""))
+                        for cell in column_cells
+                    ) + 2,
+                ),
+            )
+            worksheet.column_dimensions[
+                column_cells[0].column_letter
+            ].width = width
+
+    return {
+        "file_name": file_name,
+        "content": base64.b64encode(
+            output.getvalue()
+        ).decode("ascii"),
+        "encoding": "base64",
+        "mime_type":
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }
+
+
+@app.route(
+    route="full-reconciliation",
+    methods=["GET", "POST"],
+)
+def full_reconciliation(
+    req: func.HttpRequest,
+) -> func.HttpResponse:
+    if req.method == "GET":
+        return json_response({
+            "status": "Ready",
+            "version": APPLICATION_VERSION,
+            "required_files": {
+                "asn_files": "multiple",
+                "dispatch_files": "multiple",
+                "sfda": 1,
+            },
+            "operation": "Replace / rebuild historical Batch Master",
+            "generates_upload_csv": False,
+        })
+
+    run_record = None
+
+    try:
+        asn_files = list(
+            req.files.getlist("asn_files")
+        )
+
+        if not asn_files:
+            asn_files = list(
+                req.files.getlist("asn")
+            )
+
+        dispatch_files = list(
+            req.files.getlist(
+                "dispatch_files"
+            )
+        )
+
+        if not dispatch_files:
+            dispatch_files = list(
+                req.files.getlist("dispatch")
+            )
+
+        sfda_file = (
+            req.files.get("sfda")
+            or req.files.get("sfda_file")
+        )
+
+        if not asn_files:
+            raise ValueError(
+                "At least one historical ASN file is required."
+            )
+
+        if not dispatch_files:
+            raise ValueError(
+                "At least one historical Full Dispatch file is required."
+            )
+
+        if sfda_file is None:
+            raise ValueError(
+                "The latest SFDA Drug Count report is required."
+            )
+
+        submitted_by = str(
+            req.form.get("submitted_by")
+            or "Web User"
+        ).strip()
+
+        asn_frames = []
+
+        for uploaded in asn_files:
+            frame = read_excel_file(uploaded)
+            frame["_Source File"] = (
+                uploaded.filename
+                or "asn.xlsx"
+            )
+            frame["_Source Row"] = range(
+                2,
+                len(frame) + 2,
+            )
+            asn_frames.append(frame)
+
+        dispatch_frames = []
+
+        for uploaded in dispatch_files:
+            frame = read_excel_file(uploaded)
+            frame["_Source File"] = (
+                uploaded.filename
+                or "dispatch.xlsx"
+            )
+            frame["_Source Row"] = range(
+                2,
+                len(frame) + 2,
+            )
+            dispatch_frames.append(frame)
+
+        sfda_dataframe = read_excel_file(
+            sfda_file
+        )
+
+        asn_dataframe = pd.concat(
+            asn_frames,
+            ignore_index=True,
+            sort=False,
+        )
+
+        dispatch_dataframe = pd.concat(
+            dispatch_frames,
+            ignore_index=True,
+            sort=False,
+        )
+
+        run_record = (
+            create_full_reconciliation_run(
+                submitted_by=submitted_by,
+                application_version=
+                    APPLICATION_VERSION,
+                asn_files=len(asn_files),
+                dispatch_files=
+                    len(dispatch_files),
+                sfda_rows=len(
+                    sfda_dataframe
+                ),
+            )
+        )
+
+        engine = FullReconciliationEngine(
+            asn_df=asn_dataframe,
+            dispatch_df=
+                dispatch_dataframe,
+            sfda_df=sfda_dataframe,
+        )
+
+        result = engine.run()
+
+        save_summary = (
+            save_full_reconciliation_data(
+                run_id=run_record["run_id"],
+                receipt_rows=
+                    result["receipt_records"],
+                dispatch_rows=
+                    result["dispatch_records"],
+                master_rows=
+                    result["master_records"],
+                replace_existing=True,
+            )
+        )
+
+        master = result["master"]
+
+        balanced_records = int(
+            (
+                master["Master Status"]
+                == "BALANCED"
+            ).sum()
+        )
+        review_records = int(
+            (
+                master["Master Status"]
+                == "REVIEW REQUIRED"
+            ).sum()
+        )
+        missing_sfda_records = int(
+            (
+                master["Master Status"]
+                == "NOT IN SFDA"
+            ).sum()
+        )
+
+        complete_full_reconciliation_run(
+            run_id=run_record["run_id"],
+            receipt_events=
+                save_summary["receipt_events"],
+            dispatch_events=
+                save_summary[
+                    "dispatch_events"
+                ],
+            master_records=
+                save_summary["master_records"],
+            balanced_records=
+                balanced_records,
+            review_records=
+                review_records,
+            missing_sfda_records=
+                missing_sfda_records,
+        )
+
+        preview_columns = [
+            "BN",
+            "Expiry Month Key",
+            "GTIN",
+            "Drug Name",
+            "Total Received Packages",
+            "Total Dispatched Packages",
+            "Net Physical Packages",
+            "SFDA Active",
+            "Physical vs SFDA Active Variance",
+            "Master Status",
+        ]
+
+        preview = (
+            master[preview_columns]
+            .head(200)
+            .where(
+                pd.notna(
+                    master[
+                        preview_columns
+                    ].head(200)
+                ),
+                None,
+            )
+            .to_dict(orient="records")
+        )
+
+        return json_response({
+            "status": "Completed",
+            "mode": "full-reconciliation",
+            "version": APPLICATION_VERSION,
+            "run_id": run_record["run_id"],
+            "run_number":
+                run_record["run_number"],
+            "summary": {
+                "asn_files":
+                    len(asn_files),
+                "dispatch_files":
+                    len(dispatch_files),
+                "asn_input_rows":
+                    len(asn_dataframe),
+                "dispatch_input_rows":
+                    len(dispatch_dataframe),
+                "sfda_rows":
+                    len(sfda_dataframe),
+                "receipt_events":
+                    save_summary[
+                        "receipt_events"
+                    ],
+                "dispatch_events":
+                    save_summary[
+                        "dispatch_events"
+                    ],
+                "master_records":
+                    save_summary[
+                        "master_records"
+                    ],
+                "balanced_records":
+                    balanced_records,
+                "review_records":
+                    review_records,
+                "missing_sfda_records":
+                    missing_sfda_records,
+            },
+            "preview": preview,
+            "outputs": {
+                "batch_master":
+                    _full_excel_payload(
+                        result["master"],
+                        "Batch_Master.xlsx",
+                        "Batch Master",
+                    ),
+                "receipt_history":
+                    _full_excel_payload(
+                        result[
+                            "receipt_events"
+                        ],
+                        "Receipt_History.xlsx",
+                        "Receipt History",
+                    ),
+                "dispatch_history":
+                    _full_excel_payload(
+                        result[
+                            "dispatch_events"
+                        ],
+                        "Dispatch_History.xlsx",
+                        "Dispatch History",
+                    ),
+            },
+            "note": (
+                "No SFDA Accept or Dispatch upload "
+                "CSV files were generated."
+            ),
+        })
+
+    except Exception as ex:
+        logging.exception(
+            "Full reconciliation failed"
+        )
+
+        if run_record is not None:
+            try:
+                fail_full_reconciliation_run(
+                    run_id=
+                        run_record["run_id"],
+                    error_message=str(ex),
+                )
+            except Exception:
+                logging.exception(
+                    "Unable to mark the Full "
+                    "Reconciliation run as failed."
+                )
+
+        return json_response({
+            "status": "Failed",
+            "mode": "full-reconciliation",
+            "error": str(ex),
+            "error_type":
+                type(ex).__name__,
+            "trace": traceback.format_exc(),
+        }, 500)
+
+
+@app.route(
+    route="batch-master",
+    methods=["GET"],
+)
+def batch_master_api(
+    req: func.HttpRequest,
+) -> func.HttpResponse:
+    try:
+        limit = int(
+            req.params.get("limit")
+            or 500
+        )
+        status = (
+            req.params.get("status")
+            or None
+        )
+
+        rows = get_batch_master(
+            limit=limit,
+            status=status,
+        )
+
+        return json_response({
+            "status": "Completed",
+            "count": len(rows),
+            "rows": rows,
+        })
+
+    except Exception as ex:
+        return json_response({
+            "status": "Failed",
+            "error": str(ex),
+            "error_type":
+                type(ex).__name__,
+        }, 500)
 
 
 @app.route(
