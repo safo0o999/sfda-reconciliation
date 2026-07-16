@@ -230,54 +230,65 @@ class Calculator:
         )
 
     @staticmethod
-    def _summarize_dispatch_customers(
+    def _prepare_dispatch_rows(
         dispatch_df
     ):
+        """
+        Preserve every Full Dispatch transaction row.
 
-        dispatch = dispatch_df.copy()
+        Allocation happens at Sales Order / Order Line level.
+        Customer grouping is deferred until CSV export.
+        """
+        dispatch = Calculator._normalize_merge_keys(
+            dispatch_df
+        )
 
         dispatch["_Source Order"] = range(
             len(dispatch)
         )
 
-        dispatch = dispatch[
-            dispatch["Dispatched Quantity"] > 0
-        ].copy()
+        if "Dispatched Quantity" not in dispatch.columns:
+            dispatch["Dispatched Quantity"] = 0
 
-        grouped = (
-            dispatch
-            .groupby(
-                [
-                    "BN",
-                    "Expiry Date",
-                    "To Address"
-                ],
-                as_index=False,
-                dropna=False
-            )
-            .agg(
-                {
-                    "Dispatched Quantity": "sum",
-                    "_Source Order": "min",
-                    "Trade Item Number": "first",
-                    "Trade Name": "first"
-                }
-            )
-        )
+        dispatch["Dispatched Quantity"] = pd.to_numeric(
+            dispatch["Dispatched Quantity"],
+            errors="coerce"
+        ).fillna(0)
 
-        grouped["To Address"] = (
-            grouped["To Address"]
+        optional_columns = {
+            "To Address": Calculator.DUMMY_CUSTOMER,
+            "Sales Order Number": "",
+            "Order Line": "",
+            "Trade Item Number": "",
+            "Trade Name": "",
+            "Generic Item Number": "",
+            "Confirm Date": pd.NaT,
+            "Order Line Status": "",
+        }
+
+        for column, default in optional_columns.items():
+            if column not in dispatch.columns:
+                dispatch[column] = default
+
+        dispatch["To Address"] = (
+            dispatch["To Address"]
             .fillna("")
             .astype(str)
             .str.strip()
         )
 
-        grouped.loc[
-            grouped["To Address"] == "",
+        dispatch.loc[
+            dispatch["To Address"] == "",
             "To Address"
         ] = Calculator.DUMMY_CUSTOMER
 
-        return grouped
+        dispatch = dispatch[
+            dispatch["Dispatched Quantity"] > 0
+        ].copy()
+
+        return dispatch.reset_index(
+            drop=True
+        )
 
     @staticmethod
     def _allocate_dispatch_by_customer(
@@ -285,24 +296,18 @@ class Calculator:
         dispatch_df,
         gln_df
     ):
+        """
+        Allocate the batch target across original Full Dispatch rows.
 
+        Every Sales Order and Order Line remains available in the
+        allocation output. CSV customer grouping happens later.
+        """
         master = Calculator._normalize_merge_keys(
             master
         )
-        dispatch_df = Calculator._normalize_merge_keys(
+
+        dispatch_rows = Calculator._prepare_dispatch_rows(
             dispatch_df
-        )
-
-        customer_dispatch = (
-            Calculator._summarize_dispatch_customers(
-                dispatch_df
-            )
-        )
-
-        customer_dispatch = (
-            Calculator._normalize_merge_keys(
-                customer_dispatch
-            )
         )
 
         dispatch_targets = master[
@@ -320,41 +325,46 @@ class Calculator:
             ]
         ].copy()
 
-        customer_dispatch = (
-            customer_dispatch
-            .merge(
-                dispatch_targets,
-                on=Calculator.KEYS,
-                how="inner"
-            )
+        dispatch_targets = Calculator._normalize_merge_keys(
+            dispatch_targets
         )
 
-        customer_dispatch["PackageSize"] = (
+        transaction_dispatch = dispatch_rows.merge(
+            dispatch_targets,
+            on=Calculator.KEYS,
+            how="inner",
+            validate="many_to_one"
+        )
+
+        transaction_dispatch["PackageSize"] = (
             pd.to_numeric(
-                customer_dispatch["PackageSize"],
+                transaction_dispatch["PackageSize"],
                 errors="coerce"
             )
             .fillna(1)
         )
 
-        customer_dispatch.loc[
-            customer_dispatch["PackageSize"] <= 0,
+        transaction_dispatch.loc[
+            transaction_dispatch["PackageSize"] <= 0,
             "PackageSize"
         ] = 1
 
-        customer_dispatch[
+        transaction_dispatch[
             "Actual Dispatch Packages"
         ] = (
-            customer_dispatch[
-                "Dispatched Quantity"
-            ]
-            / customer_dispatch["PackageSize"]
+            pd.to_numeric(
+                transaction_dispatch[
+                    "Dispatched Quantity"
+                ],
+                errors="coerce"
+            ).fillna(0)
+            / transaction_dispatch["PackageSize"]
         )
 
-        customer_dispatch[
+        transaction_dispatch[
             "Actual Dispatch Packages"
         ] = (
-            customer_dispatch[
+            transaction_dispatch[
                 "Actual Dispatch Packages"
             ]
             .fillna(0)
@@ -362,14 +372,13 @@ class Calculator:
             .apply(int)
         )
 
-        customer_dispatch = (
-            customer_dispatch
+        transaction_dispatch = (
+            transaction_dispatch
             .sort_values(
                 by=[
                     "BN",
                     "Expiry Date",
-                    "_Source Order",
-                    "To Address"
+                    "_Source Order"
                 ],
                 kind="stable"
             )
@@ -382,28 +391,24 @@ class Calculator:
         for (
             batch_number,
             expiry_date
-        ), group in customer_dispatch.groupby(
+        ), group in transaction_dispatch.groupby(
             Calculator.KEYS,
             sort=False,
             dropna=False
         ):
-
             target_quantity = int(
                 group[
                     "Calculated To Be Dispatch"
                 ].iloc[0]
             )
 
-            remaining_quantity = (
-                target_quantity
-            )
+            remaining_quantity = target_quantity
 
             for _, row in group.iterrows():
-
                 if remaining_quantity <= 0:
                     break
 
-                actual_customer_quantity = int(
+                actual_row_quantity = int(
                     row[
                         "Actual Dispatch Packages"
                     ]
@@ -411,18 +416,16 @@ class Calculator:
 
                 allocated_quantity = min(
                     remaining_quantity,
-                    actual_customer_quantity
+                    actual_row_quantity
                 )
 
                 if allocated_quantity <= 0:
                     continue
 
                 allocated_row = row.to_dict()
-
                 allocated_row[
                     "Allocated To Be Dispatch"
                 ] = allocated_quantity
-
                 allocated_row[
                     "To Be Dispatch"
                 ] = allocated_quantity
@@ -431,14 +434,11 @@ class Calculator:
                     allocated_row
                 )
 
-                remaining_quantity -= (
-                    allocated_quantity
-                )
+                remaining_quantity -= allocated_quantity
 
             first_row = group.iloc[0]
 
             if remaining_quantity > 0:
-
                 variance_rows.append(
                     {
                         "GTIN": first_row["GTIN"],
@@ -466,30 +466,35 @@ class Calculator:
             allocated_rows
         )
 
+        allocated_columns = [
+            "GTIN",
+            "Drug Name",
+            "BN",
+            "Expiry Date",
+            "To Address",
+            "GLN",
+            "Customer Status",
+            "Sales Order Number",
+            "Order Line",
+            "Trade Item Number",
+            "Trade Name",
+            "Generic Item Number",
+            "Confirm Date",
+            "Order Line Status",
+            "Dispatched Quantity",
+            "PackageSize",
+            "Actual Dispatch Packages",
+            "Calculated To Be Dispatch",
+            "Allocated To Be Dispatch",
+            "To Be Dispatch",
+            "_Source Order",
+        ]
+
         if allocated.empty:
-
             allocated = pd.DataFrame(
-                columns=[
-                    "GTIN",
-                    "Drug Name",
-                    "BN",
-                    "Expiry Date",
-                    "To Address",
-                    "GLN",
-                    "Customer Status",
-                    "Trade Item Number",
-                    "Trade Name",
-                    "Dispatched Quantity",
-                    "PackageSize",
-                    "Actual Dispatch Packages",
-                    "Calculated To Be Dispatch",
-                    "Allocated To Be Dispatch",
-                    "To Be Dispatch"
-                ]
+                columns=allocated_columns
             )
-
         else:
-
             gln = Calculator._prepare_gln(
                 gln_df
             )
@@ -497,7 +502,8 @@ class Calculator:
             allocated = allocated.merge(
                 gln,
                 on="To Address",
-                how="left"
+                how="left",
+                validate="many_to_one"
             )
 
             allocated[
@@ -529,30 +535,19 @@ class Calculator:
                 "GLN"
             ] = Calculator.DUMMY_GLN
 
-            allocated.loc[
-                ~registered_mask,
-                "To Address"
-            ] = Calculator.DUMMY_CUSTOMER
-
-            allocated[
-                "Allocated To Be Dispatch"
-            ] = (
-                allocated[
-                    "Allocated To Be Dispatch"
-                ]
-                .fillna(0)
-                .astype(int)
-            )
-
-            allocated[
-                "To Be Dispatch"
-            ] = (
-                allocated[
-                    "To Be Dispatch"
-                ]
-                .fillna(0)
-                .astype(int)
-            )
+            for quantity_column in [
+                "Allocated To Be Dispatch",
+                "To Be Dispatch",
+                "Actual Dispatch Packages"
+            ]:
+                allocated[quantity_column] = (
+                    pd.to_numeric(
+                        allocated[quantity_column],
+                        errors="coerce"
+                    )
+                    .fillna(0)
+                    .astype(int)
+                )
 
             allocated = (
                 allocated
@@ -562,7 +557,8 @@ class Calculator:
                         "To Address",
                         "GTIN",
                         "BN",
-                        "Expiry Date"
+                        "Expiry Date",
+                        "_Source Order"
                     ],
                     kind="stable"
                 )
