@@ -41,7 +41,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "4.0.4"
+APPLICATION_VERSION = "4.0.5"
 
 REQUIRED_FILES = [
     "asn",
@@ -374,12 +374,27 @@ def _normalize_key_text(value):
 
 
 def _normalize_date_key(value):
+    """
+    Match expiry by year and month only.
+
+    WMS commonly reports the last day of the expiry month, while SFDA may
+    report another day in the same month. Full dates are still retained in
+    the generated reports and SFDA upload files.
+    """
     if pd.isna(value) or str(value).strip() == "":
         return ""
-    parsed = pd.to_datetime(value, errors="coerce", dayfirst=True)
+
+    parsed = pd.to_datetime(
+        value,
+        errors="coerce",
+        dayfirst=True,
+        format="mixed"
+    )
+
     if pd.isna(parsed):
         return _normalize_text(value)
-    return parsed.strftime("%Y-%m-%d")
+
+    return parsed.strftime("%Y-%m")
 
 
 def _prepare_asn_transactions(asn_df):
