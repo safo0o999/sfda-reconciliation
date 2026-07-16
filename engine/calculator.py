@@ -195,14 +195,26 @@ class Calculator:
             dispatch_evidence=row["Dispatch"]
         )
 
+        dispatch_evidence = max(
+            0,
+            float(row["Dispatch"] or 0)
+        )
+
+        active_quantity = max(
+            0,
+            float(row["Active"] or 0)
+        )
+
         return pd.Series({
             "To Be Accept": to_be_accept,
             "Dispatch Gap": dispatch_gap,
-            "Calculated To Be Dispatch": calculated_to_be_dispatch,
+            "Calculated To Be Dispatch":
+                calculated_to_be_dispatch,
             "Unexplained Dispatch Variance": max(
                 0,
-                dispatch_gap - calculated_to_be_dispatch
-            )
+                active_quantity
+                - calculated_to_be_dispatch
+            ) if dispatch_evidence > 0 else 0
         })
 
     @staticmethod
