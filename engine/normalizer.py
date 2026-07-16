@@ -14,6 +14,7 @@ class Normalizer:
             match = normalized.get(
                 str(candidate).strip().lower()
             )
+
             if match is not None:
                 return match
 
@@ -65,57 +66,86 @@ class Normalizer:
 
         return result
 
-       @staticmethod
-    def date(series):
+    @staticmethod
+    def _safe_datetime(series):
+        """
+        Convert mixed Excel/text datetime values safely.
 
-        value = (
-            series.fillna("")
+        Dates outside pandas datetime64[ns] range, including common
+        sentinel dates such as 9999-12-30, are converted to NaT.
+        The returned dtype is always datetime64[ns] so all dataframe
+        merge keys use the same datetime precision.
+        """
+        cleaned = series.copy()
+
+        text_values = (
+            cleaned.fillna("")
             .astype(str)
             .str.strip()
         )
 
-        value = value.replace(
-            {
-                "9999-12-30": "",
-                "9999-12-31": "",
-                "31/12/9999": "",
-                "30/12/9999": "",
-            }
+        invalid_date_mask = (
+            text_values.str.match(
+                r"^9999[-/]",
+                na=False
+            )
+            | text_values.str.contains(
+                r"[-/]9999(?:\s|$)",
+                regex=True,
+                na=False
+            )
+            | text_values.isin(
+                {
+                    "9999-12-30",
+                    "9999-12-31",
+                    "30/12/9999",
+                    "31/12/9999",
+                    "9999/12/30",
+                    "9999/12/31",
+                }
+            )
+        )
+
+        cleaned = cleaned.mask(
+            invalid_date_mask,
+            None
         )
 
         result = pd.to_datetime(
-            value,
+            cleaned,
             errors="coerce",
-            dayfirst=True
+            dayfirst=True,
+            format="mixed"
         )
 
-        max_supported = pd.Timestamp(
-            "2262-04-11"
-        )
+        # pandas may parse large years using microsecond precision.
+        # Remove anything outside datetime64[ns] before enforcing ns dtype.
+        max_supported = pd.Timestamp.max
+        min_supported = pd.Timestamp.min
 
-        result = result.where(
-            result <= max_supported,
+        result = result.mask(
+            (result > max_supported)
+            | (result < min_supported),
             pd.NaT
         )
 
-        return result.dt.normalize()
-
-    @staticmethod
-    def datetime(series):
-
-        return pd.to_datetime(
-            series,
-            errors="coerce",
-            dayfirst=True
+        return result.astype(
+            "datetime64[ns]"
         )
-    @staticmethod
 
+    @staticmethod
+    def date(series):
+
+        return (
+            Normalizer._safe_datetime(series)
+            .dt.normalize()
+        )
+
+    @staticmethod
     def datetime(series):
 
-        return pd.to_datetime(
-            series,
-            errors="coerce",
-            dayfirst=True
+        return Normalizer._safe_datetime(
+            series
         )
 
     @staticmethod
