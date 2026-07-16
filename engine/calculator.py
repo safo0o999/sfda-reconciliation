@@ -8,7 +8,7 @@ class Calculator:
 
     KEYS = [
         "BN",
-        "Expiry Date"
+        "_EXPIRY_MONTH_KEY"
     ]
 
     DUMMY_CUSTOMER = "DUMMY CUSTOMER"
@@ -17,11 +17,13 @@ class Calculator:
     @staticmethod
     def _normalize_merge_keys(dataframe):
         """
-        Normalize BN + Expiry Date before every groupby/merge.
+        Normalize reconciliation matching keys.
 
-        This prevents pandas merge failures when one source contains
-        object/string dates and another contains datetime64[us] or
-        datetime64[ns] dates.
+        Matching uses:
+            BN + Expiry Year/Month
+
+        The complete Expiry Date remains unchanged for reports and the
+        SFDA upload CSV. Only the internal matching key ignores the day.
         """
         if dataframe is None:
             return pd.DataFrame(
@@ -53,10 +55,17 @@ class Calculator:
             pd.to_datetime(
                 result["Expiry Date"],
                 errors="coerce",
-                dayfirst=True
+                dayfirst=True,
+                format="mixed"
             )
             .dt.normalize()
             .astype("datetime64[ns]")
+        )
+
+        result["_EXPIRY_MONTH_KEY"] = (
+            result["Expiry Date"]
+            .dt.strftime("%Y-%m")
+            .fillna("")
         )
 
         return result
@@ -298,6 +307,16 @@ class Calculator:
             dispatch["Dispatched Quantity"] > 0
         ].copy()
 
+        # Preserve the WMS date for diagnostics and Dispatch Details.
+        # The merged Expiry Date will come from the SFDA master.
+        dispatch["WMS Expiry Date"] = (
+            dispatch["Expiry Date"]
+        )
+
+        dispatch = dispatch.drop(
+            columns=["Expiry Date"]
+        )
+
         return dispatch.reset_index(
             drop=True
         )
@@ -402,7 +421,7 @@ class Calculator:
 
         for (
             batch_number,
-            expiry_date
+            expiry_month_key
         ), group in transaction_dispatch.groupby(
             Calculator.KEYS,
             sort=False,
@@ -457,7 +476,10 @@ class Calculator:
                         "Drug Name":
                             first_row["Drug Name"],
                         "BN": batch_number,
-                        "Expiry Date": expiry_date,
+                        "Expiry Date":
+                            first_row["Expiry Date"],
+                        "Expiry Match Month":
+                            expiry_month_key,
                         "To Address": "N/A",
                         "GLN": "N/A",
                         "Customer Status":
