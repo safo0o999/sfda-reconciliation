@@ -17,6 +17,28 @@ class BusinessRules:
 
     @staticmethod
     def to_be_dispatch(inventory, active, dispatch_evidence):
-        dispatch_evidence = max(0, float(dispatch_evidence or 0))
-        gap = BusinessRules.dispatch_gap(inventory, active)
-        return floor(min(gap, dispatch_evidence))
+        """
+        Calculate the quantity that can be uploaded to SFDA as Dispatch.
+
+        Full Dispatch is the physical dispatch evidence. Inventory is not
+        used to cap the upload quantity because its snapshot timing may be
+        earlier than picking, staging, or dispatch confirmation.
+
+        The upload quantity is capped only by:
+        1. the current SFDA Active quantity; and
+        2. the actual Full Dispatch quantity converted to packages.
+
+        Inventory remains available separately for variance analysis.
+        """
+        active = max(0, float(active or 0))
+        dispatch_evidence = max(
+            0,
+            float(dispatch_evidence or 0)
+        )
+
+        return floor(
+            min(
+                active,
+                dispatch_evidence
+            )
+        )
