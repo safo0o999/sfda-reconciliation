@@ -65,39 +65,51 @@ class Normalizer:
 
         return result
 
+       @staticmethod
+    def date(series):
+
+        value = (
+            series.fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+        value = value.replace(
+            {
+                "9999-12-30": "",
+                "9999-12-31": "",
+                "31/12/9999": "",
+                "30/12/9999": "",
+            }
+        )
+
+        result = pd.to_datetime(
+            value,
+            errors="coerce",
+            dayfirst=True
+        )
+
+        max_supported = pd.Timestamp(
+            "2262-04-11"
+        )
+
+        result = result.where(
+            result <= max_supported,
+            pd.NaT
+        )
+
+        return result.dt.normalize()
+
     @staticmethod
-def date(series):
+    def datetime(series):
 
-    value = (
-        series.fillna("")
-        .astype(str)
-        .str.strip()
-    )
-
-    value = value.replace(
-        {
-            "9999-12-30": "",
-            "9999-12-31": "",
-            "31/12/9999": "",
-            "30/12/9999": "",
-        }
-    )
-
-    result = pd.to_datetime(
-        value,
-        errors="coerce",
-        dayfirst=True
-    )
-
-    max_supported = pd.Timestamp("2262-04-11")
-
-    result = result.where(
-        result <= max_supported,
-        pd.NaT
-    )
-
-    return result.dt.normalize()
+        return pd.to_datetime(
+            series,
+            errors="coerce",
+            dayfirst=True
+        )
     @staticmethod
+
     def datetime(series):
 
         return pd.to_datetime(
