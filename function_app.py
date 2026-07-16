@@ -41,7 +41,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "4.0.0"
+APPLICATION_VERSION = "4.0.3"
 
 REQUIRED_FILES = [
     "asn",
@@ -703,11 +703,10 @@ def build_dispatch_details(
     dispatch_output,
 ):
     """
-    Build Dispatch_Details.xlsx as an operational view of Full Dispatch.
+    Build Dispatch_Details.xlsx from original Full Dispatch rows.
 
-    Full Dispatch remains the transaction source of truth.
-    This function does not rebuild transactions, perform fallback matching,
-    redistribute quantities, or recalculate the dispatch allocation.
+    The allocated quantity is linked to the same Sales Order and
+    Order Line that produced the evidence.
     """
 
     output_columns = [
@@ -731,7 +730,9 @@ def build_dispatch_details(
 
     def build_empty_output():
         return Exporter.build_formatted_excel_file(
-            df=pd.DataFrame(columns=output_columns),
+            df=pd.DataFrame(
+                columns=output_columns
+            ),
             file_name="Dispatch_Details.xlsx",
             sheet_name="Dispatch Details",
             title="SFDA Dispatch Details",
@@ -787,48 +788,44 @@ def build_dispatch_details(
 
         return allocated[column].copy()
 
-    # ---------------------------------------------------------
-    # Full Dispatch transaction fields
-    # ---------------------------------------------------------
     source["_BN_VALUE"] = source_column([
         "BN",
         "Batch/Lot",
         "Batch Number",
         "Lot No/Batch",
     ])
-
     source["_EXPIRY_VALUE"] = source_column([
         "Expiry Date",
         "Best Before Date",
         "Expiration Date",
     ])
-
     source["_GENERIC_ITEM_VALUE"] = source_column([
         "Generic Item Number",
         "Item Number",
         "Generic Number",
     ])
-
     source["_TRADE_ITEM_VALUE"] = source_column([
         "Trade Item Number",
         "Trade Item",
         "Trade Number",
     ])
-
     source["_TRADE_DESCRIPTION_VALUE"] = source_column([
         "Trade Description",
         "Trade Name",
         "Trade Item Description",
         "Description",
     ])
-
     source["_SALES_ORDER_VALUE"] = source_column([
         "Sales Order Number",
         "Order Number",
         "Sales Order",
         "SO Number",
     ])
-
+    source["_ORDER_LINE_VALUE"] = source_column([
+        "Order Line",
+        "order line",
+        "Sales Order Line",
+    ])
     source["_PICK_QTY_VALUE"] = source_column(
         [
             "Pick Qty",
@@ -837,26 +834,22 @@ def build_dispatch_details(
         ],
         default=0,
     )
-
     source["_QU_VALUE"] = source_column([
         "QU",
         "Quantity Unit",
         "Unit",
         "UOM",
     ])
-
     source["_CONFIRM_DATE_VALUE"] = source_column([
         "Confirm Date",
         "Confirmation Date",
         "Dispatch Confirm Date",
         "Dispatched Date",
     ])
-
     source["_TO_ADDRESS_VALUE"] = source_column([
         "To Address",
         "Customer Name",
     ])
-
     source["_ORDER_LINE_STATUS_VALUE"] = source_column([
         "Order Line Status",
         "Line Status",
@@ -865,61 +858,57 @@ def build_dispatch_details(
 
     source["_BN_KEY"] = source[
         "_BN_VALUE"
-    ].map(
-        _normalize_key_text
-    )
-
+    ].map(_normalize_key_text)
     source["_EXPIRY_KEY"] = source[
         "_EXPIRY_VALUE"
-    ].map(
-        _normalize_date_key
-    )
-
+    ].map(_normalize_date_key)
     source["_CUSTOMER_KEY"] = source[
         "_TO_ADDRESS_VALUE"
-    ].map(
-        _normalize_key_text
-    )
+    ].map(_normalize_key_text)
+    source["_SALES_ORDER_KEY"] = source[
+        "_SALES_ORDER_VALUE"
+    ].map(_normalize_key_text)
+    source["_ORDER_LINE_KEY"] = source[
+        "_ORDER_LINE_VALUE"
+    ].map(_normalize_key_text)
 
-    # ---------------------------------------------------------
-    # Existing dispatch_output fields
-    # ---------------------------------------------------------
     allocated["_BN_VALUE"] = allocated_column([
         "BN",
         "Batch/Lot",
         "Batch Number",
         "Lot No/Batch",
     ])
-
     allocated["_EXPIRY_VALUE"] = allocated_column([
         "Expiry Date",
         "Best Before Date",
         "Expiration Date",
     ])
-
     allocated["_TO_ADDRESS_VALUE"] = allocated_column([
+        "Original To Address",
         "To Address",
         "Customer Name",
     ])
-
+    allocated["_SALES_ORDER_VALUE"] = allocated_column([
+        "Sales Order Number",
+        "Order Number",
+        "Sales Order",
+        "SO Number",
+    ])
+    allocated["_ORDER_LINE_VALUE"] = allocated_column([
+        "Order Line",
+        "order line",
+        "Sales Order Line",
+    ])
     allocated["_GTIN_VALUE"] = allocated_column([
         "GTIN",
     ])
-
     allocated["_GLN_VALUE"] = allocated_column([
         "GLN",
     ])
-
     allocated["_CUSTOMER_STATUS_VALUE"] = allocated_column([
         "Customer Status",
         "Custody",
     ])
-
-    allocated["_DRUG_NAME_VALUE"] = allocated_column([
-        "Drug Name",
-        "Trade Name",
-    ])
-
     allocated["_PACKAGE_SIZE_VALUE"] = allocated_column(
         [
             "PackageSize",
@@ -933,14 +922,13 @@ def build_dispatch_details(
         allocated,
         [
             "Allocated To Be Dispatch",
-            "Calculated To Be Dispatch",
             "To Be Dispatch",
         ],
     )
 
     if quantity_column is None:
         raise ValueError(
-            "dispatch_output does not contain the existing "
+            "dispatch_output does not contain a row-level "
             "dispatch allocation quantity column."
         )
 
@@ -958,71 +946,31 @@ def build_dispatch_details(
 
     allocated["_BN_KEY"] = allocated[
         "_BN_VALUE"
-    ].map(
-        _normalize_key_text
-    )
-
+    ].map(_normalize_key_text)
     allocated["_EXPIRY_KEY"] = allocated[
         "_EXPIRY_VALUE"
-    ].map(
-        _normalize_date_key
-    )
-
+    ].map(_normalize_date_key)
     allocated["_CUSTOMER_KEY"] = allocated[
         "_TO_ADDRESS_VALUE"
-    ].map(
-        _normalize_key_text
-    )
+    ].map(_normalize_key_text)
+    allocated["_SALES_ORDER_KEY"] = allocated[
+        "_SALES_ORDER_VALUE"
+    ].map(_normalize_key_text)
+    allocated["_ORDER_LINE_KEY"] = allocated[
+        "_ORDER_LINE_VALUE"
+    ].map(_normalize_key_text)
 
-    # ---------------------------------------------------------
-    # Keep Full Dispatch rows only when BN + Expiry exist in
-    # dispatch_output. No transaction reconstruction is performed.
-    # ---------------------------------------------------------
-    dispatch_batch_keys = (
-        allocated[
-            [
-                "_BN_KEY",
-                "_EXPIRY_KEY",
-            ]
-        ]
-        .drop_duplicates()
-        .copy()
-    )
+    transaction_keys = [
+        "_BN_KEY",
+        "_EXPIRY_KEY",
+        "_CUSTOMER_KEY",
+        "_SALES_ORDER_KEY",
+        "_ORDER_LINE_KEY",
+    ]
 
-    source = source.merge(
-        dispatch_batch_keys.assign(
-            _IN_DISPATCH_OUTPUT=True
-        ),
-        on=[
-            "_BN_KEY",
-            "_EXPIRY_KEY",
-        ],
-        how="left",
-        sort=False,
-        validate="many_to_one",
-    )
-
-    source = source[
-        source["_IN_DISPATCH_OUTPUT"].fillna(False)
-    ].copy()
-
-    if source.empty:
-        return build_empty_output()
-
-    # ---------------------------------------------------------
-    # Build a direct enrichment lookup from the already calculated
-    # dispatch allocation.
-    #
-    # This is a direct BN + Expiry + To Address join only.
-    # There is no fallback customer matching and no redistribution.
-    # ---------------------------------------------------------
     allocation_lookup = (
         allocated.groupby(
-            [
-                "_BN_KEY",
-                "_EXPIRY_KEY",
-                "_CUSTOMER_KEY",
-            ],
+            transaction_keys,
             as_index=False,
             sort=False,
             dropna=False,
@@ -1031,7 +979,6 @@ def build_dispatch_details(
             "_GTIN_VALUE": _join_unique,
             "_GLN_VALUE": _join_unique,
             "_CUSTOMER_STATUS_VALUE": _join_unique,
-            "_DRUG_NAME_VALUE": _join_unique,
             "_PACKAGE_SIZE_VALUE": "first",
             "_ALLOC_QTY": "sum",
         })
@@ -1039,12 +986,8 @@ def build_dispatch_details(
 
     source = source.merge(
         allocation_lookup,
-        on=[
-            "_BN_KEY",
-            "_EXPIRY_KEY",
-            "_CUSTOMER_KEY",
-        ],
-        how="left",
+        on=transaction_keys,
+        how="inner",
         sort=False,
         validate="many_to_one",
     )
@@ -1054,9 +997,6 @@ def build_dispatch_details(
         kind="stable",
     ).reset_index(drop=True)
 
-    # ---------------------------------------------------------
-    # Qty / Pack
-    # ---------------------------------------------------------
     numeric_pick_qty = pd.to_numeric(
         source["_PICK_QTY_VALUE"],
         errors="coerce",
@@ -1085,45 +1025,6 @@ def build_dispatch_details(
         ]
     )
 
-    # ---------------------------------------------------------
-    # Preserve the locked allocation total.
-    #
-    # If Full Dispatch contains multiple rows for the same
-    # BN + Expiry + To Address, the existing allocation is shown
-    # once on the first original row so it is not duplicated.
-    # No allocation quantity is recalculated or redistributed.
-    # ---------------------------------------------------------
-    source["_ALLOCATION_ROW_NUMBER"] = (
-        source.groupby(
-            [
-                "_BN_KEY",
-                "_EXPIRY_KEY",
-                "_CUSTOMER_KEY",
-            ],
-            sort=False,
-            dropna=False,
-        )
-        .cumcount()
-    )
-
-    source["_TO_BE_DISPATCH_VALUE"] = 0.0
-
-    allocation_first_row = (
-        source["_ALLOCATION_ROW_NUMBER"].eq(0)
-        & source["_ALLOC_QTY"].notna()
-    )
-
-    source.loc[
-        allocation_first_row,
-        "_TO_BE_DISPATCH_VALUE",
-    ] = source.loc[
-        allocation_first_row,
-        "_ALLOC_QTY",
-    ]
-
-    # ---------------------------------------------------------
-    # Final operational output
-    # ---------------------------------------------------------
     run_date = pd.Timestamp.now().normalize()
 
     details = pd.DataFrame({
@@ -1173,9 +1074,10 @@ def build_dispatch_details(
         "Order Line Status": source[
             "_ORDER_LINE_STATUS_VALUE"
         ],
-        "To Be Dispatch": source[
-            "_TO_BE_DISPATCH_VALUE"
-        ],
+        "To Be Dispatch": pd.to_numeric(
+            source["_ALLOC_QTY"],
+            errors="coerce",
+        ).fillna(0).astype(int),
     })
 
     return Exporter.build_formatted_excel_file(
