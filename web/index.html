@@ -673,30 +673,56 @@
             </div>
           </div>
 
-          <div class="form-grid">
-            <div>
-              <label for="fullAsnFiles">Historical ASN Files</label>
-              <input class="control" id="fullAsnFiles" name="asn_files" type="file" accept=".xls,.xlsx" multiple required>
-              <div class="file-info" id="fullAsnMeta">No files selected</div>
+          <div class="grid">
+            <div class="file-card">
+              <div class="file-card-top">
+                <div>
+                  <div class="file-title">① Historical ASN Files</div>
+                  <div class="card-subtitle" style="margin-top:5px">Select all ASN receipt files from the historical cutover date until today.</div>
+                </div>
+                <span class="badge info">Multiple</span>
+              </div>
+              <div class="file-row">
+                <input id="fullAsnFiles" name="asn_files" type="file" accept=".xls,.xlsx" multiple required>
+              </div>
+              <div class="file-meta" id="fullAsnMeta">No files selected</div>
             </div>
 
-            <div>
-              <label for="fullDispatchFiles">Historical Full Dispatch Files</label>
-              <input class="control" id="fullDispatchFiles" name="dispatch_files" type="file" accept=".xls,.xlsx" multiple required>
-              <div class="file-info" id="fullDispatchMeta">No files selected</div>
+            <div class="file-card">
+              <div class="file-card-top">
+                <div>
+                  <div class="file-title">② Historical Full Dispatch Files</div>
+                  <div class="card-subtitle" style="margin-top:5px">Select all Full Dispatch reports covering the same historical period.</div>
+                </div>
+                <span class="badge info">Multiple</span>
+              </div>
+              <div class="file-row">
+                <input id="fullDispatchFiles" name="dispatch_files" type="file" accept=".xls,.xlsx" multiple required>
+              </div>
+              <div class="file-meta" id="fullDispatchMeta">No files selected</div>
             </div>
 
-            <div>
-              <label for="fullSfdaFile">Latest SFDA Drug Count</label>
-              <input class="control" id="fullSfdaFile" name="sfda" type="file" accept=".xls,.xlsx" required>
-              <div class="file-info" id="fullSfdaMeta">No file selected</div>
+            <div class="file-card">
+              <div class="file-card-top">
+                <div>
+                  <div class="file-title">③ Latest SFDA Drug Count</div>
+                  <div class="card-subtitle" style="margin-top:5px">Upload the latest SFDA snapshot used to compare the historical physical movements.</div>
+                </div>
+                <span class="badge success">Required</span>
+              </div>
+              <div class="file-row">
+                <input id="fullSfdaFile" name="sfda" type="file" accept=".xls,.xlsx" required>
+              </div>
+              <div class="file-meta" id="fullSfdaMeta">No file selected</div>
             </div>
+          </div>
 
+          <div class="card run-panel" style="margin-top:16px;box-shadow:none">
             <div>
-              <label>Database Operation</label>
-              <input class="control" value="Replace / rebuild current Batch Master" disabled>
-              <div class="file-info">Existing Full Reconciliation master data is replaced only after calculations succeed.</div>
+              <div class="run-title">Database Operation</div>
+              <div class="run-sub">Replace and rebuild the current Batch Master only after all calculations complete successfully.</div>
             </div>
+            <span class="badge warning">Replace Current Master</span>
           </div>
 
           <button class="btn btn-purple" id="fullRunButton" type="submit" disabled style="margin-top:16px;width:100%">
@@ -999,14 +1025,17 @@
     $("fullAsnMeta").textContent=asnCount
       ? `✓ ${asnCount} ASN files selected`
       : "No files selected";
+    $("fullAsnMeta").classList.toggle("ready",Boolean(asnCount));
 
     $("fullDispatchMeta").textContent=dispatchCount
       ? `✓ ${dispatchCount} Full Dispatch files selected`
       : "No files selected";
+    $("fullDispatchMeta").classList.toggle("ready",Boolean(dispatchCount));
 
     $("fullSfdaMeta").textContent=sfdaFile
       ? `✓ ${sfdaFile.name} · ${(sfdaFile.size/1024/1024).toFixed(2)} MB`
       : "No file selected";
+    $("fullSfdaMeta").classList.toggle("ready",Boolean(sfdaFile));
 
     $("fullRunButton").disabled=!(
       asnCount
