@@ -1575,3 +1575,620 @@ def record_verification_results(
     )
 
     return len(rows)
+
+# =====================================================================
+# Full Reconciliation / Historical Batch Master
+# =====================================================================
+
+def initialize_full_reconciliation_database() -> None:
+    database = Database()
+
+    database.execute(
+        """
+        IF OBJECT_ID(
+            N'dbo.FullReconciliationRuns',
+            N'U'
+        ) IS NULL
+        BEGIN
+            CREATE TABLE dbo.FullReconciliationRuns
+            (
+                FullRunID BIGINT IDENTITY(1,1)
+                    NOT NULL
+                    CONSTRAINT PK_FullReconciliationRuns
+                    PRIMARY KEY,
+                RunNumber NVARCHAR(60) NOT NULL,
+                SubmittedBy NVARCHAR(200) NULL,
+                ApplicationVersion NVARCHAR(30) NULL,
+                Status NVARCHAR(50) NOT NULL,
+                ASNFiles INT NOT NULL DEFAULT 0,
+                DispatchFiles INT NOT NULL DEFAULT 0,
+                SFDARows BIGINT NOT NULL DEFAULT 0,
+                ReceiptEvents BIGINT NOT NULL DEFAULT 0,
+                DispatchEvents BIGINT NOT NULL DEFAULT 0,
+                MasterRecords BIGINT NOT NULL DEFAULT 0,
+                BalancedRecords BIGINT NOT NULL DEFAULT 0,
+                ReviewRecords BIGINT NOT NULL DEFAULT 0,
+                MissingSFDARecords BIGINT NOT NULL DEFAULT 0,
+                ErrorMessage NVARCHAR(MAX) NULL,
+                StartedAt DATETIME2(3) NOT NULL
+                    DEFAULT SYSUTCDATETIME(),
+                CompletedAt DATETIME2(3) NULL,
+                CONSTRAINT UQ_FullReconciliationRuns_RunNumber
+                    UNIQUE (RunNumber)
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF OBJECT_ID(
+            N'dbo.FullReceiptEvents',
+            N'U'
+        ) IS NULL
+        BEGIN
+            CREATE TABLE dbo.FullReceiptEvents
+            (
+                ReceiptEventID BIGINT IDENTITY(1,1)
+                    NOT NULL
+                    CONSTRAINT PK_FullReceiptEvents
+                    PRIMARY KEY,
+                FullRunID BIGINT NOT NULL,
+                EventKey NVARCHAR(64) NOT NULL,
+                BN NVARCHAR(200) NOT NULL,
+                ExpiryMonthKey CHAR(7) NOT NULL,
+                WMSExpiryDate DATE NULL,
+                EventDate DATE NULL,
+                SourceFile NVARCHAR(500) NULL,
+                SupplierName NVARCHAR(500) NULL,
+                SupplierCode NVARCHAR(200) NULL,
+                PONumber NVARCHAR(200) NULL,
+                InvoiceNumber NVARCHAR(200) NULL,
+                InboundShipment NVARCHAR(200) NULL,
+                TradeName NVARCHAR(500) NULL,
+                GenericItemNumber NVARCHAR(200) NULL,
+                TradeItemNumber NVARCHAR(200) NULL,
+                PackageSize DECIMAL(19,4) NOT NULL DEFAULT 1,
+                QuantityUnits DECIMAL(19,4) NOT NULL DEFAULT 0,
+                QuantityPackages DECIMAL(19,4) NOT NULL DEFAULT 0,
+                CreatedAt DATETIME2(3) NOT NULL
+                    DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT FK_FullReceiptEvents_Run
+                    FOREIGN KEY (FullRunID)
+                    REFERENCES dbo.FullReconciliationRuns(
+                        FullRunID
+                    )
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF OBJECT_ID(
+            N'dbo.FullDispatchEvents',
+            N'U'
+        ) IS NULL
+        BEGIN
+            CREATE TABLE dbo.FullDispatchEvents
+            (
+                DispatchEventID BIGINT IDENTITY(1,1)
+                    NOT NULL
+                    CONSTRAINT PK_FullDispatchEvents
+                    PRIMARY KEY,
+                FullRunID BIGINT NOT NULL,
+                EventKey NVARCHAR(64) NOT NULL,
+                BN NVARCHAR(200) NOT NULL,
+                ExpiryMonthKey CHAR(7) NOT NULL,
+                WMSExpiryDate DATE NULL,
+                EventDate DATE NULL,
+                SourceFile NVARCHAR(500) NULL,
+                CustomerName NVARCHAR(500) NULL,
+                SalesOrderNumber NVARCHAR(200) NULL,
+                OrderLine NVARCHAR(100) NULL,
+                TradeName NVARCHAR(500) NULL,
+                GenericItemNumber NVARCHAR(200) NULL,
+                TradeItemNumber NVARCHAR(200) NULL,
+                PackageSize DECIMAL(19,4) NOT NULL DEFAULT 1,
+                QuantityUnits DECIMAL(19,4) NOT NULL DEFAULT 0,
+                QuantityPackages DECIMAL(19,4) NOT NULL DEFAULT 0,
+                CreatedAt DATETIME2(3) NOT NULL
+                    DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT FK_FullDispatchEvents_Run
+                    FOREIGN KEY (FullRunID)
+                    REFERENCES dbo.FullReconciliationRuns(
+                        FullRunID
+                    )
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF OBJECT_ID(
+            N'dbo.BatchMaster',
+            N'U'
+        ) IS NULL
+        BEGIN
+            CREATE TABLE dbo.BatchMaster
+            (
+                BatchMasterID BIGINT IDENTITY(1,1)
+                    NOT NULL
+                    CONSTRAINT PK_BatchMaster
+                    PRIMARY KEY,
+                FullRunID BIGINT NOT NULL,
+                BN NVARCHAR(200) NOT NULL,
+                ExpiryMonthKey CHAR(7) NOT NULL,
+                GTIN NVARCHAR(100) NULL,
+                DrugName NVARCHAR(500) NULL,
+                GenericItemNumber NVARCHAR(200) NULL,
+                TradeItemNumber NVARCHAR(200) NULL,
+                PackageSize DECIMAL(19,4) NOT NULL DEFAULT 1,
+                WMSReceiptExpiryDate DATE NULL,
+                WMSDispatchExpiryDate DATE NULL,
+                SFDAExpiryDate DATE NULL,
+                FirstReceiptDate DATE NULL,
+                LastReceiptDate DATE NULL,
+                FirstDispatchDate DATE NULL,
+                LastDispatchDate DATE NULL,
+                TotalReceivedUnits DECIMAL(19,4)
+                    NOT NULL DEFAULT 0,
+                TotalReceivedPackages DECIMAL(19,4)
+                    NOT NULL DEFAULT 0,
+                TotalDispatchedUnits DECIMAL(19,4)
+                    NOT NULL DEFAULT 0,
+                TotalDispatchedPackages DECIMAL(19,4)
+                    NOT NULL DEFAULT 0,
+                NetPhysicalPackages DECIMAL(19,4)
+                    NOT NULL DEFAULT 0,
+                SFDAQuantity DECIMAL(19,4)
+                    NOT NULL DEFAULT 0,
+                SFDAActive DECIMAL(19,4)
+                    NOT NULL DEFAULT 0,
+                SFDAReceivePending DECIMAL(19,4)
+                    NOT NULL DEFAULT 0,
+                SFDASendPending DECIMAL(19,4)
+                    NOT NULL DEFAULT 0,
+                PhysicalActiveVariance DECIMAL(19,4)
+                    NOT NULL DEFAULT 0,
+                HistoricalReceiptUncovered DECIMAL(19,4)
+                    NOT NULL DEFAULT 0,
+                HistoricalDispatchUncovered DECIMAL(19,4)
+                    NOT NULL DEFAULT 0,
+                MasterStatus NVARCHAR(50) NOT NULL,
+                UpdatedAt DATETIME2(3) NOT NULL
+                    DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT FK_BatchMaster_Run
+                    FOREIGN KEY (FullRunID)
+                    REFERENCES dbo.FullReconciliationRuns(
+                        FullRunID
+                    ),
+                CONSTRAINT UQ_BatchMaster_BatchMonth
+                    UNIQUE (BN, ExpiryMonthKey)
+            );
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF NOT EXISTS
+        (
+            SELECT 1
+            FROM sys.indexes
+            WHERE name =
+                N'IX_BatchMaster_Status'
+              AND object_id =
+                OBJECT_ID(N'dbo.BatchMaster')
+        )
+        BEGIN
+            CREATE INDEX IX_BatchMaster_Status
+            ON dbo.BatchMaster
+            (
+                MasterStatus,
+                ExpiryMonthKey,
+                BN
+            );
+        END;
+        """
+    )
+
+
+def _generate_full_run_number() -> str:
+    now = datetime.now(timezone.utc)
+    return now.strftime(
+        "FULL-%Y%m%d-%H%M%S-%f"
+    )[:-3]
+
+
+def create_full_reconciliation_run(
+    submitted_by: str = "Web User",
+    application_version: Optional[str] = None,
+    asn_files: int = 0,
+    dispatch_files: int = 0,
+    sfda_rows: int = 0,
+) -> Dict[str, Any]:
+    initialize_full_reconciliation_database()
+
+    database = Database()
+    run_number = _generate_full_run_number()
+
+    run_id = database.execute_scalar(
+        """
+        INSERT INTO dbo.FullReconciliationRuns
+        (
+            RunNumber,
+            SubmittedBy,
+            ApplicationVersion,
+            Status,
+            ASNFiles,
+            DispatchFiles,
+            SFDARows,
+            StartedAt
+        )
+        OUTPUT INSERTED.FullRunID
+        VALUES
+        (
+            %s, %s, %s, N'Processing',
+            %s, %s, %s, SYSUTCDATETIME()
+        );
+        """,
+        (
+            run_number,
+            submitted_by,
+            application_version,
+            int(asn_files),
+            int(dispatch_files),
+            int(sfda_rows),
+        ),
+    )
+
+    return {
+        "run_id": int(run_id),
+        "run_number": run_number,
+        "status": "Processing",
+    }
+
+
+def save_full_reconciliation_data(
+    run_id: int,
+    receipt_rows: List[Dict[str, Any]],
+    dispatch_rows: List[Dict[str, Any]],
+    master_rows: List[Dict[str, Any]],
+    replace_existing: bool = True,
+    batch_size: int = 2000,
+) -> Dict[str, int]:
+    database = Database()
+    connection = database.connect()
+
+    try:
+        cursor = connection.cursor()
+
+        if replace_existing:
+            cursor.execute(
+                "DELETE FROM dbo.BatchMaster;"
+            )
+            cursor.execute(
+                "DELETE FROM dbo.FullReceiptEvents;"
+            )
+            cursor.execute(
+                "DELETE FROM dbo.FullDispatchEvents;"
+            )
+
+        receipt_parameters = [
+            (
+                int(run_id),
+                row.get("Event Key"),
+                row.get("BN"),
+                row.get("Expiry Month Key"),
+                row.get("Expiry Date"),
+                row.get("Event Date"),
+                row.get("Source File"),
+                row.get("Supplier Name"),
+                row.get("Supplier Code"),
+                row.get("PO Number"),
+                row.get("Invoice Number"),
+                row.get("Inbound Shipment"),
+                row.get("Trade Name"),
+                row.get("Generic Item Number"),
+                row.get("Trade Item"),
+                float(row.get("PackageSize") or 1),
+                float(row.get("Received Quantity") or 0),
+                float(row.get("Quantity Packages") or 0),
+            )
+            for row in receipt_rows
+        ]
+
+        dispatch_parameters = [
+            (
+                int(run_id),
+                row.get("Event Key"),
+                row.get("BN"),
+                row.get("Expiry Month Key"),
+                row.get("Expiry Date"),
+                row.get("Event Date"),
+                row.get("Source File"),
+                row.get("To Address"),
+                row.get("Sales Order Number"),
+                row.get("Order Line"),
+                row.get("Trade Name"),
+                row.get("Generic Item Number"),
+                row.get("Trade Item Number"),
+                float(row.get("PackageSize") or 1),
+                float(row.get("Dispatched Quantity") or 0),
+                float(row.get("Quantity Packages") or 0),
+            )
+            for row in dispatch_rows
+        ]
+
+        master_parameters = [
+            (
+                int(run_id),
+                row.get("BN"),
+                row.get("Expiry Month Key"),
+                row.get("GTIN"),
+                row.get("Drug Name"),
+                row.get("Generic Item Number"),
+                row.get("Trade Item Number"),
+                float(row.get("PackageSize") or 1),
+                row.get("WMS Receipt Expiry Date"),
+                row.get("WMS Dispatch Expiry Date"),
+                row.get("SFDA Expiry Date"),
+                row.get("First Receipt Date"),
+                row.get("Last Receipt Date"),
+                row.get("First Dispatch Date"),
+                row.get("Last Dispatch Date"),
+                float(row.get("Total Received Units") or 0),
+                float(row.get("Total Received Packages") or 0),
+                float(row.get("Total Dispatched Units") or 0),
+                float(row.get("Total Dispatched Packages") or 0),
+                float(row.get("Net Physical Packages") or 0),
+                float(row.get("SFDA Quantity") or 0),
+                float(row.get("SFDA Active") or 0),
+                float(row.get("SFDA Receive Pending") or 0),
+                float(row.get("SFDA Send Pending") or 0),
+                float(
+                    row.get(
+                        "Physical vs SFDA Active Variance"
+                    )
+                    or 0
+                ),
+                float(
+                    row.get(
+                        "Historical Receipt Uncovered"
+                    )
+                    or 0
+                ),
+                float(
+                    row.get(
+                        "Historical Dispatch Uncovered"
+                    )
+                    or 0
+                ),
+                row.get("Master Status"),
+            )
+            for row in master_rows
+        ]
+
+        def insert_batches(sql: str, rows: List[tuple]):
+            for start in range(
+                0,
+                len(rows),
+                max(1, int(batch_size)),
+            ):
+                cursor.executemany(
+                    sql,
+                    rows[
+                        start:
+                        start + batch_size
+                    ],
+                )
+
+        insert_batches(
+            """
+            INSERT INTO dbo.FullReceiptEvents
+            (
+                FullRunID, EventKey, BN,
+                ExpiryMonthKey, WMSExpiryDate,
+                EventDate, SourceFile,
+                SupplierName, SupplierCode,
+                PONumber, InvoiceNumber,
+                InboundShipment, TradeName,
+                GenericItemNumber,
+                TradeItemNumber, PackageSize,
+                QuantityUnits, QuantityPackages
+            )
+            VALUES
+            (
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s
+            );
+            """,
+            receipt_parameters,
+        )
+
+        insert_batches(
+            """
+            INSERT INTO dbo.FullDispatchEvents
+            (
+                FullRunID, EventKey, BN,
+                ExpiryMonthKey, WMSExpiryDate,
+                EventDate, SourceFile,
+                CustomerName, SalesOrderNumber,
+                OrderLine, TradeName,
+                GenericItemNumber,
+                TradeItemNumber, PackageSize,
+                QuantityUnits, QuantityPackages
+            )
+            VALUES
+            (
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s
+            );
+            """,
+            dispatch_parameters,
+        )
+
+        insert_batches(
+            """
+            INSERT INTO dbo.BatchMaster
+            (
+                FullRunID, BN, ExpiryMonthKey,
+                GTIN, DrugName,
+                GenericItemNumber,
+                TradeItemNumber, PackageSize,
+                WMSReceiptExpiryDate,
+                WMSDispatchExpiryDate,
+                SFDAExpiryDate,
+                FirstReceiptDate,
+                LastReceiptDate,
+                FirstDispatchDate,
+                LastDispatchDate,
+                TotalReceivedUnits,
+                TotalReceivedPackages,
+                TotalDispatchedUnits,
+                TotalDispatchedPackages,
+                NetPhysicalPackages,
+                SFDAQuantity, SFDAActive,
+                SFDAReceivePending,
+                SFDASendPending,
+                PhysicalActiveVariance,
+                HistoricalReceiptUncovered,
+                HistoricalDispatchUncovered,
+                MasterStatus
+            )
+            VALUES
+            (
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s
+            );
+            """,
+            master_parameters,
+        )
+
+        connection.commit()
+
+        return {
+            "receipt_events":
+                len(receipt_parameters),
+            "dispatch_events":
+                len(dispatch_parameters),
+            "master_records":
+                len(master_parameters),
+        }
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
+
+
+def complete_full_reconciliation_run(
+    run_id: int,
+    receipt_events: int,
+    dispatch_events: int,
+    master_records: int,
+    balanced_records: int,
+    review_records: int,
+    missing_sfda_records: int,
+) -> None:
+    database = Database()
+
+    database.execute(
+        """
+        UPDATE dbo.FullReconciliationRuns
+        SET
+            ReceiptEvents = %s,
+            DispatchEvents = %s,
+            MasterRecords = %s,
+            BalancedRecords = %s,
+            ReviewRecords = %s,
+            MissingSFDARecords = %s,
+            Status = N'Completed',
+            ErrorMessage = NULL,
+            CompletedAt = SYSUTCDATETIME()
+        WHERE FullRunID = %s;
+        """,
+        (
+            int(receipt_events),
+            int(dispatch_events),
+            int(master_records),
+            int(balanced_records),
+            int(review_records),
+            int(missing_sfda_records),
+            int(run_id),
+        ),
+    )
+
+
+def fail_full_reconciliation_run(
+    run_id: int,
+    error_message: str,
+) -> None:
+    database = Database()
+
+    database.execute(
+        """
+        UPDATE dbo.FullReconciliationRuns
+        SET
+            Status = N'Failed',
+            ErrorMessage = %s,
+            CompletedAt = SYSUTCDATETIME()
+        WHERE FullRunID = %s;
+        """,
+        (
+            str(error_message)[:4000],
+            int(run_id),
+        ),
+    )
+
+
+def get_batch_master(
+    limit: int = 500,
+    status: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    initialize_full_reconciliation_database()
+
+    database = Database()
+    safe_limit = max(
+        1,
+        min(int(limit), 5000),
+    )
+
+    if status:
+        return database.fetch_all(
+            f"""
+            SELECT TOP ({safe_limit}) *
+            FROM dbo.BatchMaster
+            WHERE MasterStatus = %s
+            ORDER BY
+                ExpiryMonthKey,
+                BN;
+            """,
+            (status,),
+        )
+
+    return database.fetch_all(
+        f"""
+        SELECT TOP ({safe_limit}) *
+        FROM dbo.BatchMaster
+        ORDER BY
+            CASE MasterStatus
+                WHEN N'REVIEW REQUIRED'
+                    THEN 1
+                WHEN N'NOT IN SFDA'
+                    THEN 2
+                ELSE 3
+            END,
+            ExpiryMonthKey,
+            BN;
+        """
+    )
