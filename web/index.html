@@ -556,6 +556,21 @@
               <div class="file-card"><div class="file-title">③ SFDA Drug Count — Before Accept</div><div class="file-row"><input id="acceptSfda" name="sfda" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="acceptSfdaName">No file selected</div></div>
             </div>
             <button class="btn btn-success" id="acceptRunButton" type="submit" disabled style="margin-top:16px;width:100%">▶ Generate Accept Files</button>
+            <div class="card progress-card" id="acceptProgressCard" style="box-shadow:none">
+              <div class="progress-head">
+                <span id="acceptProgressLabel">Preparing Accept reconciliation...</span>
+                <span id="acceptProgressPercent">0%</span>
+              </div>
+              <div class="progress-track">
+                <div class="progress-bar" id="acceptProgressBar"></div>
+              </div>
+              <div class="progress-steps">
+                <div class="progress-step" id="acceptStepRead">○ Reading files</div>
+                <div class="progress-step" id="acceptStepValidate">○ Validating data</div>
+                <div class="progress-step" id="acceptStepCalculate">○ Calculating Accept</div>
+                <div class="progress-step" id="acceptStepGenerate">○ Generating outputs</div>
+              </div>
+            </div>
           </form>
 
           <form id="dispatchForm" class="card" style="padding:20px">
@@ -567,22 +582,26 @@
               <div class="file-card"><div class="file-title">③ Updated SFDA Drug Count — After Accept</div><div class="file-row"><input id="dispatchSfda" name="sfda" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="dispatchSfdaName">No file selected</div></div>
             </div>
             <button class="btn btn-purple" id="dispatchRunButton" type="submit" disabled style="margin-top:16px;width:100%">▶ Generate Dispatch Files</button>
+            <div class="card progress-card" id="dispatchProgressCard" style="box-shadow:none">
+              <div class="progress-head">
+                <span id="dispatchProgressLabel">Preparing Dispatch reconciliation...</span>
+                <span id="dispatchProgressPercent">0%</span>
+              </div>
+              <div class="progress-track">
+                <div class="progress-bar" id="dispatchProgressBar"></div>
+              </div>
+              <div class="progress-steps">
+                <div class="progress-step" id="dispatchStepRead">○ Reading files</div>
+                <div class="progress-step" id="dispatchStepValidate">○ Validating data</div>
+                <div class="progress-step" id="dispatchStepCalculate">○ Calculating Dispatch</div>
+                <div class="progress-step" id="dispatchStepGenerate">○ Generating outputs</div>
+              </div>
+            </div>
           </form>
         </div>
 
         <div class="card run-panel">
           <div><div class="run-title">Two-Step Reconciliation Workflow</div><div class="run-sub">Complete Accept first, upload it to SFDA, download the refreshed Drug Count, then run Dispatch.</div></div>
-        </div>
-
-        <div class="card progress-card" id="progressCard">
-          <div class="progress-head"><span id="progressLabel">Preparing files...</span><span id="progressPercent">0%</span></div>
-          <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
-          <div class="progress-steps">
-            <div class="progress-step" id="stepRead">○ Reading files</div>
-            <div class="progress-step" id="stepValidate">○ Validating data</div>
-            <div class="progress-step" id="stepCalculate">○ Calculating reconciliation</div>
-            <div class="progress-step" id="stepGenerate">○ Generating outputs</div>
-          </div>
         </div>
 
         <div class="status-banner" id="statusBox"></div>
@@ -867,37 +886,111 @@
   }
   function clearStatus(){ $("statusBox").className="status-banner"; $("statusBox").textContent=""; }
 
-  function startProgress(){
-    clearInterval(progressTimer); $("progressCard").classList.add("show");
-    $("progressBar").style.width="20%"; $("progressPercent").textContent="20%"; $("progressLabel").textContent="Reading and validating files...";
+  function progressElements(stage){
+    const prefix=stage==="Accept"?"accept":"dispatch";
+    return {
+      card:$(`${prefix}ProgressCard`),
+      bar:$(`${prefix}ProgressBar`),
+      percent:$(`${prefix}ProgressPercent`),
+      label:$(`${prefix}ProgressLabel`),
+      steps:[
+        $(`${prefix}StepRead`),
+        $(`${prefix}StepValidate`),
+        $(`${prefix}StepCalculate`),
+        $(`${prefix}StepGenerate`)
+      ]
+    };
+  }
+
+  function updateProgressSteps(elements,percent){
+    const completed=
+      percent>=80?4:
+      percent>=60?3:
+      percent>=40?2:
+      percent>=20?1:0;
+
+    elements.steps.forEach((step,index)=>{
+      const done=index<completed;
+      step.classList.toggle("done",done);
+      step.textContent=(done?"✓":"○")+" "+step.textContent.replace(/^[✓○]\s*/,"");
+    });
+  }
+
+  function startProgress(stage){
+    clearInterval(progressTimer);
+
+    ["Accept","Dispatch"].forEach(name=>{
+      if(name!==stage){
+        const other=progressElements(name);
+        other.card.classList.remove("show");
+      }
+    });
+
+    const elements=progressElements(stage);
+    elements.card.classList.add("show");
+    elements.bar.style.width="10%";
+    elements.percent.textContent="10%";
+    elements.label.textContent=`Reading ${stage} files...`;
+    updateProgressSteps(elements,10);
+
+    elements.card.scrollIntoView({
+      behavior:"smooth",
+      block:"nearest"
+    });
+
     progressTimer=setInterval(()=>{
-      const current=parseInt($("progressPercent").textContent)||20;
-      const next=Math.min(90,current+10);
-      $("progressBar").style.width=`${next}%`; $("progressPercent").textContent=`${next}%`;
+      const current=parseInt(elements.percent.textContent)||10;
+      const next=Math.min(90,current+5);
+
+      elements.bar.style.width=`${next}%`;
+      elements.percent.textContent=`${next}%`;
+
+      if(next<35){
+        elements.label.textContent=`Reading ${stage} files...`;
+      }else if(next<55){
+        elements.label.textContent="Validating data...";
+      }else if(next<80){
+        elements.label.textContent=`Calculating ${stage} reconciliation...`;
+      }else{
+        elements.label.textContent="Generating output files...";
+      }
+
+      updateProgressSteps(elements,next);
     },1200);
   }
-  function finishProgress(success){
-    clearInterval(progressTimer); $("progressBar").style.width="100%";
-    $("progressPercent").textContent=success?"100%":"Failed";
-    $("progressLabel").textContent=success?"Reconciliation completed successfully.":"Reconciliation failed.";
+
+  function finishProgress(stage,success){
+    clearInterval(progressTimer);
+    const elements=progressElements(stage);
+
+    if(success){
+      elements.bar.style.width="100%";
+      elements.percent.textContent="100%";
+      elements.label.textContent=`${stage} reconciliation completed successfully.`;
+      updateProgressSteps(elements,100);
+    }else{
+      elements.bar.style.width="100%";
+      elements.percent.textContent="Failed";
+      elements.label.textContent=`${stage} reconciliation failed.`;
+    }
   }
 
   async function runStage({formId,items,buttonId,url,label}){
     clearStatus(); $("summaryPanel").classList.remove("show");
     const button=$(buttonId);
     try{
-      validateStageFiles(items); button.disabled=true; button.textContent="Processing..."; startProgress();
+      validateStageFiles(items); button.disabled=true; button.textContent="Processing..."; startProgress(label);
       const formData=new FormData();
       items.forEach(item=>formData.append(item.field,$(item.input).files[0],$(item.input).files[0].name));
       const response=await fetch(url,{method:"POST",body:formData});
       let result; try{ result=await response.json(); }catch{ throw new Error(`The server returned HTTP ${response.status} without valid JSON.`); }
       if(!response.ok||result.status==="Failed") throw new Error(result.error||result.message||`Request failed with HTTP ${response.status}.`);
-      currentResult=result; finishProgress(true); setStatus("success",`${label} files generated successfully.`);
+      currentResult=result; finishProgress(label,true); setStatus("success",`${label} files generated successfully.`);
       populateSummary(result); populateResults(result); await refreshAzureHistory({silent:true});
       $("inlineResults").classList.add("show"); setTimeout(()=>$("inlineResults").scrollIntoView({behavior:"smooth",block:"start"}),120);
       toast(`${label} files generated successfully.`,"success");
     }catch(error){
-      finishProgress(false); setStatus("error",error.message||String(error)); toast(error.message||String(error),"error");
+      finishProgress(label,false); setStatus("error",error.message||String(error)); toast(error.message||String(error),"error");
     }finally{
       button.disabled=items.some(item=>!$(item.input).files.length);
       button.textContent=label==="Accept"?"▶ Generate Accept Files":"▶ Generate Dispatch Files";
@@ -911,7 +1004,16 @@
     $("acceptForm").reset(); $("dispatchForm").reset();
     ACCEPT_INPUTS.forEach(item=>updateStageFileName(item.input,item.meta,ACCEPT_INPUTS,"acceptRunButton"));
     DISPATCH_INPUTS.forEach(item=>updateStageFileName(item.input,item.meta,DISPATCH_INPUTS,"dispatchRunButton"));
-    clearStatus(); $("progressCard").classList.remove("show"); $("summaryPanel").classList.remove("show"); $("inlineResults").classList.remove("show"); currentResult=null;
+    clearStatus();
+    clearInterval(progressTimer);
+    ["Accept","Dispatch"].forEach(stage=>{
+      const elements=progressElements(stage);
+      elements.card.classList.remove("show");
+      elements.bar.style.width="0%";
+      elements.percent.textContent="0%";
+      updateProgressSteps(elements,0);
+    });
+    $("summaryPanel").classList.remove("show"); $("inlineResults").classList.remove("show"); currentResult=null;
   });
 
   function populateSummary(result){
