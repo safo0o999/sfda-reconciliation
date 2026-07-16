@@ -15,6 +15,53 @@ class Calculator:
     DUMMY_GLN = "DUMMY"
 
     @staticmethod
+    def _normalize_merge_keys(dataframe):
+        """
+        Normalize BN + Expiry Date before every groupby/merge.
+
+        This prevents pandas merge failures when one source contains
+        object/string dates and another contains datetime64[us] or
+        datetime64[ns] dates.
+        """
+        if dataframe is None:
+            return pd.DataFrame(
+                columns=Calculator.KEYS
+            )
+
+        result = dataframe.copy()
+
+        if "BN" not in result.columns:
+            result["BN"] = ""
+
+        if "Expiry Date" not in result.columns:
+            result["Expiry Date"] = pd.NaT
+
+        result["BN"] = (
+            result["BN"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.upper()
+            .str.replace(
+                r"\.0$",
+                "",
+                regex=True
+            )
+        )
+
+        result["Expiry Date"] = (
+            pd.to_datetime(
+                result["Expiry Date"],
+                errors="coerce",
+                dayfirst=True
+            )
+            .dt.normalize()
+            .astype("datetime64[ns]")
+        )
+
+        return result
+
+    @staticmethod
     def _prepare_packsize(packsize_df):
 
         packsize = packsize_df[
@@ -85,6 +132,16 @@ class Calculator:
         dispatch_df
     ):
 
+        receiving_df = Calculator._normalize_merge_keys(
+            receiving_df
+        )
+        inventory_df = Calculator._normalize_merge_keys(
+            inventory_df
+        )
+        dispatch_df = Calculator._normalize_merge_keys(
+            dispatch_df
+        )
+
         receiving = Grouper.summarize(
             receiving_df,
             Calculator.KEYS,
@@ -101,6 +158,16 @@ class Calculator:
             dispatch_df,
             Calculator.KEYS,
             "Dispatched Quantity"
+        )
+
+        receiving = Calculator._normalize_merge_keys(
+            receiving
+        )
+        inventory = Calculator._normalize_merge_keys(
+            inventory
+        )
+        dispatch = Calculator._normalize_merge_keys(
+            dispatch
         )
 
         return (
@@ -219,9 +286,22 @@ class Calculator:
         gln_df
     ):
 
+        master = Calculator._normalize_merge_keys(
+            master
+        )
+        dispatch_df = Calculator._normalize_merge_keys(
+            dispatch_df
+        )
+
         customer_dispatch = (
             Calculator._summarize_dispatch_customers(
                 dispatch_df
+            )
+        )
+
+        customer_dispatch = (
+            Calculator._normalize_merge_keys(
+                customer_dispatch
             )
         )
 
@@ -577,6 +657,19 @@ class Calculator:
         gln_df
     ):
 
+        sfda_df = Calculator._normalize_merge_keys(
+            sfda_df
+        )
+        receiving_df = Calculator._normalize_merge_keys(
+            receiving_df
+        )
+        inventory_df = Calculator._normalize_merge_keys(
+            inventory_df
+        )
+        dispatch_df = Calculator._normalize_merge_keys(
+            dispatch_df
+        )
+
         packsize = (
             Calculator._prepare_packsize(
                 packsize_df
@@ -593,7 +686,19 @@ class Calculator:
             dispatch_df
         )
 
-        master = sfda_df.copy()
+        master = Calculator._normalize_merge_keys(
+            sfda_df
+        )
+
+        receiving = Calculator._normalize_merge_keys(
+            receiving
+        )
+        inventory = Calculator._normalize_merge_keys(
+            inventory
+        )
+        dispatch_summary = Calculator._normalize_merge_keys(
+            dispatch_summary
+        )
 
         master = master.merge(
             packsize,
@@ -712,6 +817,15 @@ class Calculator:
                 "Allocated To Be Dispatch"
             ]
             .sum()
+        )
+
+        allocated_summary = (
+            Calculator._normalize_merge_keys(
+                allocated_summary
+            )
+        )
+        master = Calculator._normalize_merge_keys(
+            master
         )
 
         master = master.merge(
