@@ -436,6 +436,7 @@
     <nav class="nav">
       <button class="nav-button active" data-page="home"><span class="nav-icon">⌂</span>Home</button>
       <button class="nav-button" data-page="upload"><span class="nav-icon">⇧</span>Upload & Run</button>
+      <button class="nav-button" data-page="full-reconciliation"><span class="nav-icon">▦</span>Full Reconciliation</button>
       <button class="nav-button" data-page="verification" id="verificationNavButton" title="Open SFDA Verification"><span class="nav-icon">✓</span>SFDA Verification</button>
       <button class="nav-button" data-page="history"><span class="nav-icon">◷</span>History</button>
       <button class="nav-button" data-page="reports"><span class="nav-icon">▥</span>Reports</button>
@@ -642,6 +643,135 @@
 
 
       <!-- SFDA VERIFICATION -->
+
+      <!-- FULL RECONCILIATION -->
+      <section class="page" id="page-full-reconciliation">
+        <div class="page-head">
+          <div>
+            <h1>Full Reconciliation</h1>
+            <p>Build or rebuild the historical Batch Master from all ASN and Full Dispatch files. This page does not generate SFDA upload CSV files.</p>
+          </div>
+          <div class="actions">
+            <span class="badge warning">Historical Build</span>
+          </div>
+        </div>
+
+        <div class="status-banner info show">
+          <span>ⓘ</span>
+          <div>
+            <strong>First-time setup:</strong>
+            upload all historical ASN and Full Dispatch files from the selected cutover date, together with the latest SFDA Drug Count report.
+            The current Batch Master will be replaced after a successful run.
+          </div>
+        </div>
+
+        <form id="fullReconciliationForm" class="card" style="margin-top:16px">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Historical Source Files</div>
+              <div class="card-subtitle">Multiple ASN files + multiple Full Dispatch files + one latest SFDA report</div>
+            </div>
+          </div>
+
+          <div class="form-grid">
+            <div>
+              <label for="fullAsnFiles">Historical ASN Files</label>
+              <input class="control" id="fullAsnFiles" name="asn_files" type="file" accept=".xls,.xlsx" multiple required>
+              <div class="file-info" id="fullAsnMeta">No files selected</div>
+            </div>
+
+            <div>
+              <label for="fullDispatchFiles">Historical Full Dispatch Files</label>
+              <input class="control" id="fullDispatchFiles" name="dispatch_files" type="file" accept=".xls,.xlsx" multiple required>
+              <div class="file-info" id="fullDispatchMeta">No files selected</div>
+            </div>
+
+            <div>
+              <label for="fullSfdaFile">Latest SFDA Drug Count</label>
+              <input class="control" id="fullSfdaFile" name="sfda" type="file" accept=".xls,.xlsx" required>
+              <div class="file-info" id="fullSfdaMeta">No file selected</div>
+            </div>
+
+            <div>
+              <label>Database Operation</label>
+              <input class="control" value="Replace / rebuild current Batch Master" disabled>
+              <div class="file-info">Existing Full Reconciliation master data is replaced only after calculations succeed.</div>
+            </div>
+          </div>
+
+          <button class="btn btn-purple" id="fullRunButton" type="submit" disabled style="margin-top:16px;width:100%">
+            ▶ Build Historical Batch Master
+          </button>
+
+          <div class="card progress-card" id="fullProgressCard" style="box-shadow:none">
+            <div class="progress-head">
+              <span id="fullProgressLabel">Preparing historical reconciliation...</span>
+              <span id="fullProgressPercent">0%</span>
+            </div>
+            <div class="progress-track">
+              <div class="progress-bar" id="fullProgressBar"></div>
+            </div>
+            <div class="progress-steps">
+              <div class="progress-step" id="fullStepRead">○ Reading historical files</div>
+              <div class="progress-step" id="fullStepNormalize">○ Normalizing events</div>
+              <div class="progress-step" id="fullStepMaster">○ Building Batch Master</div>
+              <div class="progress-step" id="fullStepSave">○ Saving to Azure SQL</div>
+            </div>
+          </div>
+        </form>
+
+        <div class="status-banner" id="fullStatusBox"></div>
+
+        <div class="grid kpi-grid" id="fullSummaryGrid" style="margin-top:16px;display:none">
+          <div class="card kpi"><div class="kpi-label">Receipt Events</div><div class="kpi-value" id="fullReceiptEvents">0</div><div class="kpi-foot">Historical receiving movements</div><div class="kpi-icon blue">R</div></div>
+          <div class="card kpi"><div class="kpi-label">Dispatch Events</div><div class="kpi-value" id="fullDispatchEvents">0</div><div class="kpi-foot">Historical dispatch movements</div><div class="kpi-icon purple">D</div></div>
+          <div class="card kpi"><div class="kpi-label">Batch Master</div><div class="kpi-value" id="fullMasterRecords">0</div><div class="kpi-foot">Unique BN + expiry month</div><div class="kpi-icon green">M</div></div>
+          <div class="card kpi"><div class="kpi-label">Review Required</div><div class="kpi-value" id="fullReviewRecords">0</div><div class="kpi-foot">Historical/SFDA variance</div><div class="kpi-icon amber">!</div></div>
+        </div>
+
+        <div class="card" id="fullDownloadsCard" style="margin-top:16px;display:none">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Historical Outputs</div>
+              <div class="card-subtitle">Audit files only — no SFDA upload CSVs</div>
+            </div>
+          </div>
+          <div class="downloads-grid">
+            <button class="btn btn-secondary" id="downloadBatchMaster">Download Batch Master</button>
+            <button class="btn btn-secondary" id="downloadReceiptHistory">Download Receipt History</button>
+            <button class="btn btn-secondary" id="downloadDispatchHistory">Download Dispatch History</button>
+          </div>
+        </div>
+
+        <div class="card table-card" id="fullPreviewCard" style="margin-top:16px;display:none">
+          <div class="table-toolbar">
+            <div>
+              <div class="card-title">Batch Master Preview</div>
+              <div class="card-subtitle">First 200 master records</div>
+            </div>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>BN</th>
+                  <th>Expiry Month</th>
+                  <th>GTIN</th>
+                  <th>Drug</th>
+                  <th>Received</th>
+                  <th>Dispatched</th>
+                  <th>Net Physical</th>
+                  <th>SFDA Active</th>
+                  <th>Variance</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="fullPreviewBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
       <section class="page" id="page-verification">
         <div class="page-head">
           <div><h1>SFDA Verification</h1><p>Verify the generated upload files against the latest SFDA Drug Count and portal notification results.</p></div>
@@ -779,6 +909,7 @@
   const PAGE_LABELS = {
     home:"Dashboard",
     upload:"Upload & Run",
+    "full-reconciliation":"Full Reconciliation",
     verification:"SFDA Verification",
     history:"History",
     reports:"Reports",
@@ -855,6 +986,222 @@
     }
     $(buttonId).disabled=stageKeys.some(item=>!$(item.input).files.length);
   }
+
+
+  let fullResult = null;
+  let fullProgressTimer = null;
+
+  function updateFullFileInputs(){
+    const asnCount=$("fullAsnFiles").files.length;
+    const dispatchCount=$("fullDispatchFiles").files.length;
+    const sfdaFile=$("fullSfdaFile").files[0];
+
+    $("fullAsnMeta").textContent=asnCount
+      ? `✓ ${asnCount} ASN files selected`
+      : "No files selected";
+
+    $("fullDispatchMeta").textContent=dispatchCount
+      ? `✓ ${dispatchCount} Full Dispatch files selected`
+      : "No files selected";
+
+    $("fullSfdaMeta").textContent=sfdaFile
+      ? `✓ ${sfdaFile.name} · ${(sfdaFile.size/1024/1024).toFixed(2)} MB`
+      : "No file selected";
+
+    $("fullRunButton").disabled=!(
+      asnCount
+      && dispatchCount
+      && sfdaFile
+    );
+  }
+
+  ["fullAsnFiles","fullDispatchFiles","fullSfdaFile"].forEach(id=>{
+    $(id).addEventListener("change",updateFullFileInputs);
+  });
+
+  function setFullProgress(percent,label){
+    $("fullProgressCard").classList.add("show");
+    $("fullProgressBar").style.width=`${percent}%`;
+    $("fullProgressPercent").textContent=`${percent}%`;
+    $("fullProgressLabel").textContent=label;
+
+    const completed=
+      percent>=80?4:
+      percent>=60?3:
+      percent>=35?2:
+      percent>=10?1:0;
+
+    [
+      $("fullStepRead"),
+      $("fullStepNormalize"),
+      $("fullStepMaster"),
+      $("fullStepSave")
+    ].forEach((step,index)=>{
+      const done=index<completed;
+      step.classList.toggle("done",done);
+      step.textContent=(done?"✓":"○")+" "+step.textContent.replace(/^[✓○]\s*/,"");
+    });
+  }
+
+  function startFullProgress(){
+    clearInterval(fullProgressTimer);
+    setFullProgress(10,"Reading historical files...");
+
+    fullProgressTimer=setInterval(()=>{
+      const current=parseInt($("fullProgressPercent").textContent)||10;
+      const next=Math.min(90,current+5);
+      const label=
+        next<35?"Reading historical files...":
+        next<60?"Normalizing receiving and dispatch events...":
+        next<80?"Building historical Batch Master...":
+        "Saving Batch Master to Azure SQL...";
+
+      setFullProgress(next,label);
+    },1500);
+  }
+
+  function finishFullProgress(success){
+    clearInterval(fullProgressTimer);
+
+    if(success){
+      setFullProgress(100,"Full Reconciliation completed successfully.");
+    }else{
+      $("fullProgressCard").classList.add("show");
+      $("fullProgressBar").style.width="100%";
+      $("fullProgressPercent").textContent="Failed";
+      $("fullProgressLabel").textContent="Full Reconciliation failed.";
+    }
+  }
+
+  function showFullStatus(message,type){
+    const box=$("fullStatusBox");
+    box.className=`status-banner ${type} show`;
+    box.innerHTML=`<span>${type==="success"?"✓":"!"}</span><div>${message}</div>`;
+  }
+
+  function renderFullPreview(rows){
+    const body=$("fullPreviewBody");
+    body.innerHTML="";
+
+    (rows||[]).forEach(row=>{
+      const tr=document.createElement("tr");
+      const status=String(row["Master Status"]||"");
+      const badgeClass=
+        status==="BALANCED"?"success":
+        status==="NOT IN SFDA"?"danger":
+        "warning";
+
+      tr.innerHTML=`
+        <td>${escapeHtml(row.BN)}</td>
+        <td>${escapeHtml(row["Expiry Month Key"])}</td>
+        <td>${escapeHtml(row.GTIN)}</td>
+        <td>${escapeHtml(row["Drug Name"])}</td>
+        <td>${formatNumber(row["Total Received Packages"])}</td>
+        <td>${formatNumber(row["Total Dispatched Packages"])}</td>
+        <td>${formatNumber(row["Net Physical Packages"])}</td>
+        <td>${formatNumber(row["SFDA Active"])}</td>
+        <td>${formatNumber(row["Physical vs SFDA Active Variance"])}</td>
+        <td><span class="badge ${badgeClass}">${escapeHtml(status)}</span></td>
+      `;
+      body.appendChild(tr);
+    });
+
+    if(!rows||!rows.length){
+      body.innerHTML='<tr><td colspan="10"><div class="empty"><strong>No Batch Master rows returned</strong></div></td></tr>';
+    }
+  }
+
+  $("fullReconciliationForm").addEventListener("submit",async event=>{
+    event.preventDefault();
+
+    const button=$("fullRunButton");
+    const formData=new FormData();
+
+    [...$("fullAsnFiles").files].forEach(file=>{
+      formData.append("asn_files",file);
+    });
+
+    [...$("fullDispatchFiles").files].forEach(file=>{
+      formData.append("dispatch_files",file);
+    });
+
+    formData.append("sfda",$("fullSfdaFile").files[0]);
+
+    button.disabled=true;
+    button.textContent="Building Historical Master...";
+    $("fullSummaryGrid").style.display="none";
+    $("fullDownloadsCard").style.display="none";
+    $("fullPreviewCard").style.display="none";
+    startFullProgress();
+
+    try{
+      const response=await fetch("/api/full-reconciliation",{
+        method:"POST",
+        body:formData
+      });
+
+      const text=await response.text();
+      let result;
+
+      try{
+        result=JSON.parse(text);
+      }catch{
+        throw new Error(`The server returned HTTP ${response.status} without a valid JSON response.`);
+      }
+
+      if(!response.ok||result.status!=="Completed"){
+        throw new Error(result.error||result.message||"Full Reconciliation failed.");
+      }
+
+      fullResult=result;
+      finishFullProgress(true);
+
+      const summary=result.summary||{};
+      $("fullReceiptEvents").textContent=formatNumber(summary.receipt_events);
+      $("fullDispatchEvents").textContent=formatNumber(summary.dispatch_events);
+      $("fullMasterRecords").textContent=formatNumber(summary.master_records);
+      $("fullReviewRecords").textContent=formatNumber(summary.review_records);
+
+      $("fullSummaryGrid").style.display="";
+      $("fullDownloadsCard").style.display="";
+      $("fullPreviewCard").style.display="";
+      renderFullPreview(result.preview||[]);
+
+      showFullStatus(
+        `<strong>Historical Batch Master created.</strong><br>
+        Run ${escapeHtml(result.run_number)} · Version ${escapeHtml(result.version)} ·
+        ${formatNumber(summary.master_records)} batches stored in Azure SQL.
+        No SFDA upload CSV files were generated.`,
+        "success"
+      );
+
+      toast("Full Reconciliation completed.","success");
+
+    }catch(error){
+      finishFullProgress(false);
+      showFullStatus(escapeHtml(error.message),"error");
+      toast(error.message,"error");
+    }finally{
+      button.disabled=false;
+      button.textContent="▶ Build Historical Batch Master";
+      updateFullFileInputs();
+    }
+  });
+
+  $("downloadBatchMaster").addEventListener("click",()=>{
+    const file=fullResult&&fullResult.outputs&&fullResult.outputs.batch_master;
+    if(file) downloadStructured({name:file.file_name,...file});
+  });
+
+  $("downloadReceiptHistory").addEventListener("click",()=>{
+    const file=fullResult&&fullResult.outputs&&fullResult.outputs.receipt_history;
+    if(file) downloadStructured({name:file.file_name,...file});
+  });
+
+  $("downloadDispatchHistory").addEventListener("click",()=>{
+    const file=fullResult&&fullResult.outputs&&fullResult.outputs.dispatch_history;
+    if(file) downloadStructured({name:file.file_name,...file});
+  });
 
   const ACCEPT_INPUTS=[
     {input:"acceptAsn",meta:"acceptAsnName",field:"asn"},
