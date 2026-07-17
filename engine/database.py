@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
 import pymssql
 
 
@@ -1851,6 +1852,35 @@ def create_full_reconciliation_run(
     }
 
 
+def _full_sql_value(value: Any) -> Any:
+    """
+    Convert pandas/numpy missing values into SQL NULL.
+
+    pymssql cannot serialize pandas.NaT and raises:
+        ValueError: NaTType does not support strftime
+    """
+    if value is None:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+
+    return value
+
+
+def _full_sql_row(values: tuple) -> tuple:
+    return tuple(
+        _full_sql_value(value)
+        for value in values
+    )
+
+
 def save_full_reconciliation_data(
     run_id: int,
     receipt_rows: List[Dict[str, Any]],
@@ -1972,14 +2002,19 @@ def save_full_reconciliation_data(
         ]
 
         def insert_batches(sql: str, rows: List[tuple]):
+            clean_rows = [
+                _full_sql_row(row)
+                for row in rows
+            ]
+
             for start in range(
                 0,
-                len(rows),
+                len(clean_rows),
                 max(1, int(batch_size)),
             ):
                 cursor.executemany(
                     sql,
-                    rows[
+                    clean_rows[
                         start:
                         start + batch_size
                     ],
