@@ -2324,6 +2324,39 @@ def _existing_event_keys(
     return existing
 
 
+def _deduplicate_full_event_rows(
+    rows: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], int]:
+    """
+    Remove duplicate Event Keys inside the same uploaded run.
+
+    SQL unique indexes remain enabled as the final database safeguard.
+    The first occurrence is retained because rows sharing the same
+    Event Key represent the same historical transaction.
+    """
+    unique_rows: List[Dict[str, Any]] = []
+    seen_keys = set()
+    duplicate_count = 0
+
+    for row in rows:
+        event_key = str(
+            row.get("Event Key")
+            or ""
+        ).strip()
+
+        if not event_key:
+            continue
+
+        if event_key in seen_keys:
+            duplicate_count += 1
+            continue
+
+        seen_keys.add(event_key)
+        unique_rows.append(row)
+
+    return unique_rows, duplicate_count
+
+
 def append_full_reconciliation_events(
     run_id: int,
     receipt_rows: List[Dict[str, Any]],
@@ -2333,15 +2366,27 @@ def append_full_reconciliation_events(
     initialize_full_reconciliation_database()
     ensure_full_reconciliation_incremental_indexes()
 
+    (
+        unique_receipt_rows,
+        receipt_run_duplicates,
+    ) = _deduplicate_full_event_rows(
+        receipt_rows
+    )
+
+    (
+        unique_dispatch_rows,
+        dispatch_run_duplicates,
+    ) = _deduplicate_full_event_rows(
+        dispatch_rows
+    )
+
     receipt_keys = [
-        str(row.get("Event Key") or "")
-        for row in receipt_rows
-        if row.get("Event Key")
+        str(row.get("Event Key") or "").strip()
+        for row in unique_receipt_rows
     ]
     dispatch_keys = [
-        str(row.get("Event Key") or "")
-        for row in dispatch_rows
-        if row.get("Event Key")
+        str(row.get("Event Key") or "").strip()
+        for row in unique_dispatch_rows
     ]
 
     existing_receipt = _existing_event_keys(
@@ -2354,15 +2399,30 @@ def append_full_reconciliation_events(
     )
 
     new_receipt_rows = [
-        row for row in receipt_rows
-        if str(row.get("Event Key") or "")
-        not in existing_receipt
+        row
+        for row in unique_receipt_rows
+        if str(
+            row.get("Event Key")
+            or ""
+        ).strip() not in existing_receipt
     ]
     new_dispatch_rows = [
-        row for row in dispatch_rows
-        if str(row.get("Event Key") or "")
-        not in existing_dispatch
+        row
+        for row in unique_dispatch_rows
+        if str(
+            row.get("Event Key")
+            or ""
+        ).strip() not in existing_dispatch
     ]
+
+    receipt_existing_duplicates = (
+        len(unique_receipt_rows)
+        - len(new_receipt_rows)
+    )
+    dispatch_existing_duplicates = (
+        len(unique_dispatch_rows)
+        - len(new_dispatch_rows)
+    )
 
     database = Database()
     connection = database.connect()
@@ -2473,12 +2533,24 @@ def append_full_reconciliation_events(
         connection.commit()
 
         return {
-            "new_receipt_events": len(new_receipt_rows),
+            "new_receipt_events":
+                len(new_receipt_rows),
             "skipped_receipt_events":
-                len(receipt_rows) - len(new_receipt_rows),
-            "new_dispatch_events": len(new_dispatch_rows),
+                receipt_run_duplicates
+                + receipt_existing_duplicates,
+            "receipt_duplicates_in_upload":
+                receipt_run_duplicates,
+            "receipt_duplicates_in_database":
+                receipt_existing_duplicates,
+            "new_dispatch_events":
+                len(new_dispatch_rows),
             "skipped_dispatch_events":
-                len(dispatch_rows) - len(new_dispatch_rows),
+                dispatch_run_duplicates
+                + dispatch_existing_duplicates,
+            "dispatch_duplicates_in_upload":
+                dispatch_run_duplicates,
+            "dispatch_duplicates_in_database":
+                dispatch_existing_duplicates,
         }
 
     except Exception:
