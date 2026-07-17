@@ -717,12 +717,28 @@
             </div>
           </div>
 
-          <div class="card run-panel" style="margin-top:16px;box-shadow:none">
-            <div>
+          <div class="card run-panel" style="margin-top:16px;box-shadow:none;align-items:flex-start">
+            <div style="flex:1">
               <div class="run-title">Database Operation</div>
-              <div class="run-sub">Replace and rebuild the current Batch Master only after all calculations complete successfully.</div>
+              <div class="run-sub">Append is the normal option. Rebuild deletes the historical master and recreates it from the uploaded files.</div>
+              <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px">
+                <label class="selection-card" style="flex:1;min-width:240px">
+                  <input type="radio" name="fullOperation" value="append" checked>
+                  <span>
+                    <strong>Append New History</strong><br>
+                    <small>Add only new receipt and dispatch events. Existing events are skipped automatically.</small>
+                  </span>
+                </label>
+                <label class="selection-card" style="flex:1;min-width:240px">
+                  <input type="radio" name="fullOperation" value="rebuild">
+                  <span>
+                    <strong>Rebuild Full History</strong><br>
+                    <small>Delete the current history and rebuild it from the uploaded files.</small>
+                  </span>
+                </label>
+              </div>
             </div>
-            <span class="badge warning">Replace Current Master</span>
+            <span class="badge success">Append Default</span>
           </div>
 
           <button class="btn btn-purple" id="fullRunButton" type="submit" disabled style="margin-top:16px;width:100%">
@@ -1155,6 +1171,8 @@
     });
 
     formData.append("sfda",$("fullSfdaFile").files[0]);
+    const selectedOperation=document.querySelector('input[name="fullOperation"]:checked');
+    formData.append("operation",selectedOperation?selectedOperation.value:"append");
 
     button.disabled=true;
     button.textContent="Building Historical Master...";
@@ -1199,7 +1217,11 @@
       showFullStatus(
         `<strong>Historical Batch Master created.</strong><br>
         Run ${escapeHtml(result.run_number)} · Version ${escapeHtml(result.version)} ·
-        ${formatNumber(summary.master_records)} batches stored in Azure SQL.
+        ${formatNumber(summary.master_records)} batches stored in Azure SQL.<br>
+        New receipt events: ${formatNumber(summary.new_receipt_events)} ·
+        Skipped receipt duplicates: ${formatNumber(summary.skipped_receipt_events)} ·
+        New dispatch events: ${formatNumber(summary.new_dispatch_events)} ·
+        Skipped dispatch duplicates: ${formatNumber(summary.skipped_dispatch_events)}.<br>
         No SFDA upload CSV files were generated.`,
         "success"
       );
