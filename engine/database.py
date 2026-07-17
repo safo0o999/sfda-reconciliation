@@ -2,7 +2,7 @@ import os
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import pymssql
@@ -2326,7 +2326,7 @@ def _existing_event_keys(
 
 def _deduplicate_full_event_rows(
     rows: List[Dict[str, Any]],
-) -> tuple[List[Dict[str, Any]], int]:
+) -> Tuple[List[Dict[str, Any]], int]:
     """
     Remove duplicate Event Keys inside the same uploaded run.
 
