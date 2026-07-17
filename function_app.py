@@ -32,6 +32,10 @@ from engine.database import (
     complete_full_reconciliation_run,
     fail_full_reconciliation_run,
     get_batch_master,
+    clear_full_reconciliation_history,
+    append_full_reconciliation_events,
+    get_full_reconciliation_summaries,
+    replace_batch_master,
 )
 
 from engine.exporter import Exporter
@@ -47,7 +51,7 @@ app = func.FunctionApp(
 
 
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "4.1.0"
+APPLICATION_VERSION = "4.2.0"
 
 REQUIRED_FILES = [
     "asn",
@@ -1552,29 +1556,72 @@ def full_reconciliation(
             )
         )
 
+        operation = str(
+            req.form.get("operation")
+            or "append"
+        ).strip().lower()
+
+        if operation not in {
+            "append",
+            "rebuild",
+        }:
+            raise ValueError(
+                "Unsupported Full Reconciliation operation."
+            )
+
         engine = FullReconciliationEngine(
             asn_df=asn_dataframe,
-            dispatch_df=
-                dispatch_dataframe,
+            dispatch_df=dispatch_dataframe,
             sfda_df=sfda_dataframe,
         )
 
-        result = engine.run()
+        prepared = engine.prepare_incremental()
 
-        save_summary = (
-            save_full_reconciliation_data(
-                run_id=run_record["run_id"],
-                receipt_rows=
-                    result["receipt_records"],
-                dispatch_rows=
-                    result["dispatch_records"],
-                master_rows=
-                    result["master_records"],
-                replace_existing=True,
-            )
+        if operation == "rebuild":
+            clear_full_reconciliation_history()
+
+        event_summary = append_full_reconciliation_events(
+            run_id=run_record["run_id"],
+            receipt_rows=prepared["receipt_records"],
+            dispatch_rows=prepared["dispatch_records"],
         )
 
-        master = result["master"]
+        historical = get_full_reconciliation_summaries()
+
+        receipt_summary = pd.DataFrame(
+            historical["receipt_summary"]
+        )
+        dispatch_summary = pd.DataFrame(
+            historical["dispatch_summary"]
+        )
+
+        master = engine.build_master_from_summaries(
+            receipt_summary=receipt_summary,
+            dispatch_summary=dispatch_summary,
+            sfda_summary=prepared["sfda_summary"],
+        )
+
+        master_records = engine._records(master)
+
+        replace_batch_master(
+            run_id=run_record["run_id"],
+            master_rows=master_records,
+        )
+
+        result = {
+            "receipt_events": prepared["receipt_events"],
+            "dispatch_events": prepared["dispatch_events"],
+            "master": master,
+        }
+
+        save_summary = {
+            "receipt_events":
+                event_summary["new_receipt_events"],
+            "dispatch_events":
+                event_summary["new_dispatch_events"],
+            "master_records":
+                len(master),
+        }
 
         balanced_records = int(
             (
@@ -1676,6 +1723,15 @@ def full_reconciliation(
                     review_records,
                 "missing_sfda_records":
                     missing_sfda_records,
+                "operation": operation,
+                "new_receipt_events":
+                    event_summary["new_receipt_events"],
+                "skipped_receipt_events":
+                    event_summary["skipped_receipt_events"],
+                "new_dispatch_events":
+                    event_summary["new_dispatch_events"],
+                "skipped_dispatch_events":
+                    event_summary["skipped_dispatch_events"],
             },
             "preview": preview,
             "outputs": {
