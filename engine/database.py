@@ -2227,3 +2227,407 @@ def get_batch_master(
             BN;
         """
     )
+
+
+# =====================================================================
+# Incremental Full Reconciliation
+# =====================================================================
+
+def ensure_full_reconciliation_incremental_indexes() -> None:
+    database = Database()
+
+    database.execute(
+        """
+        IF NOT EXISTS
+        (
+            SELECT 1
+            FROM sys.indexes
+            WHERE name = N'UX_FullReceiptEvents_EventKey'
+              AND object_id = OBJECT_ID(N'dbo.FullReceiptEvents')
+        )
+        BEGIN
+            CREATE UNIQUE INDEX UX_FullReceiptEvents_EventKey
+            ON dbo.FullReceiptEvents(EventKey);
+        END;
+        """
+    )
+
+    database.execute(
+        """
+        IF NOT EXISTS
+        (
+            SELECT 1
+            FROM sys.indexes
+            WHERE name = N'UX_FullDispatchEvents_EventKey'
+              AND object_id = OBJECT_ID(N'dbo.FullDispatchEvents')
+        )
+        BEGIN
+            CREATE UNIQUE INDEX UX_FullDispatchEvents_EventKey
+            ON dbo.FullDispatchEvents(EventKey);
+        END;
+        """
+    )
+
+
+def clear_full_reconciliation_history() -> None:
+    database = Database()
+    connection = database.connect()
+
+    try:
+        cursor = connection.cursor()
+        cursor.execute("DELETE FROM dbo.BatchMaster;")
+        cursor.execute("DELETE FROM dbo.FullReceiptEvents;")
+        cursor.execute("DELETE FROM dbo.FullDispatchEvents;")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _existing_event_keys(
+    table_name: str,
+    event_keys: List[str],
+    batch_size: int = 1000,
+) -> set:
+    if not event_keys:
+        return set()
+
+    allowed_tables = {
+        "FullReceiptEvents",
+        "FullDispatchEvents",
+    }
+    if table_name not in allowed_tables:
+        raise ValueError("Unsupported event table.")
+
+    database = Database()
+    existing = set()
+
+    for start in range(0, len(event_keys), batch_size):
+        chunk = event_keys[start:start + batch_size]
+        placeholders = ",".join(["%s"] * len(chunk))
+        rows = database.fetch_all(
+            f"""
+            SELECT EventKey
+            FROM dbo.{table_name}
+            WHERE EventKey IN ({placeholders});
+            """,
+            tuple(chunk),
+        )
+        existing.update(
+            str(row["EventKey"])
+            for row in rows
+            if row.get("EventKey")
+        )
+
+    return existing
+
+
+def append_full_reconciliation_events(
+    run_id: int,
+    receipt_rows: List[Dict[str, Any]],
+    dispatch_rows: List[Dict[str, Any]],
+    batch_size: int = 2000,
+) -> Dict[str, int]:
+    initialize_full_reconciliation_database()
+    ensure_full_reconciliation_incremental_indexes()
+
+    receipt_keys = [
+        str(row.get("Event Key") or "")
+        for row in receipt_rows
+        if row.get("Event Key")
+    ]
+    dispatch_keys = [
+        str(row.get("Event Key") or "")
+        for row in dispatch_rows
+        if row.get("Event Key")
+    ]
+
+    existing_receipt = _existing_event_keys(
+        "FullReceiptEvents",
+        receipt_keys,
+    )
+    existing_dispatch = _existing_event_keys(
+        "FullDispatchEvents",
+        dispatch_keys,
+    )
+
+    new_receipt_rows = [
+        row for row in receipt_rows
+        if str(row.get("Event Key") or "")
+        not in existing_receipt
+    ]
+    new_dispatch_rows = [
+        row for row in dispatch_rows
+        if str(row.get("Event Key") or "")
+        not in existing_dispatch
+    ]
+
+    database = Database()
+    connection = database.connect()
+
+    try:
+        cursor = connection.cursor()
+
+        receipt_parameters = [
+            _full_sql_row((
+                int(run_id),
+                row.get("Event Key"),
+                row.get("BN"),
+                row.get("Expiry Month Key"),
+                row.get("Expiry Date"),
+                row.get("Event Date"),
+                row.get("Source File"),
+                row.get("Supplier Name"),
+                row.get("Supplier Code"),
+                row.get("PO Number"),
+                row.get("Invoice Number"),
+                row.get("Inbound Shipment"),
+                row.get("Trade Name"),
+                row.get("Generic Item Number"),
+                row.get("Trade Item"),
+                float(row.get("PackageSize") or 1),
+                float(row.get("Received Quantity") or 0),
+                float(row.get("Quantity Packages") or 0),
+            ))
+            for row in new_receipt_rows
+        ]
+
+        dispatch_parameters = [
+            _full_sql_row((
+                int(run_id),
+                row.get("Event Key"),
+                row.get("BN"),
+                row.get("Expiry Month Key"),
+                row.get("Expiry Date"),
+                row.get("Event Date"),
+                row.get("Source File"),
+                row.get("To Address"),
+                row.get("Sales Order Number"),
+                row.get("Order Line"),
+                row.get("Trade Name"),
+                row.get("Generic Item Number"),
+                row.get("Trade Item Number"),
+                float(row.get("PackageSize") or 1),
+                float(row.get("Dispatched Quantity") or 0),
+                float(row.get("Quantity Packages") or 0),
+            ))
+            for row in new_dispatch_rows
+        ]
+
+        def insert_batches(sql: str, rows: List[tuple]):
+            for start in range(0, len(rows), max(1, int(batch_size))):
+                cursor.executemany(
+                    sql,
+                    rows[start:start + batch_size],
+                )
+
+        insert_batches(
+            """
+            INSERT INTO dbo.FullReceiptEvents
+            (
+                FullRunID, EventKey, BN,
+                ExpiryMonthKey, WMSExpiryDate,
+                EventDate, SourceFile,
+                SupplierName, SupplierCode,
+                PONumber, InvoiceNumber,
+                InboundShipment, TradeName,
+                GenericItemNumber,
+                TradeItemNumber, PackageSize,
+                QuantityUnits, QuantityPackages
+            )
+            VALUES
+            (
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s
+            );
+            """,
+            receipt_parameters,
+        )
+
+        insert_batches(
+            """
+            INSERT INTO dbo.FullDispatchEvents
+            (
+                FullRunID, EventKey, BN,
+                ExpiryMonthKey, WMSExpiryDate,
+                EventDate, SourceFile,
+                CustomerName, SalesOrderNumber,
+                OrderLine, TradeName,
+                GenericItemNumber,
+                TradeItemNumber, PackageSize,
+                QuantityUnits, QuantityPackages
+            )
+            VALUES
+            (
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s
+            );
+            """,
+            dispatch_parameters,
+        )
+
+        connection.commit()
+
+        return {
+            "new_receipt_events": len(new_receipt_rows),
+            "skipped_receipt_events":
+                len(receipt_rows) - len(new_receipt_rows),
+            "new_dispatch_events": len(new_dispatch_rows),
+            "skipped_dispatch_events":
+                len(dispatch_rows) - len(new_dispatch_rows),
+        }
+
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def get_full_reconciliation_summaries() -> Dict[str, List[Dict[str, Any]]]:
+    database = Database()
+
+    receipt_summary = database.fetch_all(
+        """
+        SELECT
+            BN,
+            ExpiryMonthKey AS [Expiry Month Key],
+            SUM(QuantityUnits) AS [Total Received Units],
+            SUM(QuantityPackages) AS [Total Received Packages],
+            MIN(EventDate) AS [First Receipt Date],
+            MAX(EventDate) AS [Last Receipt Date],
+            MAX(TradeName) AS [Receipt Trade Name],
+            MAX(GenericItemNumber) AS [Generic Item Number],
+            MAX(TradeItemNumber) AS [Receipt Trade Item Number],
+            MAX(WMSExpiryDate) AS [WMS Receipt Expiry Date],
+            MAX(PackageSize) AS [Receipt PackageSize]
+        FROM dbo.FullReceiptEvents
+        GROUP BY BN, ExpiryMonthKey;
+        """
+    )
+
+    dispatch_summary = database.fetch_all(
+        """
+        SELECT
+            BN,
+            ExpiryMonthKey AS [Expiry Month Key],
+            SUM(QuantityUnits) AS [Total Dispatched Units],
+            SUM(QuantityPackages) AS [Total Dispatched Packages],
+            MIN(EventDate) AS [First Dispatch Date],
+            MAX(EventDate) AS [Last Dispatch Date],
+            MAX(TradeName) AS [Dispatch Trade Name],
+            MAX(GenericItemNumber) AS [Dispatch Generic Item Number],
+            MAX(TradeItemNumber) AS [Dispatch Trade Item Number],
+            MAX(WMSExpiryDate) AS [WMS Dispatch Expiry Date],
+            MAX(PackageSize) AS [Dispatch PackageSize]
+        FROM dbo.FullDispatchEvents
+        GROUP BY BN, ExpiryMonthKey;
+        """
+    )
+
+    return {
+        "receipt_summary": receipt_summary,
+        "dispatch_summary": dispatch_summary,
+    }
+
+
+def replace_batch_master(
+    run_id: int,
+    master_rows: List[Dict[str, Any]],
+    batch_size: int = 1000,
+) -> None:
+    database = Database()
+    connection = database.connect()
+
+    try:
+        cursor = connection.cursor()
+        cursor.execute("DELETE FROM dbo.BatchMaster;")
+
+        parameters = [
+            _full_sql_row((
+                int(run_id),
+                row.get("BN"),
+                row.get("Expiry Month Key"),
+                row.get("GTIN"),
+                row.get("Drug Name"),
+                row.get("Generic Item Number"),
+                row.get("Trade Item Number"),
+                float(row.get("PackageSize") or 1),
+                row.get("WMS Receipt Expiry Date"),
+                row.get("WMS Dispatch Expiry Date"),
+                row.get("SFDA Expiry Date"),
+                row.get("First Receipt Date"),
+                row.get("Last Receipt Date"),
+                row.get("First Dispatch Date"),
+                row.get("Last Dispatch Date"),
+                float(row.get("Total Received Units") or 0),
+                float(row.get("Total Received Packages") or 0),
+                float(row.get("Total Dispatched Units") or 0),
+                float(row.get("Total Dispatched Packages") or 0),
+                float(row.get("Net Physical Packages") or 0),
+                float(row.get("SFDA Quantity") or 0),
+                float(row.get("SFDA Active") or 0),
+                float(row.get("SFDA Receive Pending") or 0),
+                float(row.get("SFDA Send Pending") or 0),
+                float(row.get("Physical vs SFDA Active Variance") or 0),
+                float(row.get("Historical Receipt Uncovered") or 0),
+                float(row.get("Historical Dispatch Uncovered") or 0),
+                row.get("Master Status"),
+            ))
+            for row in master_rows
+        ]
+
+        sql = """
+        INSERT INTO dbo.BatchMaster
+        (
+            FullRunID, BN, ExpiryMonthKey,
+            GTIN, DrugName,
+            GenericItemNumber,
+            TradeItemNumber, PackageSize,
+            WMSReceiptExpiryDate,
+            WMSDispatchExpiryDate,
+            SFDAExpiryDate,
+            FirstReceiptDate,
+            LastReceiptDate,
+            FirstDispatchDate,
+            LastDispatchDate,
+            TotalReceivedUnits,
+            TotalReceivedPackages,
+            TotalDispatchedUnits,
+            TotalDispatchedPackages,
+            NetPhysicalPackages,
+            SFDAQuantity, SFDAActive,
+            SFDAReceivePending,
+            SFDASendPending,
+            PhysicalActiveVariance,
+            HistoricalReceiptUncovered,
+            HistoricalDispatchUncovered,
+            MasterStatus
+        )
+        VALUES
+        (
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s
+        );
+        """
+
+        for start in range(0, len(parameters), batch_size):
+            cursor.executemany(
+                sql,
+                parameters[start:start + batch_size],
+            )
+
+        connection.commit()
+
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
