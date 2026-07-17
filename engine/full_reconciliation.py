@@ -749,25 +749,41 @@ class FullReconciliationEngine:
     def _records(
         dataframe: pd.DataFrame,
     ) -> List[Dict[str, Any]]:
-        clean = dataframe.copy()
+        """
+        Convert dataframe rows into database-safe Python values.
 
-        for column in clean.columns:
-            if pd.api.types.is_datetime64_any_dtype(
-                clean[column]
-            ):
-                clean[column] = clean[column].where(
-                    clean[column].notna(),
-                    None,
-                )
+        Object columns can still contain pandas.NaT, so every individual
+        value is checked rather than relying only on the column dtype.
+        """
+        records: List[Dict[str, Any]] = []
 
-        clean = clean.where(
-            pd.notna(clean),
-            None,
-        )
-
-        return clean.to_dict(
+        for source_row in dataframe.to_dict(
             orient="records"
-        )
+        ):
+            clean_row: Dict[str, Any] = {}
+
+            for key, value in source_row.items():
+                if value is None:
+                    clean_row[key] = None
+                    continue
+
+                try:
+                    if pd.isna(value):
+                        clean_row[key] = None
+                        continue
+                except (TypeError, ValueError):
+                    pass
+
+                if isinstance(value, pd.Timestamp):
+                    clean_row[key] = (
+                        value.to_pydatetime()
+                    )
+                else:
+                    clean_row[key] = value
+
+            records.append(clean_row)
+
+        return records
 
     def run(self) -> Dict[str, Any]:
         self._normalize()
