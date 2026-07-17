@@ -473,6 +473,246 @@ class FullReconciliationEngine:
             }
         )
 
+    def prepare_incremental(self) -> Dict[str, Any]:
+        """
+        Normalize the uploaded files and return only the candidate events
+        and the latest SFDA snapshot. Database deduplication happens later.
+        """
+        self._normalize()
+        package_lookup = self._prepare_packsize()
+
+        receipt_events = self._receipt_events(
+            package_lookup
+        )
+        dispatch_events = self._dispatch_events(
+            package_lookup
+        )
+        sfda_summary = self._sfda_summary(
+            package_lookup
+        )
+
+        return {
+            "receipt_events": receipt_events,
+            "dispatch_events": dispatch_events,
+            "sfda_summary": sfda_summary,
+            "receipt_records":
+                self._records(receipt_events),
+            "dispatch_records":
+                self._records(dispatch_events),
+        }
+
+    def build_master_from_summaries(
+        self,
+        receipt_summary: pd.DataFrame,
+        dispatch_summary: pd.DataFrame,
+        sfda_summary: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Build the current Batch Master from SQL historical aggregates plus
+        the latest SFDA snapshot.
+        """
+        receipt_summary = receipt_summary.copy()
+        dispatch_summary = dispatch_summary.copy()
+        sfda_summary = sfda_summary.copy()
+
+        all_keys = pd.concat(
+            [
+                receipt_summary[self.KEYS]
+                if not receipt_summary.empty
+                else pd.DataFrame(columns=self.KEYS),
+                dispatch_summary[self.KEYS]
+                if not dispatch_summary.empty
+                else pd.DataFrame(columns=self.KEYS),
+                sfda_summary[self.KEYS]
+                if not sfda_summary.empty
+                else pd.DataFrame(columns=self.KEYS),
+            ],
+            ignore_index=True,
+        ).drop_duplicates()
+
+        master = all_keys.copy()
+
+        if not receipt_summary.empty:
+            master = master.merge(
+                receipt_summary,
+                on=self.KEYS,
+                how="left",
+            )
+
+        if not dispatch_summary.empty:
+            master = master.merge(
+                dispatch_summary,
+                on=self.KEYS,
+                how="left",
+            )
+
+        if not sfda_summary.empty:
+            master = master.merge(
+                sfda_summary,
+                on=self.KEYS,
+                how="left",
+            )
+
+        defaults = {
+            "Total Received Units": 0,
+            "Total Received Packages": 0,
+            "Total Dispatched Units": 0,
+            "Total Dispatched Packages": 0,
+            "SFDA Quantity": 0,
+            "SFDA Active": 0,
+            "SFDA Receive Pending": 0,
+            "SFDA Send Pending": 0,
+            "Receipt PackageSize": 1,
+            "Dispatch PackageSize": 1,
+            "PackageSize": 1,
+            "GTIN": "",
+            "Drug Name": "",
+            "Receipt Trade Name": "",
+            "Dispatch Trade Name": "",
+            "Generic Item Number": "",
+            "Dispatch Generic Item Number": "",
+            "Receipt Trade Item Number": "",
+            "Dispatch Trade Item Number": "",
+        }
+
+        for column, default in defaults.items():
+            if column not in master.columns:
+                master[column] = default
+
+        numeric_columns = [
+            "Total Received Units",
+            "Total Received Packages",
+            "Total Dispatched Units",
+            "Total Dispatched Packages",
+            "SFDA Quantity",
+            "SFDA Active",
+            "SFDA Receive Pending",
+            "SFDA Send Pending",
+        ]
+
+        for column in numeric_columns:
+            master[column] = pd.to_numeric(
+                master[column],
+                errors="coerce",
+            ).fillna(0)
+
+        master["PackageSize"] = (
+            pd.to_numeric(
+                master["PackageSize"],
+                errors="coerce",
+            )
+            .fillna(
+                pd.to_numeric(
+                    master["Receipt PackageSize"],
+                    errors="coerce",
+                )
+            )
+            .fillna(
+                pd.to_numeric(
+                    master["Dispatch PackageSize"],
+                    errors="coerce",
+                )
+            )
+            .fillna(1)
+        )
+        master.loc[
+            master["PackageSize"] <= 0,
+            "PackageSize",
+        ] = 1
+
+        master["GTIN"] = master["GTIN"].fillna("").astype(str)
+        master["Drug Name"] = (
+            master["Drug Name"]
+            .fillna(master["Receipt Trade Name"])
+            .fillna(master["Dispatch Trade Name"])
+            .fillna("")
+        )
+        master["Generic Item Number"] = (
+            master["Generic Item Number"]
+            .fillna(master["Dispatch Generic Item Number"])
+            .fillna("")
+        )
+        master["Trade Item Number"] = (
+            master["Receipt Trade Item Number"]
+            .fillna(master["Dispatch Trade Item Number"])
+            .fillna("")
+        )
+
+        master["Net Physical Packages"] = (
+            master["Total Received Packages"]
+            - master["Total Dispatched Packages"]
+        )
+        master["Physical vs SFDA Active Variance"] = (
+            master["Net Physical Packages"]
+            - master["SFDA Active"]
+        )
+        master["Historical Receipt Uncovered"] = (
+            master["SFDA Receive Pending"]
+            - master["Total Received Packages"]
+        ).clip(lower=0)
+        master["Historical Dispatch Uncovered"] = (
+            master["SFDA Active"]
+            - master["Total Dispatched Packages"]
+        ).clip(lower=0)
+
+        master["Master Status"] = "BALANCED"
+        master.loc[
+            master["GTIN"] == "",
+            "Master Status",
+        ] = "NOT IN SFDA"
+        master.loc[
+            (master["GTIN"] != "")
+            & (
+                master[
+                    "Physical vs SFDA Active Variance"
+                ].abs() >= 1
+            ),
+            "Master Status",
+        ] = "REVIEW REQUIRED"
+
+        output_columns = [
+            "BN",
+            "Expiry Month Key",
+            "GTIN",
+            "Drug Name",
+            "Generic Item Number",
+            "Trade Item Number",
+            "PackageSize",
+            "WMS Receipt Expiry Date",
+            "WMS Dispatch Expiry Date",
+            "SFDA Expiry Date",
+            "First Receipt Date",
+            "Last Receipt Date",
+            "First Dispatch Date",
+            "Last Dispatch Date",
+            "Total Received Units",
+            "Total Received Packages",
+            "Total Dispatched Units",
+            "Total Dispatched Packages",
+            "Net Physical Packages",
+            "SFDA Quantity",
+            "SFDA Active",
+            "SFDA Receive Pending",
+            "SFDA Send Pending",
+            "Physical vs SFDA Active Variance",
+            "Historical Receipt Uncovered",
+            "Historical Dispatch Uncovered",
+            "Master Status",
+        ]
+
+        for column in output_columns:
+            if column not in master.columns:
+                master[column] = None
+
+        return (
+            master[output_columns]
+            .sort_values(
+                ["Master Status", "BN", "Expiry Month Key"],
+                kind="stable",
+            )
+            .reset_index(drop=True)
+        )
+
     def _build_master(
         self,
         receipt_events: pd.DataFrame,
