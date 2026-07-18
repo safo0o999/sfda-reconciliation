@@ -94,7 +94,7 @@ BEGIN
         LastReceivedDate datetime2 NULL,
         FirstDispatchDate datetime2 NULL,
         LastDispatchDate datetime2 NULL,
-        GenericExistsInSFDA varchar(3) NOT NULL
+        GenericExistsInSFDA nvarchar(30) NOT NULL
             CONSTRAINT DF_BatchMaster_GenericExistsInSFDA DEFAULT 'Yes',
         LastUpdated datetime2 NOT NULL
             CONSTRAINT DF_BatchMaster_LastUpdated DEFAULT SYSUTCDATETIME(),
@@ -117,6 +117,12 @@ IF COL_LENGTH('dbo.BatchMaster', 'TradeName') IS NULL
 BEGIN
     ALTER TABLE dbo.BatchMaster
     ADD TradeName nvarchar(500) NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'GenericExistsInSFDA') IS NOT NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ALTER COLUMN GenericExistsInSFDA nvarchar(30) NOT NULL;
 END;
 
 IF NOT EXISTS
