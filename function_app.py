@@ -1,642 +1,2102 @@
-import io
-import json
-import logging
-from pathlib import Path
-from typing import Iterable, List
-
-import azure.functions as func
-import pandas as pd
-
-from engine.alert_engine import AlertEngine
-from engine.database import (
-    append_events,
-    get_batch_master_df,
-    get_dispatch_events_df,
-    get_event_summaries,
-    initialize_database,
-    replace_batch_master,
-    reset_history,
-    test_database_connection,
-)
-from engine.exporter import Exporter
-from engine.full_reconciliation import FullReconciliationEngine
-from engine.reconciliation import ReconciliationEngine
 
 
-app = func.FunctionApp(
-    http_auth_level=func.AuthLevel.ANONYMOUS
-)
-
-APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "5.0.0"
-
-
-# -----------------------------------------------------------------------------
-# Response helpers
-# -----------------------------------------------------------------------------
-
-
-def json_response(data, status_code=200):
-    return func.HttpResponse(
-        json.dumps(
-            data,
-            ensure_ascii=False,
-            default=str,
-        ),
-        status_code=status_code,
-        mimetype="application/json",
-        charset="utf-8",
-    )
-
-
-def error_response(message, status_code=500, error_type=None):
-    payload = {
-        "status": "Failed",
-        "version": APPLICATION_VERSION,
-        "error": str(message),
+Index · HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title>SFDA Drug Traceability & Reconciliation Platform</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <style>
+    :root {
+      --navy-950:#05172c;
+      --navy-900:#08233f;
+      --navy-800:#0d3158;
+      --blue-700:#075fc8;
+      --blue-600:#0f6cbd;
+      --blue-500:#1d78d0;
+      --green-700:#107c41;
+      --green-600:#168a48;
+      --amber-600:#d97706;
+      --red-600:#d13438;
+      --purple-600:#6b4eff;
+      --ink:#172033;
+      --muted:#66738c;
+      --muted-2:#8b95a8;
+      --line:#e2e7ef;
+      --soft:#f4f7fb;
+      --card:#ffffff;
+      --shadow:0 14px 40px rgba(20,42,75,.08);
+      --radius:16px;
+      --radius-sm:10px;
     }
-
-    if error_type:
-        payload["error_type"] = error_type
-
-    return json_response(
-        payload,
-        status_code=status_code,
-    )
-
-
-# -----------------------------------------------------------------------------
-# Upload and Excel helpers
-# -----------------------------------------------------------------------------
-
-
-def _uploaded_file_name(uploaded):
-    return (
-        getattr(uploaded, "filename", None)
-        or "uploaded.xlsx"
-    )
-
-
-def _read_uploaded_bytes(uploaded):
-    file_name = _uploaded_file_name(uploaded)
-
-    raw = uploaded.read()
-
-    if not raw:
-        raise ValueError(
-            f"Uploaded file is empty: {file_name}"
-        )
-
-    return file_name, raw
-
-
-def read_excel(uploaded):
-    file_name, raw = _read_uploaded_bytes(uploaded)
-
-    lower_name = file_name.lower()
-
-    if lower_name.endswith(".xls"):
-        engine = "xlrd"
-    elif lower_name.endswith(".xlsx"):
-        engine = "openpyxl"
-    else:
-        raise ValueError(
-            "Unsupported file type. Only .xls and .xlsx files "
-            f"are accepted: {file_name}"
-        )
-
-    try:
-        return pd.read_excel(
-            io.BytesIO(raw),
-            engine=engine,
-            dtype=object,
-        )
-    except Exception as ex:
-        raise ValueError(
-            f"Unable to read Excel file '{file_name}': {ex}"
-        ) from ex
-
-
-def read_many(files: Iterable):
-    frames: List[pd.DataFrame] = []
-
-    for uploaded in files:
-        file_name = _uploaded_file_name(uploaded)
-        frame = read_excel(uploaded)
-        frame["_Source File"] = file_name
-        frames.append(frame)
-
-    if not frames:
-        return pd.DataFrame()
-
-    return pd.concat(
-        frames,
-        ignore_index=True,
-        sort=False,
-    )
-
-
-def excel_payload(df, file_name, title):
-    return Exporter.build_formatted_excel_file(
-        df=df,
-        file_name=file_name,
-        sheet_name=title[:31],
-        title=title,
-    )
-
-
-def safe_preview(df, rows=100):
-    preview = df.head(rows).copy()
-    preview = preview.astype(object).where(
-        pd.notna(preview),
-        None,
-    )
-    return preview.to_dict(orient="records")
-
-
-def _get_files(req, plural_name, singular_name):
-    files = list(req.files.getlist(plural_name))
-
-    if not files:
-        files = list(req.files.getlist(singular_name))
-
-    return [
-        uploaded
-        for uploaded in files
-        if uploaded is not None
-    ]
-
-
-# -----------------------------------------------------------------------------
-# UI and service status
-# -----------------------------------------------------------------------------
-
-
-@app.route(route="", methods=["GET"])
-def home(req: func.HttpRequest) -> func.HttpResponse:
-    return func.HttpResponse(
-        status_code=302,
-        headers={
-            "Location": "/api/ui"
-        },
-    )
-
-
-@app.route(route="ui", methods=["GET"])
-def ui(req: func.HttpRequest) -> func.HttpResponse:
-    path = (
-        Path(__file__).resolve().parent
-        / "web"
-        / "index.html"
-    )
-
-    if not path.exists():
-        return error_response(
-            "web/index.html was not found.",
-            status_code=404,
-            error_type="FileNotFoundError",
-        )
-
-    return func.HttpResponse(
-        path.read_text(encoding="utf-8"),
-        mimetype="text/html",
-        charset="utf-8",
-    )
-
-
-@app.route(route="health", methods=["GET"])
-def health(req: func.HttpRequest) -> func.HttpResponse:
-    try:
-        database_status = test_database_connection()
-
-        return json_response({
-            "status": "Healthy",
-            "application": APPLICATION_NAME,
-            "version": APPLICATION_VERSION,
-            "database": database_status,
-        })
-
-    except Exception as ex:
-        logging.exception("Health check failed")
-
-        return error_response(
-            ex,
-            status_code=500,
-            error_type=type(ex).__name__,
-        )
-
-
-# -----------------------------------------------------------------------------
-# Step 1 - Build or update cumulative Batch Master
-# -----------------------------------------------------------------------------
-
-
-@app.route(
-    route="batch-master/build",
-    methods=["GET", "POST"],
-)
-def build_batch_master(
-    req: func.HttpRequest,
-) -> func.HttpResponse:
-
-    if req.method == "GET":
-        return json_response({
-            "status": "Ready",
-            "application": APPLICATION_NAME,
-            "version": APPLICATION_VERSION,
-            "required_files": [
-                "asn_files",
-                "dispatch_files",
-                "sfda",
-            ],
-            "operations": [
-                "append",
-                "rebuild",
-            ],
-        })
-
-    try:
-        asn_files = _get_files(
-            req,
-            "asn_files",
-            "asn",
-        )
-
-        dispatch_files = _get_files(
-            req,
-            "dispatch_files",
-            "dispatch",
-        )
-
-        sfda_file = req.files.get("sfda")
-
-        if not asn_files:
-            raise ValueError(
-                "At least one ASN Receipt file is required."
-            )
-
-        if not dispatch_files:
-            raise ValueError(
-                "At least one Full Dispatch file is required."
-            )
-
-        if sfda_file is None:
-            raise ValueError(
-                "Latest SFDA Drug report is required."
-            )
-
-        operation = str(
-            req.form.get("operation") or "append"
-        ).strip().lower()
-
-        if operation not in {
-            "append",
-            "rebuild",
-        }:
-            raise ValueError(
-                "operation must be append or rebuild."
-            )
-
-        asn_dataframe = read_many(asn_files)
-        dispatch_dataframe = read_many(dispatch_files)
-        sfda_dataframe = read_excel(sfda_file)
-
-        engine = FullReconciliationEngine(
-            asn_df=asn_dataframe,
-            dispatch_df=dispatch_dataframe,
-            sfda_df=sfda_dataframe,
-        )
-
-        prepared = engine.prepare_incremental()
-
-        initialize_database()
-
-        if operation == "rebuild":
-            reset_history()
-
-        saved = append_events(
-            prepared["receipt_records"],
-            prepared["dispatch_records"],
-        )
-
-        receipt_summary, dispatch_summary = (
-            get_event_summaries()
-        )
-
-        master = engine.build_master_from_summaries(
-            receipt_summary=receipt_summary,
-            dispatch_summary=dispatch_summary,
-            sfda_summary=prepared["sfda_summary"],
-        )
-
-        replace_batch_master(master)
-
-        outputs = excel_payload(
-            master,
-            "Batch_Master.xlsx",
-            "Batch Master",
-        )
-
-        return json_response({
-            "status": "Completed",
-            "application": APPLICATION_NAME,
-            "version": APPLICATION_VERSION,
-            "operation": operation,
-            "summary": {
-                "uploaded_asn_files": len(asn_files),
-                "uploaded_dispatch_files": len(
-                    dispatch_files
-                ),
-                "prepared_receipt_events": len(
-                    prepared["receipt_records"]
-                ),
-                "prepared_dispatch_events": len(
-                    prepared["dispatch_records"]
-                ),
-                "new_receipt_events": saved[
-                    "receipt_events"
-                ],
-                "new_dispatch_events": saved[
-                    "dispatch_events"
-                ],
-                "batch_master_rows": len(master),
-            },
-            "outputs": outputs,
-            "preview": safe_preview(master),
-        })
-
-    except ValueError as ex:
-        logging.exception("Batch Master input failed")
-
-        return error_response(
-            ex,
-            status_code=400,
-            error_type=type(ex).__name__,
-        )
-
-    except Exception as ex:
-        logging.exception("Batch Master build failed")
-
-        return error_response(
-            ex,
-            status_code=500,
-            error_type=type(ex).__name__,
-        )
-
-
-# -----------------------------------------------------------------------------
-# Step 2 and Step 3 - Reconcile and generate SFDA files
-# -----------------------------------------------------------------------------
-
-
-@app.route(
-    route="reconcile",
-    methods=["GET", "POST"],
-)
-def reconcile(
-    req: func.HttpRequest,
-) -> func.HttpResponse:
-
-    if req.method == "GET":
-        return json_response({
-            "status": "Ready",
-            "application": APPLICATION_NAME,
-            "version": APPLICATION_VERSION,
-            "required_files": [
-                "inventory",
-                "sfda",
-            ],
-            "optional_files": [
-                "asn",
-            ],
-        })
-
-    try:
-        inventory_file = req.files.get("inventory")
-        sfda_file = req.files.get("sfda")
-        asn_file = req.files.get("asn")           # Optional - for Accept alerts
-        dispatch_file = req.files.get("dispatch")  # Optional - for Dispatch alerts
-
-        if inventory_file is None:
-            raise ValueError(
-                "Latest Inventory report is required."
-            )
-
-        if sfda_file is None:
-            raise ValueError(
-                "Latest SFDA Drug report is required."
-            )
-
-        batch_master = get_batch_master_df()
-
-        if batch_master.empty:
-            raise ValueError(
-                "Batch Master is empty. Complete Step 1 first."
-            )
-
-        inventory_dataframe = read_excel(
-            inventory_file
-        )
-
-        sfda_dataframe = read_excel(
-            sfda_file
-        )
-
-        dispatch_events = get_dispatch_events_df()
-
-        engine = ReconciliationEngine(
-            batch_master_df=batch_master,
-            inventory_df=inventory_dataframe,
-            sfda_df=sfda_dataframe,
-            dispatch_events_df=dispatch_events,
-        )
-
-        result = engine.run()
-
-        # Generate Alerts based on provided files
-        alerts = None
-        step_type = None
-
-        if asn_file is not None:
-            step_type = "accept"
-            try:
-                asn_dataframe = read_excel(asn_file)
-                alert_engine = AlertEngine(
-                    batch_master_df=batch_master,
-                    sfda_df=sfda_dataframe,
-                    inventory_df=inventory_dataframe,
-                )
-                alerts = alert_engine.generate_alerts_for_accept(
-                    asn_daily_df=asn_dataframe
-                )
-            except Exception as alert_ex:
-                logging.warning(
-                    f"Accept alert generation failed: {alert_ex}"
-                )
-                alerts = {
-                    "alert_count": 0,
-                    "alerts": [],
-                    "summary": {"error": str(alert_ex)},
-                }
-
-        elif dispatch_file is not None:
-            step_type = "dispatch"
-            try:
-                dispatch_dataframe = read_excel(dispatch_file)
-                alert_engine = AlertEngine(
-                    batch_master_df=batch_master,
-                    sfda_df=sfda_dataframe,
-                    inventory_df=inventory_dataframe,
-                )
-                alerts = alert_engine.generate_alerts_for_dispatch(
-                    sfda_updated_df=sfda_dataframe
-                )
-            except Exception as alert_ex:
-                logging.warning(
-                    f"Dispatch alert generation failed: {alert_ex}"
-                )
-                alerts = {
-                    "alert_count": 0,
-                    "alerts": [],
-                    "summary": {"error": str(alert_ex)},
-                }
-
-        accept_files = (
-            Exporter.build_sfda_upload_files(
-                df=result["accept"],
-                quantity_column="To Be Accept",
-                file_prefix="Accept",
-            )
-        )
-
-        dispatch_files = (
-            Exporter.build_dispatch_files_by_customer(
-                result["dispatch"]
-            )
-        )
-
-        reconciliation_excel = excel_payload(
-            result["report"],
-            "Reconciliation_Report.xlsx",
-            "Reconciliation Report",
-        )
-
-        outputs = {
-            "reconciliation_report": (
-                reconciliation_excel
-            ),
-            "accept_files": accept_files,
-            "dispatch_files": dispatch_files,
-        }
-
-        response_data = {
-            "status": "Completed",
-            "application": APPLICATION_NAME,
-            "version": APPLICATION_VERSION,
-            "summary": {
-                "batch_master_rows": len(batch_master),
-                "dispatch_history_rows": len(
-                    dispatch_events
-                ),
-                "reconciliation_rows": len(
-                    result["report"]
-                ),
-                "accept_rows": len(result["accept"]),
-                "dispatch_allocation_rows": len(
-                    result["dispatch"]
-                ),
-                "accept_files": len(accept_files),
-                "dispatch_files": len(dispatch_files),
-            },
-            "outputs": outputs,
-            "preview": safe_preview(
-                result["report"]
-            ),
-        }
-
-        # Add step type and alerts if generated
-        if step_type is not None:
-            response_data["step"] = step_type
-        if alerts is not None:
-            response_data["alerts"] = alerts
-
-        return json_response(response_data)
-
-    except ValueError as ex:
-        logging.exception("Reconciliation input failed")
-
-        return error_response(
-            ex,
-            status_code=400,
-            error_type=type(ex).__name__,
-        )
-
-    except Exception as ex:
-        logging.exception("Reconciliation failed")
-
-        return error_response(
-            ex,
-            status_code=500,
-            error_type=type(ex).__name__,
-        )
-
-
-# -----------------------------------------------------------------------------
-# Database inspection endpoints
-# -----------------------------------------------------------------------------
-
-
-@app.route(
-    route="batch-master",
-    methods=["GET"],
-)
-def batch_master(
-    req: func.HttpRequest,
-) -> func.HttpResponse:
-    try:
-        frame = get_batch_master_df()
-
-        return json_response({
-            "status": "Completed",
-            "application": APPLICATION_NAME,
-            "version": APPLICATION_VERSION,
-            "count": len(frame),
-            "rows": safe_preview(
-                frame,
-                rows=500,
-            ),
-        })
-
-    except Exception as ex:
-        logging.exception("Batch Master read failed")
-
-        return error_response(
-            ex,
-            status_code=500,
-            error_type=type(ex).__name__,
-        )
-
-
-@app.route(
-    route="database/status",
-    methods=["GET"],
-)
-def database_status(
-    req: func.HttpRequest,
-) -> func.HttpResponse:
-    try:
-        return json_response({
-            "status": "Completed",
-            "application": APPLICATION_NAME,
-            "version": APPLICATION_VERSION,
-            "database": test_database_connection(),
-        })
-
-    except Exception as ex:
-        logging.exception("Database status failed")
-
-        return error_response(
-            ex,
-            status_code=500,
-            error_type=type(ex).__name__,
-        )
+ 
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; }
+    body {
+      margin:0;
+      background:var(--soft);
+      color:var(--ink);
+      font-family:"Segoe UI", Inter, Arial, sans-serif;
+      min-width:320px;
+    }
+    button,input,select { font:inherit; }
+    button { cursor:pointer; }
+    [hidden] { display:none !important; }
+ 
+    .app { min-height:100vh; display:grid; grid-template-columns:260px 1fr; }
+ 
+    .sidebar {
+      position:fixed;
+      inset:0 auto 0 0;
+      width:260px;
+      background:linear-gradient(180deg,var(--navy-950),var(--navy-800));
+      color:#fff;
+      display:flex;
+      flex-direction:column;
+      z-index:30;
+      box-shadow:10px 0 34px rgba(5,23,44,.16);
+    }
+    .brand {
+      height:80px;
+      display:flex;
+      align-items:center;
+      gap:12px;
+      padding:0 18px;
+      border-bottom:1px solid rgba(255,255,255,.09);
+    }
+    .brand-mark {
+      width:44px;
+      height:44px;
+      border-radius:13px;
+      display:grid;
+      place-items:center;
+      font-size:13px;
+      font-weight:800;
+      background:linear-gradient(135deg,#0a7ee3,#20b486);
+      box-shadow:0 10px 22px rgba(0,0,0,.2);
+    }
+    .brand-title { font-size:16px; font-weight:800; line-height:1.1; }
+    .brand-subtitle { margin-top:4px; font-size:11px; color:#bad1e8; }
+ 
+    .nav { padding:16px 12px; display:grid; gap:6px; }
+    .nav-button {
+      border:0;
+      border-radius:10px;
+      min-height:44px;
+      padding:0 12px;
+      display:flex;
+      align-items:center;
+      gap:12px;
+      text-align:left;
+      color:#d6e6f7;
+      background:transparent;
+      font-size:13px;
+      font-weight:700;
+      transition:.18s ease;
+    }
+    .nav-button:hover { background:rgba(255,255,255,.08); transform:translateX(2px); color:#fff; }
+    .nav-button.active { background:linear-gradient(90deg,#0b76d7,#0e63bd); color:#fff; box-shadow:0 10px 22px rgba(0,83,171,.28); }
+    .nav-icon { width:20px; text-align:center; font-size:16px; }
+    .nav-separator { height:1px; background:rgba(255,255,255,.11); margin:8px 10px; }
+ 
+    .sidebar-footer { margin-top:auto; padding:14px 16px 18px; }
+    .user-card {
+      padding:13px;
+      border:1px solid rgba(255,255,255,.12);
+      background:rgba(255,255,255,.05);
+      border-radius:13px;
+    }
+    .user-line { display:flex; align-items:center; gap:10px; }
+    .avatar { width:36px; height:36px; border-radius:50%; display:grid; place-items:center; background:#126ac3; font-weight:800; font-size:12px; }
+    .user-name { font-size:12px; font-weight:800; }
+    .user-role { margin-top:3px; color:#b9cee5; font-size:10px; }
+    .health-line { margin-top:12px; display:flex; align-items:center; gap:7px; font-size:10px; color:#cce8d8; }
+    .dot { width:8px; height:8px; border-radius:50%; background:#31c87a; box-shadow:0 0 0 4px rgba(49,200,122,.13); }
+ 
+    .main { grid-column:2; min-width:0; }
+    .topbar {
+      height:70px;
+      position:sticky;
+      top:0;
+      z-index:20;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      padding:0 28px;
+      background:rgba(255,255,255,.95);
+      border-bottom:1px solid var(--line);
+      backdrop-filter:blur(12px);
+    }
+    .topbar-left { display:flex; align-items:center; gap:12px; }
+    .topbar-title { font-weight:800; font-size:15px; }
+    .topbar-subtitle { margin-top:2px; font-size:10px; color:var(--muted); }
+    .topbar-right { display:flex; align-items:center; gap:9px; }
+    .environment {
+      display:flex;
+      align-items:center;
+      gap:7px;
+      border:1px solid #cde8d7;
+      background:#effaf3;
+      color:#166b3e;
+      border-radius:999px;
+      padding:7px 11px;
+      font-size:11px;
+      font-weight:800;
+    }
+    .icon-btn {
+      width:38px;
+      height:38px;
+      display:grid;
+      place-items:center;
+      border:1px solid var(--line);
+      border-radius:10px;
+      background:#fff;
+      color:#43516a;
+    }
+    .icon-btn:hover { color:var(--blue-700); background:#f6fbff; border-color:#afcbea; }
+    .mobile-toggle { display:none; }
+ 
+    .content { max-width:1680px; margin:0 auto; padding:28px; }
+    .page { display:none; animation:fade .2s ease; }
+    .page.active { display:block; }
+    @keyframes fade { from{opacity:.25;transform:translateY(5px)} to{opacity:1;transform:none} }
+ 
+    .page-head { display:flex; justify-content:space-between; gap:20px; margin-bottom:20px; align-items:flex-start; }
+    .page-head h1 { margin:0; font-size:28px; line-height:1.15; letter-spacing:-.45px; }
+    .page-head p { margin:7px 0 0; color:var(--muted); font-size:13px; }
+    .actions { display:flex; flex-wrap:wrap; gap:9px; }
+ 
+    .btn {
+      border:1px solid transparent;
+      min-height:40px;
+      border-radius:9px;
+      padding:0 15px;
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      gap:8px;
+      font-size:12px;
+      font-weight:800;
+      text-decoration:none;
+      transition:.16s ease;
+    }
+    .btn:hover { transform:translateY(-1px); }
+    .btn:disabled { opacity:.5; cursor:not-allowed; transform:none; }
+    .btn-primary { color:#fff; background:var(--blue-600); box-shadow:0 8px 18px rgba(15,108,189,.18); }
+    .btn-secondary { color:var(--ink); background:#fff; border-color:#cfd7e3; }
+    .btn-success { color:#fff; background:var(--green-700); }
+    .btn-warning { color:#fff; background:var(--amber-600); }
+    .btn-purple { color:#fff; background:var(--purple-600); }
+    .btn-danger { color:#fff; background:var(--red-600); }
+ 
+    .grid { display:grid; gap:16px; }
+    .kpi-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
+    .kpi-grid-6 { grid-template-columns:repeat(6,minmax(0,1fr)); }
+    .two-col { grid-template-columns:minmax(0,1.4fr) minmax(330px,.6fr); }
+    .two-equal { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .three-col { grid-template-columns:repeat(3,minmax(0,1fr)); }
+ 
+    .card { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow); }
+    .card-header { min-height:56px; display:flex; align-items:center; justify-content:space-between; gap:16px; padding:0 20px; border-bottom:1px solid var(--line); }
+    .card-title { font-size:14px; font-weight:800; }
+    .card-subtitle { margin-top:3px; font-size:10px; color:var(--muted); }
+    .card-body { padding:20px; }
+ 
+    .kpi { padding:18px; min-height:128px; position:relative; overflow:hidden; }
+    .kpi-label { color:var(--muted); font-size:11px; font-weight:800; }
+    .kpi-value { margin-top:15px; font-size:30px; font-weight:800; letter-spacing:-.5px; }
+    .kpi-foot { margin-top:7px; font-size:10px; color:var(--muted-2); }
+    .kpi-icon { position:absolute; right:15px; top:15px; width:38px; height:38px; display:grid; place-items:center; border-radius:10px; background:#eaf4ff; color:var(--blue-700); font-weight:800; }
+    .kpi-icon.green { background:#eaf8ef; color:var(--green-700); }
+    .kpi-icon.red { background:#fdecec; color:var(--red-600); }
+    .kpi-icon.amber { background:#fff4e3; color:var(--amber-600); }
+    .kpi-icon.purple { background:#f0edff; color:var(--purple-600); }
+ 
+    .hero-strip {
+      display:grid;
+      grid-template-columns:1.25fr .75fr;
+      gap:16px;
+      margin-bottom:16px;
+    }
+    .hero-main {
+      padding:22px;
+      background:linear-gradient(135deg,#082e58,#0d6fc5);
+      color:#fff;
+      border-radius:18px;
+      box-shadow:0 18px 38px rgba(8,65,126,.22);
+      position:relative;
+      overflow:hidden;
+    }
+    .hero-main::after { content:""; position:absolute; width:230px; height:230px; border-radius:50%; background:rgba(255,255,255,.08); right:-70px; top:-80px; }
+    .hero-title { font-size:20px; font-weight:800; }
+    .hero-sub { margin-top:7px; color:#dcecff; font-size:12px; max-width:650px; line-height:1.6; }
+    .hero-actions { margin-top:18px; display:flex; flex-wrap:wrap; gap:9px; }
+    .hero-actions .btn-secondary { background:rgba(255,255,255,.95); }
+    .hero-status { padding:20px; }
+    .status-line { display:flex; justify-content:space-between; align-items:center; padding:11px 0; border-bottom:1px solid #edf1f6; font-size:11px; }
+    .status-line:last-child { border-bottom:0; }
+    .status-ok { color:var(--green-700); font-weight:800; }
+ 
+    .chart-wrap { padding:16px 18px 18px; }
+    .chart-legend { display:flex; flex-wrap:wrap; gap:14px; margin-bottom:10px; color:var(--muted); font-size:10px; }
+    .legend-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:5px; }
+    .line-chart { width:100%; height:245px; }
+ 
+    .activity-list { padding:7px 18px 15px; }
+    .activity { display:grid; grid-template-columns:34px 1fr auto; gap:11px; align-items:center; padding:12px 0; border-bottom:1px solid #eef2f6; }
+    .activity:last-child { border-bottom:0; }
+    .activity-icon { width:31px; height:31px; display:grid; place-items:center; border-radius:9px; background:#eaf8ef; color:var(--green-700); font-weight:800; }
+    .activity-title { font-size:11px; font-weight:800; }
+    .activity-meta,.activity-time { font-size:10px; color:var(--muted-2); }
+    .activity-meta { margin-top:3px; }
+ 
+    .file-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .file-card { padding:18px; min-height:150px; }
+    .file-card-top { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
+    .file-title { font-size:13px; font-weight:800; color:var(--blue-700); }
+    .file-sub { margin-top:5px; font-size:10px; color:var(--muted); line-height:1.5; }
+    .file-row { margin-top:16px; display:flex; align-items:center; gap:9px; padding:9px; border:1px dashed #98b8dc; border-radius:10px; background:#f8fbff; }
+    .file-row input { width:100%; min-width:0; font-size:11px; }
+    input[type=file]::file-selector-button { border:0; border-radius:7px; margin-right:8px; padding:8px 10px; background:var(--blue-600); color:#fff; font-weight:800; cursor:pointer; }
+    .file-meta { margin-top:10px; color:var(--muted-2); font-size:10px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+    .file-meta.ready { color:var(--green-700); font-weight:800; }
+ 
+    .badge { display:inline-flex; align-items:center; gap:5px; border-radius:999px; padding:5px 8px; font-size:9px; font-weight:800; }
+    .badge.info { background:#eaf4ff; color:#0a5daa; }
+    .badge.success { background:#eaf8ef; color:#126b3a; }
+    .badge.failed { background:#fdecec; color:#a11e22; }
+    .badge.warning { background:#fff3df; color:#975b00; }
+ 
+    .run-panel { margin-top:16px; padding:20px; display:grid; grid-template-columns:1fr auto; gap:18px; align-items:center; border:1px dashed #78a8df; background:#f8fbff; }
+    .run-title { font-size:13px; font-weight:800; }
+    .run-sub { margin-top:5px; font-size:10px; color:var(--muted); }
+ 
+    .status-banner { display:none; gap:11px; align-items:flex-start; margin-top:16px; padding:14px 15px; border-radius:11px; font-size:11px; }
+    .status-banner.show { display:flex; }
+    .status-banner.success { background:#eefaf3; color:#126b3a; border:1px solid #9bd8b3; }
+    .status-banner.error { background:#fff0f0; color:#991b1b; border:1px solid #edaaaa; }
+    .status-banner.info { background:#eff7ff; color:#174f87; border:1px solid #a9c9ed; }
+ 
+    .progress-card { display:none; margin-top:16px; padding:18px; }
+    .progress-card.show { display:block; }
+    .progress-head { display:flex; justify-content:space-between; font-size:11px; font-weight:800; }
+    .progress-track { height:10px; margin-top:10px; background:#e5eaf1; border-radius:999px; overflow:hidden; }
+    .progress-bar { height:100%; width:0; border-radius:inherit; background:linear-gradient(90deg,#0f6cbd,#16a85c); transition:width .35s ease; }
+    .progress-steps { margin-top:14px; display:grid; grid-template-columns:repeat(4,1fr); gap:9px; }
+    .progress-step { color:var(--muted-2); font-size:10px; }
+    .progress-step.done { color:var(--green-700); font-weight:800; }
+ 
+    .summary-panel { display:none; margin-top:16px; }
+    .summary-panel.show { display:block; }
+ 
+    .tabs { display:flex; flex-wrap:wrap; gap:7px; margin-bottom:16px; padding:7px; background:#fff; border:1px solid var(--line); border-radius:11px; }
+    .tab-btn { border:0; background:transparent; color:var(--muted); border-radius:8px; padding:9px 12px; font-size:10px; font-weight:800; }
+    .tab-btn.active { background:var(--blue-600); color:#fff; }
+    .tab-panel { display:none; }
+    .tab-panel.active { display:block; }
+ 
+    .download-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
+    .download-card { min-height:165px; padding:17px; display:flex; flex-direction:column; }
+    .download-card h3 { margin:0; font-size:13px; }
+    .download-card p { margin:7px 0 13px; color:var(--muted); font-size:10px; line-height:1.55; }
+    .download-card .btn { width:100%; margin-top:auto; }
+ 
+    .file-list { display:grid; gap:9px; }
+    .download-row { display:grid; grid-template-columns:38px 1fr auto; gap:11px; align-items:center; padding:11px; border:1px solid var(--line); border-radius:10px; background:#fff; }
+    .file-type { width:36px; height:36px; border-radius:9px; display:grid; place-items:center; color:#fff; background:var(--green-600); font-size:9px; font-weight:800; }
+    .file-type.xlsx { background:var(--blue-600); }
+    .file-name { font-size:11px; font-weight:800; word-break:break-word; }
+    .file-info { margin-top:3px; color:var(--muted-2); font-size:9px; }
+ 
+    .table-card { overflow:hidden; }
+    .table-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 18px; border-bottom:1px solid var(--line); }
+    .filters { display:flex; flex-wrap:wrap; gap:8px; }
+    .control { min-height:37px; border:1px solid #cfd7e3; border-radius:8px; background:#fff; color:var(--ink); padding:0 10px; font-size:10px; }
+    .search { min-width:220px; }
+    .table-scroll { overflow:auto; }
+    table { width:100%; min-width:860px; border-collapse:collapse; font-size:10px; }
+    th { text-align:left; background:#f6f8fb; color:var(--muted); font-weight:800; padding:11px 13px; border-bottom:1px solid var(--line); white-space:nowrap; }
+    td { padding:12px 13px; border-bottom:1px solid #edf1f6; white-space:nowrap; }
+    tbody tr:hover { background:#f8fbff; }
+    .table-footer { padding:12px 17px; display:flex; justify-content:space-between; color:var(--muted); font-size:10px; }
+ 
+    .intelligence-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
+    .intelligence-card { padding:18px; min-height:175px; }
+    .intelligence-card h3 { margin:0; font-size:13px; }
+    .intelligence-card p { font-size:10px; line-height:1.55; color:var(--muted); }
+    .intelligence-metric { margin-top:17px; display:flex; justify-content:space-between; align-items:end; }
+    .intelligence-metric strong { font-size:25px; }
+ 
+    .empty { padding:42px 18px; text-align:center; border:1px dashed #cbd5e1; border-radius:11px; background:#fbfcfe; color:var(--muted); font-size:11px; }
+    .empty strong { display:block; margin-bottom:5px; color:var(--ink); }
+ 
+    .alerts-list { display:grid; gap:12px; }
+    .alert-row { display:flex; align-items:flex-start; gap:12px; padding:14px; border-radius:8px; border-left:4px solid; }
+    .alert-row.alert-info { background:#e3f2fd; border-color:#2196f3; }
+    .alert-row.alert-warning { background:#fff3e0; border-color:#ff9800; }
+    .alert-row.alert-critical { background:#ffebee; border-color:#f44336; }
+    .alert-icon { font-size:18px; font-weight:bold; flex-shrink:0; margin-top:2px; }
+    .alert-row.alert-info .alert-icon { color:#2196f3; }
+    .alert-row.alert-warning .alert-icon { color:#ff9800; }
+    .alert-row.alert-critical .alert-icon { color:#f44336; }
+    .alert-content { flex:1; min-width:0; }
+    .alert-title { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px; }
+    .alert-row.alert-info .alert-title { color:#1976d2; }
+    .alert-row.alert-warning .alert-title { color:#e65100; }
+    .alert-row.alert-critical .alert-title { color:#c62828; }
+    .alert-message { font-size:13px; line-height:1.4; margin-bottom:6px; color:#333; }
+    .alert-meta { font-size:11px; color:#666; margin-top:6px; font-weight:500; }
+ 
+    .toast-wrap { position:fixed; right:20px; bottom:20px; z-index:100; display:grid; gap:9px; }
+    .toast { min-width:280px; max-width:430px; padding:12px 14px; border-radius:10px; color:#fff; font-size:11px; box-shadow:0 14px 34px rgba(0,0,0,.18); }
+    .toast.success { background:#13743e; }
+    .toast.error { background:#b4272c; }
+    .toast.info { background:#135fa8; }
+ 
+    .modal-backdrop { position:fixed; inset:0; z-index:120; display:none; align-items:center; justify-content:center; padding:22px; background:rgba(5,23,44,.62); }
+    .modal-backdrop.show { display:flex; }
+    .modal-card { width:min(980px,100%); max-height:90vh; overflow:auto; background:#fff; border-radius:16px; box-shadow:0 24px 70px rgba(0,0,0,.28); }
+    .modal-head { position:sticky; top:0; z-index:2; display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:18px 20px; background:#fff; border-bottom:1px solid var(--line); }
+    .modal-title { font-size:18px; font-weight:900; }
+    .modal-subtitle { margin-top:4px; color:var(--muted); font-size:10px; }
+    .modal-body { padding:20px; }
+    .detail-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-bottom:16px; }
+    .detail-box { padding:12px; border:1px solid var(--line); border-radius:10px; background:#f8fafc; }
+    .detail-box span { display:block; color:var(--muted); font-size:9px; font-weight:800; text-transform:uppercase; }
+    .detail-box strong { display:block; margin-top:6px; font-size:12px; word-break:break-word; }
+    .history-file-section { margin-top:16px; }
+    .history-file-section h3 { margin:0 0 9px; font-size:13px; }
+    .history-file-row { display:grid; grid-template-columns:1fr auto auto; gap:10px; align-items:center; padding:10px 12px; border:1px solid var(--line); border-radius:9px; margin-bottom:8px; }
+    .history-file-meta { color:var(--muted); font-size:9px; margin-top:3px; }
+    @media(max-width:760px){.detail-grid{grid-template-columns:1fr 1fr}.history-file-row{grid-template-columns:1fr}.modal-backdrop{padding:8px}}
+ 
+    @media (max-width:1250px) {
+      .kpi-grid-6 { grid-template-columns:repeat(3,1fr); }
+      .kpi-grid,.download-grid { grid-template-columns:repeat(2,1fr); }
+      .two-col,.hero-strip { grid-template-columns:1fr; }
+      .intelligence-grid { grid-template-columns:repeat(2,1fr); }
+    }
+    @media (max-width:820px) {
+      .app { grid-template-columns:1fr; }
+      .sidebar { transform:translateX(-100%); transition:.22s ease; }
+      .sidebar.open { transform:none; }
+      .main { grid-column:1; }
+      .mobile-toggle { display:grid; }
+      .topbar { padding:0 14px; }
+      .content { padding:20px 13px; }
+      .page-head { flex-direction:column; }
+      .kpi-grid,.kpi-grid-6,.file-grid,.two-equal,.three-col,.download-grid,.intelligence-grid { grid-template-columns:1fr; }
+      .run-panel { grid-template-columns:1fr; }
+      .progress-steps { grid-template-columns:1fr 1fr; }
+      .environment { display:none; }
+    }
+ 
+ 
+    /* V2.1 dense operational dashboard */
+    .dashboard-filter-bar{display:grid;grid-template-columns:1.1fr 1.1fr 1fr 1fr auto;gap:12px;align-items:end;padding:14px 16px;margin-bottom:16px}
+    .filter-field label{display:block;font-size:10px;font-weight:800;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.35px}
+    .filter-field input,.filter-field select{width:100%;height:38px;border:1px solid var(--line);border-radius:8px;background:#fff;padding:0 10px;color:var(--text);font-size:11px}
+    .ops-kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin-bottom:16px}
+    .ops-kpi{min-height:108px;padding:14px 14px 12px;position:relative;overflow:hidden}
+    .ops-kpi .label{font-size:10px;font-weight:800;color:var(--muted);padding-right:36px}
+    .ops-kpi .value{font-size:25px;font-weight:900;margin-top:16px;letter-spacing:-.4px}
+    .ops-kpi .unit{font-size:10px;color:var(--muted);margin-left:4px;font-weight:700}
+    .ops-kpi .mini-icon{position:absolute;right:12px;top:12px;width:32px;height:32px;display:grid;place-items:center;border-radius:9px;background:#eaf4ff;color:#0866bd;font-weight:900}
+    .ops-kpi.green{background:linear-gradient(135deg,#fff,#effaf3)} .ops-kpi.green .mini-icon{background:#e5f7eb;color:#14753f}
+    .ops-kpi.amber{background:linear-gradient(135deg,#fff,#fff7e9)} .ops-kpi.amber .mini-icon{background:#fff0d5;color:#bd6b00}
+    .ops-kpi.red{background:linear-gradient(135deg,#fff,#fff0f0)} .ops-kpi.red .mini-icon{background:#fde4e4;color:#c42d33}
+    .ops-kpi.purple{background:linear-gradient(135deg,#fff,#f7f1ff)} .ops-kpi.purple .mini-icon{background:#eee4ff;color:#7040bd}
+    .ops-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:14px}
+    .ops-main{display:grid;gap:14px}.ops-side{display:grid;gap:14px;align-content:start}
+    .compact-table table{min-width:900px;font-size:10px}.compact-table th,.compact-table td{padding:9px 10px}
+    .compact-table .table-scroll{max-height:430px;overflow-y:auto;overflow-x:auto}
+    .compact-table thead th{position:sticky;top:0;z-index:3}
+    .compact-table thead tr:first-child th{top:0}
+    .compact-table thead tr:nth-child(2) th{top:33px}
+    .group-head{font-size:9px;text-align:center;color:#334155;border-bottom:0!important}.group-sfda{background:#eaf4ff!important}.group-receive{background:#ebf8ef!important}.group-inventory{background:#fff5df!important}.group-dispatch{background:#fdeceb!important}
+    .quick-actions{padding:12px;display:grid;gap:8px}.quick-actions .btn{width:100%;justify-content:flex-start}
+    .mini-donut-wrap{padding:16px;display:grid;grid-template-columns:110px 1fr;gap:14px;align-items:center}.mini-donut{width:100px;height:100px;border-radius:50%;background:conic-gradient(#239247 0 80%,#d94747 80% 90%,#c8ced8 90% 100%);position:relative}.mini-donut:after{content:"";position:absolute;inset:22px;background:#fff;border-radius:50%}.mini-donut-label{position:absolute;inset:0;display:grid;place-items:center;z-index:2;text-align:center;font-size:11px;font-weight:900}.mini-legend{display:grid;gap:8px;font-size:10px}.mini-legend-row{display:flex;justify-content:space-between;gap:8px}
+    .recent-upload-list{padding:8px 14px 14px}.recent-upload-row{display:grid;grid-template-columns:1fr auto;gap:8px;padding:9px 0;border-bottom:1px solid #edf1f6;font-size:10px}.recent-upload-row:last-child{border-bottom:0}.upload-type{font-weight:800}.upload-time{color:var(--muted);margin-top:3px}
+    .bottom-ops-grid{display:grid;grid-template-columns:1.05fr 1fr;gap:14px}.legend-footer{display:flex;flex-wrap:wrap;gap:24px;padding:13px 16px;margin-top:14px;font-size:10px}.legend-item{display:flex;align-items:center;gap:8px}.legend-symbol{width:21px;height:21px;border-radius:50%;display:grid;place-items:center;font-weight:900}
+    .inline-results{display:none;margin-top:24px;padding-top:20px;border-top:1px solid var(--line)}.inline-results.show{display:block}.result-anchor{scroll-margin-top:86px}
+    .result-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px}.result-head h2{margin:0;font-size:22px}.result-head p{margin:5px 0 0;color:var(--muted);font-size:11px}
+    @media(max-width:1250px){.ops-kpis{grid-template-columns:repeat(3,1fr)}.ops-layout{grid-template-columns:1fr}.dashboard-filter-bar{grid-template-columns:repeat(2,1fr)}.dashboard-filter-bar .btn{width:100%}}
+    @media(max-width:760px){.ops-kpis{grid-template-columns:1fr}.dashboard-filter-bar{grid-template-columns:1fr}.bottom-ops-grid{grid-template-columns:1fr}.result-head{flex-direction:column}.mini-donut-wrap{grid-template-columns:1fr}.mini-donut{margin:auto}}
+ 
+ 
+    .verification-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,.72fr);gap:16px}
+    .verification-step{padding:18px;border:1px solid var(--line);border-radius:12px;background:#fff}
+    .verification-step-number{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;background:#eaf4ff;color:var(--blue-700);font-weight:900;font-size:11px;margin-bottom:12px}
+    .verification-step h3{margin:0;font-size:14px}.verification-step p{margin:6px 0 0;color:var(--muted);font-size:10px;line-height:1.55}
+    .verification-form{display:grid;gap:14px}.verification-form label{display:block;font-size:10px;font-weight:800;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.35px}
+    .verification-form select,.verification-form input[type=file]{width:100%}
+    .verification-file-box{padding:13px;border:1px dashed #98b8dc;border-radius:10px;background:#f8fbff}
+    .lifecycle-list{display:grid;gap:10px}.lifecycle-row{display:grid;grid-template-columns:28px 1fr auto;gap:10px;align-items:center;padding:11px;border:1px solid var(--line);border-radius:10px}
+    .lifecycle-dot{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;background:#eaf4ff;color:var(--blue-700);font-size:10px;font-weight:900}
+    @media(max-width:1000px){.verification-grid{grid-template-columns:1fr}}
+ 
+  </style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-mark">SFDA</div>
+      <div>
+        <div class="brand-title">Drug Traceability</div>
+        <div class="brand-subtitle">Reconciliation Platform</div>
+      </div>
+    </div>
+ 
+    <nav class="nav">
+      <button class="nav-button active" data-page="home"><span class="nav-icon">⌂</span>Home</button>
+      <button class="nav-button" data-page="upload"><span class="nav-icon">⇧</span>Upload & Run</button>
+      <button class="nav-button" data-page="full-reconciliation"><span class="nav-icon">▦</span>Full Reconciliation</button>
+      <button class="nav-button" data-page="verification" id="verificationNavButton" title="Open SFDA Verification"><span class="nav-icon">✓</span>SFDA Verification</button>
+      <button class="nav-button" data-page="history"><span class="nav-icon">◷</span>History</button>
+      <button class="nav-button" data-page="reports"><span class="nav-icon">▥</span>Reports</button>
+      <button class="nav-button" data-page="intelligence"><span class="nav-icon">◆</span>Product Intelligence</button>
+      <button class="nav-button" data-page="variance"><span class="nav-icon">!</span>Variance Management</button>
+      <div class="nav-separator"></div>
+      <button class="nav-button" data-page="administration"><span class="nav-icon">⚙</span>Administration</button>
+    </nav>
+ 
+    <div class="sidebar-footer">
+      <div class="user-card">
+        <div class="user-line">
+          <div class="avatar">SN</div>
+          <div>
+            <div class="user-name">Safwan Noor</div>
+            <div class="user-role">Administrator · Madinah LC</div>
+          </div>
+        </div>
+        <div class="health-line"><span class="dot"></span>Azure Function connected</div>
+      </div>
+    </div>
+  </aside>
+ 
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-left">
+        <button class="icon-btn mobile-toggle" id="mobileToggle">☰</button>
+        <div>
+          <div class="topbar-title" id="topbarTitle">Home</div>
+          <div class="topbar-subtitle">SFDA Drug Traceability & Reconciliation Platform</div>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <div class="environment"><span class="dot"></span>Production</div>
+        <button class="icon-btn" id="healthButton" title="Refresh system health">↻</button>
+        <button class="icon-btn" title="Notifications">♢</button>
+      </div>
+    </header>
+ 
+    <div class="content">
+      <!-- HOME -->
+      <section class="page active" id="page-home">
+        <div class="page-head">
+          <div><h1>Dashboard</h1><p>Operational view of SFDA, receiving, inventory, dispatch, exceptions, and customer mapping.</p></div>
+          <div class="actions"><button class="btn btn-primary" data-go="upload">▶ Run Reconciliation</button></div>
+        </div>
+ 
+        <div class="card dashboard-filter-bar">
+          <div class="filter-field"><label>Snapshot Date</label><input type="date" id="dashboardDate"></div>
+          <div class="filter-field"><label>Trade Name</label><select><option>All</option></select></div>
+          <div class="filter-field"><label>Supplier</label><select><option>All</option></select></div>
+          <div class="filter-field"><label>Customer</label><select><option>All</option></select></div>
+          <button class="btn btn-primary" id="dashboardRefresh">↻ Refresh</button>
+        </div>
+ 
+        <div class="ops-kpis">
+          <div class="card ops-kpi"><div class="label">Total Items (SFDA)</div><div class="value" id="homeInputRows">—</div><div class="mini-icon">▣</div></div>
+          <div class="card ops-kpi green"><div class="label">Pending to Accept</div><div class="value" id="homeAccept">—<span class="unit">Packs</span></div><div class="mini-icon">✓</div></div>
+          <div class="card ops-kpi amber"><div class="label">Pending to Dispatch</div><div class="value" id="homeDispatch">—<span class="unit">Packs</span></div><div class="mini-icon">⇢</div></div>
+          <div class="card ops-kpi red"><div class="label">Exceptions</div><div class="value" id="homeVariance">—<span class="unit">Items</span></div><div class="mini-icon">!</div></div>
+          <div class="card ops-kpi purple"><div class="label">Customers with GLN</div><div class="value">—<span class="unit">Customers</span></div><div class="mini-icon">◎</div></div>
+          <div class="card ops-kpi"><div class="label">Dummy GLN Used</div><div class="value">—<span class="unit">Customers</span></div><div class="mini-icon">?</div></div>
+        </div>
+ 
+        <div class="ops-layout">
+          <div class="ops-main">
+            <div class="card table-card compact-table">
+              <div class="card-header"><div><div class="card-title">Reconciliation Overview</div><div class="card-subtitle">Latest completed run preview</div></div><button class="btn btn-secondary" data-go="upload">Open Current Run</button></div>
+              <div class="table-scroll"><table>
+                <thead>
+                  <tr><th colspan="4"></th><th colspan="3" class="group-head group-sfda">SFDA</th><th colspan="2" class="group-head group-receive">WMS Receive</th><th colspan="2" class="group-head group-inventory">WMS Inventory</th><th colspan="1" class="group-head group-dispatch">WMS Dispatch</th><th></th></tr>
+                  <tr><th>BN</th><th>Expiry Date</th><th>GTIN</th><th>Drug Name</th><th>Active</th><th>Qty Sent Pending</th><th>Qty Receive Pending</th><th>Received</th><th>To Be Accept</th><th>Inventory</th><th>Variance</th><th>To Be Dispatch</th><th>Status</th></tr>
+                </thead>
+                <tbody id="homeOverviewBody">
+                  <tr><td colspan="13"><div class="empty"><strong>No reconciliation data loaded</strong>Run a reconciliation to populate this operational table.</div></td></tr>
+                </tbody>
+              </table></div>
+            </div>
+ 
+            <div class="bottom-ops-grid">
+              <div class="card table-card compact-table">
+                <div class="card-header"><div><div class="card-title">Top Exceptions</div><div class="card-subtitle">Highest-priority reconciliation issues</div></div><button class="btn btn-secondary" data-go="variance">View All</button></div>
+                <div class="table-scroll"><table><thead><tr><th>BN</th><th>Expiry Date</th><th>Issue Type</th><th>Description</th><th>Variance</th><th>Action</th></tr></thead><tbody id="homeExceptionsBody"><tr><td colspan="6"><div class="empty"><strong>No exception details available</strong>Detailed records will be loaded from the database phase.</div></td></tr></tbody></table></div>
+              </div>
+              <div class="card table-card compact-table">
+                <div class="card-header"><div><div class="card-title">Dispatch by Customer</div><div class="card-subtitle">To Be Dispatch allocation</div></div><button class="btn btn-secondary" data-go="upload">View Current Results</button></div>
+                <div class="table-scroll"><table><thead><tr><th>Customer</th><th>GLN</th><th>Total Packs</th><th>Items</th><th>Status</th></tr></thead><tbody><tr><td colspan="5"><div class="empty"><strong>No customer allocation loaded</strong>Run a reconciliation to generate customer files.</div></td></tr></tbody></table></div>
+              </div>
+            </div>
+          </div>
+ 
+          <aside class="ops-side">
+            <div class="card"><div class="card-header"><div class="card-title">Quick Actions</div></div><div class="quick-actions"><button class="btn btn-success" data-go="upload">▶ Run Reconciliation</button><button class="btn btn-primary" data-go="upload">⇩ Prepare Accept</button><button class="btn btn-warning" data-go="upload">⇢ Prepare Dispatch</button><button class="btn btn-purple" data-go="history">◷ Upload History</button><button class="btn btn-secondary" data-go="verification">✓ SFDA Verification</button></div></div>
+            <div class="card"><div class="card-header"><div class="card-title">Customer / GLN</div></div><div class="mini-donut-wrap"><div style="position:relative"><div class="mini-donut"></div><div class="mini-donut-label"><div><div style="font-size:18px">—</div><div>Total</div></div></div></div><div class="mini-legend"><div class="mini-legend-row"><span><i class="legend-dot" style="background:#239247"></i>With GLN</span><strong>—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#d94747"></i>Dummy GLN</span><strong>—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#c8ced8"></i>Not Mapped</span><strong>—</strong></div></div></div></div>
+            <div class="card"><div class="card-header"><div><div class="card-title">Recent Uploads</div><div class="card-subtitle">Latest locally selected report types</div></div></div><div class="recent-upload-list" id="recentUploads"><div class="empty"><strong>No uploads yet</strong>Selected files will appear after a run.</div></div></div>
+            <div class="card"><div class="card-header"><div class="card-title">System Status</div></div><div class="card-body"><div class="status-line"><span>Azure Function</span><span class="status-ok" id="homeHealth">Checking...</span></div><div class="status-line"><span>Version</span><strong id="homeVersion">—</strong></div><div class="status-line"><span>Total Local Runs</span><strong id="homeRuns">0</strong></div><div class="status-line"><span>Successful Runs</span><strong id="homeSuccess">0</strong></div><div class="status-line"><span>Generated Files</span><strong id="homeGenerated">—</strong></div></div></div>
+          </aside>
+        </div>
+ 
+        <div class="card legend-footer"><div class="legend-item"><span class="legend-symbol" style="background:#e9f8ee;color:#178043">✓</span><span><strong>OK</strong><br>All good</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fff3db;color:#bd7400">◷</span><span><strong>Dispatch Pending</strong><br>Pending dispatch to SFDA</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fdeaea;color:#c63034">!</span><span><strong>Diff / Exception</strong><br>Needs attention</span></div><div class="legend-item"><span class="legend-symbol" style="background:#eaf4ff;color:#0866bd">?</span><span><strong>Dummy GLN</strong><br>Customer has no GLN</span></div></div>
+        <div id="recentActivity" hidden></div>
+      </section>
+ 
+      <!-- UPLOAD -->
+      <section class="page" id="page-upload">
+        <div class="page-head">
+          <div><h1>Upload & Run Reconciliation</h1><p>Upload the four required Excel reports and execute the reconciliation workflow.</p></div>
+          <div class="actions"><button class="btn btn-secondary" id="resetButton">↻ Reset</button></div>
+        </div>
+ 
+        <div class="grid two-equal">
+          <form id="acceptForm" class="card" style="padding:20px">
+            <div class="card-title" style="font-size:18px;color:#107c41">Step 1 — Accept Reconciliation</div>
+            <div class="card-subtitle" style="margin:6px 0 18px">Generate Accept files from actual ASN receipts and current SFDA receive pending quantities.</div>
+            <div class="grid">
+              <div class="file-card"><div class="file-title">① ASN Receipt Detailed Report</div><div class="file-row"><input id="acceptAsn" name="asn" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="acceptAsnName">No file selected</div></div>
+              <div class="file-card"><div class="file-title">② Inventory Status Report</div><div class="file-row"><input id="acceptInventory" name="inventory" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="acceptInventoryName">No file selected</div></div>
+              <div class="file-card"><div class="file-title">③ SFDA Drug Count — Before Accept</div><div class="file-row"><input id="acceptSfda" name="sfda" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="acceptSfdaName">No file selected</div></div>
+            </div>
+            <button class="btn btn-success" id="acceptRunButton" type="submit" disabled style="margin-top:16px;width:100%">▶ Generate Accept Files</button>
+            <div class="card progress-card" id="acceptProgressCard" style="box-shadow:none">
+              <div class="progress-head">
+                <span id="acceptProgressLabel">Preparing Accept reconciliation...</span>
+                <span id="acceptProgressPercent">0%</span>
+              </div>
+              <div class="progress-track">
+                <div class="progress-bar" id="acceptProgressBar"></div>
+              </div>
+              <div class="progress-steps">
+                <div class="progress-step" id="acceptStepRead">○ Reading files</div>
+                <div class="progress-step" id="acceptStepValidate">○ Validating data</div>
+                <div class="progress-step" id="acceptStepCalculate">○ Calculating Accept</div>
+                <div class="progress-step" id="acceptStepGenerate">○ Generating outputs</div>
+              </div>
+            </div>
+          </form>
+ 
+          <form id="dispatchForm" class="card" style="padding:20px">
+            <div class="card-title" style="font-size:18px;color:#6b4eff">Step 2 — Dispatch Reconciliation</div>
+            <div class="card-subtitle" style="margin:6px 0 18px">Run only after the Accept upload is completed and a refreshed SFDA report is downloaded.</div>
+            <div class="grid">
+              <div class="file-card"><div class="file-title">① Full Dispatch Report</div><div class="file-row"><input id="dispatchReport" name="dispatch" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="dispatchReportName">No file selected</div></div>
+              <div class="file-card"><div class="file-title">② Inventory Status Report</div><div class="file-row"><input id="dispatchInventory" name="inventory" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="dispatchInventoryName">No file selected</div></div>
+              <div class="file-card"><div class="file-title">③ Updated SFDA Drug Count — After Accept</div><div class="file-row"><input id="dispatchSfda" name="sfda" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="dispatchSfdaName">No file selected</div></div>
+            </div>
+            <button class="btn btn-purple" id="dispatchRunButton" type="submit" disabled style="margin-top:16px;width:100%">▶ Generate Dispatch Files</button>
+            <div class="card progress-card" id="dispatchProgressCard" style="box-shadow:none">
+              <div class="progress-head">
+                <span id="dispatchProgressLabel">Preparing Dispatch reconciliation...</span>
+                <span id="dispatchProgressPercent">0%</span>
+              </div>
+              <div class="progress-track">
+                <div class="progress-bar" id="dispatchProgressBar"></div>
+              </div>
+              <div class="progress-steps">
+                <div class="progress-step" id="dispatchStepRead">○ Reading files</div>
+                <div class="progress-step" id="dispatchStepValidate">○ Validating data</div>
+                <div class="progress-step" id="dispatchStepCalculate">○ Calculating Dispatch</div>
+                <div class="progress-step" id="dispatchStepGenerate">○ Generating outputs</div>
+              </div>
+            </div>
+          </form>
+        </div>
+ 
+        <div class="card run-panel">
+          <div><div class="run-title">Two-Step Reconciliation Workflow</div><div class="run-sub">Complete Accept first, upload it to SFDA, download the refreshed Drug Count, then run Dispatch.</div></div>
+        </div>
+ 
+        <div class="status-banner" id="statusBox"></div>
+ 
+        <div class="summary-panel" id="summaryPanel">
+          <div class="page-head" style="margin:20px 0 12px"><div><h1 style="font-size:21px">Processing Summary</h1><p>Latest response from the Azure reconciliation engine.</p></div></div>
+          <div class="grid kpi-grid-6">
+            <div class="card kpi"><div class="kpi-label">Input Files</div><div class="kpi-value" id="sumFiles">0</div><div class="kpi-icon">▣</div></div>
+            <div class="card kpi"><div class="kpi-label">Input Rows</div><div class="kpi-value" id="sumInputRows">0</div><div class="kpi-icon">≡</div></div>
+            <div class="card kpi"><div class="kpi-label">Master Rows</div><div class="kpi-value" id="sumMasterRows">0</div><div class="kpi-icon">◆</div></div>
+            <div class="card kpi"><div class="kpi-label">Accept Items</div><div class="kpi-value" id="sumAccept">0</div><div class="kpi-icon green">✓</div></div>
+            <div class="card kpi"><div class="kpi-label">Dispatch Items</div><div class="kpi-value" id="sumDispatch">0</div><div class="kpi-icon purple">⇢</div></div>
+            <div class="card kpi"><div class="kpi-label">Variance Items</div><div class="kpi-value" id="sumVariance">0</div><div class="kpi-icon red">!</div></div>
+          </div>
+        </div>
+ 
+        <div class="inline-results result-anchor" id="inlineResults">
+          <div class="result-head"><div><h2>Reconciliation Results</h2><p>Review and download all files generated for the current reconciliation run.</p></div><button class="btn btn-purple" id="downloadAllButton" disabled>⇩ Download All Results</button></div>
+          <div class="status-banner info show" id="resultsInfo"><span>ⓘ</span><div>No completed reconciliation is loaded in this browser yet.</div></div>
+          <div class="grid kpi-grid" style="margin-bottom:16px">
+            <div class="card kpi"><div class="kpi-label">Accept Items</div><div class="kpi-value" id="resultAccept">—</div><div class="kpi-icon green">✓</div></div>
+            <div class="card kpi"><div class="kpi-label">Dispatch Items</div><div class="kpi-value" id="resultDispatch">—</div><div class="kpi-icon purple">⇢</div></div>
+            <div class="card kpi"><div class="kpi-label">Variance Items</div><div class="kpi-value" id="resultVariance">—</div><div class="kpi-icon red">!</div></div>
+            <div class="card kpi"><div class="kpi-label">Generated Files</div><div class="kpi-value" id="resultFiles">—</div><div class="kpi-icon amber">⇩</div></div>
+          </div>
+          <div class="tabs"><button class="tab-btn active" data-tab="summary">Overview</button><button class="tab-btn" data-tab="accept">Accept Files</button><button class="tab-btn" data-tab="dispatch">Dispatch Files</button><button class="tab-btn" data-tab="reports">Excel Reports</button><button class="tab-btn" data-tab="alerts">Alerts</button></div>
+          <div class="tab-panel active" id="tab-summary"><div class="grid download-grid">
+            <div class="card download-card"><h3>Accept Upload Files</h3><p>SFDA-ready CSV files split into 20 rows and maximum total quantity of 100,000.</p><button class="btn btn-primary" id="downloadAcceptZip" disabled>Download Accept ZIP</button></div>
+            <div class="card download-card"><h3>Dispatch Upload Files</h3><p>Customer-grouped files using GLN mapping, with unmatched customers classified as DUMMY.</p><button class="btn btn-success" id="downloadDispatchZip" disabled>Download Dispatch ZIP</button></div>
+            <div class="card download-card"><h3>Variance Report</h3><p>Unallocated quantities and reconciliation exceptions requiring investigation.</p><button class="btn btn-warning" id="downloadVariance" disabled>Download Variance Excel</button></div>
+            <div class="card download-card"><h3>All Excel Reports</h3><p>Accept Details, Dispatch Details, and Variance reports in a single archive.</p><button class="btn btn-purple" id="downloadReportsZip" disabled>Download Reports ZIP</button></div>
+          </div></div>
+          <div class="tab-panel" id="tab-accept"><div class="file-list" id="acceptFilesList"><div class="empty"><strong>No Accept files loaded</strong>Run a reconciliation first.</div></div></div>
+          <div class="tab-panel" id="tab-dispatch"><div class="file-list" id="dispatchFilesList"><div class="empty"><strong>No Dispatch files loaded</strong>Run a reconciliation first.</div></div></div>
+          <div class="tab-panel" id="tab-reports"><div class="file-list" id="reportsFilesList"><div class="empty"><strong>No Excel reports loaded</strong>Run a reconciliation first.</div></div></div>
+          <div class="tab-panel" id="tab-alerts"><div class="alerts-list" id="alertsList"><div class="empty"><strong>No alerts generated</strong>All batches match expected records.</div></div></div>
+        </div>
+      </section>
+ 
+ 
+      <!-- SFDA VERIFICATION -->
+ 
+      <!-- FULL RECONCILIATION -->
+      <section class="page" id="page-full-reconciliation">
+        <div class="page-head">
+          <div>
+            <h1>Full Reconciliation</h1>
+            <p>Build or rebuild the historical Batch Master from all ASN and Full Dispatch files. This page does not generate SFDA upload CSV files.</p>
+          </div>
+          <div class="actions">
+            <span class="badge warning">Historical Build</span>
+          </div>
+        </div>
+ 
+        <div class="status-banner info show">
+          <span>ⓘ</span>
+          <div>
+            <strong>First-time setup:</strong>
+            upload all historical ASN and Full Dispatch files from the selected cutover date, together with the latest SFDA Drug Count report.
+            The current Batch Master will be replaced after a successful run.
+          </div>
+        </div>
+ 
+        <form id="fullReconciliationForm" class="card" style="margin-top:16px">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Historical Source Files</div>
+              <div class="card-subtitle">Multiple ASN files + multiple Full Dispatch files + one latest SFDA report</div>
+            </div>
+          </div>
+ 
+          <div class="grid">
+            <div class="file-card">
+              <div class="file-card-top">
+                <div>
+                  <div class="file-title">① Historical ASN Files</div>
+                  <div class="card-subtitle" style="margin-top:5px">Select all ASN receipt files from the historical cutover date until today.</div>
+                </div>
+                <span class="badge info">Multiple</span>
+              </div>
+              <div class="file-row">
+                <input id="fullAsnFiles" name="asn_files" type="file" accept=".xls,.xlsx" multiple required>
+              </div>
+              <div class="file-meta" id="fullAsnMeta">No files selected</div>
+            </div>
+ 
+            <div class="file-card">
+              <div class="file-card-top">
+                <div>
+                  <div class="file-title">② Historical Full Dispatch Files</div>
+                  <div class="card-subtitle" style="margin-top:5px">Select all Full Dispatch reports covering the same historical period.</div>
+                </div>
+                <span class="badge info">Multiple</span>
+              </div>
+              <div class="file-row">
+                <input id="fullDispatchFiles" name="dispatch_files" type="file" accept=".xls,.xlsx" multiple required>
+              </div>
+              <div class="file-meta" id="fullDispatchMeta">No files selected</div>
+            </div>
+ 
+            <div class="file-card">
+              <div class="file-card-top">
+                <div>
+                  <div class="file-title">③ Latest SFDA Drug Count</div>
+                  <div class="card-subtitle" style="margin-top:5px">Upload the latest SFDA snapshot used to compare the historical physical movements.</div>
+                </div>
+                <span class="badge success">Required</span>
+              </div>
+              <div class="file-row">
+                <input id="fullSfdaFile" name="sfda" type="file" accept=".xls,.xlsx" required>
+              </div>
+              <div class="file-meta" id="fullSfdaMeta">No file selected</div>
+            </div>
+          </div>
+ 
+          <div class="card run-panel" style="margin-top:16px;box-shadow:none;align-items:flex-start">
+            <div style="flex:1">
+              <div class="run-title">Database Operation</div>
+              <div class="run-sub">Append is the normal option. Rebuild deletes the historical master and recreates it from the uploaded files.</div>
+              <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px">
+                <label class="selection-card" style="flex:1;min-width:240px">
+                  <input type="radio" name="fullOperation" value="append" checked>
+                  <span>
+                    <strong>Append New History</strong><br>
+                    <small>Add only new receipt and dispatch events. Existing events are skipped automatically.</small>
+                  </span>
+                </label>
+                <label class="selection-card" style="flex:1;min-width:240px">
+                  <input type="radio" name="fullOperation" value="rebuild">
+                  <span>
+                    <strong>Rebuild Full History</strong><br>
+                    <small>Delete the current history and rebuild it from the uploaded files.</small>
+                  </span>
+                </label>
+              </div>
+            </div>
+            <span class="badge success">Append Default</span>
+          </div>
+ 
+          <button class="btn btn-purple" id="fullRunButton" type="submit" disabled style="margin-top:16px;width:100%">
+            ▶ Build Historical Batch Master
+          </button>
+ 
+          <div class="card progress-card" id="fullProgressCard" style="box-shadow:none">
+            <div class="progress-head">
+              <span id="fullProgressLabel">Preparing historical reconciliation...</span>
+              <span id="fullProgressPercent">0%</span>
+            </div>
+            <div class="progress-track">
+              <div class="progress-bar" id="fullProgressBar"></div>
+            </div>
+            <div class="progress-steps">
+              <div class="progress-step" id="fullStepRead">○ Reading historical files</div>
+              <div class="progress-step" id="fullStepNormalize">○ Normalizing events</div>
+              <div class="progress-step" id="fullStepMaster">○ Building Batch Master</div>
+              <div class="progress-step" id="fullStepSave">○ Saving to Azure SQL</div>
+            </div>
+          </div>
+        </form>
+ 
+        <div class="status-banner" id="fullStatusBox"></div>
+ 
+        <div class="grid kpi-grid" id="fullSummaryGrid" style="margin-top:16px;display:none">
+          <div class="card kpi"><div class="kpi-label">New Receipt Events</div><div class="kpi-value" id="fullReceiptEvents">0</div><div class="kpi-foot">New receiving events saved to Azure SQL</div><div class="kpi-icon blue">R</div></div>
+          <div class="card kpi"><div class="kpi-label">New Dispatch Events</div><div class="kpi-value" id="fullDispatchEvents">0</div><div class="kpi-foot">New dispatch events saved to Azure SQL</div><div class="kpi-icon purple">D</div></div>
+          <div class="card kpi"><div class="kpi-label">Batch Master Rows</div><div class="kpi-value" id="fullMasterRecords">0</div><div class="kpi-foot">Current cumulative Batch Master</div><div class="kpi-icon green">M</div></div>
+          <div class="card kpi"><div class="kpi-label">Missing Batches</div><div class="kpi-value" id="fullMissingBatches">0</div><div class="kpi-foot">Batch missing while its Generic exists in SFDA</div><div class="kpi-icon red">!</div></div>
+          <div class="card kpi"><div class="kpi-label">Uploaded Files</div><div class="kpi-value" id="fullReviewRecords">0</div><div class="kpi-foot">ASN and Full Dispatch files processed</div><div class="kpi-icon amber">F</div></div>
+        </div>
+ 
+        <div class="card" id="fullDownloadsCard" style="margin-top:16px;display:none">
+          <div class="card-header">
+            <div>
+              <div class="card-title">Historical Output</div>
+              <div class="card-subtitle">Batch Master audit file only — no SFDA upload CSVs</div>
+            </div>
+          </div>
+          <div class="card-body">
+            <button class="btn btn-secondary" id="downloadBatchMaster">Download Batch Master</button>
+          </div>
+        </div>
+ 
+        <div class="card table-card" id="fullPreviewCard" style="margin-top:16px;display:none">
+          <div class="table-toolbar">
+            <div>
+              <div class="card-title">Batch Master Preview</div>
+              <div class="card-subtitle">First 200 master records</div>
+            </div>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>BN</th>
+                  <th>Expiry Month</th>
+                  <th>GTIN</th>
+                  <th>Drug Name</th>
+                  <th>Generic Item</th>
+                  <th>Exists in SFDA</th>
+                  <th>Total Receive Qty</th>
+                  <th>Total Dispatch Qty</th>
+                  <th>Net Received</th>
+                  <th>Receive Runs</th>
+                  <th>Dispatch Runs</th>
+                </tr>
+              </thead>
+              <tbody id="fullPreviewBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+ 
+      <section class="page" id="page-verification">
+        <div class="page-head">
+          <div><h1>SFDA Verification</h1><p>Verify the generated upload files against the latest SFDA Drug Count and portal notification results.</p></div>
+        </div>
+        <div class="verification-grid">
+          <div class="card">
+            <div class="card-header"><div><div class="card-title">Verification Upload</div><div class="card-subtitle">Select a reconciliation run and upload the post-portal evidence files.</div></div></div>
+            <div class="card-body">
+              <form id="verificationForm" class="verification-form">
+                <div><label for="verificationRun">Run</label><select class="control" id="verificationRun" required><option value="">Select a reconciliation run...</option></select></div>
+                <div><label for="verificationSfda">Latest SFDA Drug Count Report</label><div class="verification-file-box"><input id="verificationSfda" type="file" accept=".xls,.xlsx" required><div class="file-meta" id="verificationSfdaName">No file selected</div></div></div>
+                <div><label for="notificationFiles">Notification Result Files</label><div class="verification-file-box"><input id="notificationFiles" type="file" accept=".xls,.xlsx,.csv" multiple required><div class="file-meta" id="notificationFilesName">No files selected</div></div></div>
+                <div class="status-banner info show" id="verificationStatus"><span>ⓘ</span><div>Select the run, latest SFDA report, and all Notification Result files, then click Verify Upload.</div></div>
+                <button class="btn btn-success" id="verifyUploadButton" type="submit" disabled>✓ Verify Upload</button>
+              </form>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><div><div class="card-title">Run Lifecycle</div><div class="card-subtitle">Controlled status flow after reconciliation.</div></div></div>
+            <div class="card-body lifecycle-list">
+              <div class="lifecycle-row"><div class="lifecycle-dot">1</div><div><strong>Pending Upload</strong><div class="file-info">Upload files generated and awaiting SFDA Portal submission.</div></div><span class="badge warning">Current</span></div>
+              <div class="lifecycle-row"><div class="lifecycle-dot">2</div><div><strong>Pending Verification</strong><div class="file-info">Latest SFDA report and notification results received.</div></div><span class="badge info">Next</span></div>
+              <div class="lifecycle-row"><div class="lifecycle-dot">3</div><div><strong>Verified</strong><div class="file-info">Portal result matches the expected reconciliation outcome.</div></div><span class="badge success">Outcome</span></div>
+              <div class="lifecycle-row"><div class="lifecycle-dot">4</div><div><strong>Investigation Required</strong><div class="file-info">Mismatch or unresolved notification requires investigation.</div></div><span class="badge failed">Exception</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+ 
+      <!-- HISTORY -->
+      <section class="page" id="page-history">
+        <div class="page-head"><div><h1>Reconciliation History</h1><p>Persistent reconciliation runs stored in Azure SQL Database.</p></div><div class="actions"><button class="btn btn-secondary" id="clearHistoryButton">↻ Refresh History</button></div></div>
+        <div class="card table-card">
+          <div class="table-toolbar"><div class="card-title">Previous Reconciliation Runs</div><div class="filters"><input class="control search" id="historySearch" placeholder="Search run ID or user..."><select class="control" id="historyStatus"><option value="">All statuses</option><option>Pending Upload</option><option>Pending Verification</option><option>Verified</option><option>Investigation Required</option><option>Completed</option><option>Failed</option></select></div></div>
+          <div class="table-scroll"><table><thead><tr><th>Run ID</th><th>Date & Time</th><th>User</th><th>Status</th><th>Files</th><th>Input Rows</th><th>Accept</th><th>Dispatch</th><th>Variance</th><th>Version</th><th>Actions</th></tr></thead><tbody id="historyBody"></tbody></table></div>
+          <div class="table-footer"><span id="historyCount">0 database runs</span><span>Source: Azure SQL · ReconciliationRuns</span></div>
+        </div>
+      </section>
+ 
+      <!-- REPORTS -->
+      <section class="page" id="page-reports">
+        <div class="page-head"><div><h1>Reports & Analytics</h1><p>Operational analytics based on persistent reconciliation history stored in Azure SQL.</p></div><div class="actions"><button class="btn btn-secondary" id="exportHistoryButton">⇩ Export History JSON</button></div></div>
+        <div class="grid kpi-grid">
+          <div class="card kpi"><div class="kpi-label">Total Runs</div><div class="kpi-value" id="reportRuns">0</div><div class="kpi-icon">◷</div></div>
+          <div class="card kpi"><div class="kpi-label">Success Rate</div><div class="kpi-value" id="reportSuccessRate">0%</div><div class="kpi-icon green">✓</div></div>
+          <div class="card kpi"><div class="kpi-label">Master Rows Processed</div><div class="kpi-value" id="reportProcessed">0</div><div class="kpi-icon purple">◆</div></div>
+          <div class="card kpi"><div class="kpi-label">Total Variance Items</div><div class="kpi-value" id="reportVariance">0</div><div class="kpi-icon red">!</div></div>
+        </div>
+        <div class="grid two-equal" style="margin-top:16px">
+          <div class="card"><div class="card-header"><div><div class="card-title">Latest Run Composition</div><div class="card-subtitle">Accept, Dispatch, and Variance</div></div></div><div class="card-body" id="compositionContent"></div></div>
+          <div class="card"><div class="card-header"><div><div class="card-title">Future Enterprise Reports</div><div class="card-subtitle">Enabled after persistent database implementation</div></div></div><div class="card-body"><div class="status-line"><span>Receiving by date</span><span class="badge warning">Planned</span></div><div class="status-line"><span>Dispatch by customer</span><span class="badge warning">Planned</span></div><div class="status-line"><span>Variance by supplier</span><span class="badge warning">Planned</span></div><div class="status-line"><span>Missing SFDA registrations</span><span class="badge warning">Planned</span></div></div></div>
+        </div>
+      </section>
+ 
+      <!-- PRODUCT INTELLIGENCE -->
+      <section class="page" id="page-intelligence">
+        <div class="page-head"><div><h1>Product Intelligence</h1><p>Generic, Trade, GTIN, Batch, supplier, and SFDA knowledge base.</p></div></div>
+        <div class="grid intelligence-grid">
+          <div class="card intelligence-card"><h3>Generic Product Master</h3><p>Classifies each Generic Item Number as SFDA Required: Yes, No, or Unknown.</p><div class="intelligence-metric"><span class="badge info">Database Phase</span><strong>—</strong></div></div>
+          <div class="card intelligence-card"><h3>Trade Product Master</h3><p>Links commercial Trade Item Numbers and GTINs to the correct Generic Item Number.</p><div class="intelligence-metric"><span class="badge info">Database Phase</span><strong>—</strong></div></div>
+          <div class="card intelligence-card"><h3>Batch Master</h3><p>Tracks first and last appearance, receiving, dispatch, expiry, and SFDA history for each Batch.</p><div class="intelligence-metric"><span class="badge info">Database Phase</span><strong>—</strong></div></div>
+          <div class="card intelligence-card"><h3>Missing SFDA Registration</h3><p>Flags a new Trade under a known SFDA-required Generic when it is absent from the current SFDA file.</p><div class="intelligence-metric"><span class="badge warning">Planned Logic</span><strong>—</strong></div></div>
+          <div class="card intelligence-card"><h3>Master Data Exceptions</h3><p>Detects conflicting Generic, Trade, GTIN, Batch, description, and Package Size relationships.</p><div class="intelligence-metric"><span class="badge warning">Planned Logic</span><strong>—</strong></div></div>
+          <div class="card intelligence-card"><h3>Drug Journey</h3><p>Search a Batch and view supplier receipt, SFDA acceptance, inventory, dispatch, customer, and final status.</p><div class="intelligence-metric"><span class="badge warning">Planned Logic</span><strong>—</strong></div></div>
+        </div>
+      </section>
+ 
+      <!-- VARIANCE -->
+      <section class="page" id="page-variance">
+        <div class="page-head"><div><h1>Variance Management</h1><p>Investigate receiving discrepancies, missing SFDA registrations, dispatch evidence, and customer mapping issues.</p></div><div class="actions"><button class="btn btn-warning" disabled>Generate SFDA Discrepancy Report</button></div></div>
+        <div class="grid kpi-grid">
+          <div class="card kpi"><div class="kpi-label">Receiving Variance</div><div class="kpi-value">—</div><div class="kpi-foot">Under / over delivery</div><div class="kpi-icon amber">R</div></div>
+          <div class="card kpi"><div class="kpi-label">Missing Registration</div><div class="kpi-value">—</div><div class="kpi-foot">Received but absent from SFDA</div><div class="kpi-icon red">M</div></div>
+          <div class="card kpi"><div class="kpi-label">Dispatch Variance</div><div class="kpi-value" id="varianceLatest">—</div><div class="kpi-foot">Missing dispatch evidence</div><div class="kpi-icon purple">D</div></div>
+          <div class="card kpi"><div class="kpi-label">Unmapped Customers</div><div class="kpi-value">—</div><div class="kpi-foot">Missing GLN mapping</div><div class="kpi-icon red">C</div></div>
+        </div>
+        <div class="card table-card" style="margin-top:16px">
+          <div class="table-toolbar"><div class="card-title">Variance Investigation Queue</div><div class="filters"><input class="control search" placeholder="Search Batch, GTIN, supplier, customer..."><select class="control"><option>All variance types</option><option>Under Delivery</option><option>Over Delivery</option><option>Missing SFDA Registration</option><option>Missing Dispatch Evidence</option><option>Unmapped Customer</option></select><select class="control"><option>All statuses</option><option>New</option><option>Under Review</option><option>Resolved</option></select></div></div>
+          <div class="empty"><strong>Variance workflow database is not implemented yet</strong>The latest dispatch variance count is shown above. Detailed investigation records will be enabled after Azure SQL persistence.</div>
+        </div>
+      </section>
+ 
+      <!-- ADMIN -->
+      <section class="page" id="page-administration">
+        <div class="page-head"><div><h1>Administration</h1><p>Manage reference files, business rules, platform status, and future enterprise configuration.</p></div></div>
+        <div class="grid three-col">
+          <div class="card intelligence-card"><h3>GLN Mapping</h3><p>Maps WMS To Address values to registered SFDA customer GLNs. Unknown customers are classified as DUMMY.</p><div class="intelligence-metric"><span class="badge success">Internal File Active</span><strong>✓</strong></div></div>
+          <div class="card intelligence-card"><h3>Pack Size Mapping</h3><p>Converts warehouse units into SFDA packages using controlled internal Package Size references.</p><div class="intelligence-metric"><span class="badge success">Internal File Active</span><strong>✓</strong></div></div>
+          <div class="card intelligence-card"><h3>Business Rules</h3><p>Controls Accept, Dispatch, Variance allocation, maximum rows, quantity limits, and file generation.</p><div class="intelligence-metric"><span class="badge success">Python Rules Active</span><strong>✓</strong></div></div>
+        </div>
+        <div class="card" style="margin-top:16px"><div class="card-header"><div><div class="card-title">System Information</div><div class="card-subtitle">Current Azure Function environment</div></div></div><div class="card-body"><div class="grid two-equal"><div><div class="card-subtitle">API Endpoint</div><div style="margin-top:6px;font-size:11px;font-weight:800;word-break:break-all" id="apiEndpoint">/api/process-accept · /api/process-dispatch</div></div><div><div class="card-subtitle">Health Status</div><div style="margin-top:6px;font-size:11px;font-weight:800;color:#107c41" id="adminHealth">Checking...</div></div><div><div class="card-subtitle">Application Version</div><div style="margin-top:6px;font-size:11px;font-weight:800" id="adminVersion">—</div></div><div><div class="card-subtitle">Authentication</div><div style="margin-top:6px;font-size:11px;font-weight:800;color:#d97706">Anonymous prototype</div></div></div></div></div>
+      </section>
+    </div>
+  </main>
+</div>
+<div class="modal-backdrop" id="runDetailsModal" aria-hidden="true">
+  <div class="modal-card">
+    <div class="modal-head">
+      <div><div class="modal-title" id="runDetailsTitle">Run Details</div><div class="modal-subtitle" id="runDetailsSubtitle">Loading...</div></div>
+      <button class="icon-btn" id="closeRunDetails" type="button">×</button>
+    </div>
+    <div class="modal-body" id="runDetailsBody"><div class="empty"><strong>Loading run details</strong>Please wait.</div></div>
+  </div>
+</div>
+<div class="toast-wrap" id="toastWrap"></div>
+ 
+<script>
+  const ACCEPT_API_URL = "/api/reconcile";
+  const DISPATCH_API_URL = "/api/reconcile";
+  const VERIFY_URL = "/api/verify";
+  const HEALTH_URL = "/api/health";
+  const VERSION_URL = "/api/version";
+  const ACCEPT_FILE_KEYS = ["acceptAsn","acceptInventory","acceptSfda"];
+  const DISPATCH_FILE_KEYS = ["dispatchReport","dispatchInventory","dispatchSfda"];
+  const HISTORY_URL = "/api/history";
+  const DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v1";
+  let currentResult = null;
+  let progressTimer = null;
+  let historyCache = [];
+  let historyLoaded = false;
+  let historyLoading = false;
+ 
+  const $ = id => document.getElementById(id);
+  const formatNumber = value => Number(value || 0).toLocaleString("en-US");
+  const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
+ 
+  function toast(message,type="info") {
+    const el=document.createElement("div");
+    el.className=`toast ${type}`;
+    el.textContent=message;
+    $("toastWrap").appendChild(el);
+    setTimeout(()=>el.remove(),4200);
+  }
+ 
+  const PAGE_LABELS = {
+    home:"Dashboard",
+    upload:"Upload & Run",
+    "full-reconciliation":"Full Reconciliation",
+    verification:"SFDA Verification",
+    history:"History",
+    reports:"Reports",
+    intelligence:"Product Intelligence",
+    variance:"Variance Management",
+    administration:"Administration"
+  };
+ 
+  function navigate(page, options={}) {
+    const requestedPage = String(page || "home").trim();
+    const target = $(`page-${requestedPage}`);
+ 
+    if (!target) {
+      console.error(`Page not found: page-${requestedPage}`);
+      toast("The requested page is unavailable.","error");
+      return false;
+    }
+ 
+    document.querySelectorAll(".page").forEach(element=>{
+      element.classList.toggle("active", element === target);
+    });
+ 
+    document.querySelectorAll(".nav-button").forEach(button=>{
+      button.classList.toggle("active", button.dataset.page === requestedPage);
+    });
+ 
+    $("topbarTitle").textContent = PAGE_LABELS[requestedPage] || "SFDA Platform";
+    $("sidebar").classList.remove("open");
+ 
+    if (!options.skipHash && window.location.hash !== `#${requestedPage}`) {
+      history.replaceState(null, "", `#${requestedPage}`);
+    }
+ 
+    if (requestedPage === "verification") {
+      Promise.resolve(refreshVerificationRuns()).catch(error=>{
+        console.error("Unable to refresh verification runs.", error);
+        toast("SFDA Verification opened, but the run list could not be refreshed.","error");
+      });
+    }
+ 
+    if (requestedPage === "history" || requestedPage === "reports") {
+      Promise.resolve(refreshAzureHistory()).catch(error=>{
+        console.error("Unable to refresh reconciliation history.", error);
+      });
+    }
+ 
+    window.scrollTo({top:0, behavior: options.instant ? "auto" : "smooth"});
+    return true;
+  }
+ 
+  document.querySelectorAll("[data-page]").forEach(button=>{
+    button.addEventListener("click",()=>navigate(button.dataset.page));
+  });
+ 
+  document.querySelectorAll("[data-go]").forEach(button=>{
+    button.addEventListener("click",()=>navigate(button.dataset.go));
+  });
+ 
+  window.addEventListener("hashchange",()=>{
+    const page = window.location.hash.replace(/^#/, "") || "home";
+    navigate(page, {skipHash:true});
+  });
+  $("mobileToggle").addEventListener("click",()=>$("sidebar").classList.toggle("open"));
+ 
+  function updateStageFileName(inputId, metaId, stageKeys, buttonId) {
+    const input=$(inputId), box=$(metaId);
+    if(input.files.length){
+      const file=input.files[0];
+      box.textContent=`✓ ${file.name} · ${(file.size/1024/1024).toFixed(2)} MB`;
+      box.classList.add("ready");
+    }else{
+      box.textContent="No file selected";
+      box.classList.remove("ready");
+    }
+    $(buttonId).disabled=stageKeys.some(item=>!$(item.input).files.length);
+  }
+ 
+ 
+  let fullResult = null;
+  let fullProgressTimer = null;
+ 
+  function updateFullFileInputs(){
+    const asnCount=$("fullAsnFiles").files.length;
+    const dispatchCount=$("fullDispatchFiles").files.length;
+    const sfdaFile=$("fullSfdaFile").files[0];
+ 
+    $("fullAsnMeta").textContent=asnCount
+      ? `✓ ${asnCount} ASN file${asnCount===1?"":"s"} selected`
+      : "No files selected";
+    $("fullAsnMeta").classList.toggle("ready",Boolean(asnCount));
+ 
+    $("fullDispatchMeta").textContent=dispatchCount
+      ? `✓ ${dispatchCount} Full Dispatch file${dispatchCount===1?"":"s"} selected`
+      : "No files selected";
+    $("fullDispatchMeta").classList.toggle("ready",Boolean(dispatchCount));
+ 
+    $("fullSfdaMeta").textContent=sfdaFile
+      ? `✓ ${sfdaFile.name} · ${(sfdaFile.size/1024/1024).toFixed(2)} MB`
+      : "No file selected";
+    $("fullSfdaMeta").classList.toggle("ready",Boolean(sfdaFile));
+ 
+    $("fullRunButton").disabled=!(asnCount&&dispatchCount&&sfdaFile);
+  }
+ 
+  ["fullAsnFiles","fullDispatchFiles","fullSfdaFile"].forEach(id=>{
+    $(id).addEventListener("change",updateFullFileInputs);
+  });
+ 
+  function setFullProgress(percent,label){
+    $("fullProgressCard").classList.add("show");
+    $("fullProgressBar").style.width=`${percent}%`;
+    $("fullProgressPercent").textContent=`${percent}%`;
+    $("fullProgressLabel").textContent=label;
+ 
+    const completed=
+      percent>=100?4:
+      percent>=80?3:
+      percent>=55?2:
+      percent>=20?1:0;
+ 
+    [
+      $("fullStepRead"),
+      $("fullStepNormalize"),
+      $("fullStepMaster"),
+      $("fullStepSave")
+    ].forEach((step,index)=>{
+      const done=index<completed;
+      step.classList.toggle("done",done);
+      step.textContent=(done?"✓":"○")+" "+step.textContent.replace(/^[✓○]\s*/,"");
+    });
+  }
+ 
+  function startFullProgress(){
+    clearInterval(fullProgressTimer);
+    setFullProgress(10,"Reading historical files...");
+ 
+    fullProgressTimer=setInterval(()=>{
+      const current=parseInt($("fullProgressPercent").textContent)||10;
+      const next=Math.min(90,current+5);
+      const label=
+        next<35?"Reading historical files...":
+        next<60?"Normalizing receipt and dispatch events...":
+        next<80?"Building cumulative Batch Master...":
+        "Saving events and Batch Master to Azure SQL...";
+ 
+      setFullProgress(next,label);
+    },1500);
+  }
+ 
+  function finishFullProgress(success){
+    clearInterval(fullProgressTimer);
+ 
+    if(success){
+      setFullProgress(100,"Full Reconciliation completed successfully.");
+    }else{
+      $("fullProgressCard").classList.add("show");
+      $("fullProgressBar").style.width="100%";
+      $("fullProgressPercent").textContent="Failed";
+      $("fullProgressLabel").textContent="Full Reconciliation failed.";
+    }
+  }
+ 
+  function showFullStatus(message,type){
+    const box=$("fullStatusBox");
+    box.className=`status-banner ${type} show`;
+    box.innerHTML=`<span>${type==="success"?"✓":"!"}</span><div>${message}</div>`;
+  }
+ 
+  function renderFullPreview(rows){
+    const body=$("fullPreviewBody");
+    body.innerHTML="";
+ 
+    (rows||[]).forEach(row=>{
+      const tr=document.createElement("tr");
+ 
+      const sfdaStatus=String(
+        row["Exists in SFDA"]
+        ?? row["SFDA Status"]
+        ?? ""
+      ).trim();
+ 
+      const sfdaStatusHtml=sfdaStatus==="Missing Batch"
+        ? '<span class="badge danger">Missing Batch</span>'
+        : '<span class="badge success">Yes</span>';
+ 
+      if(sfdaStatus==="Missing Batch"){
+        tr.style.background="#fff4f4";
+      }
+ 
+      tr.innerHTML=`
+        <td>${escapeHtml(row.BN)}</td>
+        <td>${escapeHtml(row["Expiry Month Key"])}</td>
+        <td>${escapeHtml(row.GTIN)}</td>
+        <td>${escapeHtml(row["Drug Name"])}</td>
+        <td>${escapeHtml(row["Generic Item Number"])}</td>
+        <td>${sfdaStatusHtml}</td>
+        <td>${formatNumber(row["Total Receive Qty"])}</td>
+        <td>${formatNumber(row["Total Dispatched Qty"])}</td>
+        <td>${formatNumber(row["Net Received Less Dispatch"])}</td>
+        <td>${formatNumber(row["Receive Runs"])}</td>
+        <td>${formatNumber(row["Dispatch Runs"])}</td>
+      `;
+      body.appendChild(tr);
+    });
+ 
+    if(!rows||!rows.length){
+      body.innerHTML='<tr><td colspan="11"><div class="empty"><strong>No Batch Master rows returned</strong>The request completed but the Batch Master preview is empty.</div></td></tr>';
+    }
+  }
+ 
+  function getBatchMasterOutput(outputs){
+    if(!outputs||typeof outputs!=="object") return null;
+ 
+    if(outputs["Batch_Master.xlsx"]){
+      return {
+        name:"Batch_Master.xlsx",
+        ...outputs["Batch_Master.xlsx"]
+      };
+    }
+ 
+    for(const [name,value] of Object.entries(outputs)){
+      if(
+        value
+        && typeof value==="object"
+        && typeof value.content==="string"
+      ){
+        return {
+          name,
+          ...value
+        };
+      }
+    }
+ 
+    return null;
+  }
+ 
+  $("fullReconciliationForm").addEventListener("submit",async event=>{
+    event.preventDefault();
+ 
+    const button=$("fullRunButton");
+    const operation=document.querySelector('input[name="fullOperation"]:checked')?.value||"append";
+ 
+    if(operation==="rebuild"){
+      const confirmed=window.confirm(
+        "Rebuild Full History will delete the existing Receipt Events, Dispatch Events, and Batch Master before loading the uploaded complete history. Continue?"
+      );
+      if(!confirmed) return;
+    }
+ 
+    const formData=new FormData();
+ 
+    Array.from($("fullAsnFiles").files).forEach(file=>{
+      formData.append("asn_files",file,file.name);
+    });
+ 
+    Array.from($("fullDispatchFiles").files).forEach(file=>{
+      formData.append("dispatch_files",file,file.name);
+    });
+ 
+    formData.append("sfda",$("fullSfdaFile").files[0],$("fullSfdaFile").files[0].name);
+    formData.append("operation",operation);
+ 
+    button.disabled=true;
+    button.textContent=operation==="rebuild"
+      ?"Rebuilding Historical Master..."
+      :"Updating Historical Master...";
+ 
+    $("fullSummaryGrid").style.display="none";
+    $("fullDownloadsCard").style.display="none";
+    $("fullPreviewCard").style.display="none";
+    $("fullStatusBox").className="status-banner";
+    fullResult=null;
+    startFullProgress();
+ 
+    try{
+      const response=await fetch("/api/batch-master/build",{
+        method:"POST",
+        body:formData,
+        cache:"no-store"
+      });
+ 
+      const text=await response.text();
+      let result;
+ 
+      try{
+        result=JSON.parse(text);
+      }catch{
+        throw new Error(
+          `The server returned HTTP ${response.status} without valid JSON. ${text.slice(0,250)}`
+        );
+      }
+ 
+      if(!response.ok||result.status!=="Completed"){
+        throw new Error(
+          result.error
+          || result.message
+          || `Batch Master request failed with HTTP ${response.status}.`
+        );
+      }
+ 
+      fullResult=result;
+      finishFullProgress(true);
+ 
+      const summary=result.summary||{};
+      const uploadedFiles=
+        Number(summary.uploaded_asn_files||0)
+        + Number(summary.uploaded_dispatch_files||0);
+ 
+      const fullPreviewRows=result.preview||[];
+      const missingBatchCount=Number(
+        summary.missing_batch_rows
+        ?? summary.missing_batches
+        ?? fullPreviewRows.filter(row=>
+          String(
+            row["Exists in SFDA"]
+            ?? row["SFDA Status"]
+            ?? ""
+          ).trim()==="Missing Batch"
+        ).length
+      );
+ 
+      $("fullReceiptEvents").textContent=formatNumber(summary.new_receipt_events);
+      $("fullDispatchEvents").textContent=formatNumber(summary.new_dispatch_events);
+      $("fullMasterRecords").textContent=formatNumber(summary.batch_master_rows);
+      $("fullMissingBatches").textContent=formatNumber(missingBatchCount);
+      $("fullReviewRecords").textContent=formatNumber(uploadedFiles);
+ 
+      $("fullSummaryGrid").style.display="";
+      $("fullPreviewCard").style.display="";
+      renderFullPreview(fullPreviewRows);
+ 
+      const batchMasterFile=getBatchMasterOutput(result.outputs);
+      if(batchMasterFile){
+        $("fullDownloadsCard").style.display="";
+      }
+ 
+      const preparedReceipt=summary.prepared_receipt_events;
+      const preparedDispatch=summary.prepared_dispatch_events;
+      const preparedText=(
+        preparedReceipt!==undefined
+        || preparedDispatch!==undefined
+      )
+        ? `<br>Prepared receipt events: ${formatNumber(preparedReceipt)} · Prepared dispatch events: ${formatNumber(preparedDispatch)}.`
+        : "";
+ 
+      showFullStatus(
+        `<strong>Historical Batch Master ${operation==="rebuild"?"rebuilt":"updated"} successfully.</strong><br>
+        Version ${escapeHtml(result.version||"5.0.0")} ·
+        ${formatNumber(summary.batch_master_rows)} Batch Master rows stored in Azure SQL.<br>
+        New receipt events: ${formatNumber(summary.new_receipt_events)} ·
+        New dispatch events: ${formatNumber(summary.new_dispatch_events)} ·
+        Missing batches: ${formatNumber(missingBatchCount)} ·
+        Uploaded files: ${formatNumber(uploadedFiles)}.
+        ${preparedText}<br>
+        No SFDA upload CSV files were generated from this page.`,
+        "success"
+      );
+ 
+      toast("Full Reconciliation completed.","success");
+ 
+    }catch(error){
+      finishFullProgress(false);
+      showFullStatus(escapeHtml(error.message||String(error)),"error");
+      toast(error.message||String(error),"error");
+    }finally{
+      button.textContent="▶ Build Historical Batch Master";
+      updateFullFileInputs();
+    }
+  });
+ 
+  $("downloadBatchMaster").addEventListener("click",()=>{
+    const file=getBatchMasterOutput(fullResult&&fullResult.outputs);
+ 
+    if(!file){
+      toast("Batch Master output is not available.","error");
+      return;
+    }
+ 
+    downloadStructured({
+      name:file.name||"Batch_Master.xlsx",
+      content:file.content,
+      encoding:file.encoding,
+      mime:file.mime_type||file.mime
+    });
+  });
+ 
+  const ACCEPT_INPUTS=[
+    {input:"acceptAsn",meta:"acceptAsnName",field:"asn"},
+    {input:"acceptInventory",meta:"acceptInventoryName",field:"inventory"},
+    {input:"acceptSfda",meta:"acceptSfdaName",field:"sfda"}
+  ];
+  const DISPATCH_INPUTS=[
+    {input:"dispatchReport",meta:"dispatchReportName",field:"dispatch"},
+    {input:"dispatchInventory",meta:"dispatchInventoryName",field:"inventory"},
+    {input:"dispatchSfda",meta:"dispatchSfdaName",field:"sfda"}
+  ];
+ 
+  ACCEPT_INPUTS.forEach(item=>$(item.input).addEventListener("change",()=>updateStageFileName(item.input,item.meta,ACCEPT_INPUTS,"acceptRunButton")));
+  DISPATCH_INPUTS.forEach(item=>$(item.input).addEventListener("change",()=>updateStageFileName(item.input,item.meta,DISPATCH_INPUTS,"dispatchRunButton")));
+ 
+  function validateStageFiles(items){
+    for(const item of items){
+      const input=$(item.input);
+      if(!input.files.length) throw new Error("Please select all three required Excel files.");
+      const name=input.files[0].name.toLowerCase();
+      if(!name.endsWith(".xls")&&!name.endsWith(".xlsx")) throw new Error(`${input.files[0].name}: only .xls and .xlsx files are allowed.`);
+    }
+  }
+ 
+  function setStatus(type,message){
+    const box=$("statusBox");
+    box.className=`status-banner ${type} show`;
+    box.innerHTML=`<span>${type==="success"?"✓":type==="error"?"!":"ⓘ"}</span><div>${escapeHtml(message)}</div>`;
+  }
+  function clearStatus(){ $("statusBox").className="status-banner"; $("statusBox").textContent=""; }
+ 
+  function progressElements(stage){
+    const prefix=stage==="Accept"?"accept":"dispatch";
+    return {
+      card:$(`${prefix}ProgressCard`),
+      bar:$(`${prefix}ProgressBar`),
+      percent:$(`${prefix}ProgressPercent`),
+      label:$(`${prefix}ProgressLabel`),
+      steps:[
+        $(`${prefix}StepRead`),
+        $(`${prefix}StepValidate`),
+        $(`${prefix}StepCalculate`),
+        $(`${prefix}StepGenerate`)
+      ]
+    };
+  }
+ 
+  function updateProgressSteps(elements,percent){
+    const completed=
+      percent>=80?4:
+      percent>=60?3:
+      percent>=40?2:
+      percent>=20?1:0;
+ 
+    elements.steps.forEach((step,index)=>{
+      const done=index<completed;
+      step.classList.toggle("done",done);
+      step.textContent=(done?"✓":"○")+" "+step.textContent.replace(/^[✓○]\s*/,"");
+    });
+  }
+ 
+  function startProgress(stage){
+    clearInterval(progressTimer);
+ 
+    ["Accept","Dispatch"].forEach(name=>{
+      if(name!==stage){
+        const other=progressElements(name);
+        other.card.classList.remove("show");
+      }
+    });
+ 
+    const elements=progressElements(stage);
+    elements.card.classList.add("show");
+    elements.bar.style.width="10%";
+    elements.percent.textContent="10%";
+    elements.label.textContent=`Reading ${stage} files...`;
+    updateProgressSteps(elements,10);
+ 
+    elements.card.scrollIntoView({
+      behavior:"smooth",
+      block:"nearest"
+    });
+ 
+    progressTimer=setInterval(()=>{
+      const current=parseInt(elements.percent.textContent)||10;
+      const next=Math.min(90,current+5);
+ 
+      elements.bar.style.width=`${next}%`;
+      elements.percent.textContent=`${next}%`;
+ 
+      if(next<35){
+        elements.label.textContent=`Reading ${stage} files...`;
+      }else if(next<55){
+        elements.label.textContent="Validating data...";
+      }else if(next<80){
+        elements.label.textContent=`Calculating ${stage} reconciliation...`;
+      }else{
+        elements.label.textContent="Generating output files...";
+      }
+ 
+      updateProgressSteps(elements,next);
+    },1200);
+  }
+ 
+  function finishProgress(stage,success){
+    clearInterval(progressTimer);
+    const elements=progressElements(stage);
+ 
+    if(success){
+      elements.bar.style.width="100%";
+      elements.percent.textContent="100%";
+      elements.label.textContent=`${stage} reconciliation completed successfully.`;
+      updateProgressSteps(elements,100);
+    }else{
+      elements.bar.style.width="100%";
+      elements.percent.textContent="Failed";
+      elements.label.textContent=`${stage} reconciliation failed.`;
+    }
+  }
+ 
+  async function runStage({formId,items,buttonId,url,label}){
+    clearStatus(); $("summaryPanel").classList.remove("show");
+    const button=$(buttonId);
+    try{
+      validateStageFiles(items); button.disabled=true; button.textContent="Processing..."; startProgress(label);
+      const formData=new FormData();
+      items.forEach(item=>formData.append(item.field,$(item.input).files[0],$(item.input).files[0].name));
+      const response=await fetch(url,{method:"POST",body:formData});
+      let result; try{ result=await response.json(); }catch{ throw new Error(`The server returned HTTP ${response.status} without valid JSON.`); }
+      if(!response.ok||result.status==="Failed") throw new Error(result.error||result.message||`Request failed with HTTP ${response.status}.`);
+      currentResult=result; finishProgress(label,true); setStatus("success",`${label} files generated successfully.`);
+      populateSummary(result); populateResults(result); await refreshAzureHistory({silent:true});
+      $("inlineResults").classList.add("show"); setTimeout(()=>$("inlineResults").scrollIntoView({behavior:"smooth",block:"start"}),120);
+      toast(`${label} files generated successfully.`,"success");
+    }catch(error){
+      finishProgress(label,false); setStatus("error",error.message||String(error)); toast(error.message||String(error),"error");
+    }finally{
+      button.disabled=items.some(item=>!$(item.input).files.length);
+      button.textContent=label==="Accept"?"▶ Generate Accept Files":"▶ Generate Dispatch Files";
+    }
+  }
+ 
+  $("acceptForm").addEventListener("submit",event=>{event.preventDefault();runStage({formId:"acceptForm",items:ACCEPT_INPUTS,buttonId:"acceptRunButton",url:ACCEPT_API_URL,label:"Accept"});});
+  $("dispatchForm").addEventListener("submit",event=>{event.preventDefault();runStage({formId:"dispatchForm",items:DISPATCH_INPUTS,buttonId:"dispatchRunButton",url:DISPATCH_API_URL,label:"Dispatch"});});
+ 
+  $("resetButton").addEventListener("click",()=>{
+    $("acceptForm").reset(); $("dispatchForm").reset();
+    ACCEPT_INPUTS.forEach(item=>updateStageFileName(item.input,item.meta,ACCEPT_INPUTS,"acceptRunButton"));
+    DISPATCH_INPUTS.forEach(item=>updateStageFileName(item.input,item.meta,DISPATCH_INPUTS,"dispatchRunButton"));
+    clearStatus();
+    clearInterval(progressTimer);
+    ["Accept","Dispatch"].forEach(stage=>{
+      const elements=progressElements(stage);
+      elements.card.classList.remove("show");
+      elements.bar.style.width="0%";
+      elements.percent.textContent="0%";
+      updateProgressSteps(elements,0);
+    });
+    $("summaryPanel").classList.remove("show"); $("inlineResults").classList.remove("show"); currentResult=null;
+  });
+ 
+  function populateSummary(result){
+    const s=result.summary||{};
+    $("sumFiles").textContent=formatNumber(s.files_count);
+    $("sumInputRows").textContent=formatNumber(s.total_input_rows);
+    $("sumMasterRows").textContent=formatNumber(s.master_rows);
+    $("sumAccept").textContent=formatNumber(s.accept_rows);
+    $("sumDispatch").textContent=formatNumber(s.dispatch_rows);
+    $("sumVariance").textContent=formatNumber(s.variance_rows);
+    $("summaryPanel").classList.add("show");
+  }
+ 
+  function normalizeFileGroup(group){
+    if(!group) return [];
+    return Object.entries(group).map(([name,value])=>{
+      if(typeof value==="string") return {name,content:value,encoding:"text",mime:"text/plain"};
+      if(value&&typeof value==="object") return {name,content:value.content??value.data??"",encoding:value.encoding||"base64",mime:value.mime_type||value.mime||"application/octet-stream"};
+      return {name,content:"",encoding:"text",mime:"application/octet-stream"};
+    });
+  }
+  function countReports(outputs){ return normalizeFileGroup(outputs.accept_details).length+normalizeFileGroup(outputs.dispatch_details).length+normalizeFileGroup(outputs.variance).length+normalizeFileGroup(outputs.details).length+normalizeFileGroup(outputs.reports).length; }
+  function firstFile(group){ const files=normalizeFileGroup(group); return files.length?files[0]:null; }
+ 
+  function renderAlerts(alerts){
+    const container=$("alertsList");
+    container.innerHTML="";
+    
+    if(!alerts || !alerts.alerts || alerts.alerts.length === 0){
+      container.innerHTML=`<div class="empty"><strong>No alerts generated</strong>All batches match expected records.</div>`;
+      return;
+    }
+    
+    alerts.alerts.forEach((alert, index) => {
+      const severity = alert.severity || "info";
+      const icon = severity === "critical" ? "!" : severity === "warning" ? "⚠" : "ⓘ";
+      const row = document.createElement("div");
+      row.className = `alert-row alert-${severity}`;
+      row.innerHTML = `
+        <div class="alert-icon">${icon}</div>
+        <div class="alert-content">
+          <div class="alert-title">${escapeHtml(alert.type)}</div>
+          <div class="alert-message">${escapeHtml(alert.message)}</div>
+          ${alert.batch_no ? `<div class="alert-meta"><strong>Batch:</strong> ${escapeHtml(alert.batch_no)} | <strong>Generic:</strong> ${escapeHtml(alert.generic_no)}</div>` : ""}
+        </div>
+      `;
+      container.appendChild(row);
+    });
+  }
+ 
+  function populateResults(result){
+    const s=result.summary||{}, outputs=result.outputs||{};
+    $("resultAccept").textContent=formatNumber(s.accept_rows);
+    $("resultDispatch").textContent=formatNumber(s.dispatch_rows);
+    $("resultVariance").textContent=formatNumber(s.variance_rows);
+    $("varianceLatest").textContent=formatNumber(s.variance_rows);
+    $("resultFiles").textContent=formatNumber((s.accept_files_count||0)+(s.dispatch_files_count||0)+countReports(outputs));
+    $("resultsInfo").className="status-banner success show";
+    $("resultsInfo").innerHTML=`<span>✓</span><div><strong>Upload files generated successfully.</strong><br>Run ${escapeHtml(result.run_number||"—")} is now <strong>Pending Upload</strong> · Version ${escapeHtml(result.version||"—")} · ${formatNumber(s.total_input_rows)} input rows processed.</div>`;
+    renderCsvFiles("acceptFilesList",outputs.accept_files||{},"Accept");
+    renderCsvFiles("dispatchFilesList",outputs.dispatch_files||{},"Dispatch");
+    renderReportsFiles(outputs);
+    
+    // Render alerts if provided
+    if(result.alerts){
+      renderAlerts(result.alerts);
+    }
+    
+    const hasAccept=Object.keys(outputs.accept_files||{}).length>0;
+    const hasDispatch=Object.keys(outputs.dispatch_files||{}).length>0;
+    const hasReports=countReports(outputs)>0;
+    $("downloadAcceptZip").disabled=!hasAccept;
+    $("downloadDispatchZip").disabled=!hasDispatch;
+    $("downloadVariance").disabled=!firstFile(outputs.variance);
+    $("downloadReportsZip").disabled=!hasReports;
+    $("downloadAllButton").disabled=!(hasAccept||hasDispatch||hasReports);
+  }
+ 
+  function renderCsvFiles(containerId,files,label){
+    const container=$(containerId); container.innerHTML="";
+    const entries=Object.entries(files);
+    if(!entries.length){ container.innerHTML=`<div class="empty"><strong>No ${label} files generated</strong>The reconciliation returned no matching rows.</div>`; return; }
+    entries.forEach(([name,content])=>{
+      const row=document.createElement("div"); row.className="download-row";
+      row.innerHTML=`<div class="file-type">CSV</div><div><div class="file-name">${escapeHtml(name)}</div><div class="file-info">${formatNumber(String(content||"").length)} characters</div></div><button class="btn btn-secondary">Download</button>`;
+      row.querySelector("button").addEventListener("click",()=>downloadText(name,content,"text/csv;charset=utf-8"));
+      container.appendChild(row);
+    });
+  }
+ 
+  function renderReportsFiles(outputs){
+    const container=$("reportsFilesList"); container.innerHTML="";
+    const groups=[["Accept Details",outputs.accept_details],["Dispatch Details",outputs.dispatch_details],["Variance",outputs.variance],["Details",outputs.details],["Reports",outputs.reports]];
+    let total=0;
+    groups.forEach(([label,group])=>normalizeFileGroup(group).forEach(file=>{
+      total++;
+      const row=document.createElement("div"); row.className="download-row";
+      row.innerHTML=`<div class="file-type xlsx">XLSX</div><div><div class="file-name">${escapeHtml(file.name)}</div><div class="file-info">${escapeHtml(label)} · ${escapeHtml(file.encoding)}</div></div><button class="btn btn-secondary">Download</button>`;
+      row.querySelector("button").addEventListener("click",()=>downloadStructured(file));
+      container.appendChild(row);
+    }));
+    if(!total) container.innerHTML=`<div class="empty"><strong>No Excel reports generated</strong>The API response did not include report files.</div>`;
+  }
+ 
+  function downloadText(name,content,mime){ triggerBlob(name,new Blob([content??""],{type:mime})); }
+  function downloadBase64(name,base64,mime){
+    const cleaned=String(base64||"").replace(/^data:.*?;base64,/,"").replace(/\s/g,"");
+    const binary=atob(cleaned), bytes=new Uint8Array(binary.length);
+    for(let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
+    triggerBlob(name,new Blob([bytes],{type:mime}));
+  }
+  function downloadStructured(file){ file.encoding==="base64"?downloadBase64(file.name,file.content,file.mime):downloadText(file.name,file.content,file.mime); }
+  function triggerBlob(name,blob){ const url=URL.createObjectURL(blob),a=document.createElement("a"); a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000); }
+ 
+  async function zipTextFiles(map,name){ const zip=new JSZip(); Object.entries(map||{}).forEach(([n,c])=>zip.file(n,c??"")); triggerBlob(name,await zip.generateAsync({type:"blob"})); }
+  async function zipReports(outputs,name){
+    const zip=new JSZip();
+    [outputs.accept_details,outputs.dispatch_details,outputs.variance,outputs.details,outputs.reports].flatMap(normalizeFileGroup).forEach(file=>{ if(file.encoding==="base64") zip.file(file.name,file.content,{base64:true}); else zip.file(file.name,file.content??""); });
+    triggerBlob(name,await zip.generateAsync({type:"blob"}));
+  }
+ 
+  $("downloadAcceptZip").addEventListener("click",()=>currentResult&&zipTextFiles(currentResult.outputs.accept_files,"SFDA_Accept_Files.zip"));
+  $("downloadDispatchZip").addEventListener("click",()=>currentResult&&zipTextFiles(currentResult.outputs.dispatch_files,"SFDA_Dispatch_Files.zip"));
+  $("downloadVariance").addEventListener("click",()=>{ const file=currentResult&&firstFile(currentResult.outputs.variance); if(file) downloadStructured(file); });
+  $("downloadReportsZip").addEventListener("click",()=>currentResult&&zipReports(currentResult.outputs,"SFDA_Excel_Reports.zip"));
+  $("downloadAllButton").addEventListener("click",async()=>{
+    if(!currentResult) return;
+    const zip=new JSZip(),outputs=currentResult.outputs||{};
+    Object.entries(outputs.accept_files||{}).forEach(([n,c])=>zip.file(`Accept/${n}`,c??""));
+    Object.entries(outputs.dispatch_files||{}).forEach(([n,c])=>zip.file(`Dispatch/${n}`,c??""));
+    [outputs.accept_details,outputs.dispatch_details,outputs.variance,outputs.details,outputs.reports].flatMap(normalizeFileGroup).forEach(file=>{ if(file.encoding==="base64") zip.file(`Reports/${file.name}`,file.content,{base64:true}); else zip.file(`Reports/${file.name}`,file.content??""); });
+    triggerBlob("SFDA_Reconciliation_All_Results.zip",await zip.generateAsync({type:"blob"}));
+  });
+ 
+  document.querySelectorAll(".tab-btn").forEach(btn=>btn.addEventListener("click",()=>{
+    document.querySelectorAll(".tab-btn").forEach(x=>x.classList.toggle("active",x===btn));
+    document.querySelectorAll(".tab-panel").forEach(x=>x.classList.remove("active"));
+    $(`tab-${btn.dataset.tab}`).classList.add("active");
+  }));
+ 
+  function normalizeHistoryRecord(row){
+    return {
+      runId: row.RunNumber || `RUN-${row.RunID ?? "—"}`,
+      runNumber: row.RunNumber || "—",
+      databaseRunId: row.RunID ?? null,
+      timestamp: row.StartedAt || row.RunDate || null,
+      completedAt: row.CompletedAt || null,
+      user: row.SubmittedBy || "Web User",
+      status: row.Status || "Unknown",
+      files: Number(row.ASNFiles || 0) + Number(row.InventoryFiles || 0) + Number(row.DispatchFiles || 0) + Number(row.SFDAFiles || 0),
+      inputRows: Number(row.TotalInputRows || 0),
+      masterRows: Number(row.MasterRecords || 0),
+      accept: Number(row.AcceptRecords || 0),
+      dispatch: Number(row.DispatchRecords || 0),
+      variance: Number(row.ExceptionRecords || 0),
+      generated: Number(row.GeneratedFiles || 0),
+      version: row.ApplicationVersion || "—",
+      error: row.ErrorMessage || "",
+      durationSeconds: calculateRunDuration(row.StartedAt, row.CompletedAt)
+    };
+  }
+ 
+  function calculateRunDuration(startedAt, completedAt){
+    if(!startedAt || !completedAt) return null;
+    const start = new Date(startedAt);
+    const end = new Date(completedAt);
+    if(Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+    return Math.max(0, (end.getTime() - start.getTime()) / 1000);
+  }
+ 
+  function getHistory(){
+    return historyCache;
+  }
+ 
+  async function refreshAzureHistory(options={}){
+    const {silent=false} = options;
+    if(historyLoading) return historyCache;
+    historyLoading = true;
+    if(!silent) toast("Refreshing Azure SQL history...","info");
+    try{
+      const response = await fetch(`${HISTORY_URL}?limit=500`, {cache:"no-store"});
+      let payload;
+      try{
+        payload = await response.json();
+      }catch{
+        throw new Error(`History endpoint returned HTTP ${response.status} without valid JSON.`);
+      }
+      if(!response.ok || payload.status === "Failed"){
+        throw new Error(payload.error || payload.message || `History request failed with HTTP ${response.status}.`);
+      }
+      const sourceRows = Array.isArray(payload.history) ? payload.history : [];
+      historyCache = sourceRows.map(normalizeHistoryRecord);
+      historyLoaded = true;
+      renderHistory();
+      refreshVerificationRuns();
+      updateDashboard();
+      renderReports();
+      if(!silent) toast(`History refreshed: ${historyCache.length} run${historyCache.length===1?"":"s"}.`,"success");
+      return historyCache;
+    }catch(error){
+      console.error("Unable to load Azure SQL history.", error);
+      historyLoaded = true;
+      renderHistory(error);
+      updateDashboard();
+      renderReports();
+      if(!silent) toast(error.message || String(error),"error");
+      return historyCache;
+    }finally{
+      historyLoading = false;
+    }
+  }
+ 
+  function renderHistory(loadError=null){
+    const q=$('historySearch').value.trim().toLowerCase();
+    const status=$('historyStatus').value;
+    const rows=getHistory().filter(r=>(!q||r.runId.toLowerCase().includes(q)||r.user.toLowerCase().includes(q))&&(!status||r.status===status));
+    const body=$('historyBody');
+    body.innerHTML="";
+ 
+    if(loadError && !historyCache.length){
+      body.innerHTML=`<tr><td colspan="11"><div class="empty"><strong>Unable to load Azure SQL history</strong>${escapeHtml(loadError.message || String(loadError))}</div></td></tr>`;
+      $('historyCount').textContent="History unavailable";
+      return;
+    }
+ 
+    rows.forEach(r=>{
+      const tr=document.createElement('tr');
+      const dateText=r.timestamp ? new Date(r.timestamp).toLocaleString() : "—";
+      const statusClass=["Verified","Completed"].includes(r.status)?"success":["Failed","Investigation Required"].includes(r.status)?"failed":r.status==="Pending Verification"?"info":"warning";
+      const errorTitle=r.error?` title="${escapeHtml(r.error)}"`:"";
+      tr.innerHTML=`<td><strong style="color:#075fc8"${errorTitle}>${escapeHtml(r.runId)}</strong></td><td>${escapeHtml(dateText)}</td><td>${escapeHtml(r.user)}</td><td><span class="badge ${statusClass}"${errorTitle}>${escapeHtml(r.status)}</span></td><td>${formatNumber(r.files)}</td><td>${formatNumber(r.inputRows)}</td><td>${formatNumber(r.accept)}</td><td>${formatNumber(r.dispatch)}</td><td>${formatNumber(r.variance)}</td><td>${escapeHtml(r.version||"—")}</td><td><button class="btn btn-secondary view-run-btn" type="button">View</button></td>`;
+      tr.querySelector(".view-run-btn").addEventListener("click",()=>openRunDetails(r.runNumber));
+      body.appendChild(tr);
+    });
+ 
+    if(!rows.length){
+      const message=historyLoaded?"No matching database runs were found.":"Loading reconciliation history from Azure SQL...";
+      body.innerHTML=`<tr><td colspan="11"><div class="empty"><strong>${historyLoaded?"No history found":"Loading history"}</strong>${message}</div></td></tr>`;
+    }
+    $('historyCount').textContent=`${rows.length} database run${rows.length===1?"":"s"}`;
+  }
+ 
+  function formatBytes(value){
+    const bytes=Number(value||0);
+    if(bytes<1024) return `${bytes} B`;
+    if(bytes<1024*1024) return `${(bytes/1024).toFixed(1)} KB`;
+    return `${(bytes/1024/1024).toFixed(2)} MB`;
+  }
+ 
+  function closeRunDetails(){
+    $('runDetailsModal').classList.remove('show');
+    $('runDetailsModal').setAttribute('aria-hidden','true');
+  }
+ 
+  function renderRunFileSection(title,files){
+    if(!files.length) return `<div class="history-file-section"><h3>${escapeHtml(title)}</h3><div class="empty"><strong>No files</strong>No files were stored in this category.</div></div>`;
+    return `<div class="history-file-section"><h3>${escapeHtml(title)} (${files.length})</h3>${files.map(file=>`
+      <div class="history-file-row">
+        <div><div class="file-name">${escapeHtml(file.FileName||'File')}</div><div class="history-file-meta">${escapeHtml(file.FileType||file.FileCategory||'')} · ${formatBytes(file.SizeBytes)} · ${escapeHtml(file.ContentType||'')}</div></div>
+        <span class="badge info">${escapeHtml(file.FileCategory||'file')}</span>
+        <a class="btn btn-primary" href="${escapeHtml(file.download_url)}">Download</a>
+      </div>`).join('')}</div>`;
+  }
+ 
+  async function openRunDetails(runNumber){
+    const modal=$('runDetailsModal');
+    modal.classList.add('show');
+    modal.setAttribute('aria-hidden','false');
+    $('runDetailsTitle').textContent=runNumber||'Run Details';
+    $('runDetailsSubtitle').textContent='Loading files and run information...';
+    $('runDetailsBody').innerHTML='<div class="empty"><strong>Loading run details</strong>Please wait.</div>';
+    try{
+      const response=await fetch(`${HISTORY_URL}/${encodeURIComponent(runNumber)}`,{cache:'no-store'});
+      const payload=await response.json();
+      if(!response.ok||payload.status==='Failed') throw new Error(payload.error||payload.message||`HTTP ${response.status}`);
+      const run=payload.run||{};
+      const files=Array.isArray(payload.files)?payload.files:[];
+      $('runDetailsSubtitle').textContent=`${run.Status||'Unknown'} · ${run.SubmittedBy||'Web User'} · ${run.ApplicationVersion||'—'}`;
+      const start=run.StartedAt?new Date(run.StartedAt):null;
+      const end=run.CompletedAt?new Date(run.CompletedAt):null;
+      const duration=(start&&end&&!Number.isNaN(start.getTime())&&!Number.isNaN(end.getTime()))?`${((end-start)/1000).toFixed(1)} sec`:'—';
+      const detailHtml=`<div class="detail-grid">
+        <div class="detail-box"><span>Run Number</span><strong>${escapeHtml(run.RunNumber||'—')}</strong></div>
+        <div class="detail-box"><span>Status</span><strong>${escapeHtml(run.Status||'—')}</strong></div>
+        <div class="detail-box"><span>Started</span><strong>${escapeHtml(start?start.toLocaleString():'—')}</strong></div>
+        <div class="detail-box"><span>Duration</span><strong>${escapeHtml(duration)}</strong></div>
+        <div class="detail-box"><span>Input Rows</span><strong>${formatNumber(run.TotalInputRows)}</strong></div>
+        <div class="detail-box"><span>Master Records</span><strong>${formatNumber(run.MasterRecords)}</strong></div>
+        <div class="detail-box"><span>Accept</span><strong>${formatNumber(run.AcceptRecords)}</strong></div>
+        <div class="detail-box"><span>Dispatch</span><strong>${formatNumber(run.DispatchRecords)}</strong></div>
+        <div class="detail-box"><span>Variance</span><strong>${formatNumber(run.ExceptionRecords)}</strong></div>
+        <div class="detail-box"><span>Generated Files</span><strong>${formatNumber(run.GeneratedFiles)}</strong></div>
+        <div class="detail-box"><span>User</span><strong>${escapeHtml(run.SubmittedBy||'—')}</strong></div>
+        <div class="detail-box"><span>Version</span><strong>${escapeHtml(run.ApplicationVersion||'—')}</strong></div>
+      </div>${run.ErrorMessage?`<div class="status-banner error show"><span>!</span><div>${escapeHtml(run.ErrorMessage)}</div></div>`:''}`;
+      $('runDetailsBody').innerHTML=detailHtml+
+        renderRunFileSection('Input Files',files.filter(f=>f.FileCategory==='input'))+
+        renderRunFileSection('Output Files',files.filter(f=>f.FileCategory==='output'))+
+        renderRunFileSection('Metadata',files.filter(f=>f.FileCategory==='metadata'));
+    }catch(error){
+      $('runDetailsSubtitle').textContent='Unable to load run details';
+      $('runDetailsBody').innerHTML=`<div class="empty"><strong>Run details could not be loaded</strong>${escapeHtml(error.message||String(error))}</div>`;
+    }
+  }
+ 
+  $('closeRunDetails').addEventListener('click',closeRunDetails);
+  $('runDetailsModal').addEventListener('click',event=>{if(event.target===$('runDetailsModal')) closeRunDetails();});
+  document.addEventListener('keydown',event=>{if(event.key==='Escape') closeRunDetails();});
+ 
+  function updateVerificationFileState(){
+    const sfdaFile=$("verificationSfda").files[0];
+    const notifications=Array.from($("notificationFiles").files||[]);
+    $("verificationSfdaName").textContent=sfdaFile?`✓ ${sfdaFile.name}`:"No file selected";
+    $("notificationFilesName").textContent=notifications.length?`✓ ${notifications.length} notification result file${notifications.length===1?"":"s"} selected`:"No files selected";
+    const ready=Boolean($("verificationRun").value&&sfdaFile&&notifications.length);
+    $("verifyUploadButton").disabled=!ready;
+  }
+ 
+  function refreshVerificationRuns(){
+    const selector=$("verificationRun");
+    if(!selector) return;
+ 
+    const selected=selector.value;
+    const eligibleStatuses=[
+      "Pending Upload",
+      "Pending Verification",
+      "Completed"
+    ];
+ 
+    const eligible=getHistory()
+      .filter(run=>eligibleStatuses.includes(run.status))
+      .sort((a,b)=>{
+        const aTime=new Date(a.startedAt||a.runDate||0).getTime()||0;
+        const bTime=new Date(b.startedAt||b.runDate||0).getTime()||0;
+        return bTime-aTime;
+      });
+ 
+    selector.innerHTML=
+      '<option value="">Select a reconciliation run...</option>'+
+      eligible.map(run=>
+        `<option value="${escapeHtml(run.runNumber)}">${escapeHtml(run.runNumber)} · ${escapeHtml(run.status)}</option>`
+      ).join("");
+ 
+    if(eligible.some(run=>run.runNumber===selected)){
+      selector.value=selected;
+    }else if(eligible.length===1){
+      selector.value=eligible[0].runNumber;
+    }
+ 
+    const box=$("verificationStatus");
+ 
+    if(!eligible.length){
+      box.className="status-banner error show";
+      box.innerHTML='<span>!</span><div>No eligible reconciliation run was found. Complete a reconciliation run, refresh History, then return to SFDA Verification.</div>';
+    }else if(!selector.value){
+      box.className="status-banner info show";
+      box.innerHTML=`<span>ⓘ</span><div>${eligible.length} eligible run${eligible.length===1?"":"s"} found. Select the correct run to enable Verify Upload.</div>`;
+    }
+ 
+    updateVerificationFileState();
+  }
+ 
+  $("verificationRun").addEventListener("change",updateVerificationFileState);
+  $("verificationSfda").addEventListener("change",updateVerificationFileState);
+  $("notificationFiles").addEventListener("change",updateVerificationFileState);
+ 
+  $("verificationForm").addEventListener("submit",async event=>{
+    event.preventDefault();
+    updateVerificationFileState();
+ 
+    const runNumber=$("verificationRun").value;
+    const sfdaFile=$("verificationSfda").files[0];
+    const notifications=Array.from($("notificationFiles").files||[]);
+    const button=$("verifyUploadButton");
+    const box=$("verificationStatus");
+ 
+    if(!runNumber||!sfdaFile||!notifications.length){
+      box.className="status-banner error show";
+      box.innerHTML='<span>!</span><div>Select a run, the latest SFDA report, and at least one Notification Result file.</div>';
+      toast("Verification files are incomplete.","error");
+      updateVerificationFileState();
+      return;
+    }
+ 
+    const formData=new FormData();
+    formData.append("run_number",runNumber);
+    formData.append("latest_sfda",sfdaFile,sfdaFile.name);
+ 
+    notifications.forEach(file=>{
+      formData.append("notification_files",file,file.name);
+    });
+ 
+    button.disabled=true;
+    button.textContent="◷ Verifying Upload...";
+    box.className="status-banner info show";
+    box.innerHTML=`<span>◷</span><div>Uploading ${notifications.length} Notification Result file${notifications.length===1?"":"s"} and running SFDA verification. Keep this page open until processing is complete.</div>`;
+ 
+    try{
+      const response=await fetch(VERIFY_URL,{
+        method:"POST",
+        body:formData,
+        cache:"no-store"
+      });
+ 
+      let payload;
+      try{
+        payload=await response.json();
+      }catch{
+        throw new Error(`Verification endpoint returned HTTP ${response.status} without valid JSON.`);
+      }
+ 
+      if(!response.ok||payload.status==="Failed"){
+        const failedStep=payload.failed_step?` (${payload.failed_step})`:"";
+        throw new Error(
+          (payload.error||payload.message||`Verification failed with HTTP ${response.status}.`)
+          + failedStep
+        );
+      }
+ 
+      const summary=payload.summary||{};
+      const overallStatus=payload.status||"Verification Completed";
+      const isVerified=overallStatus==="Verified";
+      const statusClass=isVerified?"success":"error";
+      const statusIcon=isVerified?"✓":"!";
+      const expected=Number(summary.expected_rows||0).toLocaleString();
+      const notificationsCount=Number(summary.notification_rows||0).toLocaleString();
+      const verified=Number(summary.verified_rows||0).toLocaleString();
+      const rejected=Number(summary.rejected_rows||0).toLocaleString();
+      const unclassified=Number(summary.unclassified_rows||0).toLocaleString();
+      const mismatches=Number(summary.mismatch_rows||0).toLocaleString();
+      const missing=Number(summary.missing_expected_rows||0).toLocaleString();
+ 
+      box.className=`status-banner ${statusClass} show`;
+      box.innerHTML=`
+        <span>${statusIcon}</span>
+        <div>
+          <strong>${escapeHtml(overallStatus)}</strong><br>
+          Expected: ${expected} · Notification rows: ${notificationsCount} ·
+          Verified: ${verified} · Rejected: ${rejected} ·
+          Unclassified: ${unclassified} · Mismatches: ${mismatches} ·
+          Missing results: ${missing}
+        </div>`;
+ 
+      toast(
+        isVerified
+          ? "SFDA upload verified successfully."
+          : "Verification completed and requires investigation.",
+        isVerified?"success":"error"
+      );
+ 
+      await refreshAzureHistory({silent:true});
+      refreshVerificationRuns();
+ 
+      if(isVerified){
+        $("verificationSfda").value="";
+        $("notificationFiles").value="";
+        updateVerificationFileState();
+      }
+    }catch(error){
+      console.error("SFDA Verification failed.",error);
+      box.className="status-banner error show";
+      box.innerHTML=`<span>!</span><div><strong>Verification failed.</strong><br>${escapeHtml(error.message||String(error))}</div>`;
+      toast(error.message||String(error),"error");
+    }finally{
+      button.textContent="✓ Verify Upload";
+      updateVerificationFileState();
+    }
+  });
+ 
+  $('historySearch').addEventListener('input',()=>renderHistory());
+  $('historyStatus').addEventListener('change',()=>renderHistory());
+  $('clearHistoryButton').addEventListener('click',()=>refreshAzureHistory());
+ 
+  function getDashboardPreview(){
+    try{
+      const rows=JSON.parse(localStorage.getItem(DASHBOARD_PREVIEW_KEY) || "[]");
+      return Array.isArray(rows) ? rows : [];
+    }catch{
+      return [];
+    }
+  }
+ 
+  function dashboardCell(value,numeric=false){
+    if(value===null || value===undefined || value==="") return "—";
+    return numeric ? formatNumber(value) : escapeHtml(value);
+  }
+ 
+  function renderDashboardOverview(){
+    const body=$("homeOverviewBody");
+    if(!body) return;
+    const rows=getDashboardPreview();
+    if(!rows.length){
+      body.innerHTML=`<tr><td colspan="13"><div class="empty"><strong>No reconciliation data loaded</strong>Run a reconciliation to populate this operational table.</div></td></tr>`;
+      return;
+    }
+    body.innerHTML=rows.map(row=>{
+      const status=String(row.Status||"OK");
+      const badgeClass=status==="OK"?"success":status==="DIFF"?"failed":"warning";
+      return `<tr>
+        <td><strong>${dashboardCell(row.BN)}</strong></td>
+        <td>${dashboardCell(row["Expiry Date"])}</td>
+        <td>${dashboardCell(row.GTIN)}</td>
+        <td>${dashboardCell(row["Drug Name"])}</td>
+        <td>${dashboardCell(row.Active,true)}</td>
+        <td>${dashboardCell(row["Quantity Sent Pending"],true)}</td>
+        <td>${dashboardCell(row["Quantity Receive Pending"],true)}</td>
+        <td>${dashboardCell(row.Receiving,true)}</td>
+        <td>${dashboardCell(row["To Be Accept"],true)}</td>
+        <td>${dashboardCell(row.Inventory,true)}</td>
+        <td>${dashboardCell(row.Variance,true)}</td>
+        <td>${dashboardCell(row["To Be Dispatch"],true)}</td>
+        <td><span class="badge ${badgeClass}">${escapeHtml(status)}</span></td>
+      </tr>`;
+    }).join("");
+  }
+ 
+  function updateDashboard(){
+    renderDashboardOverview();
+    const history=getHistory(),latest=history.find(x=>["Pending Upload","Pending Verification","Verified","Completed"].includes(x.status));
+    $("homeRuns").textContent=formatNumber(history.length);
+    $("homeSuccess").textContent=formatNumber(history.filter(x=>["Verified","Completed"].includes(x.status)).length);
+    $("homeInputRows").textContent=latest?formatNumber(latest.inputRows):"—";
+    $("homeAccept").textContent=latest?formatNumber(latest.accept):"—";
+    $("homeDispatch").textContent=latest?formatNumber(latest.dispatch):"—";
+    $("homeVariance").textContent=latest?formatNumber(latest.variance):"—";
+    $("homeGenerated").textContent=latest?formatNumber(latest.generated):"—";
+    const list=$("recentActivity"); list.innerHTML="";
+    history.slice(0,6).forEach(r=>{ const div=document.createElement("div"); div.className="activity"; div.innerHTML=`<div class="activity-icon" style="${r.status==="Failed"?"background:#fdecec;color:#d13438":""}">${r.status==="Failed"?"!":"✓"}</div><div><div class="activity-title">${r.status==="Failed"?"Reconciliation failed":"Reconciliation completed successfully"}</div><div class="activity-meta">${escapeHtml(r.runId)} · ${formatNumber(r.inputRows)} input rows</div></div><div class="activity-time">${new Date(r.timestamp).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})}</div>`; list.appendChild(div); });
+    if(!history.length) list.innerHTML=`<div class="empty"><strong>No activity yet</strong>Run your first reconciliation to populate the dashboard.</div>`;
+    const uploads=$("recentUploads");
+    if(uploads){
+      if(latest){
+        uploads.innerHTML=["SFDA Drug Count","WMS ASN Receive","WMS Inventory","WMS Dispatch Report"].map((name,i)=>`<div class="recent-upload-row"><div><div class="upload-type">${name}</div><div class="upload-time">${new Date(latest.timestamp).toLocaleString()}</div></div><span class="badge success">Success</span></div>`).join("");
+      }else uploads.innerHTML=`<div class="empty"><strong>No uploads yet</strong>Selected files will appear after a run.</div>`;
+    }
+  }
+ 
+  function renderReports(){
+    const history=getHistory(),completed=history.filter(x=>["Verified","Completed"].includes(x.status)),latest=completed[0]||history.find(x=>x.status==="Pending Upload")||{};
+    $("reportRuns").textContent=formatNumber(history.length);
+    $("reportSuccessRate").textContent=`${history.length?(completed.length/history.length*100).toFixed(1):0}%`;
+    $("reportProcessed").textContent=formatNumber(completed.reduce((s,x)=>s+Number(x.masterRows||0),0));
+    $("reportVariance").textContent=formatNumber(completed.reduce((s,x)=>s+Number(x.variance||0),0));
+    const total=Number(latest.accept||0)+Number(latest.dispatch||0)+Number(latest.variance||0);
+    $("compositionContent").innerHTML=total?`<div class="status-line"><span>Accept Items</span><strong>${formatNumber(latest.accept)}</strong></div><div class="status-line"><span>Dispatch Items</span><strong>${formatNumber(latest.dispatch)}</strong></div><div class="status-line"><span>Variance Items</span><strong>${formatNumber(latest.variance)}</strong></div><div class="status-line"><span>Total Result Items</span><strong>${formatNumber(total)}</strong></div>`:`<div class="empty"><strong>No report data yet</strong>Run a reconciliation first.</div>`;
+  }
+  $("exportHistoryButton").addEventListener("click",()=>downloadText("SFDA_Reconciliation_Azure_SQL_History.json",JSON.stringify(getHistory(),null,2),"application/json;charset=utf-8"));
+ 
+  async function checkHealth(){
+    try{
+      const [hRes,vRes]=await Promise.all([fetch(HEALTH_URL),fetch(VERSION_URL)]);
+      const h=await hRes.json(),v=await vRes.json();
+      const version=v.version||h.version||"—";
+      $("homeHealth").textContent=h.status||"Healthy";
+      $("homeVersion").textContent=version;
+      $("adminHealth").textContent=h.status||"Healthy";
+      $("adminVersion").textContent=version;
+      $("apiEndpoint").textContent=new URL(ACCEPT_API_URL,window.location.href).href + " · " + new URL(DISPATCH_API_URL,window.location.href).href;
+      return true;
+    }catch{
+      $("homeHealth").textContent="Unavailable";
+      $("homeHealth").style.color="#d13438";
+      $("adminHealth").textContent="Unavailable";
+      $("adminHealth").style.color="#d13438";
+      return false;
+    }
+  }
+  $("healthButton").addEventListener("click",async()=>{ const ok=await checkHealth(); toast(ok?"Azure Function is healthy.":"Azure Function health check failed.",ok?"success":"error"); });
+ 
+  if($("dashboardDate")) $("dashboardDate").value=new Date().toISOString().slice(0,10);
+  if($("dashboardRefresh")) $("dashboardRefresh").addEventListener("click",()=>refreshAzureHistory());
+  renderHistory();
+  updateDashboard();
+  renderReports();
+  checkHealth();
+  refreshAzureHistory({silent:true});
+ 
+  const initialPage = window.location.hash.replace(/^#/, "") || "home";
+  navigate(initialPage, {skipHash:true, instant:true});
+</script>
+</body>
+</html>
+ 
