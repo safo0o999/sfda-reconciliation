@@ -1,1062 +1,707 @@
 from __future__ import annotations
 
 import hashlib
-from pathlib import Path
 from typing import Any, Dict, List
 
 import pandas as pd
 
 from engine.normalizer import Normalizer
+from engine.validator import Validator
 
 
 class FullReconciliationEngine:
+    """Step 1: normalize ASN/Dispatch files and prepare incremental SQL events.
+
+    Business grain:
+        BN + Expiry Month + Generic Item Number
+
+    SQL tables:
+        ReceiptEvents
+        DispatchEvents
+        BatchMaster
+
+    SFDA matching is performed using:
+        BN + Expiry Month
+
+    because the SFDA Drug Count report does not reliably contain the WMS
+    Generic Item Number.
     """
-    Build the historical Batch Master without generating SFDA upload CSVs.
 
-    Matching rule:
-        BN + Expiry Year/Month
+    KEYS = [
+        "BN",
+        "Expiry Month Key",
+        "Generic Item Number",
+    ]
 
-    The exact SFDA and WMS expiry dates remain available for audit.
-    """
+    SFDA_KEYS = [
+        "BN",
+        "Expiry Month Key",
+    ]
 
-    KEYS = ["BN", "Expiry Month Key"]
+    RECEIPT_EVENT_COLUMNS = [
+        "Event Key",
+        "BN",
+        "Expiry Month Key",
+        "Expiry Date",
+        "Generic Item Number",
+        "Trade Item",
+        "Trade Name",
+        "Received Quantity",
+        "Inbound Shipment",
+        "ASN Line",
+        "Supplier Name",
+        "Received Date",
+    ]
+
+    DISPATCH_EVENT_COLUMNS = [
+        "Event Key",
+        "BN",
+        "Expiry Month Key",
+        "Expiry Date",
+        "Generic Item Number",
+        "Trade Item Number",
+        "Trade Name",
+        "Dispatched Quantity",
+        "To Address",
+        "Sales Order Number",
+        "Order Line",
+        "Dispatch Date",
+    ]
+
+    MASTER_COLUMNS = [
+        "BN",
+        "Expiry Month Key",
+        "Expiry Date",
+        "Generic Item Number",
+        "Trade Item Number",
+        "Trade Name",
+        "GTIN",
+        "Drug Name",
+        "Total Receive Qty",
+        "Total Dispatched Qty",
+        "Receive Runs",
+        "Dispatch Runs",
+        "First Received Date",
+        "Last Received Date",
+        "First Dispatch Date",
+        "Last Dispatch Date",
+        "Generic Exists in SFDA",
+        "Last Updated",
+    ]
 
     def __init__(
         self,
         asn_df: pd.DataFrame,
         dispatch_df: pd.DataFrame,
         sfda_df: pd.DataFrame,
-    ) -> None:
-        self.asn = asn_df.copy()
-        self.dispatch = dispatch_df.copy()
-        self.sfda = sfda_df.copy()
-
-        config_path = (
-            Path(__file__).resolve().parent.parent
-            / "config"
+    ):
+        self.asn = (
+            asn_df.copy()
+            if asn_df is not None
+            else pd.DataFrame()
         )
-        packsize_path = config_path / "pack_size.xlsx"
 
-        if not packsize_path.exists():
-            raise FileNotFoundError(
-                "config/pack_size.xlsx was not found."
-            )
+        self.dispatch = (
+            dispatch_df.copy()
+            if dispatch_df is not None
+            else pd.DataFrame()
+        )
 
-        self.packsize = pd.read_excel(
-            packsize_path,
-            engine="openpyxl",
-            dtype=object,
+        self.sfda = (
+            sfda_df.copy()
+            if sfda_df is not None
+            else pd.DataFrame()
         )
 
     @staticmethod
     def _month_key(series: pd.Series) -> pd.Series:
-        dates = Normalizer.date(series)
-        return dates.dt.strftime("%Y-%m").fillna("")
-
-    @staticmethod
-    def _clean_text(series: pd.Series) -> pd.Series:
         return (
-            series.fillna("")
-            .astype(str)
-            .str.strip()
+            Normalizer.date(series)
+            .dt.strftime("%Y-%m")
+            .fillna("")
         )
 
     @staticmethod
-    def _first_non_blank(series: pd.Series) -> str:
-        for value in series:
-            text = str(value or "").strip()
-            if text and text.lower() != "nan":
-                return text
-        return ""
+    def _clean_key_part(value: Any) -> str:
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
 
-    @staticmethod
-    def _first_valid_date(series: pd.Series):
-        values = pd.to_datetime(
-            series,
-            errors="coerce",
-        ).dropna()
+        if isinstance(value, pd.Timestamp):
+            if pd.isna(value):
+                return ""
+            return value.isoformat()
 
-        if values.empty:
-            return pd.NaT
+        text = str(value).strip()
 
-        return values.min()
+        if text.endswith(".0"):
+            text = text[:-2]
 
-    @staticmethod
-    def _last_valid_date(series: pd.Series):
-        values = pd.to_datetime(
-            series,
-            errors="coerce",
-        ).dropna()
+        return text.upper()
 
-        if values.empty:
-            return pd.NaT
-
-        return values.max()
-
-    @staticmethod
-    def _event_key(values: List[Any]) -> str:
-        raw = "|".join(
-            "" if value is None else str(value)
-            for value in values
+    @classmethod
+    def _event_key(cls, parts: List[Any]) -> str:
+        raw_key = "|".join(
+            cls._clean_key_part(part)
+            for part in parts
         )
+
         return hashlib.sha256(
-            raw.encode("utf-8")
+            raw_key.encode("utf-8")
         ).hexdigest()
 
-    def _prepare_packsize(self) -> pd.DataFrame:
-        packsize = Normalizer.normalize_packsize(
-            self.packsize
-        )
+    @staticmethod
+    def _ensure_columns(
+        dataframe: pd.DataFrame,
+        columns: List[str],
+    ) -> pd.DataFrame:
+        frame = dataframe.copy()
 
-        packsize = (
-            packsize[
-                ["Trade Name", "PackageSize"]
-            ]
-            .drop_duplicates(
-                subset=["Trade Name"],
-                keep="first",
-            )
-            .copy()
-        )
+        for column in columns:
+            if column not in frame.columns:
+                frame[column] = None
 
-        packsize["PackageSize"] = (
+        return frame
+
+    @staticmethod
+    def _normalize_quantity(
+        series: pd.Series,
+    ) -> pd.Series:
+        return (
             pd.to_numeric(
-                packsize["PackageSize"],
+                series,
                 errors="coerce",
             )
-            .fillna(1)
+            .fillna(0)
         )
 
-        packsize.loc[
-            packsize["PackageSize"] <= 0,
-            "PackageSize",
-        ] = 1
-
-        return packsize
-
-    def _normalize(self) -> None:
+    def normalize(self) -> None:
         self.asn = Normalizer.normalize_asn(
             self.asn
         )
+
         self.dispatch = Normalizer.normalize_dispatch(
             self.dispatch
         )
+
         self.sfda = Normalizer.normalize_sfda(
             self.sfda
         )
 
-        self.asn["Expiry Month Key"] = (
-            self._month_key(
-                self.asn["Expiry Date"]
-            )
-        )
-        self.dispatch["Expiry Month Key"] = (
-            self._month_key(
-                self.dispatch["Expiry Date"]
-            )
-        )
-        self.sfda["Expiry Month Key"] = (
-            self._month_key(
-                self.sfda["Expiry Date"]
-            )
+        self.asn["Expiry Month Key"] = self._month_key(
+            self.asn["Expiry Date"]
         )
 
-        for dataframe, label in [
-            (self.asn, "ASN"),
-            (self.dispatch, "DISPATCH"),
-            (self.sfda, "SFDA"),
-        ]:
-            invalid = dataframe[
-                (dataframe["BN"] == "")
-                | (
-                    dataframe[
-                        "Expiry Month Key"
-                    ] == ""
-                )
-            ]
-
-            if not invalid.empty:
-                dataframe.drop(
-                    index=invalid.index,
-                    inplace=True,
-                )
-
-            if dataframe.empty:
-                raise ValueError(
-                    f"{label} contains no valid "
-                    "BN + expiry-month records."
-                )
-
-    def _receipt_events(
-        self,
-        package_lookup: pd.DataFrame,
-    ) -> pd.DataFrame:
-        receipt = self.asn.copy()
-
-        receipt["Source File"] = (
-            self._clean_text(
-                receipt.get(
-                    "_Source File",
-                    pd.Series(
-                        [""] * len(receipt),
-                        index=receipt.index,
-                    ),
-                )
-            )
+        self.dispatch["Expiry Month Key"] = self._month_key(
+            self.dispatch["Expiry Date"]
         )
 
-        receipt["Event Date"] = pd.to_datetime(
-            receipt["Received Date"],
-            errors="coerce",
-        ).dt.normalize()
-
-        receipt["Received Quantity"] = (
-            pd.to_numeric(
-                receipt["Received Quantity"],
-                errors="coerce",
-            )
-            .fillna(0)
+        self.sfda["Expiry Month Key"] = self._month_key(
+            self.sfda["Expiry Date"]
         )
 
-        receipt = receipt[
-            receipt["Received Quantity"] > 0
-        ].copy()
-
-        receipt = receipt.merge(
-            package_lookup,
-            on="Trade Name",
-            how="left",
+        self.asn["Received Quantity"] = self._normalize_quantity(
+            self.asn["Received Quantity"]
         )
 
-        receipt["PackageSize"] = (
-            pd.to_numeric(
-                receipt["PackageSize"],
-                errors="coerce",
-            )
-            .fillna(1)
+        self.dispatch["Dispatched Quantity"] = self._normalize_quantity(
+            self.dispatch["Dispatched Quantity"]
         )
-        receipt.loc[
-            receipt["PackageSize"] <= 0,
-            "PackageSize",
-        ] = 1
 
-        group_columns = [
+    def validate(self) -> None:
+        Validator.validate(
+            self.asn,
+            "ASN",
+        )
+
+        Validator.validate(
+            self.dispatch,
+            "DISPATCH",
+        )
+
+        Validator.validate(
+            self.sfda,
+            "SFDA",
+        )
+
+    def _sfda_keys(self) -> pd.DataFrame:
+        required = [
             "BN",
             "Expiry Month Key",
-            "Event Date",
-            "Source File",
-            "Supplier Name",
-            "Supplier Code",
-            "PO Number",
-            "Invoice Number",
-            "Inbound Shipment",
-            "Trade Name",
-            "Generic Item Number",
-            "Trade Item",
-            "PackageSize",
+            "Expiry Date",
+            "GTIN",
+            "Drug Name",
         ]
 
-        grouped = (
-            receipt.groupby(
-                group_columns,
-                as_index=False,
-                dropna=False,
+        sfda = self._ensure_columns(
+            self.sfda,
+            required,
+        )[required].copy()
+
+        sfda = sfda[
+            (sfda["BN"].astype(str).str.strip() != "")
+            & (
+                sfda["Expiry Month Key"]
+                .astype(str)
+                .str.strip()
+                != ""
             )
-            .agg({
-                "Received Quantity": "sum",
-                "Expiry Date": "first",
-            })
+        ].copy()
+
+        sfda["Expiry Date"] = Normalizer.date(
+            sfda["Expiry Date"]
         )
 
-        grouped["Quantity Packages"] = (
-            grouped["Received Quantity"]
-            / grouped["PackageSize"]
+        sfda = (
+            sfda.sort_values(
+                by=[
+                    "BN",
+                    "Expiry Month Key",
+                    "Expiry Date",
+                ],
+                kind="stable",
+            )
+            .drop_duplicates(
+                subset=self.SFDA_KEYS,
+                keep="first",
+            )
+            .reset_index(drop=True)
         )
 
-        grouped["Event Type"] = "RECEIPT"
+        return sfda
 
-        grouped["Event Key"] = grouped.apply(
+    def _receipt_events(self) -> pd.DataFrame:
+        frame = self._ensure_columns(
+            self.asn,
+            self.RECEIPT_EVENT_COLUMNS,
+        )
+
+        frame = frame[
+            (frame["BN"].astype(str).str.strip() != "")
+            & (
+                frame["Expiry Month Key"]
+                .astype(str)
+                .str.strip()
+                != ""
+            )
+            & (
+                frame["Generic Item Number"]
+                .astype(str)
+                .str.strip()
+                != ""
+            )
+            & (
+                pd.to_numeric(
+                    frame["Received Quantity"],
+                    errors="coerce",
+                ).fillna(0)
+                != 0
+            )
+        ].copy()
+
+        sfda_keys = self._sfda_keys()[
+            self.SFDA_KEYS
+        ].copy()
+
+        frame = frame.merge(
+            sfda_keys,
+            on=self.SFDA_KEYS,
+            how="inner",
+            validate="many_to_one",
+        )
+
+        frame["Event Key"] = frame.apply(
             lambda row: self._event_key([
                 "RECEIPT",
-                row["BN"],
-                row["Expiry Month Key"],
-                row["Event Date"],
-                row["Source File"],
-                row["Supplier Name"],
-                row["PO Number"],
-                row["Invoice Number"],
-                row["Inbound Shipment"],
-                row["Received Quantity"],
+                row.get("Inbound Shipment"),
+                row.get("ASN Line"),
+                row.get("BN"),
+                row.get("Expiry Month Key"),
+                row.get("Generic Item Number"),
+                row.get("Trade Item"),
+                row.get("Received Date"),
+                row.get("Received Quantity"),
+                row.get("_Source File"),
             ]),
             axis=1,
         )
 
-        return grouped
-
-    def _dispatch_events(
-        self,
-        package_lookup: pd.DataFrame,
-    ) -> pd.DataFrame:
-        dispatch = self.dispatch.copy()
-
-        dispatch["Source File"] = (
-            self._clean_text(
-                dispatch.get(
-                    "_Source File",
-                    pd.Series(
-                        [""] * len(dispatch),
-                        index=dispatch.index,
-                    ),
-                )
-            )
+        frame = self._ensure_columns(
+            frame,
+            self.RECEIPT_EVENT_COLUMNS,
         )
 
-        dispatch["Event Date"] = pd.to_datetime(
-            dispatch["Dispatch Date"],
-            errors="coerce",
-        ).dt.normalize()
-
-        dispatch["Dispatched Quantity"] = (
-            pd.to_numeric(
-                dispatch["Dispatched Quantity"],
-                errors="coerce",
+        return (
+            frame[self.RECEIPT_EVENT_COLUMNS]
+            .drop_duplicates(
+                subset=["Event Key"],
+                keep="first",
             )
-            .fillna(0)
+            .reset_index(drop=True)
         )
 
-        dispatch = dispatch[
-            dispatch["Dispatched Quantity"] > 0
+    def _dispatch_events(self) -> pd.DataFrame:
+        frame = self._ensure_columns(
+            self.dispatch,
+            self.DISPATCH_EVENT_COLUMNS,
+        )
+
+        frame = frame[
+            (frame["BN"].astype(str).str.strip() != "")
+            & (
+                frame["Expiry Month Key"]
+                .astype(str)
+                .str.strip()
+                != ""
+            )
+            & (
+                frame["Generic Item Number"]
+                .astype(str)
+                .str.strip()
+                != ""
+            )
+            & (
+                pd.to_numeric(
+                    frame["Dispatched Quantity"],
+                    errors="coerce",
+                ).fillna(0)
+                != 0
+            )
         ].copy()
 
-        dispatch = dispatch.merge(
-            package_lookup,
-            on="Trade Name",
-            how="left",
+        sfda_keys = self._sfda_keys()[
+            self.SFDA_KEYS
+        ].copy()
+
+        frame = frame.merge(
+            sfda_keys,
+            on=self.SFDA_KEYS,
+            how="inner",
+            validate="many_to_one",
         )
 
-        dispatch["PackageSize"] = (
-            pd.to_numeric(
-                dispatch["PackageSize"],
-                errors="coerce",
-            )
-            .fillna(1)
-        )
-        dispatch.loc[
-            dispatch["PackageSize"] <= 0,
-            "PackageSize",
-        ] = 1
-
-        group_columns = [
-            "BN",
-            "Expiry Month Key",
-            "Event Date",
-            "Source File",
-            "To Address",
-            "Sales Order Number",
-            "Order Line",
-            "Trade Name",
-            "Generic Item Number",
-            "Trade Item Number",
-            "PackageSize",
-        ]
-
-        grouped = (
-            dispatch.groupby(
-                group_columns,
-                as_index=False,
-                dropna=False,
-            )
-            .agg({
-                "Dispatched Quantity": "sum",
-                "Expiry Date": "first",
-            })
-        )
-
-        grouped["Quantity Packages"] = (
-            grouped["Dispatched Quantity"]
-            / grouped["PackageSize"]
-        )
-
-        grouped["Event Type"] = "DISPATCH"
-
-        grouped["Event Key"] = grouped.apply(
+        frame["Event Key"] = frame.apply(
             lambda row: self._event_key([
                 "DISPATCH",
-                row["BN"],
-                row["Expiry Month Key"],
-                row["Event Date"],
-                row["Source File"],
-                row["To Address"],
-                row["Sales Order Number"],
-                row["Order Line"],
-                row["Dispatched Quantity"],
+                row.get("Sales Order Number"),
+                row.get("Order Line"),
+                row.get("To Address"),
+                row.get("BN"),
+                row.get("Expiry Month Key"),
+                row.get("Generic Item Number"),
+                row.get("Trade Item Number"),
+                row.get("Dispatch Date"),
+                row.get("Dispatched Quantity"),
+                row.get("_Source File"),
             ]),
             axis=1,
         )
 
-        return grouped
-
-    def _sfda_summary(
-        self,
-        package_lookup: pd.DataFrame,
-    ) -> pd.DataFrame:
-        sfda = self.sfda.copy()
-
-        sfda = sfda.merge(
-            package_lookup,
-            left_on="Drug Name",
-            right_on="Trade Name",
-            how="left",
+        frame = self._ensure_columns(
+            frame,
+            self.DISPATCH_EVENT_COLUMNS,
         )
 
-        sfda["PackageSize"] = (
-            pd.to_numeric(
-                sfda["PackageSize"],
-                errors="coerce",
+        return (
+            frame[self.DISPATCH_EVENT_COLUMNS]
+            .drop_duplicates(
+                subset=["Event Key"],
+                keep="first",
             )
-            .fillna(1)
+            .reset_index(drop=True)
         )
-        sfda.loc[
-            sfda["PackageSize"] <= 0,
-            "PackageSize",
-        ] = 1
-
-        for column in [
-            "Quantity",
-            "Active",
-            "Quantity Receive Pending",
-            "Quantity sent pending",
-        ]:
-            sfda[column] = pd.to_numeric(
-                sfda[column],
-                errors="coerce",
-            ).fillna(0)
-
-        summary = (
-            sfda.groupby(
-                self.KEYS,
-                as_index=False,
-                dropna=False,
-            )
-            .agg({
-                "GTIN":
-                    self._first_non_blank,
-                "Drug Name":
-                    self._first_non_blank,
-                "Expiry Date":
-                    "first",
-                "PackageSize":
-                    "first",
-                "Quantity":
-                    "sum",
-                "Active":
-                    "sum",
-                "Quantity Receive Pending":
-                    "sum",
-                "Quantity sent pending":
-                    "sum",
-            })
-        )
-
-        return summary.rename(
-            columns={
-                "Expiry Date":
-                    "SFDA Expiry Date",
-                "Quantity":
-                    "SFDA Quantity",
-                "Active":
-                    "SFDA Active",
-                "Quantity Receive Pending":
-                    "SFDA Receive Pending",
-                "Quantity sent pending":
-                    "SFDA Send Pending",
-            }
-        )
-
-    def prepare_incremental(self) -> Dict[str, Any]:
-        """
-        Normalize the uploaded files and return only the candidate events
-        and the latest SFDA snapshot. Database deduplication happens later.
-        """
-        self._normalize()
-        package_lookup = self._prepare_packsize()
-
-        receipt_events = self._receipt_events(
-            package_lookup
-        )
-        dispatch_events = self._dispatch_events(
-            package_lookup
-        )
-        sfda_summary = self._sfda_summary(
-            package_lookup
-        )
-
-        return {
-            "receipt_events": receipt_events,
-            "dispatch_events": dispatch_events,
-            "sfda_summary": sfda_summary,
-            "receipt_records":
-                self._records(receipt_events),
-            "dispatch_records":
-                self._records(dispatch_events),
-        }
 
     def build_master_from_summaries(
         self,
         receipt_summary: pd.DataFrame,
         dispatch_summary: pd.DataFrame,
-        sfda_summary: pd.DataFrame,
+        sfda_summary: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """
-        Build the current Batch Master from SQL historical aggregates plus
-        the latest SFDA snapshot.
-        """
-        receipt_summary = receipt_summary.copy()
-        dispatch_summary = dispatch_summary.copy()
-        sfda_summary = sfda_summary.copy()
+        receipt = (
+            receipt_summary.copy()
+            if receipt_summary is not None
+            else pd.DataFrame()
+        )
 
-        all_keys = pd.concat(
-            [
-                receipt_summary[self.KEYS]
-                if not receipt_summary.empty
-                else pd.DataFrame(columns=self.KEYS),
-                dispatch_summary[self.KEYS]
-                if not dispatch_summary.empty
-                else pd.DataFrame(columns=self.KEYS),
-                sfda_summary[self.KEYS]
-                if not sfda_summary.empty
-                else pd.DataFrame(columns=self.KEYS),
+        dispatch = (
+            dispatch_summary.copy()
+            if dispatch_summary is not None
+            else pd.DataFrame()
+        )
+
+        receipt = self._ensure_columns(
+            receipt,
+            self.KEYS + [
+                "Trade Item Number",
+                "Trade Name",
+                "Receive Runs",
+                "Total Receive Qty",
+                "First Received Date",
+                "Last Received Date",
             ],
-            ignore_index=True,
-        ).drop_duplicates()
-
-        master = all_keys.copy()
-
-        if not receipt_summary.empty:
-            master = master.merge(
-                receipt_summary,
-                on=self.KEYS,
-                how="left",
-            )
-
-        if not dispatch_summary.empty:
-            master = master.merge(
-                dispatch_summary,
-                on=self.KEYS,
-                how="left",
-            )
-
-        if not sfda_summary.empty:
-            master = master.merge(
-                sfda_summary,
-                on=self.KEYS,
-                how="left",
-            )
-
-        defaults = {
-            "Total Received Units": 0,
-            "Total Received Packages": 0,
-            "Total Dispatched Units": 0,
-            "Total Dispatched Packages": 0,
-            "SFDA Quantity": 0,
-            "SFDA Active": 0,
-            "SFDA Receive Pending": 0,
-            "SFDA Send Pending": 0,
-            "Receipt PackageSize": 1,
-            "Dispatch PackageSize": 1,
-            "PackageSize": 1,
-            "GTIN": "",
-            "Drug Name": "",
-            "Receipt Trade Name": "",
-            "Dispatch Trade Name": "",
-            "Generic Item Number": "",
-            "Dispatch Generic Item Number": "",
-            "Receipt Trade Item Number": "",
-            "Dispatch Trade Item Number": "",
-        }
-
-        for column, default in defaults.items():
-            if column not in master.columns:
-                master[column] = default
-
-        numeric_columns = [
-            "Total Received Units",
-            "Total Received Packages",
-            "Total Dispatched Units",
-            "Total Dispatched Packages",
-            "SFDA Quantity",
-            "SFDA Active",
-            "SFDA Receive Pending",
-            "SFDA Send Pending",
-        ]
-
-        for column in numeric_columns:
-            master[column] = pd.to_numeric(
-                master[column],
-                errors="coerce",
-            ).fillna(0)
-
-        master["PackageSize"] = (
-            pd.to_numeric(
-                master["PackageSize"],
-                errors="coerce",
-            )
-            .fillna(
-                pd.to_numeric(
-                    master["Receipt PackageSize"],
-                    errors="coerce",
-                )
-            )
-            .fillna(
-                pd.to_numeric(
-                    master["Dispatch PackageSize"],
-                    errors="coerce",
-                )
-            )
-            .fillna(1)
         )
-        master.loc[
-            master["PackageSize"] <= 0,
-            "PackageSize",
-        ] = 1
 
-        master["GTIN"] = master["GTIN"].fillna("").astype(str)
-        master["Drug Name"] = (
-            master["Drug Name"]
-            .fillna(master["Receipt Trade Name"])
-            .fillna(master["Dispatch Trade Name"])
-            .fillna("")
+        dispatch = self._ensure_columns(
+            dispatch,
+            self.KEYS + [
+                "Trade Item Number",
+                "Trade Name",
+                "Dispatch Runs",
+                "Total Dispatched Qty",
+                "First Dispatch Date",
+                "Last Dispatch Date",
+            ],
         )
-        master["Generic Item Number"] = (
-            master["Generic Item Number"]
-            .fillna(master["Dispatch Generic Item Number"])
-            .fillna("")
+
+        if receipt.empty and dispatch.empty:
+            return pd.DataFrame(
+                columns=self.MASTER_COLUMNS
+            )
+
+        receipt = receipt.rename(
+            columns={
+                "Trade Item Number": (
+                    "Receipt Trade Item Number"
+                ),
+                "Trade Name": "Receipt Trade Name",
+            }
         )
+
+        dispatch = dispatch.rename(
+            columns={
+                "Trade Item Number": (
+                    "Dispatch Trade Item Number"
+                ),
+                "Trade Name": "Dispatch Trade Name",
+            }
+        )
+
+        master = receipt.merge(
+            dispatch,
+            on=self.KEYS,
+            how="outer",
+            validate="one_to_one",
+        )
+
+        sfda = (
+            self._sfda_keys()
+            if sfda_summary is None
+            else sfda_summary.copy()
+        )
+
+        sfda = self._ensure_columns(
+            sfda,
+            self.SFDA_KEYS + [
+                "Expiry Date",
+                "GTIN",
+                "Drug Name",
+            ],
+        )
+
+        sfda = sfda.drop_duplicates(
+            subset=self.SFDA_KEYS,
+            keep="first",
+        )
+
+        master = master.merge(
+            sfda[
+                self.SFDA_KEYS
+                + [
+                    "Expiry Date",
+                    "GTIN",
+                    "Drug Name",
+                ]
+            ],
+            on=self.SFDA_KEYS,
+            how="inner",
+            validate="many_to_one",
+        )
+
         master["Trade Item Number"] = (
             master["Receipt Trade Item Number"]
-            .fillna(master["Dispatch Trade Item Number"])
             .fillna("")
+            .astype(str)
+            .str.strip()
         )
 
-        master["Net Physical Packages"] = (
-            master["Total Received Packages"]
-            - master["Total Dispatched Packages"]
+        missing_trade_item = (
+            master["Trade Item Number"] == ""
         )
-        master["Physical vs SFDA Active Variance"] = (
-            master["Net Physical Packages"]
-            - master["SFDA Active"]
-        )
-        master["Historical Receipt Uncovered"] = (
-            master["SFDA Receive Pending"]
-            - master["Total Received Packages"]
-        ).clip(lower=0)
-        master["Historical Dispatch Uncovered"] = (
-            master["SFDA Active"]
-            - master["Total Dispatched Packages"]
-        ).clip(lower=0)
 
-        master["Master Status"] = "BALANCED"
         master.loc[
-            master["GTIN"] == "",
-            "Master Status",
-        ] = "NOT IN SFDA"
-        master.loc[
-            (master["GTIN"] != "")
-            & (
-                master[
-                    "Physical vs SFDA Active Variance"
-                ].abs() >= 1
-            ),
-            "Master Status",
-        ] = "REVIEW REQUIRED"
-
-        output_columns = [
-            "BN",
-            "Expiry Month Key",
-            "GTIN",
-            "Drug Name",
-            "Generic Item Number",
+            missing_trade_item,
             "Trade Item Number",
-            "PackageSize",
-            "WMS Receipt Expiry Date",
-            "WMS Dispatch Expiry Date",
-            "SFDA Expiry Date",
-            "First Receipt Date",
-            "Last Receipt Date",
+        ] = (
+            master.loc[
+                missing_trade_item,
+                "Dispatch Trade Item Number",
+            ]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+        master["Trade Name"] = (
+            master["Receipt Trade Name"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+        missing_trade_name = (
+            master["Trade Name"] == ""
+        )
+
+        master.loc[
+            missing_trade_name,
+            "Trade Name",
+        ] = (
+            master.loc[
+                missing_trade_name,
+                "Dispatch Trade Name",
+            ]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+        numeric_defaults = {
+            "Total Receive Qty": 0,
+            "Total Dispatched Qty": 0,
+            "Receive Runs": 0,
+            "Dispatch Runs": 0,
+        }
+
+        for column, default in numeric_defaults.items():
+            master[column] = (
+                pd.to_numeric(
+                    master[column],
+                    errors="coerce",
+                )
+                .fillna(default)
+            )
+
+        master["Receive Runs"] = (
+            master["Receive Runs"]
+            .round(0)
+            .astype(int)
+        )
+
+        master["Dispatch Runs"] = (
+            master["Dispatch Runs"]
+            .round(0)
+            .astype(int)
+        )
+
+        for column in [
+            "Expiry Date",
+            "First Received Date",
+            "Last Received Date",
             "First Dispatch Date",
             "Last Dispatch Date",
-            "Total Received Units",
-            "Total Received Packages",
-            "Total Dispatched Units",
-            "Total Dispatched Packages",
-            "Net Physical Packages",
-            "SFDA Quantity",
-            "SFDA Active",
-            "SFDA Receive Pending",
-            "SFDA Send Pending",
-            "Physical vs SFDA Active Variance",
-            "Historical Receipt Uncovered",
-            "Historical Dispatch Uncovered",
-            "Master Status",
-        ]
+        ]:
+            master[column] = pd.to_datetime(
+                master[column],
+                errors="coerce",
+            )
 
-        for column in output_columns:
-            if column not in master.columns:
-                master[column] = None
+        master["Generic Exists in SFDA"] = "Yes"
+
+        master["Last Updated"] = (
+            pd.Timestamp.utcnow()
+            .tz_localize(None)
+        )
+
+        master = self._ensure_columns(
+            master,
+            self.MASTER_COLUMNS,
+        )
 
         return (
-            master[output_columns]
+            master[self.MASTER_COLUMNS]
             .sort_values(
-                ["Master Status", "BN", "Expiry Month Key"],
+                by=self.KEYS,
                 kind="stable",
             )
             .reset_index(drop=True)
         )
 
-    def _build_master(
-        self,
-        receipt_events: pd.DataFrame,
-        dispatch_events: pd.DataFrame,
-        sfda_summary: pd.DataFrame,
-    ) -> pd.DataFrame:
-        receipt_summary = (
-            receipt_events.groupby(
-                self.KEYS,
-                as_index=False,
-                dropna=False,
-            )
-            .agg({
-                "Received Quantity": "sum",
-                "Quantity Packages": "sum",
-                "Event Date": [
-                    self._first_valid_date,
-                    self._last_valid_date,
-                ],
-                "Trade Name":
-                    self._first_non_blank,
-                "Generic Item Number":
-                    self._first_non_blank,
-                "Trade Item":
-                    self._first_non_blank,
-                "Expiry Date":
-                    "first",
-                "PackageSize":
-                    "first",
-            })
-        )
-
-        receipt_summary.columns = [
-            "BN",
-            "Expiry Month Key",
-            "Total Received Units",
-            "Total Received Packages",
-            "First Receipt Date",
-            "Last Receipt Date",
-            "Receipt Trade Name",
-            "Generic Item Number",
-            "Receipt Trade Item Number",
-            "WMS Receipt Expiry Date",
-            "Receipt PackageSize",
-        ]
-
-        dispatch_summary = (
-            dispatch_events.groupby(
-                self.KEYS,
-                as_index=False,
-                dropna=False,
-            )
-            .agg({
-                "Dispatched Quantity": "sum",
-                "Quantity Packages": "sum",
-                "Event Date": [
-                    self._first_valid_date,
-                    self._last_valid_date,
-                ],
-                "Trade Name":
-                    self._first_non_blank,
-                "Generic Item Number":
-                    self._first_non_blank,
-                "Trade Item Number":
-                    self._first_non_blank,
-                "Expiry Date":
-                    "first",
-                "PackageSize":
-                    "first",
-            })
-        )
-
-        dispatch_summary.columns = [
-            "BN",
-            "Expiry Month Key",
-            "Total Dispatched Units",
-            "Total Dispatched Packages",
-            "First Dispatch Date",
-            "Last Dispatch Date",
-            "Dispatch Trade Name",
-            "Dispatch Generic Item Number",
-            "Dispatch Trade Item Number",
-            "WMS Dispatch Expiry Date",
-            "Dispatch PackageSize",
-        ]
-
-        all_keys = pd.concat(
-            [
-                receipt_summary[self.KEYS],
-                dispatch_summary[self.KEYS],
-                sfda_summary[self.KEYS],
-            ],
-            ignore_index=True,
-        ).drop_duplicates()
-
-        master = all_keys.merge(
-            receipt_summary,
-            on=self.KEYS,
-            how="left",
-        )
-
-        master = master.merge(
-            dispatch_summary,
-            on=self.KEYS,
-            how="left",
-        )
-
-        master = master.merge(
-            sfda_summary,
-            on=self.KEYS,
-            how="left",
-        )
-
-        numeric_columns = [
-            "Total Received Units",
-            "Total Received Packages",
-            "Total Dispatched Units",
-            "Total Dispatched Packages",
-            "SFDA Quantity",
-            "SFDA Active",
-            "SFDA Receive Pending",
-            "SFDA Send Pending",
-        ]
-
-        for column in numeric_columns:
-            master[column] = pd.to_numeric(
-                master[column],
-                errors="coerce",
-            ).fillna(0)
-
-        master["PackageSize"] = (
-            pd.to_numeric(
-                master["PackageSize"],
-                errors="coerce",
-            )
-            .fillna(
-                pd.to_numeric(
-                    master["Receipt PackageSize"],
-                    errors="coerce",
-                )
-            )
-            .fillna(
-                pd.to_numeric(
-                    master["Dispatch PackageSize"],
-                    errors="coerce",
-                )
-            )
-            .fillna(1)
-        )
-
-        master.loc[
-            master["PackageSize"] <= 0,
-            "PackageSize",
-        ] = 1
-
-        master["GTIN"] = (
-            master["GTIN"]
-            .fillna("")
-            .astype(str)
-        )
-
-        master["Drug Name"] = (
-            master["Drug Name"]
-            .fillna(master["Receipt Trade Name"])
-            .fillna(master["Dispatch Trade Name"])
-            .fillna("")
-        )
-
-        master["Generic Item Number"] = (
-            master["Generic Item Number"]
-            .fillna(
-                master[
-                    "Dispatch Generic Item Number"
-                ]
-            )
-            .fillna("")
-        )
-
-        master["Trade Item Number"] = (
-            master[
-                "Receipt Trade Item Number"
-            ]
-            .fillna(
-                master[
-                    "Dispatch Trade Item Number"
-                ]
-            )
-            .fillna("")
-        )
-
-        master["Net Physical Packages"] = (
-            master["Total Received Packages"]
-            - master[
-                "Total Dispatched Packages"
-            ]
-        )
-
-        master["Physical vs SFDA Active Variance"] = (
-            master["Net Physical Packages"]
-            - master["SFDA Active"]
-        )
-
-        master["Historical Receipt Uncovered"] = (
-            master["SFDA Receive Pending"]
-            - master["Total Received Packages"]
-        ).clip(lower=0)
-
-        master["Historical Dispatch Uncovered"] = (
-            master["SFDA Active"]
-            - master["Total Dispatched Packages"]
-        ).clip(lower=0)
-
-        master["Master Status"] = "BALANCED"
-
-        master.loc[
-            master["GTIN"] == "",
-            "Master Status",
-        ] = "NOT IN SFDA"
-
-        master.loc[
-            (
-                master["GTIN"] != ""
-            )
-            & (
-                master[
-                    "Physical vs SFDA Active Variance"
-                ].abs() >= 1
-            ),
-            "Master Status",
-        ] = "REVIEW REQUIRED"
-
-        master = master.sort_values(
-            by=[
-                "Master Status",
-                "BN",
-                "Expiry Month Key",
-            ],
-            kind="stable",
-        ).reset_index(drop=True)
-
-        output_columns = [
-            "BN",
-            "Expiry Month Key",
-            "GTIN",
-            "Drug Name",
-            "Generic Item Number",
-            "Trade Item Number",
-            "PackageSize",
-            "WMS Receipt Expiry Date",
-            "WMS Dispatch Expiry Date",
-            "SFDA Expiry Date",
-            "First Receipt Date",
-            "Last Receipt Date",
-            "First Dispatch Date",
-            "Last Dispatch Date",
-            "Total Received Units",
-            "Total Received Packages",
-            "Total Dispatched Units",
-            "Total Dispatched Packages",
-            "Net Physical Packages",
-            "SFDA Quantity",
-            "SFDA Active",
-            "SFDA Receive Pending",
-            "SFDA Send Pending",
-            "Physical vs SFDA Active Variance",
-            "Historical Receipt Uncovered",
-            "Historical Dispatch Uncovered",
-            "Master Status",
-        ]
-
-        return master[output_columns].copy()
-
     @staticmethod
     def _records(
         dataframe: pd.DataFrame,
     ) -> List[Dict[str, Any]]:
-        """
-        Convert dataframe rows into database-safe Python values.
-
-        Object columns can still contain pandas.NaT, so every individual
-        value is checked rather than relying only on the column dtype.
-        """
         records: List[Dict[str, Any]] = []
 
-        for source_row in dataframe.to_dict(
+        for row in dataframe.to_dict(
             orient="records"
         ):
-            clean_row: Dict[str, Any] = {}
+            clean: Dict[str, Any] = {}
 
-            for key, value in source_row.items():
-                if value is None:
-                    clean_row[key] = None
-                    continue
-
+            for key, value in row.items():
                 try:
                     if pd.isna(value):
-                        clean_row[key] = None
+                        clean[key] = None
                         continue
                 except (TypeError, ValueError):
                     pass
 
                 if isinstance(value, pd.Timestamp):
-                    clean_row[key] = (
-                        value.to_pydatetime()
-                    )
+                    clean[key] = value.to_pydatetime()
+                elif hasattr(value, "item"):
+                    try:
+                        clean[key] = value.item()
+                    except Exception:
+                        clean[key] = value
                 else:
-                    clean_row[key] = value
+                    clean[key] = value
 
-            records.append(clean_row)
+            records.append(clean)
 
         return records
 
-    def run(self) -> Dict[str, Any]:
-        self._normalize()
+    def prepare_incremental(
+        self,
+    ) -> Dict[str, Any]:
+        self.normalize()
+        self.validate()
 
-        package_lookup = self._prepare_packsize()
-
-        receipt_events = self._receipt_events(
-            package_lookup
-        )
-        dispatch_events = self._dispatch_events(
-            package_lookup
-        )
-        sfda_summary = self._sfda_summary(
-            package_lookup
-        )
-
-        master = self._build_master(
-            receipt_events,
-            dispatch_events,
-            sfda_summary,
-        )
+        receipt_events = self._receipt_events()
+        dispatch_events = self._dispatch_events()
 
         return {
-            "receipt_events":
-                receipt_events,
-            "dispatch_events":
-                dispatch_events,
-            "master":
-                master,
-            "receipt_records":
-                self._records(receipt_events),
-            "dispatch_records":
-                self._records(dispatch_events),
-            "master_records":
-                self._records(master),
+            "receipt_events": receipt_events,
+            "dispatch_events": dispatch_events,
+            "receipt_records": self._records(
+                receipt_events
+            ),
+            "dispatch_records": self._records(
+                dispatch_events
+            ),
+            "sfda_summary": self._sfda_keys(),
         }
+
+    def run(
+        self,
+        receipt_summary: pd.DataFrame | None = None,
+        dispatch_summary: pd.DataFrame | None = None,
+    ) -> Dict[str, Any]:
+        prepared = self.prepare_incremental()
+
+        if (
+            receipt_summary is not None
+            and dispatch_summary is not None
+        ):
+            master = self.build_master_from_summaries(
+                receipt_summary,
+                dispatch_summary,
+                prepared["sfda_summary"],
+            )
+
+            prepared["master"] = master
+            prepared["master_records"] = self._records(
+                master
+            )
+
+        return prepared
