@@ -765,23 +765,22 @@
         <div class="status-banner" id="fullStatusBox"></div>
 
         <div class="grid kpi-grid" id="fullSummaryGrid" style="margin-top:16px;display:none">
-          <div class="card kpi"><div class="kpi-label">Receipt Events</div><div class="kpi-value" id="fullReceiptEvents">0</div><div class="kpi-foot">Historical receiving movements</div><div class="kpi-icon blue">R</div></div>
-          <div class="card kpi"><div class="kpi-label">Dispatch Events</div><div class="kpi-value" id="fullDispatchEvents">0</div><div class="kpi-foot">Historical dispatch movements</div><div class="kpi-icon purple">D</div></div>
-          <div class="card kpi"><div class="kpi-label">Batch Master</div><div class="kpi-value" id="fullMasterRecords">0</div><div class="kpi-foot">Unique BN + expiry month</div><div class="kpi-icon green">M</div></div>
-          <div class="card kpi"><div class="kpi-label">Review Required</div><div class="kpi-value" id="fullReviewRecords">0</div><div class="kpi-foot">Historical/SFDA variance</div><div class="kpi-icon amber">!</div></div>
+          <div class="card kpi"><div class="kpi-label">New Receipt Events</div><div class="kpi-value" id="fullReceiptEvents">0</div><div class="kpi-foot">New receiving events saved to Azure SQL</div><div class="kpi-icon blue">R</div></div>
+          <div class="card kpi"><div class="kpi-label">New Dispatch Events</div><div class="kpi-value" id="fullDispatchEvents">0</div><div class="kpi-foot">New dispatch events saved to Azure SQL</div><div class="kpi-icon purple">D</div></div>
+          <div class="card kpi"><div class="kpi-label">Batch Master Rows</div><div class="kpi-value" id="fullMasterRecords">0</div><div class="kpi-foot">Current cumulative Batch Master</div><div class="kpi-icon green">M</div></div>
+          <div class="card kpi"><div class="kpi-label">Missing Batches</div><div class="kpi-value" id="fullMissingBatches">0</div><div class="kpi-foot">Batch missing while its Generic exists in SFDA</div><div class="kpi-icon red">!</div></div>
+          <div class="card kpi"><div class="kpi-label">Uploaded Files</div><div class="kpi-value" id="fullReviewRecords">0</div><div class="kpi-foot">ASN and Full Dispatch files processed</div><div class="kpi-icon amber">F</div></div>
         </div>
 
         <div class="card" id="fullDownloadsCard" style="margin-top:16px;display:none">
           <div class="card-header">
             <div>
-              <div class="card-title">Historical Outputs</div>
-              <div class="card-subtitle">Audit files only — no SFDA upload CSVs</div>
+              <div class="card-title">Historical Output</div>
+              <div class="card-subtitle">Batch Master audit file only — no SFDA upload CSVs</div>
             </div>
           </div>
-          <div class="downloads-grid">
+          <div class="card-body">
             <button class="btn btn-secondary" id="downloadBatchMaster">Download Batch Master</button>
-            <button class="btn btn-secondary" id="downloadReceiptHistory">Download Receipt History</button>
-            <button class="btn btn-secondary" id="downloadDispatchHistory">Download Dispatch History</button>
           </div>
         </div>
 
@@ -799,13 +798,14 @@
                   <th>BN</th>
                   <th>Expiry Month</th>
                   <th>GTIN</th>
-                  <th>Drug</th>
-                  <th>Received</th>
-                  <th>Dispatched</th>
-                  <th>Net Physical</th>
-                  <th>SFDA Active</th>
-                  <th>Variance</th>
-                  <th>Status</th>
+                  <th>Drug Name</th>
+                  <th>Generic Item</th>
+                  <th>Exists in SFDA</th>
+                  <th>Total Receive Qty</th>
+                  <th>Total Dispatch Qty</th>
+                  <th>Net Received</th>
+                  <th>Receive Runs</th>
+                  <th>Dispatch Runs</th>
                 </tr>
               </thead>
               <tbody id="fullPreviewBody"></tbody>
@@ -1039,12 +1039,12 @@
     const sfdaFile=$("fullSfdaFile").files[0];
 
     $("fullAsnMeta").textContent=asnCount
-      ? `✓ ${asnCount} ASN files selected`
+      ? `✓ ${asnCount} ASN file${asnCount===1?"":"s"} selected`
       : "No files selected";
     $("fullAsnMeta").classList.toggle("ready",Boolean(asnCount));
 
     $("fullDispatchMeta").textContent=dispatchCount
-      ? `✓ ${dispatchCount} Full Dispatch files selected`
+      ? `✓ ${dispatchCount} Full Dispatch file${dispatchCount===1?"":"s"} selected`
       : "No files selected";
     $("fullDispatchMeta").classList.toggle("ready",Boolean(dispatchCount));
 
@@ -1053,11 +1053,7 @@
       : "No file selected";
     $("fullSfdaMeta").classList.toggle("ready",Boolean(sfdaFile));
 
-    $("fullRunButton").disabled=!(
-      asnCount
-      && dispatchCount
-      && sfdaFile
-    );
+    $("fullRunButton").disabled=!(asnCount&&dispatchCount&&sfdaFile);
   }
 
   ["fullAsnFiles","fullDispatchFiles","fullSfdaFile"].forEach(id=>{
@@ -1071,10 +1067,10 @@
     $("fullProgressLabel").textContent=label;
 
     const completed=
-      percent>=80?4:
-      percent>=60?3:
-      percent>=35?2:
-      percent>=10?1:0;
+      percent>=100?4:
+      percent>=80?3:
+      percent>=55?2:
+      percent>=20?1:0;
 
     [
       $("fullStepRead"),
@@ -1097,9 +1093,9 @@
       const next=Math.min(90,current+5);
       const label=
         next<35?"Reading historical files...":
-        next<60?"Normalizing receiving and dispatch events...":
-        next<80?"Building historical Batch Master...":
-        "Saving Batch Master to Azure SQL...";
+        next<60?"Normalizing receipt and dispatch events...":
+        next<80?"Building cumulative Batch Master...":
+        "Saving events and Batch Master to Azure SQL...";
 
       setFullProgress(next,label);
     },1500);
@@ -1130,61 +1126,111 @@
 
     (rows||[]).forEach(row=>{
       const tr=document.createElement("tr");
-      const status=String(row["Master Status"]||"");
-      const badgeClass=
-        status==="BALANCED"?"success":
-        status==="NOT IN SFDA"?"danger":
-        "warning";
+
+      const sfdaStatus=String(
+        row["Exists in SFDA"]
+        ?? row["SFDA Status"]
+        ?? ""
+      ).trim();
+
+      const sfdaStatusHtml=sfdaStatus==="Missing Batch"
+        ? '<span class="badge danger">Missing Batch</span>'
+        : '<span class="badge success">Yes</span>';
+
+      if(sfdaStatus==="Missing Batch"){
+        tr.style.background="#fff4f4";
+      }
 
       tr.innerHTML=`
         <td>${escapeHtml(row.BN)}</td>
         <td>${escapeHtml(row["Expiry Month Key"])}</td>
         <td>${escapeHtml(row.GTIN)}</td>
         <td>${escapeHtml(row["Drug Name"])}</td>
-        <td>${formatNumber(row["Total Received Packages"])}</td>
-        <td>${formatNumber(row["Total Dispatched Packages"])}</td>
-        <td>${formatNumber(row["Net Physical Packages"])}</td>
-        <td>${formatNumber(row["SFDA Active"])}</td>
-        <td>${formatNumber(row["Physical vs SFDA Active Variance"])}</td>
-        <td><span class="badge ${badgeClass}">${escapeHtml(status)}</span></td>
+        <td>${escapeHtml(row["Generic Item Number"])}</td>
+        <td>${sfdaStatusHtml}</td>
+        <td>${formatNumber(row["Total Receive Qty"])}</td>
+        <td>${formatNumber(row["Total Dispatched Qty"])}</td>
+        <td>${formatNumber(row["Net Received Less Dispatch"])}</td>
+        <td>${formatNumber(row["Receive Runs"])}</td>
+        <td>${formatNumber(row["Dispatch Runs"])}</td>
       `;
       body.appendChild(tr);
     });
 
     if(!rows||!rows.length){
-      body.innerHTML='<tr><td colspan="10"><div class="empty"><strong>No Batch Master rows returned</strong></div></td></tr>';
+      body.innerHTML='<tr><td colspan="11"><div class="empty"><strong>No Batch Master rows returned</strong>The request completed but the Batch Master preview is empty.</div></td></tr>';
     }
+  }
+
+  function getBatchMasterOutput(outputs){
+    if(!outputs||typeof outputs!=="object") return null;
+
+    if(outputs["Batch_Master.xlsx"]){
+      return {
+        name:"Batch_Master.xlsx",
+        ...outputs["Batch_Master.xlsx"]
+      };
+    }
+
+    for(const [name,value] of Object.entries(outputs)){
+      if(
+        value
+        && typeof value==="object"
+        && typeof value.content==="string"
+      ){
+        return {
+          name,
+          ...value
+        };
+      }
+    }
+
+    return null;
   }
 
   $("fullReconciliationForm").addEventListener("submit",async event=>{
     event.preventDefault();
 
     const button=$("fullRunButton");
+    const operation=document.querySelector('input[name="fullOperation"]:checked')?.value||"append";
+
+    if(operation==="rebuild"){
+      const confirmed=window.confirm(
+        "Rebuild Full History will delete the existing Receipt Events, Dispatch Events, and Batch Master before loading the uploaded complete history. Continue?"
+      );
+      if(!confirmed) return;
+    }
+
     const formData=new FormData();
 
-    [...$("fullAsnFiles").files].forEach(file=>{
-      formData.append("asn_files",file);
+    Array.from($("fullAsnFiles").files).forEach(file=>{
+      formData.append("asn_files",file,file.name);
     });
 
-    [...$("fullDispatchFiles").files].forEach(file=>{
-      formData.append("dispatch_files",file);
+    Array.from($("fullDispatchFiles").files).forEach(file=>{
+      formData.append("dispatch_files",file,file.name);
     });
 
-    formData.append("sfda",$("fullSfdaFile").files[0]);
-    const selectedOperation=document.querySelector('input[name="fullOperation"]:checked');
-    formData.append("operation",selectedOperation?selectedOperation.value:"append");
+    formData.append("sfda",$("fullSfdaFile").files[0],$("fullSfdaFile").files[0].name);
+    formData.append("operation",operation);
 
     button.disabled=true;
-    button.textContent="Building Historical Master...";
+    button.textContent=operation==="rebuild"
+      ?"Rebuilding Historical Master..."
+      :"Updating Historical Master...";
+
     $("fullSummaryGrid").style.display="none";
     $("fullDownloadsCard").style.display="none";
     $("fullPreviewCard").style.display="none";
+    $("fullStatusBox").className="status-banner";
+    fullResult=null;
     startFullProgress();
 
     try{
-      const response=await fetch("/api/full-reconciliation",{
+      const response=await fetch("/api/batch-master/build",{
         method:"POST",
-        body:formData
+        body:formData,
+        cache:"no-store"
       });
 
       const text=await response.text();
@@ -1193,36 +1239,74 @@
       try{
         result=JSON.parse(text);
       }catch{
-        throw new Error(`The server returned HTTP ${response.status} without a valid JSON response.`);
+        throw new Error(
+          `The server returned HTTP ${response.status} without valid JSON. ${text.slice(0,250)}`
+        );
       }
 
       if(!response.ok||result.status!=="Completed"){
-        throw new Error(result.error||result.message||"Full Reconciliation failed.");
+        throw new Error(
+          result.error
+          || result.message
+          || `Batch Master request failed with HTTP ${response.status}.`
+        );
       }
 
       fullResult=result;
       finishFullProgress(true);
 
       const summary=result.summary||{};
-      $("fullReceiptEvents").textContent=formatNumber(summary.receipt_events);
-      $("fullDispatchEvents").textContent=formatNumber(summary.dispatch_events);
-      $("fullMasterRecords").textContent=formatNumber(summary.master_records);
-      $("fullReviewRecords").textContent=formatNumber(summary.review_records);
+      const uploadedFiles=
+        Number(summary.uploaded_asn_files||0)
+        + Number(summary.uploaded_dispatch_files||0);
+
+      const fullPreviewRows=result.preview||[];
+      const missingBatchCount=Number(
+        summary.missing_batch_rows
+        ?? summary.missing_batches
+        ?? fullPreviewRows.filter(row=>
+          String(
+            row["Exists in SFDA"]
+            ?? row["SFDA Status"]
+            ?? ""
+          ).trim()==="Missing Batch"
+        ).length
+      );
+
+      $("fullReceiptEvents").textContent=formatNumber(summary.new_receipt_events);
+      $("fullDispatchEvents").textContent=formatNumber(summary.new_dispatch_events);
+      $("fullMasterRecords").textContent=formatNumber(summary.batch_master_rows);
+      $("fullMissingBatches").textContent=formatNumber(missingBatchCount);
+      $("fullReviewRecords").textContent=formatNumber(uploadedFiles);
 
       $("fullSummaryGrid").style.display="";
-      $("fullDownloadsCard").style.display="";
       $("fullPreviewCard").style.display="";
-      renderFullPreview(result.preview||[]);
+      renderFullPreview(fullPreviewRows);
+
+      const batchMasterFile=getBatchMasterOutput(result.outputs);
+      if(batchMasterFile){
+        $("fullDownloadsCard").style.display="";
+      }
+
+      const preparedReceipt=summary.prepared_receipt_events;
+      const preparedDispatch=summary.prepared_dispatch_events;
+      const preparedText=(
+        preparedReceipt!==undefined
+        || preparedDispatch!==undefined
+      )
+        ? `<br>Prepared receipt events: ${formatNumber(preparedReceipt)} · Prepared dispatch events: ${formatNumber(preparedDispatch)}.`
+        : "";
 
       showFullStatus(
-        `<strong>Historical Batch Master created.</strong><br>
-        Run ${escapeHtml(result.run_number)} · Version ${escapeHtml(result.version)} ·
-        ${formatNumber(summary.master_records)} batches stored in Azure SQL.<br>
+        `<strong>Historical Batch Master ${operation==="rebuild"?"rebuilt":"updated"} successfully.</strong><br>
+        Version ${escapeHtml(result.version||"5.0.0")} ·
+        ${formatNumber(summary.batch_master_rows)} Batch Master rows stored in Azure SQL.<br>
         New receipt events: ${formatNumber(summary.new_receipt_events)} ·
-        Skipped receipt duplicates: ${formatNumber(summary.skipped_receipt_events)} ·
         New dispatch events: ${formatNumber(summary.new_dispatch_events)} ·
-        Skipped dispatch duplicates: ${formatNumber(summary.skipped_dispatch_events)}.<br>
-        No SFDA upload CSV files were generated.`,
+        Missing batches: ${formatNumber(missingBatchCount)} ·
+        Uploaded files: ${formatNumber(uploadedFiles)}.
+        ${preparedText}<br>
+        No SFDA upload CSV files were generated from this page.`,
         "success"
       );
 
@@ -1230,28 +1314,28 @@
 
     }catch(error){
       finishFullProgress(false);
-      showFullStatus(escapeHtml(error.message),"error");
-      toast(error.message,"error");
+      showFullStatus(escapeHtml(error.message||String(error)),"error");
+      toast(error.message||String(error),"error");
     }finally{
-      button.disabled=false;
       button.textContent="▶ Build Historical Batch Master";
       updateFullFileInputs();
     }
   });
 
   $("downloadBatchMaster").addEventListener("click",()=>{
-    const file=fullResult&&fullResult.outputs&&fullResult.outputs.batch_master;
-    if(file) downloadStructured({name:file.file_name,...file});
-  });
+    const file=getBatchMasterOutput(fullResult&&fullResult.outputs);
 
-  $("downloadReceiptHistory").addEventListener("click",()=>{
-    const file=fullResult&&fullResult.outputs&&fullResult.outputs.receipt_history;
-    if(file) downloadStructured({name:file.file_name,...file});
-  });
+    if(!file){
+      toast("Batch Master output is not available.","error");
+      return;
+    }
 
-  $("downloadDispatchHistory").addEventListener("click",()=>{
-    const file=fullResult&&fullResult.outputs&&fullResult.outputs.dispatch_history;
-    if(file) downloadStructured({name:file.file_name,...file});
+    downloadStructured({
+      name:file.name||"Batch_Master.xlsx",
+      content:file.content,
+      encoding:file.encoding,
+      mime:file.mime_type||file.mime
+    });
   });
 
   const ACCEPT_INPUTS=[
