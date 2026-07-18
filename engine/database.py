@@ -107,24 +107,6 @@ BEGIN
     );
 END;
 
-IF COL_LENGTH('dbo.ReceiptEvents', 'ExpiryDate') IS NULL
-BEGIN
-    ALTER TABLE dbo.ReceiptEvents
-    ADD ExpiryDate date NULL;
-END;
-
-IF COL_LENGTH('dbo.DispatchEvents', 'ExpiryDate') IS NULL
-BEGIN
-    ALTER TABLE dbo.DispatchEvents
-    ADD ExpiryDate date NULL;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'ExpiryDate') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD ExpiryDate date NULL;
-END;
-
 IF COL_LENGTH('dbo.BatchMaster', 'TradeItemNumber') IS NULL
 BEGIN
     ALTER TABLE dbo.BatchMaster
@@ -287,13 +269,60 @@ END;
 """
 
 
+def _consume_all_results(cursor: pyodbc.Cursor) -> None:
+    """Advance through every result set and row-count message.
+
+    SQL Server may return non-query result messages for multi-statement
+    batches. Consuming them prevents later fetch operations from failing with:
+    "No results. Previous SQL was not a query."
+    """
+
+    while True:
+        if cursor.description is not None:
+            cursor.fetchall()
+
+        try:
+            has_next = cursor.nextset()
+        except pyodbc.ProgrammingError:
+            break
+
+        if not has_next:
+            break
+
+
+def _fetch_inserted_result(cursor: pyodbc.Cursor) -> int:
+    """Return the Inserted value from a multi-statement SQL batch."""
+
+    while True:
+        if cursor.description is not None:
+            row = cursor.fetchone()
+
+            if row is not None:
+                return int(row[0])
+
+        try:
+            has_next = cursor.nextset()
+        except pyodbc.ProgrammingError:
+            return 0
+
+        if not has_next:
+            return 0
+
+
 def initialize_database() -> None:
     """Create or safely upgrade all Version 5 database objects."""
 
     with Database().connect() as connection:
         cursor = connection.cursor()
-        cursor.execute(_SCHEMA_SQL)
-        connection.commit()
+
+        try:
+            cursor.execute(_SCHEMA_SQL)
+            _consume_all_results(cursor)
+            connection.commit()
+
+        except Exception:
+            connection.rollback()
+            raise
 
 
 def _value(
@@ -466,16 +495,18 @@ def append_events(
                     _RECEIPT_INSERT_SQL,
                     _receipt_parameters(row),
                 )
-                result = cursor.fetchone()
-                inserted_receipts += int(result[0]) if result else 0
+                inserted_receipts += _fetch_inserted_result(
+                    cursor
+                )
 
             for row in dispatch_rows or []:
                 cursor.execute(
                     _DISPATCH_INSERT_SQL,
                     _dispatch_parameters(row),
                 )
-                result = cursor.fetchone()
-                inserted_dispatches += int(result[0]) if result else 0
+                inserted_dispatches += _fetch_inserted_result(
+                    cursor
+                )
 
             connection.commit()
 
