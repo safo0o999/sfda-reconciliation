@@ -224,6 +224,9 @@ class ReconciliationEngine:
             .reset_index()
         )
 
+        sfda_match = sfda.copy()
+        sfda_match["_Batch Exists in SFDA"] = True
+
         report = (
             master.merge(
                 inventory,
@@ -231,14 +234,41 @@ class ReconciliationEngine:
                 how="left",
             )
             .merge(
-                sfda,
+                sfda_match,
                 on=self.SFDA_KEYS,
-                how="inner",
+                how="left",
                 suffixes=("", " SFDA"),
             )
         )
 
-        report["Generic Exists in SFDA"] = "Yes"
+        # Re-evaluate status against the latest SFDA report used for this run.
+        # Yes: this exact batch exists in SFDA.
+        # Missing Batch: another batch for the same Generic exists in SFDA.
+        # Generic Not in SFDA: no batch for this Generic exists in SFDA.
+        matched_generics = set(
+            report.loc[
+                report["_Batch Exists in SFDA"].fillna(False),
+                "Generic Item Number",
+            ]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+        report["Generic Exists in SFDA"] = "Generic Not in SFDA"
+        report.loc[
+            report["Generic Item Number"].isin(matched_generics),
+            "Generic Exists in SFDA",
+        ] = "Missing Batch"
+        report.loc[
+            report["_Batch Exists in SFDA"].fillna(False),
+            "Generic Exists in SFDA",
+        ] = "Yes"
+
+        report = report[
+            report["Generic Exists in SFDA"] != "Generic Not in SFDA"
+        ].copy()
+        report = report.drop(columns=["_Batch Exists in SFDA"])
 
         master_trade_name = report.get(
             "Trade Name",
@@ -336,41 +366,16 @@ class ReconciliationEngine:
 
         report["Expiry Date"] = report[
             "SFDA Expiry Date"
-        ]
+        ].where(
+            report["SFDA Expiry Date"].notna(),
+            report.get("Expiry Date"),
+        )
 
-        report_columns = [
-            "BN",
-            "Expiry Date",
-            "Expiry Month Key",
-            "Generic Item Number",
-            "Generic Exists in SFDA",
-            "GTIN",
-            "Drug Name",
-            "PackageSize",
-            "Total Receive Qty",
-            "Total Receive Pack",
-            "Total Dispatched Qty",
-            "Total Dispatched Pack",
-            "Inventory Available Each",
-            "Inventory Available Pack",
-            "Quantity",
-            "Active",
-            "Send Pending",
-            "Receive Pending",
-            "To Be Accept",
-            "To Be Dispatched",
-        ]
-
-        report = report[
-            [
-                column
-                for column in report_columns
-                if column in report.columns
-            ]
-        ].copy()
+        # Build Step 3 datasets before renaming the user-facing report columns.
+        eligible_for_csv = report["Generic Exists in SFDA"] == "Yes"
 
         accept = report[
-            report["To Be Accept"] > 0
+            eligible_for_csv & (report["To Be Accept"] > 0)
         ][
             [
                 "GTIN",
@@ -381,15 +386,63 @@ class ReconciliationEngine:
         ].copy()
 
         dispatch_targets = report[
-            report["To Be Dispatched"] > 0
+            eligible_for_csv & (report["To Be Dispatched"] > 0)
         ].copy()
 
         dispatch = self._allocate_dispatch(
             dispatch_targets
         )
 
+        # Step 2 report: generated fresh on every run and not stored in SQL.
+        reconciliation_report = report.rename(
+            columns={
+                "BN": "Batch No",
+                "Generic Item Number": "Generic No",
+                "Generic Exists in SFDA": "Exists in SFDA",
+                "PackageSize": "Pack Size",
+                "Total Receive Qty": "Total Received Each",
+                "Total Receive Pack": "Total Received Pack",
+                "Total Dispatched Qty": "Total Dispatched Each",
+                "Total Dispatched Pack": "Total Dispatched Pack",
+                "Inventory Available Each": "Inventory Each",
+                "Inventory Available Pack": "Inventory Pack",
+                "Quantity": "SFDA Quantity",
+                "Active": "SFDA Active",
+                "To Be Dispatched": "To Be Dispatch",
+            }
+        )
+
+        report_columns = [
+            "Batch No",
+            "Expiry Date",
+            "GTIN",
+            "Generic No",
+            "Exists in SFDA",
+            "Pack Size",
+            "Total Received Each",
+            "Total Received Pack",
+            "Total Dispatched Each",
+            "Total Dispatched Pack",
+            "Inventory Each",
+            "Inventory Pack",
+            "SFDA Quantity",
+            "SFDA Active",
+            "Receive Pending",
+            "Send Pending",
+            "To Be Accept",
+            "To Be Dispatch",
+        ]
+
+        reconciliation_report = reconciliation_report[
+            [
+                column
+                for column in report_columns
+                if column in reconciliation_report.columns
+            ]
+        ].copy()
+
         return {
-            "report": report,
+            "report": reconciliation_report,
             "accept": accept,
             "dispatch": dispatch,
         }
