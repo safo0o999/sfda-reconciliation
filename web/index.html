@@ -666,22 +666,202 @@
       <section class="page" id="page-full-reconciliation">
         <div class="page-head">
           <div>
-            <h1>Full Reconciliation</h1>
-            <p>Build or rebuild the historical Batch Master from all ASN and Full Dispatch files. This page does not generate SFDA upload CSV files.</p>
+            <h1>Full Reconciliation Setup</h1>
+            <p>Complete initial setup - Build Batch Master, then reconcile with inventory. Run this once to establish the historical baseline.</p>
           </div>
           <div class="actions">
-            <span class="badge warning">Historical Build</span>
+            <span class="badge warning">Initial Setup Only</span>
           </div>
         </div>
  
         <div class="status-banner info show">
           <span>ⓘ</span>
           <div>
-            <strong>First-time setup:</strong>
-            upload all historical ASN and Full Dispatch files from the selected cutover date, together with the latest SFDA Drug Count report.
-            The current Batch Master will be replaced after a successful run.
+            <strong>Two-Step Process:</strong> Step 1: Upload all historical files to build Batch Master. Step 2: Upload inventory for initial reconciliation. After this, use "Upload & Run" daily.
           </div>
         </div>
+ 
+        <!-- STEP 1: BUILD BATCH MASTER -->
+        <div style="margin:32px 0">
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
+            <div style="width:40px;height:40px;border-radius:50%;background:#0C447C;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:18px">1</div>
+            <div>
+              <h2 style="margin:0;font-size:18px">Build Batch Master (Historical Data)</h2>
+              <p style="margin:6px 0 0;color:var(--muted);font-size:12px">Upload all historical ASN, Dispatch files and latest SFDA report to build the Batch Master</p>
+            </div>
+          </div>
+ 
+          <div class="card" style="padding:20px">
+            <div class="card-header">
+              <div>
+                <div class="card-title">Historical Source Files</div>
+                <div class="card-subtitle">Multiple ASN files + multiple Full Dispatch files + one latest SFDA report</div>
+              </div>
+            </div>
+ 
+            <div class="grid">
+              <div class="file-card">
+                <div class="file-card-top">
+                  <div>
+                    <div class="file-title">① Historical ASN Files</div>
+                    <div class="card-subtitle" style="margin-top:5px">Select all ASN receipt files from cutover date until today.</div>
+                  </div>
+                  <span class="badge info">Multiple</span>
+                </div>
+                <div class="file-row">
+                  <input id="step1AsnFiles" name="asn_files" type="file" accept=".xls,.xlsx" multiple required>
+                </div>
+                <div class="file-meta" id="step1AsnMeta">No files selected</div>
+              </div>
+ 
+              <div class="file-card">
+                <div class="file-card-top">
+                  <div>
+                    <div class="file-title">② Historical Full Dispatch Files</div>
+                    <div class="card-subtitle" style="margin-top:5px">Select all Full Dispatch reports for the same historical period.</div>
+                  </div>
+                  <span class="badge info">Multiple</span>
+                </div>
+                <div class="file-row">
+                  <input id="step1DispatchFiles" name="dispatch_files" type="file" accept=".xls,.xlsx" multiple required>
+                </div>
+                <div class="file-meta" id="step1DispatchMeta">No files selected</div>
+              </div>
+ 
+              <div class="file-card">
+                <div class="file-card-top">
+                  <div>
+                    <div class="file-title">③ Latest SFDA Drug Count</div>
+                    <div class="card-subtitle" style="margin-top:5px">Upload the latest SFDA snapshot to match against historical movements.</div>
+                  </div>
+                  <span class="badge success">Required</span>
+                </div>
+                <div class="file-row">
+                  <input id="step1SfdaFile" name="sfda" type="file" accept=".xls,.xlsx" required>
+                </div>
+                <div class="file-meta" id="step1SfdaMeta">No file selected</div>
+              </div>
+            </div>
+ 
+            <div class="card run-panel" style="margin-top:16px;box-shadow:none;align-items:flex-start">
+              <div style="flex:1">
+                <div class="run-title">Database Operation</div>
+                <div class="run-sub">Choose to append new data or rebuild from scratch.</div>
+                <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px">
+                  <label class="selection-card" style="flex:1;min-width:240px">
+                    <input type="radio" name="step1Operation" value="append" checked>
+                    <span>
+                      <strong>Append New History</strong><br>
+                      <small>Add only new receipt and dispatch events.</small>
+                    </span>
+                  </label>
+                  <label class="selection-card" style="flex:1;min-width:240px">
+                    <input type="radio" name="step1Operation" value="rebuild">
+                    <span>
+                      <strong>Rebuild Full History</strong><br>
+                      <small>Delete current and rebuild from uploaded files.</small>
+                    </span>
+                  </label>
+                </div>
+              </div>
+            </div>
+ 
+            <button class="btn btn-purple" id="step1Button" type="button" style="margin-top:16px;width:100%">▶ Build Batch Master</button>
+            <div class="card progress-card" id="step1ProgressCard" style="box-shadow:none;margin-top:16px;display:none">
+              <div class="progress-head">
+                <span id="step1ProgressLabel">Building Batch Master...</span>
+                <span id="step1ProgressPercent">0%</span>
+              </div>
+              <div class="progress-track">
+                <div class="progress-bar" id="step1ProgressBar"></div>
+              </div>
+              <div class="progress-steps">
+                <div class="progress-step" id="step1StepRead">○ Reading files</div>
+                <div class="progress-step" id="step1StepValidate">○ Validating data</div>
+                <div class="progress-step" id="step1StepBuild">○ Building Master</div>
+                <div class="progress-step" id="step1StepSave">○ Saving to Database</div>
+              </div>
+            </div>
+          </div>
+        </div>
+ 
+        <!-- STEP 2: INITIAL RECONCILIATION -->
+        <div style="margin:32px 0">
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
+            <div style="width:40px;height:40px;border-radius:50%;background:#D85A30;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:18px">2</div>
+            <div>
+              <h2 style="margin:0;font-size:18px">Initial Reconciliation (Current Inventory)</h2>
+              <p style="margin:6px 0 0;color:var(--muted);font-size:12px">Match current inventory against historical Batch Master to generate Accept and Dispatch files</p>
+            </div>
+          </div>
+ 
+          <div class="card" style="padding:20px">
+            <div class="card-header">
+              <div>
+                <div class="card-title">Current Status Files</div>
+                <div class="card-subtitle">Latest inventory report + latest SFDA drug count</div>
+              </div>
+            </div>
+ 
+            <div class="grid">
+              <div class="file-card">
+                <div class="file-card-top">
+                  <div>
+                    <div class="file-title">① Inventory Status Report</div>
+                    <div class="card-subtitle" style="margin-top:5px">Current inventory snapshot for reconciliation.</div>
+                  </div>
+                  <span class="badge success">Required</span>
+                </div>
+                <div class="file-row">
+                  <input id="step2InventoryFile" name="inventory" type="file" accept=".xls,.xlsx" required>
+                </div>
+                <div class="file-meta" id="step2InventoryMeta">No file selected</div>
+              </div>
+ 
+              <div class="file-card">
+                <div class="file-card-top">
+                  <div>
+                    <div class="file-title">② Latest SFDA Drug Count</div>
+                    <div class="card-subtitle" style="margin-top:5px">Current SFDA snapshot for matching.</div>
+                  </div>
+                  <span class="badge success">Required</span>
+                </div>
+                <div class="file-row">
+                  <input id="step2SfdaFile" name="sfda" type="file" accept=".xls,.xlsx" required>
+                </div>
+                <div class="file-meta" id="step2SfdaMeta">No file selected</div>
+              </div>
+            </div>
+ 
+            <button class="btn btn-success" id="step2Button" type="button" style="margin-top:16px;width:100%">▶ Run Initial Reconciliation</button>
+            <div class="card progress-card" id="step2ProgressCard" style="box-shadow:none;margin-top:16px;display:none">
+              <div class="progress-head">
+                <span id="step2ProgressLabel">Running Reconciliation...</span>
+                <span id="step2ProgressPercent">0%</span>
+              </div>
+              <div class="progress-track">
+                <div class="progress-bar" id="step2ProgressBar"></div>
+              </div>
+              <div class="progress-steps">
+                <div class="progress-step" id="step2StepRead">○ Reading files</div>
+                <div class="progress-step" id="step2StepValidate">○ Validating data</div>
+                <div class="progress-step" id="step2StepMatch">○ Matching Batch Master</div>
+                <div class="progress-step" id="step2StepGenerate">○ Generating outputs</div>
+              </div>
+            </div>
+          </div>
+        </div>
+ 
+        <!-- RESULTS SECTION -->
+        <div class="inline-results result-anchor" id="fullReconciliationResults" style="display:none;margin-top:32px">
+          <div class="result-head"><div><h2>Full Reconciliation Results</h2><p>Download the Batch Master and reconciliation files below.</p></div><button class="btn btn-purple" id="fullDownloadAllButton">⇩ Download All Results</button></div>
+          <div class="status-banner info show" id="fullResultsInfo"><span>ⓘ</span><div>Setup completed successfully.</div></div>
+          <div class="tabs"><button class="tab-btn active" data-tab="full-summary">Overview</button><button class="tab-btn" data-tab="full-master">Batch Master</button><button class="tab-btn" data-tab="full-reports">Reports & Files</button></div>
+          <div class="tab-panel active" id="tab-full-summary"><div style="display:grid;gap:16px"><div class="card" style="padding:20px"><h3>Batch Master Created</h3><p>Successfully built and saved to database.</p><div class="file-list" id="fullMasterPreview"></div></div></div></div>
+          <div class="tab-panel" id="tab-full-master"><div class="file-list" id="fullBatchMasterFiles"></div></div>
+          <div class="tab-panel" id="tab-full-reports"><div class="file-list" id="fullReportFiles"></div></div>
+        </div>
+      </section>
  
         <form id="fullReconciliationForm" class="card" style="margin-top:16px">
           <div class="card-header">
@@ -2096,4 +2276,3 @@
 </script>
 </body>
 </html>
- 
