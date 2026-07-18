@@ -1,26 +1,36 @@
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import pyodbc
 
 
 class Database:
+    """Azure SQL connection provider for SFDA Reconciliation v5."""
+
     def __init__(self):
-        connection_string = os.getenv("SQL_CONNECTION_STRING")
+        connection_string = os.getenv("SQL_CONNECTION_STRING", "").strip()
+
         if not connection_string:
             raise RuntimeError("SQL_CONNECTION_STRING is missing.")
+
         self.connection_string = connection_string
 
     def connect(self):
-        return pyodbc.connect(self.connection_string)
+        return pyodbc.connect(
+            self.connection_string,
+            autocommit=False,
+        )
 
 
-def initialize_database():
-    sql = r"""
-    IF OBJECT_ID('dbo.ReceiptEvents','U') IS NULL
-    CREATE TABLE dbo.ReceiptEvents(
-        EventKey varchar(64) NOT NULL PRIMARY KEY,
+_SCHEMA_SQL = r"""
+SET XACT_ABORT ON;
+
+IF OBJECT_ID('dbo.ReceiptEvents', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.ReceiptEvents
+    (
+        EventKey varchar(64) NOT NULL,
         BN nvarchar(120) NOT NULL,
         ExpiryMonthKey char(7) NOT NULL,
         ExpiryDate date NULL,
@@ -32,12 +42,17 @@ def initialize_database():
         ASNLine nvarchar(100) NULL,
         SupplierName nvarchar(500) NULL,
         ReceivedDate datetime2 NULL,
-        CreatedAt datetime2 NOT NULL DEFAULT SYSUTCDATETIME()
+        CreatedAt datetime2 NOT NULL
+            CONSTRAINT DF_ReceiptEvents_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_ReceiptEvents PRIMARY KEY (EventKey)
     );
+END;
 
-    IF OBJECT_ID('dbo.DispatchEvents','U') IS NULL
-    CREATE TABLE dbo.DispatchEvents(
-        EventKey varchar(64) NOT NULL PRIMARY KEY,
+IF OBJECT_ID('dbo.DispatchEvents', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.DispatchEvents
+    (
+        EventKey varchar(64) NOT NULL,
         BN nvarchar(120) NOT NULL,
         ExpiryMonthKey char(7) NOT NULL,
         ExpiryDate date NULL,
@@ -49,147 +64,664 @@ def initialize_database():
         SalesOrderNumber nvarchar(150) NULL,
         OrderLine nvarchar(100) NULL,
         DispatchDate datetime2 NULL,
-        CreatedAt datetime2 NOT NULL DEFAULT SYSUTCDATETIME()
+        CreatedAt datetime2 NOT NULL
+            CONSTRAINT DF_DispatchEvents_CreatedAt DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_DispatchEvents PRIMARY KEY (EventKey)
     );
+END;
 
-    IF OBJECT_ID('dbo.BatchMaster','U') IS NULL
-    CREATE TABLE dbo.BatchMaster(
+IF OBJECT_ID('dbo.BatchMaster', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.BatchMaster
+    (
         BN nvarchar(120) NOT NULL,
         ExpiryMonthKey char(7) NOT NULL,
         ExpiryDate date NULL,
         GenericItemNumber nvarchar(120) NOT NULL,
+        TradeItemNumber nvarchar(120) NULL,
+        TradeName nvarchar(500) NULL,
         GTIN nvarchar(20) NULL,
         DrugName nvarchar(500) NULL,
-        TotalReceiveQty decimal(19,4) NOT NULL DEFAULT 0,
-        TotalDispatchedQty decimal(19,4) NOT NULL DEFAULT 0,
-        ReceiveRuns int NOT NULL DEFAULT 0,
-        DispatchRuns int NOT NULL DEFAULT 0,
+        TotalReceiveQty decimal(19,4) NOT NULL
+            CONSTRAINT DF_BatchMaster_TotalReceiveQty DEFAULT 0,
+        TotalDispatchedQty decimal(19,4) NOT NULL
+            CONSTRAINT DF_BatchMaster_TotalDispatchedQty DEFAULT 0,
+        ReceiveRuns int NOT NULL
+            CONSTRAINT DF_BatchMaster_ReceiveRuns DEFAULT 0,
+        DispatchRuns int NOT NULL
+            CONSTRAINT DF_BatchMaster_DispatchRuns DEFAULT 0,
         FirstReceivedDate datetime2 NULL,
         LastReceivedDate datetime2 NULL,
         FirstDispatchDate datetime2 NULL,
         LastDispatchDate datetime2 NULL,
-        GenericExistsInSFDA varchar(3) NOT NULL DEFAULT 'Yes',
-        LastUpdated datetime2 NOT NULL DEFAULT SYSUTCDATETIME(),
-        CONSTRAINT PK_BatchMaster PRIMARY KEY(BN, ExpiryMonthKey, GenericItemNumber)
+        GenericExistsInSFDA varchar(3) NOT NULL
+            CONSTRAINT DF_BatchMaster_GenericExistsInSFDA DEFAULT 'Yes',
+        LastUpdated datetime2 NOT NULL
+            CONSTRAINT DF_BatchMaster_LastUpdated DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_BatchMaster PRIMARY KEY
+        (
+            BN,
+            ExpiryMonthKey,
+            GenericItemNumber
+        )
     );
-    """
-    with Database().connect() as connection:
-        connection.cursor().execute(sql)
-        connection.commit()
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'TradeItemNumber') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD TradeItemNumber nvarchar(120) NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'TradeName') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD TradeName nvarchar(500) NULL;
+END;
+
+IF NOT EXISTS
+(
+    SELECT 1
+    FROM sys.indexes
+    WHERE name = 'IX_ReceiptEvents_Batch'
+      AND object_id = OBJECT_ID('dbo.ReceiptEvents')
+)
+BEGIN
+    CREATE INDEX IX_ReceiptEvents_Batch
+        ON dbo.ReceiptEvents
+        (
+            BN,
+            ExpiryMonthKey,
+            GenericItemNumber
+        )
+        INCLUDE
+        (
+            ReceivedQuantity,
+            ReceivedDate,
+            TradeItemNumber,
+            TradeName
+        );
+END;
+
+IF NOT EXISTS
+(
+    SELECT 1
+    FROM sys.indexes
+    WHERE name = 'IX_DispatchEvents_Batch'
+      AND object_id = OBJECT_ID('dbo.DispatchEvents')
+)
+BEGIN
+    CREATE INDEX IX_DispatchEvents_Batch
+        ON dbo.DispatchEvents
+        (
+            BN,
+            ExpiryMonthKey,
+            GenericItemNumber
+        )
+        INCLUDE
+        (
+            DispatchedQuantity,
+            DispatchDate,
+            ToAddress,
+            TradeItemNumber,
+            TradeName
+        );
+END;
+
+IF NOT EXISTS
+(
+    SELECT 1
+    FROM sys.indexes
+    WHERE name = 'IX_DispatchEvents_Allocation'
+      AND object_id = OBJECT_ID('dbo.DispatchEvents')
+)
+BEGIN
+    CREATE INDEX IX_DispatchEvents_Allocation
+        ON dbo.DispatchEvents
+        (
+            BN,
+            ExpiryMonthKey,
+            GenericItemNumber,
+            DispatchDate
+        )
+        INCLUDE
+        (
+            DispatchedQuantity,
+            ToAddress,
+            SalesOrderNumber,
+            OrderLine
+        );
+END;
+"""
 
 
-def _value(row, name, default=None):
-    value = row.get(name, default)
-    try:
-        return default if pd.isna(value) else value
-    except Exception:
-        return value
+_RECEIPT_INSERT_SQL = r"""
+IF EXISTS
+(
+    SELECT 1
+    FROM dbo.ReceiptEvents
+    WHERE EventKey = ?
+)
+BEGIN
+    SELECT CAST(0 AS int) AS Inserted;
+END
+ELSE
+BEGIN
+    INSERT INTO dbo.ReceiptEvents
+    (
+        EventKey,
+        BN,
+        ExpiryMonthKey,
+        ExpiryDate,
+        GenericItemNumber,
+        TradeItemNumber,
+        TradeName,
+        ReceivedQuantity,
+        InboundShipment,
+        ASNLine,
+        SupplierName,
+        ReceivedDate
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+    SELECT CAST(1 AS int) AS Inserted;
+END;
+"""
 
 
-def append_events(receipt_rows: List[Dict[str, Any]], dispatch_rows: List[Dict[str, Any]]) -> Dict[str, int]:
-    initialize_database()
-    receipt_sql = """
-    IF NOT EXISTS(SELECT 1 FROM dbo.ReceiptEvents WHERE EventKey=?)
-    INSERT INTO dbo.ReceiptEvents(EventKey,BN,ExpiryMonthKey,ExpiryDate,GenericItemNumber,TradeItemNumber,TradeName,ReceivedQuantity,InboundShipment,ASNLine,SupplierName,ReceivedDate)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-    """
-    dispatch_sql = """
-    IF NOT EXISTS(SELECT 1 FROM dbo.DispatchEvents WHERE EventKey=?)
-    INSERT INTO dbo.DispatchEvents(EventKey,BN,ExpiryMonthKey,ExpiryDate,GenericItemNumber,TradeItemNumber,TradeName,DispatchedQuantity,ToAddress,SalesOrderNumber,OrderLine,DispatchDate)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-    """
-    inserted_receipts = inserted_dispatches = 0
+_DISPATCH_INSERT_SQL = r"""
+IF EXISTS
+(
+    SELECT 1
+    FROM dbo.DispatchEvents
+    WHERE EventKey = ?
+)
+BEGIN
+    SELECT CAST(0 AS int) AS Inserted;
+END
+ELSE
+BEGIN
+    INSERT INTO dbo.DispatchEvents
+    (
+        EventKey,
+        BN,
+        ExpiryMonthKey,
+        ExpiryDate,
+        GenericItemNumber,
+        TradeItemNumber,
+        TradeName,
+        DispatchedQuantity,
+        ToAddress,
+        SalesOrderNumber,
+        OrderLine,
+        DispatchDate
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+    SELECT CAST(1 AS int) AS Inserted;
+END;
+"""
+
+
+def initialize_database() -> None:
+    """Create or safely upgrade all Version 5 database objects."""
+
     with Database().connect() as connection:
         cursor = connection.cursor()
-        for row in receipt_rows:
-            before = cursor.rowcount
-            cursor.execute(receipt_sql, (
-                _value(row,"Event Key"), _value(row,"BN",""), _value(row,"Expiry Month Key",""),
-                _value(row,"Expiry Date"), _value(row,"Generic Item Number",""), _value(row,"Trade Item",""),
-                _value(row,"Trade Name",""), float(_value(row,"Received Quantity",0) or 0),
-                _value(row,"Inbound Shipment",""), _value(row,"ASN Line",""), _value(row,"Supplier Name",""),
-                _value(row,"Received Date")
-            ))
-            inserted_receipts += max(cursor.rowcount, 0)
-        for row in dispatch_rows:
-            cursor.execute(dispatch_sql, (
-                _value(row,"Event Key"), _value(row,"BN",""), _value(row,"Expiry Month Key",""),
-                _value(row,"Expiry Date"), _value(row,"Generic Item Number",""), _value(row,"Trade Item Number",""),
-                _value(row,"Trade Name",""), float(_value(row,"Dispatched Quantity",0) or 0),
-                _value(row,"To Address",""), _value(row,"Sales Order Number",""), _value(row,"Order Line",""),
-                _value(row,"Dispatch Date")
-            ))
-            inserted_dispatches += max(cursor.rowcount, 0)
+        cursor.execute(_SCHEMA_SQL)
         connection.commit()
-    return {"receipt_events": inserted_receipts, "dispatch_events": inserted_dispatches}
 
 
-def get_event_summaries():
+def _value(
+    row: Dict[str, Any],
+    name: str,
+    default: Any = None,
+) -> Any:
+    value = row.get(name, default)
+
+    try:
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+
+    return value
+
+
+def _text(
+    row: Dict[str, Any],
+    name: str,
+    default: str = "",
+) -> str:
+    value = _value(row, name, default)
+
+    if value is None:
+        return default
+
+    text = str(value).strip()
+
+    if text.endswith(".0"):
+        text = text[:-2]
+
+    return text
+
+
+def _number(
+    row: Dict[str, Any],
+    name: str,
+    default: float = 0,
+) -> float:
+    value = pd.to_numeric(
+        pd.Series([_value(row, name, default)]),
+        errors="coerce",
+    ).iloc[0]
+
+    if pd.isna(value):
+        return float(default)
+
+    return float(value)
+
+
+def _integer(
+    row: Dict[str, Any],
+    name: str,
+    default: int = 0,
+) -> int:
+    return int(_number(row, name, default))
+
+
+def _validate_event_identity(
+    event_key: str,
+    bn: str,
+    expiry_month_key: str,
+    generic_item_number: str,
+) -> None:
+    missing = []
+
+    if not event_key:
+        missing.append("Event Key")
+    if not bn:
+        missing.append("BN")
+    if not expiry_month_key:
+        missing.append("Expiry Month Key")
+    if not generic_item_number:
+        missing.append("Generic Item Number")
+
+    if missing:
+        raise ValueError(
+            "Event cannot be saved because required values are missing: "
+            + ", ".join(missing)
+        )
+
+
+def _receipt_parameters(row: Dict[str, Any]) -> Tuple[Any, ...]:
+    event_key = _text(row, "Event Key")
+    bn = _text(row, "BN")
+    expiry_month_key = _text(row, "Expiry Month Key")
+    generic_item_number = _text(row, "Generic Item Number")
+
+    _validate_event_identity(
+        event_key,
+        bn,
+        expiry_month_key,
+        generic_item_number,
+    )
+
+    values = (
+        event_key,
+        bn,
+        expiry_month_key,
+        _value(row, "Expiry Date"),
+        generic_item_number,
+        _text(row, "Trade Item"),
+        _text(row, "Trade Name"),
+        _number(row, "Received Quantity"),
+        _text(row, "Inbound Shipment"),
+        _text(row, "ASN Line"),
+        _text(row, "Supplier Name"),
+        _value(row, "Received Date"),
+    )
+
+    return (event_key, *values)
+
+
+def _dispatch_parameters(row: Dict[str, Any]) -> Tuple[Any, ...]:
+    event_key = _text(row, "Event Key")
+    bn = _text(row, "BN")
+    expiry_month_key = _text(row, "Expiry Month Key")
+    generic_item_number = _text(row, "Generic Item Number")
+
+    _validate_event_identity(
+        event_key,
+        bn,
+        expiry_month_key,
+        generic_item_number,
+    )
+
+    values = (
+        event_key,
+        bn,
+        expiry_month_key,
+        _value(row, "Expiry Date"),
+        generic_item_number,
+        _text(row, "Trade Item Number"),
+        _text(row, "Trade Name"),
+        _number(row, "Dispatched Quantity"),
+        _text(row, "To Address"),
+        _text(row, "Sales Order Number"),
+        _text(row, "Order Line"),
+        _value(row, "Dispatch Date"),
+    )
+
+    return (event_key, *values)
+
+
+def append_events(
+    receipt_rows: List[Dict[str, Any]],
+    dispatch_rows: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """Append only new receipt and dispatch events.
+
+    EventKey is the immutable de-duplication key. Existing rows are ignored.
+    """
+
+    initialize_database()
+
+    inserted_receipts = 0
+    inserted_dispatches = 0
+
     with Database().connect() as connection:
-        receipt = pd.read_sql("""
-            SELECT BN, ExpiryMonthKey AS [Expiry Month Key], GenericItemNumber AS [Generic Item Number],
-                   COUNT(*) AS [Receive Runs], SUM(ReceivedQuantity) AS [Total Receive Qty],
-                   MIN(ReceivedDate) AS [First Received Date], MAX(ReceivedDate) AS [Last Received Date]
-            FROM dbo.ReceiptEvents GROUP BY BN, ExpiryMonthKey, GenericItemNumber
-        """, connection)
-        dispatch = pd.read_sql("""
-            SELECT BN, ExpiryMonthKey AS [Expiry Month Key], GenericItemNumber AS [Generic Item Number],
-                   COUNT(*) AS [Dispatch Runs], SUM(DispatchedQuantity) AS [Total Dispatched Qty],
-                   MIN(DispatchDate) AS [First Dispatch Date], MAX(DispatchDate) AS [Last Dispatch Date]
-            FROM dbo.DispatchEvents GROUP BY BN, ExpiryMonthKey, GenericItemNumber
-        """, connection)
+        cursor = connection.cursor()
+
+        try:
+            for row in receipt_rows or []:
+                cursor.execute(
+                    _RECEIPT_INSERT_SQL,
+                    _receipt_parameters(row),
+                )
+                result = cursor.fetchone()
+                inserted_receipts += int(result[0]) if result else 0
+
+            for row in dispatch_rows or []:
+                cursor.execute(
+                    _DISPATCH_INSERT_SQL,
+                    _dispatch_parameters(row),
+                )
+                result = cursor.fetchone()
+                inserted_dispatches += int(result[0]) if result else 0
+
+            connection.commit()
+
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "receipt_events": inserted_receipts,
+        "dispatch_events": inserted_dispatches,
+    }
+
+
+def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return cumulative receipt and dispatch summaries for Batch Master."""
+
+    initialize_database()
+
+    receipt_sql = r"""
+        SELECT
+            BN,
+            ExpiryMonthKey AS [Expiry Month Key],
+            GenericItemNumber AS [Generic Item Number],
+            MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
+            MAX(NULLIF(TradeName, '')) AS [Trade Name],
+            COUNT_BIG(*) AS [Receive Runs],
+            SUM(ReceivedQuantity) AS [Total Receive Qty],
+            MIN(ReceivedDate) AS [First Received Date],
+            MAX(ReceivedDate) AS [Last Received Date]
+        FROM dbo.ReceiptEvents
+        GROUP BY
+            BN,
+            ExpiryMonthKey,
+            GenericItemNumber;
+    """
+
+    dispatch_sql = r"""
+        SELECT
+            BN,
+            ExpiryMonthKey AS [Expiry Month Key],
+            GenericItemNumber AS [Generic Item Number],
+            MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
+            MAX(NULLIF(TradeName, '')) AS [Trade Name],
+            COUNT_BIG(*) AS [Dispatch Runs],
+            SUM(DispatchedQuantity) AS [Total Dispatched Qty],
+            MIN(DispatchDate) AS [First Dispatch Date],
+            MAX(DispatchDate) AS [Last Dispatch Date]
+        FROM dbo.DispatchEvents
+        GROUP BY
+            BN,
+            ExpiryMonthKey,
+            GenericItemNumber;
+    """
+
+    with Database().connect() as connection:
+        receipt = pd.read_sql(receipt_sql, connection)
+        dispatch = pd.read_sql(dispatch_sql, connection)
+
     return receipt, dispatch
 
 
-def replace_batch_master(master: pd.DataFrame):
+def replace_batch_master(master: pd.DataFrame) -> None:
+    """Atomically replace Batch Master from cumulative event summaries."""
+
     initialize_database()
+
+    required_columns = [
+        "BN",
+        "Expiry Month Key",
+        "Generic Item Number",
+    ]
+
+    missing = [
+        column
+        for column in required_columns
+        if column not in master.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            "Batch Master is missing required columns: "
+            + ", ".join(missing)
+        )
+
+    insert_sql = r"""
+        INSERT INTO dbo.BatchMaster
+        (
+            BN,
+            ExpiryMonthKey,
+            ExpiryDate,
+            GenericItemNumber,
+            TradeItemNumber,
+            TradeName,
+            GTIN,
+            DrugName,
+            TotalReceiveQty,
+            TotalDispatchedQty,
+            ReceiveRuns,
+            DispatchRuns,
+            FirstReceivedDate,
+            LastReceivedDate,
+            FirstDispatchDate,
+            LastDispatchDate,
+            GenericExistsInSFDA,
+            LastUpdated
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """
+
+    rows: Iterable[Tuple[Any, ...]] = (
+        (
+            _text(row, "BN"),
+            _text(row, "Expiry Month Key"),
+            _value(row, "Expiry Date"),
+            _text(row, "Generic Item Number"),
+            _text(
+                row,
+                "Trade Item Number",
+                _text(row, "Trade Item"),
+            ),
+            _text(row, "Trade Name"),
+            _text(row, "GTIN"),
+            _text(row, "Drug Name"),
+            _number(row, "Total Receive Qty"),
+            _number(row, "Total Dispatched Qty"),
+            _integer(row, "Receive Runs"),
+            _integer(row, "Dispatch Runs"),
+            _value(row, "First Received Date"),
+            _value(row, "Last Received Date"),
+            _value(row, "First Dispatch Date"),
+            _value(row, "Last Dispatch Date"),
+            _text(row, "Generic Exists in SFDA", "Yes") or "Yes",
+            _value(
+                row,
+                "Last Updated",
+                pd.Timestamp.utcnow().tz_localize(None),
+            ),
+        )
+        for row in master.to_dict(orient="records")
+    )
+
     with Database().connect() as connection:
         cursor = connection.cursor()
-        cursor.execute("DELETE FROM dbo.BatchMaster")
-        sql = """INSERT INTO dbo.BatchMaster(BN,ExpiryMonthKey,ExpiryDate,GenericItemNumber,GTIN,DrugName,TotalReceiveQty,TotalDispatchedQty,ReceiveRuns,DispatchRuns,FirstReceivedDate,LastReceivedDate,FirstDispatchDate,LastDispatchDate,GenericExistsInSFDA,LastUpdated)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
-        for row in master.to_dict(orient="records"):
-            cursor.execute(sql, (
-                _value(row,"BN",""), _value(row,"Expiry Month Key",""), _value(row,"Expiry Date"),
-                _value(row,"Generic Item Number",""), _value(row,"GTIN",""), _value(row,"Drug Name",""),
-                float(_value(row,"Total Receive Qty",0) or 0), float(_value(row,"Total Dispatched Qty",0) or 0),
-                int(_value(row,"Receive Runs",0) or 0), int(_value(row,"Dispatch Runs",0) or 0),
-                _value(row,"First Received Date"), _value(row,"Last Received Date"),
-                _value(row,"First Dispatch Date"), _value(row,"Last Dispatch Date"), "Yes", _value(row,"Last Updated")
-            ))
-        connection.commit()
+
+        try:
+            cursor.execute("DELETE FROM dbo.BatchMaster;")
+
+            prepared_rows = list(rows)
+
+            if prepared_rows:
+                cursor.fast_executemany = True
+                cursor.executemany(insert_sql, prepared_rows)
+
+            connection.commit()
+
+        except Exception:
+            connection.rollback()
+            raise
 
 
-def get_batch_master_df():
+def get_batch_master_df() -> pd.DataFrame:
     initialize_database()
+
+    sql = r"""
+        SELECT
+            BN,
+            ExpiryMonthKey AS [Expiry Month Key],
+            ExpiryDate AS [Expiry Date],
+            GenericItemNumber AS [Generic Item Number],
+            TradeItemNumber AS [Trade Item Number],
+            TradeName AS [Trade Name],
+            GTIN,
+            DrugName AS [Drug Name],
+            TotalReceiveQty AS [Total Receive Qty],
+            TotalDispatchedQty AS [Total Dispatched Qty],
+            ReceiveRuns AS [Receive Runs],
+            DispatchRuns AS [Dispatch Runs],
+            FirstReceivedDate AS [First Received Date],
+            LastReceivedDate AS [Last Received Date],
+            FirstDispatchDate AS [First Dispatch Date],
+            LastDispatchDate AS [Last Dispatch Date],
+            GenericExistsInSFDA AS [Generic Exists in SFDA],
+            LastUpdated AS [Last Updated]
+        FROM dbo.BatchMaster
+        ORDER BY
+            BN,
+            ExpiryMonthKey,
+            GenericItemNumber;
+    """
+
     with Database().connect() as connection:
-        return pd.read_sql("""
-            SELECT BN, ExpiryMonthKey AS [Expiry Month Key], ExpiryDate AS [Expiry Date],
-                   GenericItemNumber AS [Generic Item Number], GTIN, DrugName AS [Drug Name],
-                   TotalReceiveQty AS [Total Receive Qty], TotalDispatchedQty AS [Total Dispatched Qty],
-                   ReceiveRuns AS [Receive Runs], DispatchRuns AS [Dispatch Runs],
-                   FirstReceivedDate AS [First Received Date], LastReceivedDate AS [Last Received Date],
-                   FirstDispatchDate AS [First Dispatch Date], LastDispatchDate AS [Last Dispatch Date],
-                   GenericExistsInSFDA AS [Generic Exists in SFDA], LastUpdated AS [Last Updated]
-            FROM dbo.BatchMaster
-        """, connection)
+        return pd.read_sql(sql, connection)
 
 
-def get_dispatch_events_df():
+def get_dispatch_events_df() -> pd.DataFrame:
+    """Return dispatch evidence used for To Address allocation in Step 3."""
+
     initialize_database()
+
+    sql = r"""
+        SELECT
+            EventKey AS [Event Key],
+            BN,
+            ExpiryMonthKey AS [Expiry Month Key],
+            ExpiryDate AS [Expiry Date],
+            GenericItemNumber AS [Generic Item Number],
+            TradeItemNumber AS [Trade Item Number],
+            TradeName AS [Trade Name],
+            DispatchedQuantity AS [Dispatched Quantity],
+            ToAddress AS [To Address],
+            SalesOrderNumber AS [Sales Order Number],
+            OrderLine AS [Order Line],
+            DispatchDate AS [Dispatch Date]
+        FROM dbo.DispatchEvents
+        ORDER BY
+            DispatchDate,
+            SalesOrderNumber,
+            OrderLine,
+            EventKey;
+    """
+
     with Database().connect() as connection:
-        return pd.read_sql("""
-            SELECT BN, ExpiryMonthKey AS [Expiry Month Key], ExpiryDate AS [Expiry Date],
-                   GenericItemNumber AS [Generic Item Number], TradeItemNumber AS [Trade Item Number],
-                   TradeName AS [Trade Name], DispatchedQuantity AS [Dispatched Quantity],
-                   ToAddress AS [To Address], SalesOrderNumber AS [Sales Order Number],
-                   OrderLine AS [Order Line], DispatchDate AS [Dispatch Date]
-            FROM dbo.DispatchEvents ORDER BY DispatchDate, SalesOrderNumber, OrderLine
-        """, connection)
+        return pd.read_sql(sql, connection)
 
 
-def test_database_connection():
+def reset_history() -> None:
+    """Delete all cumulative history and Batch Master rows for rebuild mode."""
+
     initialize_database()
+
     with Database().connect() as connection:
-        row = connection.cursor().execute("SELECT DB_NAME(), @@SERVERNAME, SYSUTCDATETIME()").fetchone()
-    return {"status":"Connected", "database":row[0], "server":row[1], "server_utc_time":row[2]}
+        cursor = connection.cursor()
+
+        try:
+            cursor.execute(
+                """
+                DELETE FROM dbo.BatchMaster;
+                DELETE FROM dbo.DispatchEvents;
+                DELETE FROM dbo.ReceiptEvents;
+                """
+            )
+            connection.commit()
+
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def test_database_connection() -> Dict[str, Optional[Any]]:
+    initialize_database()
+
+    sql = r"""
+        SELECT
+            DB_NAME() AS DatabaseName,
+            @@SERVERNAME AS ServerName,
+            SYSUTCDATETIME() AS ServerUtcTime,
+            (SELECT COUNT_BIG(*) FROM dbo.ReceiptEvents) AS ReceiptEvents,
+            (SELECT COUNT_BIG(*) FROM dbo.DispatchEvents) AS DispatchEvents,
+            (SELECT COUNT_BIG(*) FROM dbo.BatchMaster) AS BatchMasterRows;
+    """
+
+    with Database().connect() as connection:
+        row = connection.cursor().execute(sql).fetchone()
+
+    return {
+        "status": "Connected",
+        "database": row[0],
+        "server": row[1],
+        "server_utc_time": row[2],
+        "receipt_events": int(row[3]),
+        "dispatch_events": int(row[4]),
+        "batch_master_rows": int(row[5]),
+    }
