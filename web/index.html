@@ -31,7 +31,7 @@
       --radius:16px;
       --radius-sm:10px;
     }
-
+ 
     * { box-sizing:border-box; }
     html { scroll-behavior:smooth; }
     body {
@@ -44,9 +44,9 @@
     button,input,select { font:inherit; }
     button { cursor:pointer; }
     [hidden] { display:none !important; }
-
+ 
     .app { min-height:100vh; display:grid; grid-template-columns:260px 1fr; }
-
+ 
     .sidebar {
       position:fixed;
       inset:0 auto 0 0;
@@ -79,7 +79,7 @@
     }
     .brand-title { font-size:16px; font-weight:800; line-height:1.1; }
     .brand-subtitle { margin-top:4px; font-size:11px; color:#bad1e8; }
-
+ 
     .nav { padding:16px 12px; display:grid; gap:6px; }
     .nav-button {
       border:0;
@@ -100,7 +100,7 @@
     .nav-button.active { background:linear-gradient(90deg,#0b76d7,#0e63bd); color:#fff; box-shadow:0 10px 22px rgba(0,83,171,.28); }
     .nav-icon { width:20px; text-align:center; font-size:16px; }
     .nav-separator { height:1px; background:rgba(255,255,255,.11); margin:8px 10px; }
-
+ 
     .sidebar-footer { margin-top:auto; padding:14px 16px 18px; }
     .user-card {
       padding:13px;
@@ -114,7 +114,7 @@
     .user-role { margin-top:3px; color:#b9cee5; font-size:10px; }
     .health-line { margin-top:12px; display:flex; align-items:center; gap:7px; font-size:10px; color:#cce8d8; }
     .dot { width:8px; height:8px; border-radius:50%; background:#31c87a; box-shadow:0 0 0 4px rgba(49,200,122,.13); }
-
+ 
     .main { grid-column:2; min-width:0; }
     .topbar {
       height:70px;
@@ -157,17 +157,17 @@
     }
     .icon-btn:hover { color:var(--blue-700); background:#f6fbff; border-color:#afcbea; }
     .mobile-toggle { display:none; }
-
+ 
     .content { max-width:1680px; margin:0 auto; padding:28px; }
     .page { display:none; animation:fade .2s ease; }
     .page.active { display:block; }
     @keyframes fade { from{opacity:.25;transform:translateY(5px)} to{opacity:1;transform:none} }
-
+ 
     .page-head { display:flex; justify-content:space-between; gap:20px; margin-bottom:20px; align-items:flex-start; }
     .page-head h1 { margin:0; font-size:28px; line-height:1.15; letter-spacing:-.45px; }
     .page-head p { margin:7px 0 0; color:var(--muted); font-size:13px; }
     .actions { display:flex; flex-wrap:wrap; gap:9px; }
-
+ 
     .btn {
       border:1px solid transparent;
       min-height:40px;
@@ -190,20 +190,20 @@
     .btn-warning { color:#fff; background:var(--amber-600); }
     .btn-purple { color:#fff; background:var(--purple-600); }
     .btn-danger { color:#fff; background:var(--red-600); }
-
+ 
     .grid { display:grid; gap:16px; }
     .kpi-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
     .kpi-grid-6 { grid-template-columns:repeat(6,minmax(0,1fr)); }
     .two-col { grid-template-columns:minmax(0,1.4fr) minmax(330px,.6fr); }
     .two-equal { grid-template-columns:repeat(2,minmax(0,1fr)); }
     .three-col { grid-template-columns:repeat(3,minmax(0,1fr)); }
-
+ 
     .card { background:var(--card); border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow); }
     .card-header { min-height:56px; display:flex; align-items:center; justify-content:space-between; gap:16px; padding:0 20px; border-bottom:1px solid var(--line); }
     .card-title { font-size:14px; font-weight:800; }
     .card-subtitle { margin-top:3px; font-size:10px; color:var(--muted); }
     .card-body { padding:20px; }
-
+ 
     .kpi { padding:18px; min-height:128px; position:relative; overflow:hidden; }
     .kpi-label { color:var(--muted); font-size:11px; font-weight:800; }
     .kpi-value { margin-top:15px; font-size:30px; font-weight:800; letter-spacing:-.5px; }
@@ -213,7 +213,7 @@
     .kpi-icon.red { background:#fdecec; color:var(--red-600); }
     .kpi-icon.amber { background:#fff4e3; color:var(--amber-600); }
     .kpi-icon.purple { background:#f0edff; color:var(--purple-600); }
-
+ 
     .hero-strip {
       display:grid;
       grid-template-columns:1.25fr .75fr;
@@ -238,12 +238,12 @@
     .status-line { display:flex; justify-content:space-between; align-items:center; padding:11px 0; border-bottom:1px solid #edf1f6; font-size:11px; }
     .status-line:last-child { border-bottom:0; }
     .status-ok { color:var(--green-700); font-weight:800; }
-
+ 
     .chart-wrap { padding:16px 18px 18px; }
     .chart-legend { display:flex; flex-wrap:wrap; gap:14px; margin-bottom:10px; color:var(--muted); font-size:10px; }
     .legend-dot { width:8px; height:8px; border-radius:50%; display:inline-block; margin-right:5px; }
     .line-chart { width:100%; height:245px; }
-
+ 
     .activity-list { padding:7px 18px 15px; }
     .activity { display:grid; grid-template-columns:34px 1fr auto; gap:11px; align-items:center; padding:12px 0; border-bottom:1px solid #eef2f6; }
     .activity:last-child { border-bottom:0; }
@@ -251,7 +251,7 @@
     .activity-title { font-size:11px; font-weight:800; }
     .activity-meta,.activity-time { font-size:10px; color:var(--muted-2); }
     .activity-meta { margin-top:3px; }
-
+ 
     .file-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
     .file-card { padding:18px; min-height:150px; }
     .file-card-top { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
@@ -262,23 +262,23 @@
     input[type=file]::file-selector-button { border:0; border-radius:7px; margin-right:8px; padding:8px 10px; background:var(--blue-600); color:#fff; font-weight:800; cursor:pointer; }
     .file-meta { margin-top:10px; color:var(--muted-2); font-size:10px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
     .file-meta.ready { color:var(--green-700); font-weight:800; }
-
+ 
     .badge { display:inline-flex; align-items:center; gap:5px; border-radius:999px; padding:5px 8px; font-size:9px; font-weight:800; }
     .badge.info { background:#eaf4ff; color:#0a5daa; }
     .badge.success { background:#eaf8ef; color:#126b3a; }
     .badge.failed { background:#fdecec; color:#a11e22; }
     .badge.warning { background:#fff3df; color:#975b00; }
-
+ 
     .run-panel { margin-top:16px; padding:20px; display:grid; grid-template-columns:1fr auto; gap:18px; align-items:center; border:1px dashed #78a8df; background:#f8fbff; }
     .run-title { font-size:13px; font-weight:800; }
     .run-sub { margin-top:5px; font-size:10px; color:var(--muted); }
-
+ 
     .status-banner { display:none; gap:11px; align-items:flex-start; margin-top:16px; padding:14px 15px; border-radius:11px; font-size:11px; }
     .status-banner.show { display:flex; }
     .status-banner.success { background:#eefaf3; color:#126b3a; border:1px solid #9bd8b3; }
     .status-banner.error { background:#fff0f0; color:#991b1b; border:1px solid #edaaaa; }
     .status-banner.info { background:#eff7ff; color:#174f87; border:1px solid #a9c9ed; }
-
+ 
     .progress-card { display:none; margin-top:16px; padding:18px; }
     .progress-card.show { display:block; }
     .progress-head { display:flex; justify-content:space-between; font-size:11px; font-weight:800; }
@@ -287,29 +287,29 @@
     .progress-steps { margin-top:14px; display:grid; grid-template-columns:repeat(4,1fr); gap:9px; }
     .progress-step { color:var(--muted-2); font-size:10px; }
     .progress-step.done { color:var(--green-700); font-weight:800; }
-
+ 
     .summary-panel { display:none; margin-top:16px; }
     .summary-panel.show { display:block; }
-
+ 
     .tabs { display:flex; flex-wrap:wrap; gap:7px; margin-bottom:16px; padding:7px; background:#fff; border:1px solid var(--line); border-radius:11px; }
     .tab-btn { border:0; background:transparent; color:var(--muted); border-radius:8px; padding:9px 12px; font-size:10px; font-weight:800; }
     .tab-btn.active { background:var(--blue-600); color:#fff; }
     .tab-panel { display:none; }
     .tab-panel.active { display:block; }
-
+ 
     .download-grid { grid-template-columns:repeat(4,minmax(0,1fr)); }
     .download-card { min-height:165px; padding:17px; display:flex; flex-direction:column; }
     .download-card h3 { margin:0; font-size:13px; }
     .download-card p { margin:7px 0 13px; color:var(--muted); font-size:10px; line-height:1.55; }
     .download-card .btn { width:100%; margin-top:auto; }
-
+ 
     .file-list { display:grid; gap:9px; }
     .download-row { display:grid; grid-template-columns:38px 1fr auto; gap:11px; align-items:center; padding:11px; border:1px solid var(--line); border-radius:10px; background:#fff; }
     .file-type { width:36px; height:36px; border-radius:9px; display:grid; place-items:center; color:#fff; background:var(--green-600); font-size:9px; font-weight:800; }
     .file-type.xlsx { background:var(--blue-600); }
     .file-name { font-size:11px; font-weight:800; word-break:break-word; }
     .file-info { margin-top:3px; color:var(--muted-2); font-size:9px; }
-
+ 
     .table-card { overflow:hidden; }
     .table-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:14px 18px; border-bottom:1px solid var(--line); }
     .filters { display:flex; flex-wrap:wrap; gap:8px; }
@@ -321,23 +321,40 @@
     td { padding:12px 13px; border-bottom:1px solid #edf1f6; white-space:nowrap; }
     tbody tr:hover { background:#f8fbff; }
     .table-footer { padding:12px 17px; display:flex; justify-content:space-between; color:var(--muted); font-size:10px; }
-
+ 
     .intelligence-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
     .intelligence-card { padding:18px; min-height:175px; }
     .intelligence-card h3 { margin:0; font-size:13px; }
     .intelligence-card p { font-size:10px; line-height:1.55; color:var(--muted); }
     .intelligence-metric { margin-top:17px; display:flex; justify-content:space-between; align-items:end; }
     .intelligence-metric strong { font-size:25px; }
-
+ 
     .empty { padding:42px 18px; text-align:center; border:1px dashed #cbd5e1; border-radius:11px; background:#fbfcfe; color:var(--muted); font-size:11px; }
     .empty strong { display:block; margin-bottom:5px; color:var(--ink); }
-
+ 
+    .alerts-list { display:grid; gap:12px; }
+    .alert-row { display:flex; align-items:flex-start; gap:12px; padding:14px; border-radius:8px; border-left:4px solid; }
+    .alert-row.alert-info { background:#e3f2fd; border-color:#2196f3; }
+    .alert-row.alert-warning { background:#fff3e0; border-color:#ff9800; }
+    .alert-row.alert-critical { background:#ffebee; border-color:#f44336; }
+    .alert-icon { font-size:18px; font-weight:bold; flex-shrink:0; margin-top:2px; }
+    .alert-row.alert-info .alert-icon { color:#2196f3; }
+    .alert-row.alert-warning .alert-icon { color:#ff9800; }
+    .alert-row.alert-critical .alert-icon { color:#f44336; }
+    .alert-content { flex:1; min-width:0; }
+    .alert-title { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:4px; }
+    .alert-row.alert-info .alert-title { color:#1976d2; }
+    .alert-row.alert-warning .alert-title { color:#e65100; }
+    .alert-row.alert-critical .alert-title { color:#c62828; }
+    .alert-message { font-size:13px; line-height:1.4; margin-bottom:6px; color:#333; }
+    .alert-meta { font-size:11px; color:#666; margin-top:6px; font-weight:500; }
+ 
     .toast-wrap { position:fixed; right:20px; bottom:20px; z-index:100; display:grid; gap:9px; }
     .toast { min-width:280px; max-width:430px; padding:12px 14px; border-radius:10px; color:#fff; font-size:11px; box-shadow:0 14px 34px rgba(0,0,0,.18); }
     .toast.success { background:#13743e; }
     .toast.error { background:#b4272c; }
     .toast.info { background:#135fa8; }
-
+ 
     .modal-backdrop { position:fixed; inset:0; z-index:120; display:none; align-items:center; justify-content:center; padding:22px; background:rgba(5,23,44,.62); }
     .modal-backdrop.show { display:flex; }
     .modal-card { width:min(980px,100%); max-height:90vh; overflow:auto; background:#fff; border-radius:16px; box-shadow:0 24px 70px rgba(0,0,0,.28); }
@@ -354,7 +371,7 @@
     .history-file-row { display:grid; grid-template-columns:1fr auto auto; gap:10px; align-items:center; padding:10px 12px; border:1px solid var(--line); border-radius:9px; margin-bottom:8px; }
     .history-file-meta { color:var(--muted); font-size:9px; margin-top:3px; }
     @media(max-width:760px){.detail-grid{grid-template-columns:1fr 1fr}.history-file-row{grid-template-columns:1fr}.modal-backdrop{padding:8px}}
-
+ 
     @media (max-width:1250px) {
       .kpi-grid-6 { grid-template-columns:repeat(3,1fr); }
       .kpi-grid,.download-grid { grid-template-columns:repeat(2,1fr); }
@@ -375,8 +392,8 @@
       .progress-steps { grid-template-columns:1fr 1fr; }
       .environment { display:none; }
     }
-
-
+ 
+ 
     /* V2.1 dense operational dashboard */
     .dashboard-filter-bar{display:grid;grid-template-columns:1.1fr 1.1fr 1fr 1fr auto;gap:12px;align-items:end;padding:14px 16px;margin-bottom:16px}
     .filter-field label{display:block;font-size:10px;font-weight:800;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.35px}
@@ -407,8 +424,8 @@
     .result-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px}.result-head h2{margin:0;font-size:22px}.result-head p{margin:5px 0 0;color:var(--muted);font-size:11px}
     @media(max-width:1250px){.ops-kpis{grid-template-columns:repeat(3,1fr)}.ops-layout{grid-template-columns:1fr}.dashboard-filter-bar{grid-template-columns:repeat(2,1fr)}.dashboard-filter-bar .btn{width:100%}}
     @media(max-width:760px){.ops-kpis{grid-template-columns:1fr}.dashboard-filter-bar{grid-template-columns:1fr}.bottom-ops-grid{grid-template-columns:1fr}.result-head{flex-direction:column}.mini-donut-wrap{grid-template-columns:1fr}.mini-donut{margin:auto}}
-
-
+ 
+ 
     .verification-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,.72fr);gap:16px}
     .verification-step{padding:18px;border:1px solid var(--line);border-radius:12px;background:#fff}
     .verification-step-number{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;background:#eaf4ff;color:var(--blue-700);font-weight:900;font-size:11px;margin-bottom:12px}
@@ -419,7 +436,7 @@
     .lifecycle-list{display:grid;gap:10px}.lifecycle-row{display:grid;grid-template-columns:28px 1fr auto;gap:10px;align-items:center;padding:11px;border:1px solid var(--line);border-radius:10px}
     .lifecycle-dot{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;background:#eaf4ff;color:var(--blue-700);font-size:10px;font-weight:900}
     @media(max-width:1000px){.verification-grid{grid-template-columns:1fr}}
-
+ 
   </style>
 </head>
 <body>
@@ -432,7 +449,7 @@
         <div class="brand-subtitle">Reconciliation Platform</div>
       </div>
     </div>
-
+ 
     <nav class="nav">
       <button class="nav-button active" data-page="home"><span class="nav-icon">⌂</span>Home</button>
       <button class="nav-button" data-page="upload"><span class="nav-icon">⇧</span>Upload & Run</button>
@@ -445,7 +462,7 @@
       <div class="nav-separator"></div>
       <button class="nav-button" data-page="administration"><span class="nav-icon">⚙</span>Administration</button>
     </nav>
-
+ 
     <div class="sidebar-footer">
       <div class="user-card">
         <div class="user-line">
@@ -459,7 +476,7 @@
       </div>
     </div>
   </aside>
-
+ 
   <main class="main">
     <header class="topbar">
       <div class="topbar-left">
@@ -475,7 +492,7 @@
         <button class="icon-btn" title="Notifications">♢</button>
       </div>
     </header>
-
+ 
     <div class="content">
       <!-- HOME -->
       <section class="page active" id="page-home">
@@ -483,7 +500,7 @@
           <div><h1>Dashboard</h1><p>Operational view of SFDA, receiving, inventory, dispatch, exceptions, and customer mapping.</p></div>
           <div class="actions"><button class="btn btn-primary" data-go="upload">▶ Run Reconciliation</button></div>
         </div>
-
+ 
         <div class="card dashboard-filter-bar">
           <div class="filter-field"><label>Snapshot Date</label><input type="date" id="dashboardDate"></div>
           <div class="filter-field"><label>Trade Name</label><select><option>All</option></select></div>
@@ -491,7 +508,7 @@
           <div class="filter-field"><label>Customer</label><select><option>All</option></select></div>
           <button class="btn btn-primary" id="dashboardRefresh">↻ Refresh</button>
         </div>
-
+ 
         <div class="ops-kpis">
           <div class="card ops-kpi"><div class="label">Total Items (SFDA)</div><div class="value" id="homeInputRows">—</div><div class="mini-icon">▣</div></div>
           <div class="card ops-kpi green"><div class="label">Pending to Accept</div><div class="value" id="homeAccept">—<span class="unit">Packs</span></div><div class="mini-icon">✓</div></div>
@@ -500,7 +517,7 @@
           <div class="card ops-kpi purple"><div class="label">Customers with GLN</div><div class="value">—<span class="unit">Customers</span></div><div class="mini-icon">◎</div></div>
           <div class="card ops-kpi"><div class="label">Dummy GLN Used</div><div class="value">—<span class="unit">Customers</span></div><div class="mini-icon">?</div></div>
         </div>
-
+ 
         <div class="ops-layout">
           <div class="ops-main">
             <div class="card table-card compact-table">
@@ -515,7 +532,7 @@
                 </tbody>
               </table></div>
             </div>
-
+ 
             <div class="bottom-ops-grid">
               <div class="card table-card compact-table">
                 <div class="card-header"><div><div class="card-title">Top Exceptions</div><div class="card-subtitle">Highest-priority reconciliation issues</div></div><button class="btn btn-secondary" data-go="variance">View All</button></div>
@@ -527,7 +544,7 @@
               </div>
             </div>
           </div>
-
+ 
           <aside class="ops-side">
             <div class="card"><div class="card-header"><div class="card-title">Quick Actions</div></div><div class="quick-actions"><button class="btn btn-success" data-go="upload">▶ Run Reconciliation</button><button class="btn btn-primary" data-go="upload">⇩ Prepare Accept</button><button class="btn btn-warning" data-go="upload">⇢ Prepare Dispatch</button><button class="btn btn-purple" data-go="history">◷ Upload History</button><button class="btn btn-secondary" data-go="verification">✓ SFDA Verification</button></div></div>
             <div class="card"><div class="card-header"><div class="card-title">Customer / GLN</div></div><div class="mini-donut-wrap"><div style="position:relative"><div class="mini-donut"></div><div class="mini-donut-label"><div><div style="font-size:18px">—</div><div>Total</div></div></div></div><div class="mini-legend"><div class="mini-legend-row"><span><i class="legend-dot" style="background:#239247"></i>With GLN</span><strong>—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#d94747"></i>Dummy GLN</span><strong>—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#c8ced8"></i>Not Mapped</span><strong>—</strong></div></div></div></div>
@@ -535,18 +552,18 @@
             <div class="card"><div class="card-header"><div class="card-title">System Status</div></div><div class="card-body"><div class="status-line"><span>Azure Function</span><span class="status-ok" id="homeHealth">Checking...</span></div><div class="status-line"><span>Version</span><strong id="homeVersion">—</strong></div><div class="status-line"><span>Total Local Runs</span><strong id="homeRuns">0</strong></div><div class="status-line"><span>Successful Runs</span><strong id="homeSuccess">0</strong></div><div class="status-line"><span>Generated Files</span><strong id="homeGenerated">—</strong></div></div></div>
           </aside>
         </div>
-
+ 
         <div class="card legend-footer"><div class="legend-item"><span class="legend-symbol" style="background:#e9f8ee;color:#178043">✓</span><span><strong>OK</strong><br>All good</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fff3db;color:#bd7400">◷</span><span><strong>Dispatch Pending</strong><br>Pending dispatch to SFDA</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fdeaea;color:#c63034">!</span><span><strong>Diff / Exception</strong><br>Needs attention</span></div><div class="legend-item"><span class="legend-symbol" style="background:#eaf4ff;color:#0866bd">?</span><span><strong>Dummy GLN</strong><br>Customer has no GLN</span></div></div>
         <div id="recentActivity" hidden></div>
       </section>
-
+ 
       <!-- UPLOAD -->
       <section class="page" id="page-upload">
         <div class="page-head">
           <div><h1>Upload & Run Reconciliation</h1><p>Upload the four required Excel reports and execute the reconciliation workflow.</p></div>
           <div class="actions"><button class="btn btn-secondary" id="resetButton">↻ Reset</button></div>
         </div>
-
+ 
         <div class="grid two-equal">
           <form id="acceptForm" class="card" style="padding:20px">
             <div class="card-title" style="font-size:18px;color:#107c41">Step 1 — Accept Reconciliation</div>
@@ -573,7 +590,7 @@
               </div>
             </div>
           </form>
-
+ 
           <form id="dispatchForm" class="card" style="padding:20px">
             <div class="card-title" style="font-size:18px;color:#6b4eff">Step 2 — Dispatch Reconciliation</div>
             <div class="card-subtitle" style="margin:6px 0 18px">Run only after the Accept upload is completed and a refreshed SFDA report is downloaded.</div>
@@ -600,13 +617,13 @@
             </div>
           </form>
         </div>
-
+ 
         <div class="card run-panel">
           <div><div class="run-title">Two-Step Reconciliation Workflow</div><div class="run-sub">Complete Accept first, upload it to SFDA, download the refreshed Drug Count, then run Dispatch.</div></div>
         </div>
-
+ 
         <div class="status-banner" id="statusBox"></div>
-
+ 
         <div class="summary-panel" id="summaryPanel">
           <div class="page-head" style="margin:20px 0 12px"><div><h1 style="font-size:21px">Processing Summary</h1><p>Latest response from the Azure reconciliation engine.</p></div></div>
           <div class="grid kpi-grid-6">
@@ -618,7 +635,7 @@
             <div class="card kpi"><div class="kpi-label">Variance Items</div><div class="kpi-value" id="sumVariance">0</div><div class="kpi-icon red">!</div></div>
           </div>
         </div>
-
+ 
         <div class="inline-results result-anchor" id="inlineResults">
           <div class="result-head"><div><h2>Reconciliation Results</h2><p>Review and download all files generated for the current reconciliation run.</p></div><button class="btn btn-purple" id="downloadAllButton" disabled>⇩ Download All Results</button></div>
           <div class="status-banner info show" id="resultsInfo"><span>ⓘ</span><div>No completed reconciliation is loaded in this browser yet.</div></div>
@@ -628,7 +645,7 @@
             <div class="card kpi"><div class="kpi-label">Variance Items</div><div class="kpi-value" id="resultVariance">—</div><div class="kpi-icon red">!</div></div>
             <div class="card kpi"><div class="kpi-label">Generated Files</div><div class="kpi-value" id="resultFiles">—</div><div class="kpi-icon amber">⇩</div></div>
           </div>
-          <div class="tabs"><button class="tab-btn active" data-tab="summary">Overview</button><button class="tab-btn" data-tab="accept">Accept Files</button><button class="tab-btn" data-tab="dispatch">Dispatch Files</button><button class="tab-btn" data-tab="reports">Excel Reports</button></div>
+          <div class="tabs"><button class="tab-btn active" data-tab="summary">Overview</button><button class="tab-btn" data-tab="accept">Accept Files</button><button class="tab-btn" data-tab="dispatch">Dispatch Files</button><button class="tab-btn" data-tab="reports">Excel Reports</button><button class="tab-btn" data-tab="alerts">Alerts</button></div>
           <div class="tab-panel active" id="tab-summary"><div class="grid download-grid">
             <div class="card download-card"><h3>Accept Upload Files</h3><p>SFDA-ready CSV files split into 20 rows and maximum total quantity of 100,000.</p><button class="btn btn-primary" id="downloadAcceptZip" disabled>Download Accept ZIP</button></div>
             <div class="card download-card"><h3>Dispatch Upload Files</h3><p>Customer-grouped files using GLN mapping, with unmatched customers classified as DUMMY.</p><button class="btn btn-success" id="downloadDispatchZip" disabled>Download Dispatch ZIP</button></div>
@@ -638,12 +655,13 @@
           <div class="tab-panel" id="tab-accept"><div class="file-list" id="acceptFilesList"><div class="empty"><strong>No Accept files loaded</strong>Run a reconciliation first.</div></div></div>
           <div class="tab-panel" id="tab-dispatch"><div class="file-list" id="dispatchFilesList"><div class="empty"><strong>No Dispatch files loaded</strong>Run a reconciliation first.</div></div></div>
           <div class="tab-panel" id="tab-reports"><div class="file-list" id="reportsFilesList"><div class="empty"><strong>No Excel reports loaded</strong>Run a reconciliation first.</div></div></div>
+          <div class="tab-panel" id="tab-alerts"><div class="alerts-list" id="alertsList"><div class="empty"><strong>No alerts generated</strong>All batches match expected records.</div></div></div>
         </div>
       </section>
-
-
+ 
+ 
       <!-- SFDA VERIFICATION -->
-
+ 
       <!-- FULL RECONCILIATION -->
       <section class="page" id="page-full-reconciliation">
         <div class="page-head">
@@ -655,7 +673,7 @@
             <span class="badge warning">Historical Build</span>
           </div>
         </div>
-
+ 
         <div class="status-banner info show">
           <span>ⓘ</span>
           <div>
@@ -664,7 +682,7 @@
             The current Batch Master will be replaced after a successful run.
           </div>
         </div>
-
+ 
         <form id="fullReconciliationForm" class="card" style="margin-top:16px">
           <div class="card-header">
             <div>
@@ -672,7 +690,7 @@
               <div class="card-subtitle">Multiple ASN files + multiple Full Dispatch files + one latest SFDA report</div>
             </div>
           </div>
-
+ 
           <div class="grid">
             <div class="file-card">
               <div class="file-card-top">
@@ -687,7 +705,7 @@
               </div>
               <div class="file-meta" id="fullAsnMeta">No files selected</div>
             </div>
-
+ 
             <div class="file-card">
               <div class="file-card-top">
                 <div>
@@ -701,7 +719,7 @@
               </div>
               <div class="file-meta" id="fullDispatchMeta">No files selected</div>
             </div>
-
+ 
             <div class="file-card">
               <div class="file-card-top">
                 <div>
@@ -716,7 +734,7 @@
               <div class="file-meta" id="fullSfdaMeta">No file selected</div>
             </div>
           </div>
-
+ 
           <div class="card run-panel" style="margin-top:16px;box-shadow:none;align-items:flex-start">
             <div style="flex:1">
               <div class="run-title">Database Operation</div>
@@ -740,11 +758,11 @@
             </div>
             <span class="badge success">Append Default</span>
           </div>
-
+ 
           <button class="btn btn-purple" id="fullRunButton" type="submit" disabled style="margin-top:16px;width:100%">
             ▶ Build Historical Batch Master
           </button>
-
+ 
           <div class="card progress-card" id="fullProgressCard" style="box-shadow:none">
             <div class="progress-head">
               <span id="fullProgressLabel">Preparing historical reconciliation...</span>
@@ -761,9 +779,9 @@
             </div>
           </div>
         </form>
-
+ 
         <div class="status-banner" id="fullStatusBox"></div>
-
+ 
         <div class="grid kpi-grid" id="fullSummaryGrid" style="margin-top:16px;display:none">
           <div class="card kpi"><div class="kpi-label">New Receipt Events</div><div class="kpi-value" id="fullReceiptEvents">0</div><div class="kpi-foot">New receiving events saved to Azure SQL</div><div class="kpi-icon blue">R</div></div>
           <div class="card kpi"><div class="kpi-label">New Dispatch Events</div><div class="kpi-value" id="fullDispatchEvents">0</div><div class="kpi-foot">New dispatch events saved to Azure SQL</div><div class="kpi-icon purple">D</div></div>
@@ -771,7 +789,7 @@
           <div class="card kpi"><div class="kpi-label">Missing Batches</div><div class="kpi-value" id="fullMissingBatches">0</div><div class="kpi-foot">Batch missing while its Generic exists in SFDA</div><div class="kpi-icon red">!</div></div>
           <div class="card kpi"><div class="kpi-label">Uploaded Files</div><div class="kpi-value" id="fullReviewRecords">0</div><div class="kpi-foot">ASN and Full Dispatch files processed</div><div class="kpi-icon amber">F</div></div>
         </div>
-
+ 
         <div class="card" id="fullDownloadsCard" style="margin-top:16px;display:none">
           <div class="card-header">
             <div>
@@ -783,7 +801,7 @@
             <button class="btn btn-secondary" id="downloadBatchMaster">Download Batch Master</button>
           </div>
         </div>
-
+ 
         <div class="card table-card" id="fullPreviewCard" style="margin-top:16px;display:none">
           <div class="table-toolbar">
             <div>
@@ -813,7 +831,7 @@
           </div>
         </div>
       </section>
-
+ 
       <section class="page" id="page-verification">
         <div class="page-head">
           <div><h1>SFDA Verification</h1><p>Verify the generated upload files against the latest SFDA Drug Count and portal notification results.</p></div>
@@ -842,7 +860,7 @@
           </div>
         </div>
       </section>
-
+ 
       <!-- HISTORY -->
       <section class="page" id="page-history">
         <div class="page-head"><div><h1>Reconciliation History</h1><p>Persistent reconciliation runs stored in Azure SQL Database.</p></div><div class="actions"><button class="btn btn-secondary" id="clearHistoryButton">↻ Refresh History</button></div></div>
@@ -852,7 +870,7 @@
           <div class="table-footer"><span id="historyCount">0 database runs</span><span>Source: Azure SQL · ReconciliationRuns</span></div>
         </div>
       </section>
-
+ 
       <!-- REPORTS -->
       <section class="page" id="page-reports">
         <div class="page-head"><div><h1>Reports & Analytics</h1><p>Operational analytics based on persistent reconciliation history stored in Azure SQL.</p></div><div class="actions"><button class="btn btn-secondary" id="exportHistoryButton">⇩ Export History JSON</button></div></div>
@@ -867,7 +885,7 @@
           <div class="card"><div class="card-header"><div><div class="card-title">Future Enterprise Reports</div><div class="card-subtitle">Enabled after persistent database implementation</div></div></div><div class="card-body"><div class="status-line"><span>Receiving by date</span><span class="badge warning">Planned</span></div><div class="status-line"><span>Dispatch by customer</span><span class="badge warning">Planned</span></div><div class="status-line"><span>Variance by supplier</span><span class="badge warning">Planned</span></div><div class="status-line"><span>Missing SFDA registrations</span><span class="badge warning">Planned</span></div></div></div>
         </div>
       </section>
-
+ 
       <!-- PRODUCT INTELLIGENCE -->
       <section class="page" id="page-intelligence">
         <div class="page-head"><div><h1>Product Intelligence</h1><p>Generic, Trade, GTIN, Batch, supplier, and SFDA knowledge base.</p></div></div>
@@ -880,7 +898,7 @@
           <div class="card intelligence-card"><h3>Drug Journey</h3><p>Search a Batch and view supplier receipt, SFDA acceptance, inventory, dispatch, customer, and final status.</p><div class="intelligence-metric"><span class="badge warning">Planned Logic</span><strong>—</strong></div></div>
         </div>
       </section>
-
+ 
       <!-- VARIANCE -->
       <section class="page" id="page-variance">
         <div class="page-head"><div><h1>Variance Management</h1><p>Investigate receiving discrepancies, missing SFDA registrations, dispatch evidence, and customer mapping issues.</p></div><div class="actions"><button class="btn btn-warning" disabled>Generate SFDA Discrepancy Report</button></div></div>
@@ -895,7 +913,7 @@
           <div class="empty"><strong>Variance workflow database is not implemented yet</strong>The latest dispatch variance count is shown above. Detailed investigation records will be enabled after Azure SQL persistence.</div>
         </div>
       </section>
-
+ 
       <!-- ADMIN -->
       <section class="page" id="page-administration">
         <div class="page-head"><div><h1>Administration</h1><p>Manage reference files, business rules, platform status, and future enterprise configuration.</p></div></div>
@@ -919,10 +937,10 @@
   </div>
 </div>
 <div class="toast-wrap" id="toastWrap"></div>
-
+ 
 <script>
-  const ACCEPT_API_URL = "/api/process-accept";
-  const DISPATCH_API_URL = "/api/process-dispatch";
+  const ACCEPT_API_URL = "/api/reconcile";
+  const DISPATCH_API_URL = "/api/reconcile";
   const VERIFY_URL = "/api/verify";
   const HEALTH_URL = "/api/health";
   const VERSION_URL = "/api/version";
@@ -935,11 +953,11 @@
   let historyCache = [];
   let historyLoaded = false;
   let historyLoading = false;
-
+ 
   const $ = id => document.getElementById(id);
   const formatNumber = value => Number(value || 0).toLocaleString("en-US");
   const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
-
+ 
   function toast(message,type="info") {
     const el=document.createElement("div");
     el.className=`toast ${type}`;
@@ -947,7 +965,7 @@
     $("toastWrap").appendChild(el);
     setTimeout(()=>el.remove(),4200);
   }
-
+ 
   const PAGE_LABELS = {
     home:"Dashboard",
     upload:"Upload & Run",
@@ -959,63 +977,63 @@
     variance:"Variance Management",
     administration:"Administration"
   };
-
+ 
   function navigate(page, options={}) {
     const requestedPage = String(page || "home").trim();
     const target = $(`page-${requestedPage}`);
-
+ 
     if (!target) {
       console.error(`Page not found: page-${requestedPage}`);
       toast("The requested page is unavailable.","error");
       return false;
     }
-
+ 
     document.querySelectorAll(".page").forEach(element=>{
       element.classList.toggle("active", element === target);
     });
-
+ 
     document.querySelectorAll(".nav-button").forEach(button=>{
       button.classList.toggle("active", button.dataset.page === requestedPage);
     });
-
+ 
     $("topbarTitle").textContent = PAGE_LABELS[requestedPage] || "SFDA Platform";
     $("sidebar").classList.remove("open");
-
+ 
     if (!options.skipHash && window.location.hash !== `#${requestedPage}`) {
       history.replaceState(null, "", `#${requestedPage}`);
     }
-
+ 
     if (requestedPage === "verification") {
       Promise.resolve(refreshVerificationRuns()).catch(error=>{
         console.error("Unable to refresh verification runs.", error);
         toast("SFDA Verification opened, but the run list could not be refreshed.","error");
       });
     }
-
+ 
     if (requestedPage === "history" || requestedPage === "reports") {
       Promise.resolve(refreshAzureHistory()).catch(error=>{
         console.error("Unable to refresh reconciliation history.", error);
       });
     }
-
+ 
     window.scrollTo({top:0, behavior: options.instant ? "auto" : "smooth"});
     return true;
   }
-
+ 
   document.querySelectorAll("[data-page]").forEach(button=>{
     button.addEventListener("click",()=>navigate(button.dataset.page));
   });
-
+ 
   document.querySelectorAll("[data-go]").forEach(button=>{
     button.addEventListener("click",()=>navigate(button.dataset.go));
   });
-
+ 
   window.addEventListener("hashchange",()=>{
     const page = window.location.hash.replace(/^#/, "") || "home";
     navigate(page, {skipHash:true});
   });
   $("mobileToggle").addEventListener("click",()=>$("sidebar").classList.toggle("open"));
-
+ 
   function updateStageFileName(inputId, metaId, stageKeys, buttonId) {
     const input=$(inputId), box=$(metaId);
     if(input.files.length){
@@ -1028,50 +1046,50 @@
     }
     $(buttonId).disabled=stageKeys.some(item=>!$(item.input).files.length);
   }
-
-
+ 
+ 
   let fullResult = null;
   let fullProgressTimer = null;
-
+ 
   function updateFullFileInputs(){
     const asnCount=$("fullAsnFiles").files.length;
     const dispatchCount=$("fullDispatchFiles").files.length;
     const sfdaFile=$("fullSfdaFile").files[0];
-
+ 
     $("fullAsnMeta").textContent=asnCount
       ? `✓ ${asnCount} ASN file${asnCount===1?"":"s"} selected`
       : "No files selected";
     $("fullAsnMeta").classList.toggle("ready",Boolean(asnCount));
-
+ 
     $("fullDispatchMeta").textContent=dispatchCount
       ? `✓ ${dispatchCount} Full Dispatch file${dispatchCount===1?"":"s"} selected`
       : "No files selected";
     $("fullDispatchMeta").classList.toggle("ready",Boolean(dispatchCount));
-
+ 
     $("fullSfdaMeta").textContent=sfdaFile
       ? `✓ ${sfdaFile.name} · ${(sfdaFile.size/1024/1024).toFixed(2)} MB`
       : "No file selected";
     $("fullSfdaMeta").classList.toggle("ready",Boolean(sfdaFile));
-
+ 
     $("fullRunButton").disabled=!(asnCount&&dispatchCount&&sfdaFile);
   }
-
+ 
   ["fullAsnFiles","fullDispatchFiles","fullSfdaFile"].forEach(id=>{
     $(id).addEventListener("change",updateFullFileInputs);
   });
-
+ 
   function setFullProgress(percent,label){
     $("fullProgressCard").classList.add("show");
     $("fullProgressBar").style.width=`${percent}%`;
     $("fullProgressPercent").textContent=`${percent}%`;
     $("fullProgressLabel").textContent=label;
-
+ 
     const completed=
       percent>=100?4:
       percent>=80?3:
       percent>=55?2:
       percent>=20?1:0;
-
+ 
     [
       $("fullStepRead"),
       $("fullStepNormalize"),
@@ -1083,11 +1101,11 @@
       step.textContent=(done?"✓":"○")+" "+step.textContent.replace(/^[✓○]\s*/,"");
     });
   }
-
+ 
   function startFullProgress(){
     clearInterval(fullProgressTimer);
     setFullProgress(10,"Reading historical files...");
-
+ 
     fullProgressTimer=setInterval(()=>{
       const current=parseInt($("fullProgressPercent").textContent)||10;
       const next=Math.min(90,current+5);
@@ -1096,14 +1114,14 @@
         next<60?"Normalizing receipt and dispatch events...":
         next<80?"Building cumulative Batch Master...":
         "Saving events and Batch Master to Azure SQL...";
-
+ 
       setFullProgress(next,label);
     },1500);
   }
-
+ 
   function finishFullProgress(success){
     clearInterval(fullProgressTimer);
-
+ 
     if(success){
       setFullProgress(100,"Full Reconciliation completed successfully.");
     }else{
@@ -1113,34 +1131,34 @@
       $("fullProgressLabel").textContent="Full Reconciliation failed.";
     }
   }
-
+ 
   function showFullStatus(message,type){
     const box=$("fullStatusBox");
     box.className=`status-banner ${type} show`;
     box.innerHTML=`<span>${type==="success"?"✓":"!"}</span><div>${message}</div>`;
   }
-
+ 
   function renderFullPreview(rows){
     const body=$("fullPreviewBody");
     body.innerHTML="";
-
+ 
     (rows||[]).forEach(row=>{
       const tr=document.createElement("tr");
-
+ 
       const sfdaStatus=String(
         row["Exists in SFDA"]
         ?? row["SFDA Status"]
         ?? ""
       ).trim();
-
+ 
       const sfdaStatusHtml=sfdaStatus==="Missing Batch"
         ? '<span class="badge danger">Missing Batch</span>'
         : '<span class="badge success">Yes</span>';
-
+ 
       if(sfdaStatus==="Missing Batch"){
         tr.style.background="#fff4f4";
       }
-
+ 
       tr.innerHTML=`
         <td>${escapeHtml(row.BN)}</td>
         <td>${escapeHtml(row["Expiry Month Key"])}</td>
@@ -1156,22 +1174,22 @@
       `;
       body.appendChild(tr);
     });
-
+ 
     if(!rows||!rows.length){
       body.innerHTML='<tr><td colspan="11"><div class="empty"><strong>No Batch Master rows returned</strong>The request completed but the Batch Master preview is empty.</div></td></tr>';
     }
   }
-
+ 
   function getBatchMasterOutput(outputs){
     if(!outputs||typeof outputs!=="object") return null;
-
+ 
     if(outputs["Batch_Master.xlsx"]){
       return {
         name:"Batch_Master.xlsx",
         ...outputs["Batch_Master.xlsx"]
       };
     }
-
+ 
     for(const [name,value] of Object.entries(outputs)){
       if(
         value
@@ -1184,58 +1202,58 @@
         };
       }
     }
-
+ 
     return null;
   }
-
+ 
   $("fullReconciliationForm").addEventListener("submit",async event=>{
     event.preventDefault();
-
+ 
     const button=$("fullRunButton");
     const operation=document.querySelector('input[name="fullOperation"]:checked')?.value||"append";
-
+ 
     if(operation==="rebuild"){
       const confirmed=window.confirm(
         "Rebuild Full History will delete the existing Receipt Events, Dispatch Events, and Batch Master before loading the uploaded complete history. Continue?"
       );
       if(!confirmed) return;
     }
-
+ 
     const formData=new FormData();
-
+ 
     Array.from($("fullAsnFiles").files).forEach(file=>{
       formData.append("asn_files",file,file.name);
     });
-
+ 
     Array.from($("fullDispatchFiles").files).forEach(file=>{
       formData.append("dispatch_files",file,file.name);
     });
-
+ 
     formData.append("sfda",$("fullSfdaFile").files[0],$("fullSfdaFile").files[0].name);
     formData.append("operation",operation);
-
+ 
     button.disabled=true;
     button.textContent=operation==="rebuild"
       ?"Rebuilding Historical Master..."
       :"Updating Historical Master...";
-
+ 
     $("fullSummaryGrid").style.display="none";
     $("fullDownloadsCard").style.display="none";
     $("fullPreviewCard").style.display="none";
     $("fullStatusBox").className="status-banner";
     fullResult=null;
     startFullProgress();
-
+ 
     try{
       const response=await fetch("/api/batch-master/build",{
         method:"POST",
         body:formData,
         cache:"no-store"
       });
-
+ 
       const text=await response.text();
       let result;
-
+ 
       try{
         result=JSON.parse(text);
       }catch{
@@ -1243,7 +1261,7 @@
           `The server returned HTTP ${response.status} without valid JSON. ${text.slice(0,250)}`
         );
       }
-
+ 
       if(!response.ok||result.status!=="Completed"){
         throw new Error(
           result.error
@@ -1251,15 +1269,15 @@
           || `Batch Master request failed with HTTP ${response.status}.`
         );
       }
-
+ 
       fullResult=result;
       finishFullProgress(true);
-
+ 
       const summary=result.summary||{};
       const uploadedFiles=
         Number(summary.uploaded_asn_files||0)
         + Number(summary.uploaded_dispatch_files||0);
-
+ 
       const fullPreviewRows=result.preview||[];
       const missingBatchCount=Number(
         summary.missing_batch_rows
@@ -1272,22 +1290,22 @@
           ).trim()==="Missing Batch"
         ).length
       );
-
+ 
       $("fullReceiptEvents").textContent=formatNumber(summary.new_receipt_events);
       $("fullDispatchEvents").textContent=formatNumber(summary.new_dispatch_events);
       $("fullMasterRecords").textContent=formatNumber(summary.batch_master_rows);
       $("fullMissingBatches").textContent=formatNumber(missingBatchCount);
       $("fullReviewRecords").textContent=formatNumber(uploadedFiles);
-
+ 
       $("fullSummaryGrid").style.display="";
       $("fullPreviewCard").style.display="";
       renderFullPreview(fullPreviewRows);
-
+ 
       const batchMasterFile=getBatchMasterOutput(result.outputs);
       if(batchMasterFile){
         $("fullDownloadsCard").style.display="";
       }
-
+ 
       const preparedReceipt=summary.prepared_receipt_events;
       const preparedDispatch=summary.prepared_dispatch_events;
       const preparedText=(
@@ -1296,7 +1314,7 @@
       )
         ? `<br>Prepared receipt events: ${formatNumber(preparedReceipt)} · Prepared dispatch events: ${formatNumber(preparedDispatch)}.`
         : "";
-
+ 
       showFullStatus(
         `<strong>Historical Batch Master ${operation==="rebuild"?"rebuilt":"updated"} successfully.</strong><br>
         Version ${escapeHtml(result.version||"5.0.0")} ·
@@ -1309,9 +1327,9 @@
         No SFDA upload CSV files were generated from this page.`,
         "success"
       );
-
+ 
       toast("Full Reconciliation completed.","success");
-
+ 
     }catch(error){
       finishFullProgress(false);
       showFullStatus(escapeHtml(error.message||String(error)),"error");
@@ -1321,15 +1339,15 @@
       updateFullFileInputs();
     }
   });
-
+ 
   $("downloadBatchMaster").addEventListener("click",()=>{
     const file=getBatchMasterOutput(fullResult&&fullResult.outputs);
-
+ 
     if(!file){
       toast("Batch Master output is not available.","error");
       return;
     }
-
+ 
     downloadStructured({
       name:file.name||"Batch_Master.xlsx",
       content:file.content,
@@ -1337,7 +1355,7 @@
       mime:file.mime_type||file.mime
     });
   });
-
+ 
   const ACCEPT_INPUTS=[
     {input:"acceptAsn",meta:"acceptAsnName",field:"asn"},
     {input:"acceptInventory",meta:"acceptInventoryName",field:"inventory"},
@@ -1348,10 +1366,10 @@
     {input:"dispatchInventory",meta:"dispatchInventoryName",field:"inventory"},
     {input:"dispatchSfda",meta:"dispatchSfdaName",field:"sfda"}
   ];
-
+ 
   ACCEPT_INPUTS.forEach(item=>$(item.input).addEventListener("change",()=>updateStageFileName(item.input,item.meta,ACCEPT_INPUTS,"acceptRunButton")));
   DISPATCH_INPUTS.forEach(item=>$(item.input).addEventListener("change",()=>updateStageFileName(item.input,item.meta,DISPATCH_INPUTS,"dispatchRunButton")));
-
+ 
   function validateStageFiles(items){
     for(const item of items){
       const input=$(item.input);
@@ -1360,14 +1378,14 @@
       if(!name.endsWith(".xls")&&!name.endsWith(".xlsx")) throw new Error(`${input.files[0].name}: only .xls and .xlsx files are allowed.`);
     }
   }
-
+ 
   function setStatus(type,message){
     const box=$("statusBox");
     box.className=`status-banner ${type} show`;
     box.innerHTML=`<span>${type==="success"?"✓":type==="error"?"!":"ⓘ"}</span><div>${escapeHtml(message)}</div>`;
   }
   function clearStatus(){ $("statusBox").className="status-banner"; $("statusBox").textContent=""; }
-
+ 
   function progressElements(stage){
     const prefix=stage==="Accept"?"accept":"dispatch";
     return {
@@ -1383,50 +1401,50 @@
       ]
     };
   }
-
+ 
   function updateProgressSteps(elements,percent){
     const completed=
       percent>=80?4:
       percent>=60?3:
       percent>=40?2:
       percent>=20?1:0;
-
+ 
     elements.steps.forEach((step,index)=>{
       const done=index<completed;
       step.classList.toggle("done",done);
       step.textContent=(done?"✓":"○")+" "+step.textContent.replace(/^[✓○]\s*/,"");
     });
   }
-
+ 
   function startProgress(stage){
     clearInterval(progressTimer);
-
+ 
     ["Accept","Dispatch"].forEach(name=>{
       if(name!==stage){
         const other=progressElements(name);
         other.card.classList.remove("show");
       }
     });
-
+ 
     const elements=progressElements(stage);
     elements.card.classList.add("show");
     elements.bar.style.width="10%";
     elements.percent.textContent="10%";
     elements.label.textContent=`Reading ${stage} files...`;
     updateProgressSteps(elements,10);
-
+ 
     elements.card.scrollIntoView({
       behavior:"smooth",
       block:"nearest"
     });
-
+ 
     progressTimer=setInterval(()=>{
       const current=parseInt(elements.percent.textContent)||10;
       const next=Math.min(90,current+5);
-
+ 
       elements.bar.style.width=`${next}%`;
       elements.percent.textContent=`${next}%`;
-
+ 
       if(next<35){
         elements.label.textContent=`Reading ${stage} files...`;
       }else if(next<55){
@@ -1436,15 +1454,15 @@
       }else{
         elements.label.textContent="Generating output files...";
       }
-
+ 
       updateProgressSteps(elements,next);
     },1200);
   }
-
+ 
   function finishProgress(stage,success){
     clearInterval(progressTimer);
     const elements=progressElements(stage);
-
+ 
     if(success){
       elements.bar.style.width="100%";
       elements.percent.textContent="100%";
@@ -1456,7 +1474,7 @@
       elements.label.textContent=`${stage} reconciliation failed.`;
     }
   }
-
+ 
   async function runStage({formId,items,buttonId,url,label}){
     clearStatus(); $("summaryPanel").classList.remove("show");
     const button=$(buttonId);
@@ -1478,10 +1496,10 @@
       button.textContent=label==="Accept"?"▶ Generate Accept Files":"▶ Generate Dispatch Files";
     }
   }
-
+ 
   $("acceptForm").addEventListener("submit",event=>{event.preventDefault();runStage({formId:"acceptForm",items:ACCEPT_INPUTS,buttonId:"acceptRunButton",url:ACCEPT_API_URL,label:"Accept"});});
   $("dispatchForm").addEventListener("submit",event=>{event.preventDefault();runStage({formId:"dispatchForm",items:DISPATCH_INPUTS,buttonId:"dispatchRunButton",url:DISPATCH_API_URL,label:"Dispatch"});});
-
+ 
   $("resetButton").addEventListener("click",()=>{
     $("acceptForm").reset(); $("dispatchForm").reset();
     ACCEPT_INPUTS.forEach(item=>updateStageFileName(item.input,item.meta,ACCEPT_INPUTS,"acceptRunButton"));
@@ -1497,7 +1515,7 @@
     });
     $("summaryPanel").classList.remove("show"); $("inlineResults").classList.remove("show"); currentResult=null;
   });
-
+ 
   function populateSummary(result){
     const s=result.summary||{};
     $("sumFiles").textContent=formatNumber(s.files_count);
@@ -1508,7 +1526,7 @@
     $("sumVariance").textContent=formatNumber(s.variance_rows);
     $("summaryPanel").classList.add("show");
   }
-
+ 
   function normalizeFileGroup(group){
     if(!group) return [];
     return Object.entries(group).map(([name,value])=>{
@@ -1519,7 +1537,33 @@
   }
   function countReports(outputs){ return normalizeFileGroup(outputs.accept_details).length+normalizeFileGroup(outputs.dispatch_details).length+normalizeFileGroup(outputs.variance).length+normalizeFileGroup(outputs.details).length+normalizeFileGroup(outputs.reports).length; }
   function firstFile(group){ const files=normalizeFileGroup(group); return files.length?files[0]:null; }
-
+ 
+  function renderAlerts(alerts){
+    const container=$("alertsList");
+    container.innerHTML="";
+    
+    if(!alerts || !alerts.alerts || alerts.alerts.length === 0){
+      container.innerHTML=`<div class="empty"><strong>No alerts generated</strong>All batches match expected records.</div>`;
+      return;
+    }
+    
+    alerts.alerts.forEach((alert, index) => {
+      const severity = alert.severity || "info";
+      const icon = severity === "critical" ? "!" : severity === "warning" ? "⚠" : "ⓘ";
+      const row = document.createElement("div");
+      row.className = `alert-row alert-${severity}`;
+      row.innerHTML = `
+        <div class="alert-icon">${icon}</div>
+        <div class="alert-content">
+          <div class="alert-title">${escapeHtml(alert.type)}</div>
+          <div class="alert-message">${escapeHtml(alert.message)}</div>
+          ${alert.batch_no ? `<div class="alert-meta"><strong>Batch:</strong> ${escapeHtml(alert.batch_no)} | <strong>Generic:</strong> ${escapeHtml(alert.generic_no)}</div>` : ""}
+        </div>
+      `;
+      container.appendChild(row);
+    });
+  }
+ 
   function populateResults(result){
     const s=result.summary||{}, outputs=result.outputs||{};
     $("resultAccept").textContent=formatNumber(s.accept_rows);
@@ -1532,6 +1576,12 @@
     renderCsvFiles("acceptFilesList",outputs.accept_files||{},"Accept");
     renderCsvFiles("dispatchFilesList",outputs.dispatch_files||{},"Dispatch");
     renderReportsFiles(outputs);
+    
+    // Render alerts if provided
+    if(result.alerts){
+      renderAlerts(result.alerts);
+    }
+    
     const hasAccept=Object.keys(outputs.accept_files||{}).length>0;
     const hasDispatch=Object.keys(outputs.dispatch_files||{}).length>0;
     const hasReports=countReports(outputs)>0;
@@ -1541,7 +1591,7 @@
     $("downloadReportsZip").disabled=!hasReports;
     $("downloadAllButton").disabled=!(hasAccept||hasDispatch||hasReports);
   }
-
+ 
   function renderCsvFiles(containerId,files,label){
     const container=$(containerId); container.innerHTML="";
     const entries=Object.entries(files);
@@ -1553,7 +1603,7 @@
       container.appendChild(row);
     });
   }
-
+ 
   function renderReportsFiles(outputs){
     const container=$("reportsFilesList"); container.innerHTML="";
     const groups=[["Accept Details",outputs.accept_details],["Dispatch Details",outputs.dispatch_details],["Variance",outputs.variance],["Details",outputs.details],["Reports",outputs.reports]];
@@ -1567,7 +1617,7 @@
     }));
     if(!total) container.innerHTML=`<div class="empty"><strong>No Excel reports generated</strong>The API response did not include report files.</div>`;
   }
-
+ 
   function downloadText(name,content,mime){ triggerBlob(name,new Blob([content??""],{type:mime})); }
   function downloadBase64(name,base64,mime){
     const cleaned=String(base64||"").replace(/^data:.*?;base64,/,"").replace(/\s/g,"");
@@ -1577,14 +1627,14 @@
   }
   function downloadStructured(file){ file.encoding==="base64"?downloadBase64(file.name,file.content,file.mime):downloadText(file.name,file.content,file.mime); }
   function triggerBlob(name,blob){ const url=URL.createObjectURL(blob),a=document.createElement("a"); a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000); }
-
+ 
   async function zipTextFiles(map,name){ const zip=new JSZip(); Object.entries(map||{}).forEach(([n,c])=>zip.file(n,c??"")); triggerBlob(name,await zip.generateAsync({type:"blob"})); }
   async function zipReports(outputs,name){
     const zip=new JSZip();
     [outputs.accept_details,outputs.dispatch_details,outputs.variance,outputs.details,outputs.reports].flatMap(normalizeFileGroup).forEach(file=>{ if(file.encoding==="base64") zip.file(file.name,file.content,{base64:true}); else zip.file(file.name,file.content??""); });
     triggerBlob(name,await zip.generateAsync({type:"blob"}));
   }
-
+ 
   $("downloadAcceptZip").addEventListener("click",()=>currentResult&&zipTextFiles(currentResult.outputs.accept_files,"SFDA_Accept_Files.zip"));
   $("downloadDispatchZip").addEventListener("click",()=>currentResult&&zipTextFiles(currentResult.outputs.dispatch_files,"SFDA_Dispatch_Files.zip"));
   $("downloadVariance").addEventListener("click",()=>{ const file=currentResult&&firstFile(currentResult.outputs.variance); if(file) downloadStructured(file); });
@@ -1597,13 +1647,13 @@
     [outputs.accept_details,outputs.dispatch_details,outputs.variance,outputs.details,outputs.reports].flatMap(normalizeFileGroup).forEach(file=>{ if(file.encoding==="base64") zip.file(`Reports/${file.name}`,file.content,{base64:true}); else zip.file(`Reports/${file.name}`,file.content??""); });
     triggerBlob("SFDA_Reconciliation_All_Results.zip",await zip.generateAsync({type:"blob"}));
   });
-
+ 
   document.querySelectorAll(".tab-btn").forEach(btn=>btn.addEventListener("click",()=>{
     document.querySelectorAll(".tab-btn").forEach(x=>x.classList.toggle("active",x===btn));
     document.querySelectorAll(".tab-panel").forEach(x=>x.classList.remove("active"));
     $(`tab-${btn.dataset.tab}`).classList.add("active");
   }));
-
+ 
   function normalizeHistoryRecord(row){
     return {
       runId: row.RunNumber || `RUN-${row.RunID ?? "—"}`,
@@ -1625,7 +1675,7 @@
       durationSeconds: calculateRunDuration(row.StartedAt, row.CompletedAt)
     };
   }
-
+ 
   function calculateRunDuration(startedAt, completedAt){
     if(!startedAt || !completedAt) return null;
     const start = new Date(startedAt);
@@ -1633,11 +1683,11 @@
     if(Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
     return Math.max(0, (end.getTime() - start.getTime()) / 1000);
   }
-
+ 
   function getHistory(){
     return historyCache;
   }
-
+ 
   async function refreshAzureHistory(options={}){
     const {silent=false} = options;
     if(historyLoading) return historyCache;
@@ -1675,20 +1725,20 @@
       historyLoading = false;
     }
   }
-
+ 
   function renderHistory(loadError=null){
     const q=$('historySearch').value.trim().toLowerCase();
     const status=$('historyStatus').value;
     const rows=getHistory().filter(r=>(!q||r.runId.toLowerCase().includes(q)||r.user.toLowerCase().includes(q))&&(!status||r.status===status));
     const body=$('historyBody');
     body.innerHTML="";
-
+ 
     if(loadError && !historyCache.length){
       body.innerHTML=`<tr><td colspan="11"><div class="empty"><strong>Unable to load Azure SQL history</strong>${escapeHtml(loadError.message || String(loadError))}</div></td></tr>`;
       $('historyCount').textContent="History unavailable";
       return;
     }
-
+ 
     rows.forEach(r=>{
       const tr=document.createElement('tr');
       const dateText=r.timestamp ? new Date(r.timestamp).toLocaleString() : "—";
@@ -1698,26 +1748,26 @@
       tr.querySelector(".view-run-btn").addEventListener("click",()=>openRunDetails(r.runNumber));
       body.appendChild(tr);
     });
-
+ 
     if(!rows.length){
       const message=historyLoaded?"No matching database runs were found.":"Loading reconciliation history from Azure SQL...";
       body.innerHTML=`<tr><td colspan="11"><div class="empty"><strong>${historyLoaded?"No history found":"Loading history"}</strong>${message}</div></td></tr>`;
     }
     $('historyCount').textContent=`${rows.length} database run${rows.length===1?"":"s"}`;
   }
-
+ 
   function formatBytes(value){
     const bytes=Number(value||0);
     if(bytes<1024) return `${bytes} B`;
     if(bytes<1024*1024) return `${(bytes/1024).toFixed(1)} KB`;
     return `${(bytes/1024/1024).toFixed(2)} MB`;
   }
-
+ 
   function closeRunDetails(){
     $('runDetailsModal').classList.remove('show');
     $('runDetailsModal').setAttribute('aria-hidden','true');
   }
-
+ 
   function renderRunFileSection(title,files){
     if(!files.length) return `<div class="history-file-section"><h3>${escapeHtml(title)}</h3><div class="empty"><strong>No files</strong>No files were stored in this category.</div></div>`;
     return `<div class="history-file-section"><h3>${escapeHtml(title)} (${files.length})</h3>${files.map(file=>`
@@ -1727,7 +1777,7 @@
         <a class="btn btn-primary" href="${escapeHtml(file.download_url)}">Download</a>
       </div>`).join('')}</div>`;
   }
-
+ 
   async function openRunDetails(runNumber){
     const modal=$('runDetailsModal');
     modal.classList.add('show');
@@ -1768,11 +1818,11 @@
       $('runDetailsBody').innerHTML=`<div class="empty"><strong>Run details could not be loaded</strong>${escapeHtml(error.message||String(error))}</div>`;
     }
   }
-
+ 
   $('closeRunDetails').addEventListener('click',closeRunDetails);
   $('runDetailsModal').addEventListener('click',event=>{if(event.target===$('runDetailsModal')) closeRunDetails();});
   document.addEventListener('keydown',event=>{if(event.key==='Escape') closeRunDetails();});
-
+ 
   function updateVerificationFileState(){
     const sfdaFile=$("verificationSfda").files[0];
     const notifications=Array.from($("notificationFiles").files||[]);
@@ -1781,18 +1831,18 @@
     const ready=Boolean($("verificationRun").value&&sfdaFile&&notifications.length);
     $("verifyUploadButton").disabled=!ready;
   }
-
+ 
   function refreshVerificationRuns(){
     const selector=$("verificationRun");
     if(!selector) return;
-
+ 
     const selected=selector.value;
     const eligibleStatuses=[
       "Pending Upload",
       "Pending Verification",
       "Completed"
     ];
-
+ 
     const eligible=getHistory()
       .filter(run=>eligibleStatuses.includes(run.status))
       .sort((a,b)=>{
@@ -1800,21 +1850,21 @@
         const bTime=new Date(b.startedAt||b.runDate||0).getTime()||0;
         return bTime-aTime;
       });
-
+ 
     selector.innerHTML=
       '<option value="">Select a reconciliation run...</option>'+
       eligible.map(run=>
         `<option value="${escapeHtml(run.runNumber)}">${escapeHtml(run.runNumber)} · ${escapeHtml(run.status)}</option>`
       ).join("");
-
+ 
     if(eligible.some(run=>run.runNumber===selected)){
       selector.value=selected;
     }else if(eligible.length===1){
       selector.value=eligible[0].runNumber;
     }
-
+ 
     const box=$("verificationStatus");
-
+ 
     if(!eligible.length){
       box.className="status-banner error show";
       box.innerHTML='<span>!</span><div>No eligible reconciliation run was found. Complete a reconciliation run, refresh History, then return to SFDA Verification.</div>';
@@ -1822,24 +1872,24 @@
       box.className="status-banner info show";
       box.innerHTML=`<span>ⓘ</span><div>${eligible.length} eligible run${eligible.length===1?"":"s"} found. Select the correct run to enable Verify Upload.</div>`;
     }
-
+ 
     updateVerificationFileState();
   }
-
+ 
   $("verificationRun").addEventListener("change",updateVerificationFileState);
   $("verificationSfda").addEventListener("change",updateVerificationFileState);
   $("notificationFiles").addEventListener("change",updateVerificationFileState);
-
+ 
   $("verificationForm").addEventListener("submit",async event=>{
     event.preventDefault();
     updateVerificationFileState();
-
+ 
     const runNumber=$("verificationRun").value;
     const sfdaFile=$("verificationSfda").files[0];
     const notifications=Array.from($("notificationFiles").files||[]);
     const button=$("verifyUploadButton");
     const box=$("verificationStatus");
-
+ 
     if(!runNumber||!sfdaFile||!notifications.length){
       box.className="status-banner error show";
       box.innerHTML='<span>!</span><div>Select a run, the latest SFDA report, and at least one Notification Result file.</div>';
@@ -1847,34 +1897,34 @@
       updateVerificationFileState();
       return;
     }
-
+ 
     const formData=new FormData();
     formData.append("run_number",runNumber);
     formData.append("latest_sfda",sfdaFile,sfdaFile.name);
-
+ 
     notifications.forEach(file=>{
       formData.append("notification_files",file,file.name);
     });
-
+ 
     button.disabled=true;
     button.textContent="◷ Verifying Upload...";
     box.className="status-banner info show";
     box.innerHTML=`<span>◷</span><div>Uploading ${notifications.length} Notification Result file${notifications.length===1?"":"s"} and running SFDA verification. Keep this page open until processing is complete.</div>`;
-
+ 
     try{
       const response=await fetch(VERIFY_URL,{
         method:"POST",
         body:formData,
         cache:"no-store"
       });
-
+ 
       let payload;
       try{
         payload=await response.json();
       }catch{
         throw new Error(`Verification endpoint returned HTTP ${response.status} without valid JSON.`);
       }
-
+ 
       if(!response.ok||payload.status==="Failed"){
         const failedStep=payload.failed_step?` (${payload.failed_step})`:"";
         throw new Error(
@@ -1882,7 +1932,7 @@
           + failedStep
         );
       }
-
+ 
       const summary=payload.summary||{};
       const overallStatus=payload.status||"Verification Completed";
       const isVerified=overallStatus==="Verified";
@@ -1895,7 +1945,7 @@
       const unclassified=Number(summary.unclassified_rows||0).toLocaleString();
       const mismatches=Number(summary.mismatch_rows||0).toLocaleString();
       const missing=Number(summary.missing_expected_rows||0).toLocaleString();
-
+ 
       box.className=`status-banner ${statusClass} show`;
       box.innerHTML=`
         <span>${statusIcon}</span>
@@ -1906,17 +1956,17 @@
           Unclassified: ${unclassified} · Mismatches: ${mismatches} ·
           Missing results: ${missing}
         </div>`;
-
+ 
       toast(
         isVerified
           ? "SFDA upload verified successfully."
           : "Verification completed and requires investigation.",
         isVerified?"success":"error"
       );
-
+ 
       await refreshAzureHistory({silent:true});
       refreshVerificationRuns();
-
+ 
       if(isVerified){
         $("verificationSfda").value="";
         $("notificationFiles").value="";
@@ -1932,11 +1982,11 @@
       updateVerificationFileState();
     }
   });
-
+ 
   $('historySearch').addEventListener('input',()=>renderHistory());
   $('historyStatus').addEventListener('change',()=>renderHistory());
   $('clearHistoryButton').addEventListener('click',()=>refreshAzureHistory());
-
+ 
   function getDashboardPreview(){
     try{
       const rows=JSON.parse(localStorage.getItem(DASHBOARD_PREVIEW_KEY) || "[]");
@@ -1945,12 +1995,12 @@
       return [];
     }
   }
-
+ 
   function dashboardCell(value,numeric=false){
     if(value===null || value===undefined || value==="") return "—";
     return numeric ? formatNumber(value) : escapeHtml(value);
   }
-
+ 
   function renderDashboardOverview(){
     const body=$("homeOverviewBody");
     if(!body) return;
@@ -1979,7 +2029,7 @@
       </tr>`;
     }).join("");
   }
-
+ 
   function updateDashboard(){
     renderDashboardOverview();
     const history=getHistory(),latest=history.find(x=>["Pending Upload","Pending Verification","Verified","Completed"].includes(x.status));
@@ -2000,7 +2050,7 @@
       }else uploads.innerHTML=`<div class="empty"><strong>No uploads yet</strong>Selected files will appear after a run.</div>`;
     }
   }
-
+ 
   function renderReports(){
     const history=getHistory(),completed=history.filter(x=>["Verified","Completed"].includes(x.status)),latest=completed[0]||history.find(x=>x.status==="Pending Upload")||{};
     $("reportRuns").textContent=formatNumber(history.length);
@@ -2011,7 +2061,7 @@
     $("compositionContent").innerHTML=total?`<div class="status-line"><span>Accept Items</span><strong>${formatNumber(latest.accept)}</strong></div><div class="status-line"><span>Dispatch Items</span><strong>${formatNumber(latest.dispatch)}</strong></div><div class="status-line"><span>Variance Items</span><strong>${formatNumber(latest.variance)}</strong></div><div class="status-line"><span>Total Result Items</span><strong>${formatNumber(total)}</strong></div>`:`<div class="empty"><strong>No report data yet</strong>Run a reconciliation first.</div>`;
   }
   $("exportHistoryButton").addEventListener("click",()=>downloadText("SFDA_Reconciliation_Azure_SQL_History.json",JSON.stringify(getHistory(),null,2),"application/json;charset=utf-8"));
-
+ 
   async function checkHealth(){
     try{
       const [hRes,vRes]=await Promise.all([fetch(HEALTH_URL),fetch(VERSION_URL)]);
@@ -2032,7 +2082,7 @@
     }
   }
   $("healthButton").addEventListener("click",async()=>{ const ok=await checkHealth(); toast(ok?"Azure Function is healthy.":"Azure Function health check failed.",ok?"success":"error"); });
-
+ 
   if($("dashboardDate")) $("dashboardDate").value=new Date().toISOString().slice(0,10);
   if($("dashboardRefresh")) $("dashboardRefresh").addEventListener("click",()=>refreshAzureHistory());
   renderHistory();
@@ -2040,9 +2090,10 @@
   renderReports();
   checkHealth();
   refreshAzureHistory({silent:true});
-
+ 
   const initialPage = window.location.hash.replace(/^#/, "") || "home";
   navigate(initialPage, {skipHash:true, instant:true});
 </script>
 </body>
 </html>
+ 
