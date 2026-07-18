@@ -2273,6 +2273,151 @@
  
   const initialPage = window.location.hash.replace(/^#/, "") || "home";
   navigate(initialPage, {skipHash:true, instant:true});
+ 
+ 
+  // ============================================================
+// STEP 1 & STEP 2 EVENT HANDLERS
+// ============================================================
+ 
+// Step 1 Button Handler
+const step1Button = document.getElementById("step1Button");
+if (step1Button) {
+  step1Button.addEventListener("click", async function() {
+    event.preventDefault();
+    
+    const asn = document.getElementById("step1AsnFiles");
+    const dispatch = document.getElementById("step1DispatchFiles");
+    const sfda = document.getElementById("step1SfdaFile");
+    
+    // Validate
+    if (!asn.files.length || !dispatch.files.length || !sfda.files.length) {
+      alert("Please select all required files");
+      return;
+    }
+    
+    // Prepare FormData
+    const formData = new FormData();
+    
+    for (let file of asn.files) {
+      formData.append("asn_files", file);
+    }
+    
+    for (let file of dispatch.files) {
+      formData.append("dispatch_files", file);
+    }
+    
+    formData.append("sfda", sfda.files[0]);
+    
+    const operation = document.querySelector('input[name="step1Operation"]:checked')?.value || "append";
+    formData.append("operation", operation);
+    
+    // Disable button
+    step1Button.disabled = true;
+    step1Button.textContent = "Processing...";
+    
+    try {
+      const response = await fetch("/api/batch-master/build", {
+        method: "POST",
+        body: formData
+      });
+      
+      const result = await response.json();
+      
+      if (!response.ok) {
+        throw new Error(result.error || "Build failed");
+      }
+      
+      alert("✅ Batch Master built successfully!");
+      console.log("Result:", result);
+      
+    } catch (error) {
+      alert("❌ Error: " + error.message);
+      console.error("Error:", error);
+    } finally {
+      step1Button.disabled = false;
+      step1Button.textContent = "▶ Build Batch Master";
+    }
+  });
+}
+ 
+// Step 2 Button Handler
+const step2Button = document.getElementById("step2Button");
+if (step2Button) {
+  step2Button.addEventListener("click", async function() {
+    event.preventDefault();
+    
+    const inventory = document.getElementById("step2InventoryFile");
+    const sfda = document.getElementById("step2SfdaFile");
+    
+    // Validate
+    if (!inventory.files.length || !sfda.files.length) {
+      alert("Please select all required files");
+      return;
+    }
+    
+    // Prepare FormData
+    const formData = new FormData();
+    formData.append("inventory", inventory.files[0]);
+    formData.append("sfda", sfda.files[0]);
+    
+    // Disable button
+    step2Button.disabled = true;
+    step2Button.textContent = "Processing...";
+    
+    try {
+      const response = await fetch("/api/reconcile", {
+        method: "POST",
+        body: formData
+      });
+      
+      const result = await response.json();
+      
+      if (!response.ok) {
+        throw new Error(result.error || "Reconciliation failed");
+      }
+      
+      alert("✅ Initial reconciliation completed!");
+      console.log("Result:", result);
+      
+    } catch (error) {
+      alert("❌ Error: " + error.message);
+      console.error("Error:", error);
+    } finally {
+      step2Button.disabled = false;
+      step2Button.textContent = "▶ Run Initial Reconciliation";
+    }
+  });
+}
+ 
+// File input change listeners for Step 1
+document.getElementById("step1AsnFiles")?.addEventListener("change", function() {
+  const meta = document.getElementById("step1AsnMeta");
+  meta.textContent = this.files.length + " file(s) selected";
+});
+ 
+document.getElementById("step1DispatchFiles")?.addEventListener("change", function() {
+  const meta = document.getElementById("step1DispatchMeta");
+  meta.textContent = this.files.length + " file(s) selected";
+});
+ 
+document.getElementById("step1SfdaFile")?.addEventListener("change", function() {
+  const meta = document.getElementById("step1SfdaMeta");
+  meta.textContent = this.files.length ? this.files[0].name : "No file selected";
+});
+ 
+// File input change listeners for Step 2
+document.getElementById("step2InventoryFile")?.addEventListener("change", function() {
+  const meta = document.getElementById("step2InventoryMeta");
+  meta.textContent = this.files.length ? this.files[0].name : "No file selected";
+});
+ 
+document.getElementById("step2SfdaFile")?.addEventListener("change", function() {
+  const meta = document.getElementById("step2SfdaMeta");
+  meta.textContent = this.files.length ? this.files[0].name : "No file selected";
+});
+ 
+ 
+ 
 </script>
 </body>
 </html>
