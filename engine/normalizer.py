@@ -2,7 +2,6 @@ import pandas as pd
 
 
 class Normalizer:
-
     @staticmethod
     def _find_column(df, candidates):
         normalized = {
@@ -14,35 +13,48 @@ class Normalizer:
             match = normalized.get(
                 str(candidate).strip().lower()
             )
-
             if match is not None:
                 return match
 
         return None
 
     @staticmethod
+    def _required_series(df, candidates):
+        column = Normalizer._find_column(
+            df,
+            candidates,
+        )
+
+        if column is None:
+            raise ValueError(
+                f"Required source column not found. "
+                f"Expected one of: {candidates}"
+            )
+
+        return df[column]
+
+    @staticmethod
     def _optional_series(
         df,
         candidates,
-        default=""
+        default="",
     ):
         column = Normalizer._find_column(
             df,
-            candidates
+            candidates,
         )
 
         if column is None:
             return pd.Series(
                 [default] * len(df),
                 index=df.index,
-                dtype=object
+                dtype=object,
             )
 
         return df[column]
 
     @staticmethod
     def text(series):
-
         return (
             series.fillna("")
             .astype(str)
@@ -52,7 +64,6 @@ class Normalizer:
 
     @staticmethod
     def identifier(series, length=None):
-
         result = (
             series.fillna("")
             .astype(str)
@@ -68,14 +79,6 @@ class Normalizer:
 
     @staticmethod
     def _safe_datetime(series):
-        """
-        Convert mixed Excel/text datetime values safely.
-
-        Dates outside pandas datetime64[ns] range, including common
-        sentinel dates such as 9999-12-30, are converted to NaT.
-        The returned dtype is always datetime64[ns] so all dataframe
-        merge keys use the same datetime precision.
-        """
         cleaned = series.copy()
 
         text_values = (
@@ -87,46 +90,31 @@ class Normalizer:
         invalid_date_mask = (
             text_values.str.match(
                 r"^9999[-/]",
-                na=False
+                na=False,
             )
             | text_values.str.contains(
                 r"[-/]9999(?:\s|$)",
                 regex=True,
-                na=False
-            )
-            | text_values.isin(
-                {
-                    "9999-12-30",
-                    "9999-12-31",
-                    "30/12/9999",
-                    "31/12/9999",
-                    "9999/12/30",
-                    "9999/12/31",
-                }
+                na=False,
             )
         )
 
         cleaned = cleaned.mask(
             invalid_date_mask,
-            None
+            None,
         )
 
         result = pd.to_datetime(
             cleaned,
             errors="coerce",
             dayfirst=True,
-            format="mixed"
+            format="mixed",
         )
 
-        # pandas may parse large years using microsecond precision.
-        # Remove anything outside datetime64[ns] before enforcing ns dtype.
-        max_supported = pd.Timestamp.max
-        min_supported = pd.Timestamp.min
-
         result = result.mask(
-            (result > max_supported)
-            | (result < min_supported),
-            pd.NaT
+            (result > pd.Timestamp.max)
+            | (result < pd.Timestamp.min),
+            pd.NaT,
         )
 
         return result.astype(
@@ -135,7 +123,6 @@ class Normalizer:
 
     @staticmethod
     def date(series):
-
         return (
             Normalizer._safe_datetime(series)
             .dt.normalize()
@@ -143,59 +130,70 @@ class Normalizer:
 
     @staticmethod
     def datetime(series):
-
-        return Normalizer._safe_datetime(
-            series
-        )
+        return Normalizer._safe_datetime(series)
 
     @staticmethod
     def number(series):
-
         return (
             pd.to_numeric(
                 series,
-                errors="coerce"
+                errors="coerce",
             )
             .fillna(0)
         )
 
     @staticmethod
     def normalize_asn(df):
-
         df = df.copy()
 
         df["BN"] = Normalizer.text(
-            df["Batch Number"]
+            Normalizer._required_series(
+                df,
+                ["Batch Number", "BN", "Batch/Lot"],
+            )
         )
-
         df["Expiry Date"] = Normalizer.date(
-            df["Expiration Date"]
+            Normalizer._required_series(
+                df,
+                ["Expiration Date", "Expiry Date", "Best Before Date"],
+            )
         )
-
         df["Received Quantity"] = Normalizer.number(
-            df["Received Qty"]
+            Normalizer._required_series(
+                df,
+                ["Received Qty", "Received Quantity"],
+            )
         )
-
         df["Trade Name"] = Normalizer.text(
-            df["Trade Description"]
+            Normalizer._required_series(
+                df,
+                ["Trade Description", "Trade Name"],
+            )
         )
-
         df["Trade Item"] = Normalizer.identifier(
-            df["Trade Item"]
+            Normalizer._optional_series(
+                df,
+                ["Trade Item", "Trade Item Number"],
+            )
         )
-
         df["Inbound Shipment"] = Normalizer.identifier(
-            df["Inbound Shipment"]
+            Normalizer._optional_series(
+                df,
+                ["Inbound Shipment", "Shipment Reference"],
+            )
         )
-
         df["ASN Line"] = Normalizer.identifier(
-            df["ASN Line"]
+            Normalizer._optional_series(
+                df,
+                ["ASN Line", "Line Number"],
+            )
         )
-
         df["Supplier Name"] = Normalizer.text(
-            df["Supplier Name"]
+            Normalizer._optional_series(
+                df,
+                ["Supplier Name", "Vendor Name"],
+            )
         )
-
         df["Received Date"] = Normalizer.datetime(
             Normalizer._optional_series(
                 df,
@@ -206,50 +204,18 @@ class Normalizer:
                     "Date Received",
                     "ASN Closed Date",
                     "Closed Date",
-                    "Transaction Date"
-                ]
+                    "Transaction Date",
+                ],
             )
         )
-
         df["Generic Item Number"] = Normalizer.identifier(
             Normalizer._optional_series(
                 df,
                 [
                     "Generic Item Number",
                     "Item Number",
-                    "Generic Number"
-                ]
-            )
-        )
-
-        df["Supplier Code"] = Normalizer.identifier(
-            Normalizer._optional_series(
-                df,
-                [
-                    "Supplier Code",
-                    "Vendor Code"
-                ]
-            )
-        )
-
-        df["PO Number"] = Normalizer.identifier(
-            Normalizer._optional_series(
-                df,
-                [
-                    "PO Number",
-                    "Purchase Order Number",
-                    "NUPCO PO"
-                ]
-            )
-        )
-
-        df["Invoice Number"] = Normalizer.identifier(
-            Normalizer._optional_series(
-                df,
-                [
-                    "Invoice Number",
-                    "Invoice"
-                ]
+                    "Generic Number",
+                ],
             )
         )
 
@@ -257,56 +223,42 @@ class Normalizer:
 
     @staticmethod
     def normalize_inventory(df):
-
         df = df.copy()
 
         df["BN"] = Normalizer.text(
-            df["Lot No/Batch"]
-        )
-
-        df["Expiry Date"] = Normalizer.date(
-            df["Expiry Date"]
-        )
-
-        df["Available Quantity"] = Normalizer.number(
-            df["Available Qty"]
-        )
-
-        df["Trade Name"] = Normalizer.text(
-            df["Trade Item Description"]
-        )
-
-        df["Inventory Snapshot Date"] = Normalizer.datetime(
-            Normalizer._optional_series(
+            Normalizer._required_series(
                 df,
-                [
-                    "Snapshot Date",
-                    "Report Date",
-                    "Inventory Date",
-                    "Date Created",
-                    "Created Date",
-                    "As Of Date"
-                ]
+                ["Lot No/Batch", "BN", "Batch Number"],
             )
         )
-
+        df["Expiry Date"] = Normalizer.date(
+            Normalizer._required_series(
+                df,
+                ["Expiry Date", "Expiration Date"],
+            )
+        )
+        df["Available Quantity"] = Normalizer.number(
+            Normalizer._required_series(
+                df,
+                ["Available Qty", "Available Quantity"],
+            )
+        )
+        df["Trade Name"] = Normalizer.text(
+            Normalizer._required_series(
+                df,
+                ["Trade Item Description", "Trade Name", "Trade Description"],
+            )
+        )
         df["Generic Item Number"] = Normalizer.identifier(
             Normalizer._optional_series(
                 df,
-                [
-                    "Generic Item Number",
-                    "Item Number"
-                ]
+                ["Generic Item Number", "Item Number"],
             )
         )
-
         df["Trade Item Number"] = Normalizer.identifier(
             Normalizer._optional_series(
                 df,
-                [
-                    "Trade Item Number",
-                    "Trade Item"
-                ]
+                ["Trade Item Number", "Trade Item"],
             )
         )
 
@@ -314,41 +266,56 @@ class Normalizer:
 
     @staticmethod
     def normalize_dispatch(df):
-
         df = df.copy()
 
         df["BN"] = Normalizer.text(
-            df["Batch/Lot"]
+            Normalizer._required_series(
+                df,
+                ["Batch/Lot", "BN", "Batch Number"],
+            )
         )
-
         df["Expiry Date"] = Normalizer.date(
-            df["Best Before Date"]
+            Normalizer._required_series(
+                df,
+                ["Best Before Date", "Expiry Date", "Expiration Date"],
+            )
         )
-
         df["Dispatched Quantity"] = Normalizer.number(
-            df["Pick Qty"]
+            Normalizer._required_series(
+                df,
+                ["Pick Qty", "Dispatched Quantity", "Dispatch Qty"],
+            )
         )
-
         df["Trade Name"] = Normalizer.text(
-            df["Trade Description"]
+            Normalizer._required_series(
+                df,
+                ["Trade Description", "Trade Name"],
+            )
         )
-
         df["Trade Item Number"] = Normalizer.identifier(
-            df["Trade Item Number"]
+            Normalizer._optional_series(
+                df,
+                ["Trade Item Number", "Trade Item"],
+            )
         )
-
         df["To Address"] = Normalizer.text(
-            df["To Address"]
+            Normalizer._required_series(
+                df,
+                ["To Address", "Customer Name"],
+            )
         )
-
         df["Sales Order Number"] = Normalizer.identifier(
-            df["Sales Order Number"]
+            Normalizer._required_series(
+                df,
+                ["Sales Order Number", "Sales Order"],
+            )
         )
-
         df["Order Line"] = Normalizer.identifier(
-            df["order line"]
+            Normalizer._optional_series(
+                df,
+                ["order line", "Order Line", "Line Number"],
+            )
         )
-
         df["Dispatch Date"] = Normalizer.datetime(
             Normalizer._optional_series(
                 df,
@@ -359,39 +326,14 @@ class Normalizer:
                     "Ship Date",
                     "Shipment Date",
                     "Date Dispatched",
-                    "Transaction Date"
-                ]
+                    "Transaction Date",
+                ],
             )
         )
-
         df["Generic Item Number"] = Normalizer.identifier(
             Normalizer._optional_series(
                 df,
-                [
-                    "Generic Item Number",
-                    "Item Number"
-                ]
-            )
-        )
-
-        df["Reference Order Number"] = Normalizer.identifier(
-            Normalizer._optional_series(
-                df,
-                [
-                    "Reference order #",
-                    "Reference Order Number",
-                    "Reference Order"
-                ]
-            )
-        )
-
-        df["Ship To Customer"] = Normalizer.identifier(
-            Normalizer._optional_series(
-                df,
-                [
-                    "Ship To Customer",
-                    "Customer Code"
-                ]
+                ["Generic Item Number", "Item Number"],
             )
         )
 
@@ -399,84 +341,89 @@ class Normalizer:
 
     @staticmethod
     def normalize_sfda(df):
-
         df = df.copy()
 
         df["GTIN"] = Normalizer.identifier(
-            df["GTIN"],
-            length=14
-        )
-
-        df["BN"] = Normalizer.text(
-            df["BN"]
-        )
-
-        df["Expiry Date"] = Normalizer.date(
-            df["Expiry Date"]
-        )
-
-        df["Drug Name"] = Normalizer.text(
-            df["Drug Name"]
-        )
-
-        df["Quantity"] = Normalizer.number(
-            df["Quantity"]
-        )
-
-        df["Active"] = Normalizer.number(
-            df["Active"]
-        )
-
-        df["Quantity Receive Pending"] = Normalizer.number(
-            df["Quantity Receive Pending"]
-        )
-
-        df["Quantity sent pending"] = Normalizer.number(
-            df["Quantity sent pending"]
-        )
-
-        df["SFDA Snapshot Date"] = Normalizer.datetime(
-            Normalizer._optional_series(
+            Normalizer._required_series(
                 df,
-                [
-                    "Snapshot Date",
-                    "Report Date",
-                    "Drug Count Date",
-                    "Date Created",
-                    "Created Date",
-                    "As Of Date"
-                ]
+                ["GTIN"],
+            ),
+            length=14,
+        )
+        df["BN"] = Normalizer.text(
+            Normalizer._required_series(
+                df,
+                ["BN", "Batch Number"],
+            )
+        )
+        df["Expiry Date"] = Normalizer.date(
+            Normalizer._required_series(
+                df,
+                ["Expiry Date", "Expiration Date"],
+            )
+        )
+        df["Drug Name"] = Normalizer.text(
+            Normalizer._required_series(
+                df,
+                ["Drug Name"],
+            )
+        )
+
+        for target, candidates in {
+            "Quantity": ["Quantity"],
+            "Active": ["Active"],
+            "Quantity Receive Pending": [
+                "Quantity Receive Pending",
+                "Quantity ReceivePending",
+            ],
+            "Quantity sent pending": [
+                "Quantity sent pending",
+                "Quantity Send Pending",
+            ],
+        }.items():
+            df[target] = Normalizer.number(
+                Normalizer._required_series(
+                    df,
+                    candidates,
+                )
+            )
+
+        return df
+
+    @staticmethod
+    def normalize_packsize(df):
+        df = df.copy()
+
+        df["Trade Name"] = Normalizer.text(
+            Normalizer._required_series(
+                df,
+                ["Trade Name"],
+            )
+        )
+        df["PackageSize"] = Normalizer.number(
+            Normalizer._required_series(
+                df,
+                ["PackageSize", "Package Size"],
             )
         )
 
         return df
 
     @staticmethod
-    def normalize_packsize(df):
-
-        df = df.copy()
-
-        df["Trade Name"] = Normalizer.text(
-            df["Trade Name"]
-        )
-
-        df["PackageSize"] = Normalizer.number(
-            df["PackageSize"]
-        )
-
-        return df
-
-    @staticmethod
     def normalize_gln(df):
-
         df = df.copy()
 
         df["To Address"] = Normalizer.text(
-            df["To Address"]
+            Normalizer._required_series(
+                df,
+                ["To Address"],
+            )
         )
-
         df["GLN"] = Normalizer.identifier(
-            df["GLN"]
+            Normalizer._required_series(
+                df,
+                ["GLN"],
+            )
         )
 
         df = df[
@@ -484,11 +431,10 @@ class Normalizer:
             & (df["GLN"] != "")
         ].copy()
 
-        df = df.drop_duplicates(
-            subset=["To Address"],
-            keep="first"
-        )
-
-        return df.reset_index(
-            drop=True
+        return (
+            df.drop_duplicates(
+                subset=["To Address"],
+                keep="first",
+            )
+            .reset_index(drop=True)
         )
