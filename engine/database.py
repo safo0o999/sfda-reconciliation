@@ -107,6 +107,109 @@ BEGIN
     );
 END;
 
+
+IF COL_LENGTH('dbo.ReceiptEvents', 'ExpiryDate') IS NULL
+BEGIN
+    ALTER TABLE dbo.ReceiptEvents
+    ADD ExpiryDate date NULL;
+END;
+
+IF COL_LENGTH('dbo.DispatchEvents', 'ExpiryDate') IS NULL
+BEGIN
+    ALTER TABLE dbo.DispatchEvents
+    ADD ExpiryDate date NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'ExpiryDate') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD ExpiryDate date NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'GTIN') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD GTIN nvarchar(20) NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'DrugName') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD DrugName nvarchar(500) NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'TotalReceiveQty') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD TotalReceiveQty decimal(19,4) NOT NULL
+        CONSTRAINT DF_BatchMaster_TotalReceiveQty_Migration
+        DEFAULT 0 WITH VALUES;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'TotalDispatchedQty') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD TotalDispatchedQty decimal(19,4) NOT NULL
+        CONSTRAINT DF_BatchMaster_TotalDispatchedQty_Migration
+        DEFAULT 0 WITH VALUES;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'ReceiveRuns') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD ReceiveRuns int NOT NULL
+        CONSTRAINT DF_BatchMaster_ReceiveRuns_Migration
+        DEFAULT 0 WITH VALUES;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'DispatchRuns') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD DispatchRuns int NOT NULL
+        CONSTRAINT DF_BatchMaster_DispatchRuns_Migration
+        DEFAULT 0 WITH VALUES;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'FirstReceivedDate') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD FirstReceivedDate datetime2 NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'LastReceivedDate') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD LastReceivedDate datetime2 NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'FirstDispatchDate') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD FirstDispatchDate datetime2 NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'LastDispatchDate') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD LastDispatchDate datetime2 NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'GenericExistsInSFDA') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD GenericExistsInSFDA nvarchar(30) NOT NULL
+        CONSTRAINT DF_BatchMaster_GenericExistsInSFDA_Migration
+        DEFAULT 'Yes' WITH VALUES;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'LastUpdated') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD LastUpdated datetime2 NOT NULL
+        CONSTRAINT DF_BatchMaster_LastUpdated_Migration
+        DEFAULT SYSUTCDATETIME() WITH VALUES;
+END;
+
 IF COL_LENGTH('dbo.BatchMaster', 'TradeItemNumber') IS NULL
 BEGIN
     ALTER TABLE dbo.BatchMaster
@@ -270,12 +373,7 @@ END;
 
 
 def _consume_all_results(cursor: pyodbc.Cursor) -> None:
-    """Advance through every result set and row-count message.
-
-    SQL Server may return non-query result messages for multi-statement
-    batches. Consuming them prevents later fetch operations from failing with:
-    "No results. Previous SQL was not a query."
-    """
+    """Consume all result sets and row-count messages from a SQL batch."""
 
     while True:
         if cursor.description is not None:
@@ -291,7 +389,7 @@ def _consume_all_results(cursor: pyodbc.Cursor) -> None:
 
 
 def _fetch_inserted_result(cursor: pyodbc.Cursor) -> int:
-    """Return the Inserted value from a multi-statement SQL batch."""
+    """Read the Inserted value returned by the event insert SQL batch."""
 
     while True:
         if cursor.description is not None:
