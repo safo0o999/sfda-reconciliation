@@ -107,6 +107,24 @@ BEGIN
     );
 END;
 
+IF COL_LENGTH('dbo.ReceiptEvents', 'ExpiryDate') IS NULL
+BEGIN
+    ALTER TABLE dbo.ReceiptEvents
+    ADD ExpiryDate date NULL;
+END;
+
+IF COL_LENGTH('dbo.DispatchEvents', 'ExpiryDate') IS NULL
+BEGIN
+    ALTER TABLE dbo.DispatchEvents
+    ADD ExpiryDate date NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'ExpiryDate') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster
+    ADD ExpiryDate date NULL;
+END;
+
 IF COL_LENGTH('dbo.BatchMaster', 'TradeItemNumber') IS NULL
 BEGIN
     ALTER TABLE dbo.BatchMaster
