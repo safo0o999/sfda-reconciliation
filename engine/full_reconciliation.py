@@ -505,19 +505,52 @@ class FullReconciliationEngine:
             keep="first",
         )
 
+        sfda_match = sfda[
+            self.SFDA_KEYS
+            + [
+                "Expiry Date",
+                "GTIN",
+                "Drug Name",
+            ]
+        ].copy()
+        sfda_match["_Batch Exists in SFDA"] = True
+
         master = master.merge(
-            sfda[
-                self.SFDA_KEYS
-                + [
-                    "Expiry Date",
-                    "GTIN",
-                    "Drug Name",
-                ]
-            ],
+            sfda_match,
             on=self.SFDA_KEYS,
-            how="inner",
+            how="left",
             validate="many_to_one",
         )
+
+        # A Generic is considered an SFDA Generic when at least one of its
+        # batches exists in the latest SFDA report. Other batches for the same
+        # Generic remain in the Batch Master as Missing Batch alerts.
+        matched_generics = set(
+            master.loc[
+                master["_Batch Exists in SFDA"].fillna(False),
+                "Generic Item Number",
+            ]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+        master["Generic Exists in SFDA"] = "Generic Not in SFDA"
+        master.loc[
+            master["Generic Item Number"].isin(matched_generics),
+            "Generic Exists in SFDA",
+        ] = "Missing Batch"
+        master.loc[
+            master["_Batch Exists in SFDA"].fillna(False),
+            "Generic Exists in SFDA",
+        ] = "Yes"
+
+        # The final Batch Master contains only Generics proven to be in SFDA.
+        # Missing batches are retained for alerting and follow-up.
+        master = master[
+            master["Generic Exists in SFDA"] != "Generic Not in SFDA"
+        ].copy()
+        master = master.drop(columns=["_Batch Exists in SFDA"])
 
         master["Trade Item Number"] = (
             master["Receipt Trade Item Number"]
@@ -606,8 +639,6 @@ class FullReconciliationEngine:
                 master[column],
                 errors="coerce",
             )
-
-        master["Generic Exists in SFDA"] = "Yes"
 
         master["Last Updated"] = (
             pd.Timestamp.utcnow()
