@@ -1,6 +1,6 @@
 azure-functions
+azure-storage-blob
 pandas
 openpyxl
 xlrd
-pymssql
-azure-storage-blob
+pyodbc
