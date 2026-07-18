@@ -7,6 +7,7 @@ from typing import Iterable, List
 import azure.functions as func
 import pandas as pd
 
+from engine.alert_engine import AlertEngine
 from engine.database import (
     append_events,
     get_batch_master_df,
@@ -405,11 +406,16 @@ def reconcile(
                 "inventory",
                 "sfda",
             ],
+            "optional_files": [
+                "asn",
+            ],
         })
 
     try:
         inventory_file = req.files.get("inventory")
         sfda_file = req.files.get("sfda")
+        asn_file = req.files.get("asn")           # Optional - for Accept alerts
+        dispatch_file = req.files.get("dispatch")  # Optional - for Dispatch alerts
 
         if inventory_file is None:
             raise ValueError(
@@ -447,6 +453,54 @@ def reconcile(
 
         result = engine.run()
 
+        # Generate Alerts based on provided files
+        alerts = None
+        step_type = None
+
+        if asn_file is not None:
+            step_type = "accept"
+            try:
+                asn_dataframe = read_excel(asn_file)
+                alert_engine = AlertEngine(
+                    batch_master_df=batch_master,
+                    sfda_df=sfda_dataframe,
+                    inventory_df=inventory_dataframe,
+                )
+                alerts = alert_engine.generate_alerts_for_accept(
+                    asn_daily_df=asn_dataframe
+                )
+            except Exception as alert_ex:
+                logging.warning(
+                    f"Accept alert generation failed: {alert_ex}"
+                )
+                alerts = {
+                    "alert_count": 0,
+                    "alerts": [],
+                    "summary": {"error": str(alert_ex)},
+                }
+
+        elif dispatch_file is not None:
+            step_type = "dispatch"
+            try:
+                dispatch_dataframe = read_excel(dispatch_file)
+                alert_engine = AlertEngine(
+                    batch_master_df=batch_master,
+                    sfda_df=sfda_dataframe,
+                    inventory_df=inventory_dataframe,
+                )
+                alerts = alert_engine.generate_alerts_for_dispatch(
+                    sfda_updated_df=sfda_dataframe
+                )
+            except Exception as alert_ex:
+                logging.warning(
+                    f"Dispatch alert generation failed: {alert_ex}"
+                )
+                alerts = {
+                    "alert_count": 0,
+                    "alerts": [],
+                    "summary": {"error": str(alert_ex)},
+                }
+
         accept_files = (
             Exporter.build_sfda_upload_files(
                 df=result["accept"],
@@ -475,7 +529,7 @@ def reconcile(
             "dispatch_files": dispatch_files,
         }
 
-        return json_response({
+        response_data = {
             "status": "Completed",
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
@@ -498,7 +552,15 @@ def reconcile(
             "preview": safe_preview(
                 result["report"]
             ),
-        })
+        }
+
+        # Add step type and alerts if generated
+        if step_type is not None:
+            response_data["step"] = step_type
+        if alerts is not None:
+            response_data["alerts"] = alerts
+
+        return json_response(response_data)
 
     except ValueError as ex:
         logging.exception("Reconciliation input failed")
