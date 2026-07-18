@@ -11,7 +11,6 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
 class Exporter:
-
     MAX_ROWS_PER_FILE = 20
     MAX_QUANTITY_PER_FILE = 100000
     GTIN_LENGTH = 14
@@ -19,7 +18,6 @@ class Exporter:
 
     @staticmethod
     def _normalize_identifier(value):
-
         if pd.isna(value):
             return ""
 
@@ -30,13 +28,14 @@ class Exporter:
 
         if re.fullmatch(
             r"[+-]?\d+(\.\d+)?[eE][+-]?\d+",
-            text
+            text,
         ):
             try:
-                text = format(
-                    Decimal(text),
-                    "f"
-                ).rstrip("0").rstrip(".")
+                text = (
+                    format(Decimal(text), "f")
+                    .rstrip("0")
+                    .rstrip(".")
+                )
             except InvalidOperation:
                 pass
 
@@ -44,10 +43,10 @@ class Exporter:
 
     @staticmethod
     def _normalize_gtin(value):
-
-        gtin = Exporter._normalize_identifier(
-            value
-        ).replace(" ", "")
+        gtin = (
+            Exporter._normalize_identifier(value)
+            .replace(" ", "")
+        )
 
         if gtin.isdigit():
             gtin = gtin.zfill(
@@ -58,10 +57,9 @@ class Exporter:
 
     @staticmethod
     def _normalize_quantity(value):
-
         quantity = pd.to_numeric(
             value,
-            errors="coerce"
+            errors="coerce",
         )
 
         if pd.isna(quantity):
@@ -75,54 +73,49 @@ class Exporter:
                     .to_integral_value(
                         rounding=ROUND_FLOOR
                     )
-                )
+                ),
             )
         except (
             InvalidOperation,
             ValueError,
-            TypeError
+            TypeError,
         ):
             return 0
 
     @staticmethod
     def _normalize_expiry(value):
-
         expiry = pd.to_datetime(
             value,
             errors="coerce",
-            dayfirst=True
+            dayfirst=True,
         )
 
         if pd.isna(expiry):
             return ""
 
-        return expiry.strftime(
-            "%d-%m-%Y"
-        )
+        return expiry.strftime("%d-%m-%Y")
 
     @staticmethod
     def _safe_file_name(value):
-
-        text = str(value).strip()
-
         text = re.sub(
             r"[^A-Za-z0-9_-]+",
             "_",
-            text
+            str(value).strip(),
         )
 
-        return text.strip("_") or Exporter.DUMMY_GLN
+        return (
+            text.strip("_")
+            or Exporter.DUMMY_GLN
+        )
 
     @staticmethod
-    def _prepare_records(
-        df,
-        quantity_column
-    ):
-
+    def _prepare_records(df, quantity_column):
         records = []
 
-        for _, row in df.iterrows():
+        if df is None or df.empty:
+            return records
 
+        for _, row in df.iterrows():
             quantity = Exporter._normalize_quantity(
                 row.get(quantity_column)
             )
@@ -133,11 +126,9 @@ class Exporter:
             gtin = Exporter._normalize_gtin(
                 row.get("GTIN")
             )
-
             batch = str(
                 row.get("BN", "")
             ).strip()
-
             expiry = Exporter._normalize_expiry(
                 row.get("Expiry Date")
             )
@@ -145,52 +136,32 @@ class Exporter:
             if not gtin or not batch or not expiry:
                 continue
 
-            remaining = quantity
-
-            while remaining > 0:
-
-                split_quantity = min(
-                    remaining,
-                    Exporter.MAX_QUANTITY_PER_FILE
-                )
-
-                records.append({
-                    "GTIN": gtin,
-                    "QUANTITY": split_quantity,
-                    "BN": batch,
-                    "XD": expiry
-                })
-
-                remaining -= split_quantity
+            records.append({
+                "GTIN": gtin,
+                "QUANTITY": quantity,
+                "BN": batch,
+                "XD": expiry,
+            })
 
         return records
 
     @staticmethod
     def _split_into_files(records):
-
         files = []
-
         current_rows = []
         current_quantity = 0
 
         for record in records:
-
-            remaining = int(
-                record["QUANTITY"]
-            )
+            remaining = int(record["QUANTITY"])
 
             while remaining > 0:
-
                 if (
                     len(current_rows)
                     >= Exporter.MAX_ROWS_PER_FILE
                     or current_quantity
                     >= Exporter.MAX_QUANTITY_PER_FILE
                 ):
-                    files.append(
-                        current_rows
-                    )
-
+                    files.append(current_rows)
                     current_rows = []
                     current_quantity = 0
 
@@ -201,75 +172,59 @@ class Exporter:
 
                 quantity = min(
                     remaining,
-                    available
+                    available,
                 )
 
                 new_record = record.copy()
                 new_record["QUANTITY"] = quantity
 
-                current_rows.append(
-                    new_record
-                )
-
+                current_rows.append(new_record)
                 current_quantity += quantity
                 remaining -= quantity
 
         if current_rows:
-            files.append(
-                current_rows
-            )
+            files.append(current_rows)
 
         return files
 
     @staticmethod
     def _build_sfda_content(records):
-
-        lines = [
-            "GTIN;QUANTITY;BN;XD"
-        ]
+        lines = ["GTIN;QUANTITY;BN;XD"]
 
         for record in records:
-
             lines.append(
                 "{};{};{};{}".format(
                     record["GTIN"],
                     int(record["QUANTITY"]),
                     record["BN"],
-                    record["XD"]
+                    record["XD"],
                 )
             )
 
-        return "\r\n".join(
-            lines
-        )
+        return "\r\n".join(lines)
 
     @staticmethod
     def build_sfda_upload_files(
         df,
         quantity_column,
-        file_prefix
+        file_prefix,
     ):
-
-        records = Exporter._prepare_records(
-            df=df,
-            quantity_column=quantity_column
-        )
-
         groups = Exporter._split_into_files(
-            records
+            Exporter._prepare_records(
+                df,
+                quantity_column,
+            )
         )
 
         output = {}
 
         for index, records_group in enumerate(
             groups,
-            start=1
+            start=1,
         ):
-
             file_name = (
                 f"{file_prefix}_{index:03d}.csv"
             )
-
             output[file_name] = (
                 Exporter._build_sfda_content(
                     records_group
@@ -280,56 +235,58 @@ class Exporter:
 
     @staticmethod
     def build_dispatch_files_by_customer(
-        dispatch_df
+        dispatch_df,
     ):
-
         output = {}
 
-        if dispatch_df.empty:
+        if dispatch_df is None or dispatch_df.empty:
             return output
 
         customer_columns = [
             "Customer Status",
             "GLN",
-            "To Address"
+            "To Address",
         ]
 
-        available_customer_columns = [
+        available_columns = [
             column
             for column in customer_columns
             if column in dispatch_df.columns
         ]
 
-        if not available_customer_columns:
+        if not available_columns:
             return output
 
-        for group_values, customer_df in dispatch_df.groupby(
-            available_customer_columns,
-            dropna=False,
-            sort=True
+        for group_values, customer_df in (
+            dispatch_df.groupby(
+                available_columns,
+                dropna=False,
+                sort=True,
+            )
         ):
-
-            if not isinstance(group_values, tuple):
+            if not isinstance(
+                group_values,
+                tuple,
+            ):
                 group_values = (group_values,)
 
             group_data = dict(
                 zip(
-                    available_customer_columns,
-                    group_values
+                    available_columns,
+                    group_values,
                 )
             )
 
             customer_status = str(
                 group_data.get(
                     "Customer Status",
-                    ""
+                    "",
                 )
             ).strip().upper()
 
-            raw_gln = Exporter._normalize_identifier(
-                group_data.get(
-                    "GLN",
-                    ""
+            raw_gln = (
+                Exporter._normalize_identifier(
+                    group_data.get("GLN", "")
                 )
             )
 
@@ -345,34 +302,27 @@ class Exporter:
                 else raw_gln
             )
 
-            customer_gln = Exporter._safe_file_name(
-                customer_gln
-            )
-
-            records = Exporter._prepare_records(
-                df=customer_df,
-                quantity_column=(
-                    "Allocated To Be Dispatch"
+            customer_gln = (
+                Exporter._safe_file_name(
+                    customer_gln
                 )
             )
 
             groups = Exporter._split_into_files(
-                records
+                Exporter._prepare_records(
+                    customer_df,
+                    "Allocated To Be Dispatch",
+                )
             )
 
             for index, records_group in enumerate(
                 groups,
-                start=1
+                start=1,
             ):
-
-                # Required naming rule:
-                # Registered customer: <GLN>_001.csv
-                # Dummy customer: 9999999999999_001.csv
                 file_name = (
                     f"{customer_gln}_"
                     f"{index:03d}.csv"
                 )
-
                 output[file_name] = (
                     Exporter._build_sfda_content(
                         records_group
@@ -388,10 +338,13 @@ class Exporter:
         sheet_name,
         title,
         columns=None,
-        sort_columns=None
+        sort_columns=None,
     ):
-
-        report = df.copy()
+        report = (
+            df.copy()
+            if df is not None
+            else pd.DataFrame()
+        )
 
         if columns:
             report = report[
@@ -403,7 +356,6 @@ class Exporter:
             ]
 
         if sort_columns:
-
             available_sort_columns = [
                 column
                 for column in sort_columns
@@ -413,12 +365,10 @@ class Exporter:
             if available_sort_columns:
                 report = report.sort_values(
                     by=available_sort_columns,
-                    kind="stable"
+                    kind="stable",
                 )
 
-        report = report.reset_index(
-            drop=True
-        )
+        report = report.reset_index(drop=True)
 
         workbook = Workbook()
         worksheet = workbook.active
@@ -426,9 +376,8 @@ class Exporter:
 
         column_count = max(
             1,
-            len(report.columns)
+            len(report.columns),
         )
-
         last_column = get_column_letter(
             column_count
         )
@@ -436,71 +385,63 @@ class Exporter:
         worksheet.merge_cells(
             f"A1:{last_column}1"
         )
-
         worksheet["A1"] = title
         worksheet["A1"].font = Font(
             bold=True,
             color="FFFFFF",
-            size=16
+            size=16,
         )
         worksheet["A1"].fill = PatternFill(
             fill_type="solid",
-            fgColor="0F6CBD"
+            fgColor="0F6CBD",
         )
         worksheet["A1"].alignment = Alignment(
             horizontal="center"
         )
 
         header_row = 3
-
         border = Border(
             left=Side(
                 style="thin",
-                color="B8C4CE"
+                color="B8C4CE",
             ),
             right=Side(
                 style="thin",
-                color="B8C4CE"
+                color="B8C4CE",
             ),
             top=Side(
                 style="thin",
-                color="B8C4CE"
+                color="B8C4CE",
             ),
             bottom=Side(
                 style="thin",
-                color="B8C4CE"
-            )
+                color="B8C4CE",
+            ),
         )
 
         for column_index, column_name in enumerate(
             report.columns,
-            start=1
+            start=1,
         ):
-
             cell = worksheet.cell(
                 row=header_row,
                 column=column_index,
-                value=str(column_name)
+                value=str(column_name),
             )
-
             cell.font = Font(
                 bold=True,
-                color="FFFFFF"
+                color="FFFFFF",
             )
-
             cell.fill = PatternFill(
                 fill_type="solid",
-                fgColor="17365D"
+                fgColor="17365D",
             )
-
             cell.alignment = Alignment(
                 horizontal="center"
             )
-
             cell.border = border
 
         for row_index, row in report.iterrows():
-
             excel_row = (
                 header_row
                 + row_index
@@ -509,30 +450,29 @@ class Exporter:
 
             for column_index, column_name in enumerate(
                 report.columns,
-                start=1
+                start=1,
             ):
-
                 value = row[column_name]
+                column_text = str(
+                    column_name
+                ).lower()
 
                 if pd.isna(value):
                     value = None
-
                 elif (
-                    "Date" in str(column_name)
-                    or "Expiry" in str(column_name)
+                    "date" in column_text
+                    or "expiry" in column_text
                 ):
                     converted = pd.to_datetime(
                         value,
-                        errors="coerce"
+                        errors="coerce",
                     )
-
                     if not pd.isna(converted):
-                        value = converted.to_pydatetime()
-
+                        value = (
+                            converted.to_pydatetime()
+                        )
                 elif any(
-                    identifier in str(
-                        column_name
-                    ).lower()
+                    identifier in column_text
                     for identifier in [
                         "gtin",
                         "generic item",
@@ -541,19 +481,16 @@ class Exporter:
                         "order number",
                         "order line",
                         "inbound shipment",
-                        "trk",
                         "gln",
-                        "bn"
+                        "bn",
                     ]
                 ):
-                    value = Exporter._normalize_identifier(
-                        value
+                    value = (
+                        Exporter._normalize_identifier(
+                            value
+                        )
                     )
-
-                elif hasattr(
-                    value,
-                    "item"
-                ):
+                elif hasattr(value, "item"):
                     try:
                         value = value.item()
                     except Exception:
@@ -562,14 +499,9 @@ class Exporter:
                 cell = worksheet.cell(
                     row=excel_row,
                     column=column_index,
-                    value=value
+                    value=value,
                 )
-
                 cell.border = border
-
-                column_text = str(
-                    column_name
-                ).lower()
 
                 if any(
                     identifier in column_text
@@ -581,13 +513,11 @@ class Exporter:
                         "order number",
                         "order line",
                         "inbound shipment",
-                        "trk",
                         "gln",
-                        "bn"
+                        "bn",
                     ]
                 ):
                     cell.number_format = "@"
-
                 elif (
                     "date" in column_text
                     or "expiry" in column_text
@@ -595,101 +525,68 @@ class Exporter:
                     cell.number_format = (
                         "dd-mm-yyyy"
                     )
-
                 elif isinstance(
                     value,
-                    (
-                        int,
-                        float
-                    )
+                    (int, float),
                 ):
-                    cell.number_format = (
-                        "#,##0.##"
-                    )
+                    cell.number_format = "#,##0.##"
 
                 if row_index % 2 == 1:
-
                     cell.fill = PatternFill(
                         fill_type="solid",
-                        fgColor="EAF2F8"
+                        fgColor="EAF2F8",
                     )
 
         if len(report) > 0:
-
             table = Table(
                 displayName="ReportTable",
                 ref=(
                     f"A{header_row}:"
                     f"{last_column}"
                     f"{header_row + len(report)}"
-                )
+                ),
             )
-
             table.tableStyleInfo = (
                 TableStyleInfo(
                     name="TableStyleMedium2",
-                    showRowStripes=False
+                    showRowStripes=False,
                 )
             )
-
-            worksheet.add_table(
-                table
-            )
+            worksheet.add_table(table)
 
         worksheet.freeze_panes = (
             f"A{header_row + 1}"
         )
-
         worksheet.sheet_view.showGridLines = False
 
         for column_index, column_name in enumerate(
             report.columns,
-            start=1
+            start=1,
         ):
-
-            max_length = len(
-                str(column_name)
-            )
+            max_length = len(str(column_name))
 
             for value in report[column_name]:
-
                 if pd.isna(value):
                     continue
-
-                value_length = len(
-                    str(value)
-                )
-
                 max_length = max(
                     max_length,
-                    value_length
+                    len(str(value)),
                 )
 
             worksheet.column_dimensions[
-                get_column_letter(
-                    column_index
-                )
+                get_column_letter(column_index)
             ].width = min(
-                max(
-                    max_length + 2,
-                    12
-                ),
-                45
+                max(max_length + 2, 12),
+                45,
             )
 
         output = io.BytesIO()
-
-        workbook.save(
-            output
-        )
-
+        workbook.save(output)
         output.seek(0)
 
         content = base64.b64encode(
             output.read()
-        ).decode(
-            "ascii"
-        )
+        ).decode("ascii")
 
         return {
             file_name: {
@@ -698,6 +595,6 @@ class Exporter:
                 "mime_type": (
                     "application/vnd.openxmlformats-"
                     "officedocument.spreadsheetml.sheet"
-                )
+                ),
             }
         }
