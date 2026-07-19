@@ -7,7 +7,368 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>SFDA Drug Traceability & Reconciliation Platform</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js">
+  // ---------------------------------------------------------------------------
+  // Clean Full Reconciliation page
+  // ---------------------------------------------------------------------------
+
+  let frStep1Result = null;
+  let frStep2Result = null;
+  let frProgressTimer = null;
+
+  function frFiles(inputId) {
+    return Array.from(document.getElementById(inputId)?.files || []);
+  }
+
+  function frFileSizeText(bytes) {
+    const mb = bytes / (1024 * 1024);
+    return `${mb.toFixed(mb >= 10 ? 1 : 2)} MB`;
+  }
+
+  function frSetMeta(inputId, metaId, multiple = false) {
+    const files = frFiles(inputId);
+    const meta = document.getElementById(metaId);
+    if (!meta) return;
+    if (!files.length) {
+      meta.textContent = "No files selected";
+      meta.classList.remove("ready");
+      return;
+    }
+    meta.textContent = multiple
+      ? `${files.length} file(s) selected · ${frFileSizeText(files.reduce((sum, file) => sum + file.size, 0))}`
+      : `${files[0].name} · ${frFileSizeText(files[0].size)}`;
+    meta.classList.add("ready");
+  }
+
+  function frUpdateButtons() {
+    const step1Ready =
+      frFiles("frAsnFiles").length > 0 &&
+      frFiles("frDispatchFiles").length > 0 &&
+      frFiles("frSfdaFile").length === 1;
+
+    const step2Ready =
+      frFiles("frInventoryFile").length === 1 &&
+      frFiles("frStep2SfdaFile").length === 1;
+
+    const step1Button = document.getElementById("frStep1Button");
+    const step2Button = document.getElementById("frStep2Button");
+    if (step1Button) step1Button.disabled = !step1Ready;
+    if (step2Button) step2Button.disabled = !step2Ready;
+
+    const totalBytes = [
+      ...frFiles("frAsnFiles"),
+      ...frFiles("frDispatchFiles"),
+      ...frFiles("frSfdaFile"),
+    ].reduce((sum, file) => sum + file.size, 0);
+
+    const uploadMeta = document.getElementById("frTotalUploadMeta");
+    if (uploadMeta) {
+      uploadMeta.textContent = `Total selected upload size: ${frFileSizeText(totalBytes)}`;
+      uploadMeta.style.color = totalBytes > 90 * 1024 * 1024 ? "#d13438" : "";
+      uploadMeta.style.fontWeight = totalBytes > 90 * 1024 * 1024 ? "800" : "";
+    }
+  }
+
+  function frShowStatus(id, type, message) {
+    const box = document.getElementById(id);
+    if (!box) return;
+    box.className = `status-banner ${type} show`;
+    box.innerHTML = `<span>${type === "success" ? "✓" : type === "error" ? "!" : "ⓘ"}</span><div>${escapeHtml(message)}</div>`;
+  }
+
+  function frProgress(prefix, percent, label, completedSteps) {
+    const card = document.getElementById(`${prefix}Progress`);
+    const bar = document.getElementById(`${prefix}ProgressBar`);
+    const percentLabel = document.getElementById(`${prefix}ProgressPercent`);
+    const textLabel = document.getElementById(`${prefix}ProgressLabel`);
+    if (card) card.classList.add("show");
+    if (bar) bar.style.width = `${percent}%`;
+    if (percentLabel) percentLabel.textContent = `${percent}%`;
+    if (textLabel) textLabel.textContent = label;
+
+    const ids = prefix === "frStep1"
+      ? ["frStep1Read", "frStep1Validate", "frStep1Build", "frStep1Save"]
+      : ["frStep2Read", "frStep2Validate", "frStep2Match", "frStep2Generate"];
+
+    ids.forEach((id, index) => {
+      const item = document.getElementById(id);
+      if (!item) return;
+      item.classList.toggle("done", index < completedSteps);
+      const clean = item.textContent.replace(/^[○✓]\s*/, "");
+      item.textContent = `${index < completedSteps ? "✓" : "○"} ${clean}`;
+    });
+  }
+
+  function frStartProgress(prefix) {
+    clearInterval(frProgressTimer);
+    let percent = 8;
+    frProgress(prefix, percent, "Uploading selected files...", 0);
+    frProgressTimer = setInterval(() => {
+      percent = Math.min(88, percent + (percent < 55 ? 8 : 3));
+      const step = percent < 30 ? 0 : percent < 50 ? 1 : percent < 72 ? 2 : 3;
+      const label = step === 0
+        ? "Uploading selected files..."
+        : step === 1
+          ? "Validating report data..."
+          : step === 2
+            ? "Processing reconciliation..."
+            : "Preparing output files...";
+      frProgress(prefix, percent, label, step);
+    }, 650);
+  }
+
+  function frFinishProgress(prefix, success) {
+    clearInterval(frProgressTimer);
+    frProgressTimer = null;
+    frProgress(
+      prefix,
+      success ? 100 : 0,
+      success ? "Completed successfully." : "Processing failed.",
+      success ? 4 : 0
+    );
+  }
+
+  function frNormalizeFiles(group) {
+    if (!group) return [];
+    if (Array.isArray(group)) return group.flatMap(frNormalizeFiles);
+    if (typeof group !== "object") return [];
+    if (typeof group.content === "string") {
+      return [{
+        name: group.name || "download",
+        content: group.content,
+        encoding: group.encoding || "base64",
+        mime: group.mime_type || group.mime || "application/octet-stream",
+      }];
+    }
+    return Object.entries(group).flatMap(([name, value]) => {
+      if (typeof value === "string") {
+        return [{name, content: value, encoding: "text", mime: "text/plain;charset=utf-8"}];
+      }
+      if (value && typeof value === "object" && typeof value.content === "string") {
+        return [{
+          name,
+          content: value.content,
+          encoding: value.encoding || "base64",
+          mime: value.mime_type || value.mime || "application/octet-stream",
+        }];
+      }
+      return frNormalizeFiles(value);
+    });
+  }
+
+  function frRenderDownloads(containerId, files) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    if (!files.length) {
+      container.innerHTML = '<div class="empty"><strong>No downloadable files returned</strong>The server completed without returning a file payload.</div>';
+      return;
+    }
+    container.innerHTML = "";
+    files.forEach((file) => {
+      const row = document.createElement("div");
+      row.className = "download-row";
+      row.innerHTML = `
+        <div class="file-type ${file.name.toLowerCase().endsWith(".xlsx") ? "xlsx" : ""}">
+          ${file.name.toLowerCase().endsWith(".xlsx") ? "XLSX" : "CSV"}
+        </div>
+        <div>
+          <div class="file-name">${escapeHtml(file.name)}</div>
+          <div class="file-info">${file.encoding === "base64" ? "Generated file" : "SFDA upload text file"}</div>
+        </div>
+        <button class="btn btn-secondary" type="button">Download</button>
+      `;
+      row.querySelector("button").addEventListener("click", () => downloadStructured(file));
+      container.appendChild(row);
+    });
+  }
+
+  function frAllFiles() {
+    return [
+      ...frNormalizeFiles(frStep1Result?.outputs),
+      ...frNormalizeFiles(frStep2Result?.outputs),
+    ];
+  }
+
+  function frUpdateSummary() {
+    const s1 = frStep1Result?.summary || {};
+    const allFiles = frAllFiles();
+    document.getElementById("frReceiptEvents").textContent = formatNumber(
+      s1.new_receipt_events ?? s1.prepared_receipt_events ?? 0
+    );
+    document.getElementById("frDispatchEvents").textContent = formatNumber(
+      s1.new_dispatch_events ?? s1.prepared_dispatch_events ?? 0
+    );
+    document.getElementById("frMasterRows").textContent = formatNumber(
+      s1.batch_master_rows ?? 0
+    );
+    document.getElementById("frGeneratedFiles").textContent = formatNumber(allFiles.length);
+    const panel = document.getElementById("frSummaryPanel");
+    if (panel) panel.classList.toggle("show", !!(frStep1Result || frStep2Result));
+    const allButton = document.getElementById("frDownloadAllButton");
+    if (allButton) allButton.disabled = allFiles.length === 0;
+  }
+
+  async function frReadJsonResponse(response) {
+    const text = await response.text();
+    let result;
+    try {
+      result = JSON.parse(text);
+    } catch {
+      throw new Error(`HTTP ${response.status}: the server response was not valid JSON.`);
+    }
+    if (!response.ok || result.status === "Failed") {
+      throw new Error(result.error || result.message || `HTTP ${response.status}`);
+    }
+    return result;
+  }
+
+  document.getElementById("frStep1Button")?.addEventListener("click", async () => {
+    const button = document.getElementById("frStep1Button");
+    const operation = document.querySelector('input[name="frOperation"]:checked')?.value || "append";
+
+    if (operation === "rebuild" && !window.confirm(
+      "Rebuild will clear the current Version 5 history before loading the selected complete history. Continue?"
+    )) return;
+
+    const formData = new FormData();
+    frFiles("frAsnFiles").forEach(file => formData.append("asn_files", file, file.name));
+    frFiles("frDispatchFiles").forEach(file => formData.append("dispatch_files", file, file.name));
+    const sfda = frFiles("frSfdaFile")[0];
+    formData.append("sfda", sfda, sfda.name);
+    formData.append("operation", operation);
+
+    button.disabled = true;
+    button.textContent = "Processing...";
+    frShowStatus("frStep1Status", "info", "The historical files are being uploaded and processed.");
+    frStartProgress("frStep1");
+
+    try {
+      const response = await fetch("/api/batch-master/build", {
+        method: "POST",
+        body: formData,
+        cache: "no-store",
+      });
+      const result = await frReadJsonResponse(response);
+      frStep1Result = result;
+      frFinishProgress("frStep1", true);
+      const files = frNormalizeFiles(result.outputs);
+      frRenderDownloads("frBatchMasterDownloads", files);
+      const summary = result.summary || {};
+      frShowStatus(
+        "frStep1Status",
+        "success",
+        `Batch Master completed. ${formatNumber(summary.batch_master_rows || 0)} rows saved.`
+      );
+      frUpdateSummary();
+    } catch (error) {
+      frFinishProgress("frStep1", false);
+      frShowStatus("frStep1Status", "error", error.message || String(error));
+    } finally {
+      button.textContent = "▶ Build Batch Master";
+      frUpdateButtons();
+    }
+  });
+
+  document.getElementById("frStep2Button")?.addEventListener("click", async () => {
+    const button = document.getElementById("frStep2Button");
+    const formData = new FormData();
+    const inventory = frFiles("frInventoryFile")[0];
+    const sfda = frFiles("frStep2SfdaFile")[0];
+    formData.append("inventory", inventory, inventory.name);
+    formData.append("sfda", sfda, sfda.name);
+
+    button.disabled = true;
+    button.textContent = "Processing...";
+    frShowStatus("frStep2Status", "info", "The current Inventory and SFDA snapshots are being reconciled.");
+    frStartProgress("frStep2");
+
+    try {
+      const response = await fetch("/api/reconcile", {
+        method: "POST",
+        body: formData,
+        cache: "no-store",
+      });
+      const result = await frReadJsonResponse(response);
+      frStep2Result = result;
+      frFinishProgress("frStep2", true);
+      const files = frNormalizeFiles(result.outputs);
+      frRenderDownloads("frReconciliationDownloads", files);
+      const summary = result.summary || {};
+      frShowStatus(
+        "frStep2Status",
+        "success",
+        `Reconciliation completed. ${formatNumber(summary.reconciliation_rows || 0)} report rows generated.`
+      );
+      frUpdateSummary();
+    } catch (error) {
+      frFinishProgress("frStep2", false);
+      frShowStatus("frStep2Status", "error", error.message || String(error));
+    } finally {
+      button.textContent = "▶ Run Initial Reconciliation";
+      frUpdateButtons();
+    }
+  });
+
+  document.getElementById("frDownloadAllButton")?.addEventListener("click", async () => {
+    const files = frAllFiles();
+    if (!files.length) return;
+    const zip = new JSZip();
+    files.forEach(file => {
+      if (file.encoding === "base64") {
+        zip.file(file.name, file.content, {base64: true});
+      } else {
+        zip.file(file.name, file.content ?? "");
+      }
+    });
+    const blob = await zip.generateAsync({type: "blob"});
+    triggerBlob("Full_Reconciliation_Results.zip", blob);
+  });
+
+  document.getElementById("fullResetButton")?.addEventListener("click", () => {
+    ["frAsnFiles", "frDispatchFiles", "frSfdaFile", "frInventoryFile", "frStep2SfdaFile"]
+      .forEach(id => {
+        const input = document.getElementById(id);
+        if (input) input.value = "";
+      });
+    frStep1Result = null;
+    frStep2Result = null;
+    document.getElementById("frBatchMasterDownloads").innerHTML =
+      '<div class="empty"><strong>No Batch Master output yet</strong>Complete Step 1 to download the audit file.</div>';
+    document.getElementById("frReconciliationDownloads").innerHTML =
+      '<div class="empty"><strong>No reconciliation outputs yet</strong>Complete Step 2 to download the generated files.</div>';
+    ["frStep1Status", "frStep2Status"].forEach(id => {
+      const box = document.getElementById(id);
+      if (box) box.className = "status-banner";
+    });
+    ["frStep1Progress", "frStep2Progress"].forEach(id => {
+      const card = document.getElementById(id);
+      if (card) card.classList.remove("show");
+    });
+    frSetMeta("frAsnFiles", "frAsnMeta", true);
+    frSetMeta("frDispatchFiles", "frDispatchMeta", true);
+    frSetMeta("frSfdaFile", "frSfdaMeta");
+    frSetMeta("frInventoryFile", "frInventoryMeta");
+    frSetMeta("frStep2SfdaFile", "frStep2SfdaMeta");
+    frUpdateButtons();
+    frUpdateSummary();
+  });
+
+  [
+    ["frAsnFiles", "frAsnMeta", true],
+    ["frDispatchFiles", "frDispatchMeta", true],
+    ["frSfdaFile", "frSfdaMeta", false],
+    ["frInventoryFile", "frInventoryMeta", false],
+    ["frStep2SfdaFile", "frStep2SfdaMeta", false],
+  ].forEach(([inputId, metaId, multiple]) => {
+    document.getElementById(inputId)?.addEventListener("change", () => {
+      frSetMeta(inputId, metaId, multiple);
+      frUpdateButtons();
+    });
+  });
+
+  frUpdateButtons();
+
+</script>
   <style>
     :root {
       --navy-950:#05172c;
@@ -661,114 +1022,202 @@
  
  
       <!-- SFDA VERIFICATION -->
- 
+
       <!-- FULL RECONCILIATION -->
       <section class="page" id="page-full-reconciliation">
         <div class="page-head">
           <div>
             <h1>Full Reconciliation</h1>
-            <p>Build the cumulative Batch Master, then reconcile the latest inventory and generate all output files.</p>
+            <p>Build the historical Batch Master, then reconcile it with the latest Inventory and SFDA snapshots.</p>
           </div>
-          <div class="actions"><span class="badge info">Version 5.0</span></div>
+          <div class="actions">
+            <button class="btn btn-secondary" id="fullResetButton" type="button">↻ Reset</button>
+          </div>
         </div>
 
-        <div class="grid two-equal">
-          <form id="step1Form" class="card" style="padding:20px">
-            <div class="card-title" style="font-size:18px;color:#6b4eff">Step 1 — Build Batch Master</div>
-            <div class="card-subtitle" style="margin:6px 0 18px">Upload historical ASN and Full Dispatch files with the latest SFDA Drug Count.</div>
+        <div class="status-banner info show">
+          <span>ⓘ</span>
+          <div>
+            <strong>Initial setup workflow:</strong>
+            Complete Step 1 first. After the Batch Master is created, complete Step 2 to generate the reconciliation report and SFDA upload files.
+          </div>
+        </div>
+
+        <div class="grid two-equal" style="margin-top:16px">
+          <!-- STEP 1 -->
+          <div class="card" style="padding:20px">
+            <div class="card-title" style="font-size:18px;color:#0f6cbd">Step 1 — Build Batch Master</div>
+            <div class="card-subtitle" style="margin:6px 0 18px">
+              Upload historical ASN and Full Dispatch reports with the latest SFDA Drug Count.
+            </div>
 
             <div class="grid">
               <div class="file-card">
-                <div class="file-card-top"><div><div class="file-title">① Historical ASN Files</div><div class="file-sub">Multiple files are supported.</div></div><span class="badge info">Multiple</span></div>
-                <div class="file-row"><input id="step1AsnFiles" name="asn_files" type="file" accept=".xls,.xlsx" multiple required></div>
-                <div class="file-meta" id="step1AsnMeta">No files selected</div>
+                <div class="file-card-top">
+                  <div>
+                    <div class="file-title">① Historical ASN Receipt Files</div>
+                    <div class="file-sub">Select one or more ASN receipt reports.</div>
+                  </div>
+                  <span class="badge info">Multiple</span>
+                </div>
+                <div class="file-row">
+                  <input id="frAsnFiles" type="file" accept=".xls,.xlsx" multiple>
+                </div>
+                <div class="file-meta" id="frAsnMeta">No files selected</div>
               </div>
+
               <div class="file-card">
-                <div class="file-card-top"><div><div class="file-title">② Historical Full Dispatch Files</div><div class="file-sub">Select all files for the same historical period.</div></div><span class="badge info">Multiple</span></div>
-                <div class="file-row"><input id="step1DispatchFiles" name="dispatch_files" type="file" accept=".xls,.xlsx" multiple required></div>
-                <div class="file-meta" id="step1DispatchMeta">No files selected</div>
+                <div class="file-card-top">
+                  <div>
+                    <div class="file-title">② Historical Full Dispatch Files</div>
+                    <div class="file-sub">Select one or more Full Dispatch reports.</div>
+                  </div>
+                  <span class="badge info">Multiple</span>
+                </div>
+                <div class="file-row">
+                  <input id="frDispatchFiles" type="file" accept=".xls,.xlsx" multiple>
+                </div>
+                <div class="file-meta" id="frDispatchMeta">No files selected</div>
               </div>
+
               <div class="file-card">
-                <div class="file-card-top"><div><div class="file-title">③ Latest SFDA Drug Count</div><div class="file-sub">Used to identify SFDA batches and Generics.</div></div><span class="badge success">Required</span></div>
-                <div class="file-row"><input id="step1SfdaFile" name="sfda" type="file" accept=".xls,.xlsx" required></div>
-                <div class="file-meta" id="step1SfdaMeta">No file selected</div>
+                <div class="file-card-top">
+                  <div>
+                    <div class="file-title">③ Latest SFDA Drug Count</div>
+                    <div class="file-sub">Used to identify SFDA generics and match batches.</div>
+                  </div>
+                  <span class="badge success">Required</span>
+                </div>
+                <div class="file-row">
+                  <input id="frSfdaFile" type="file" accept=".xls,.xlsx">
+                </div>
+                <div class="file-meta" id="frSfdaMeta">No file selected</div>
               </div>
             </div>
 
             <div class="card run-panel" style="box-shadow:none;margin-top:16px;grid-template-columns:1fr">
-              <div><div class="run-title">Database Operation</div><div class="run-sub">Append skips existing Event Keys. Rebuild clears Version 5 history and rebuilds it from the uploaded files.</div></div>
-              <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-                <label style="display:flex;gap:9px;align-items:flex-start;padding:12px;border:1px solid var(--line);border-radius:10px;background:#fff"><input type="radio" name="step1Operation" value="append" checked><span><strong style="font-size:12px">Append New History</strong><br><small style="color:var(--muted)">Add only new events.</small></span></label>
-                <label style="display:flex;gap:9px;align-items:flex-start;padding:12px;border:1px solid var(--line);border-radius:10px;background:#fff"><input type="radio" name="step1Operation" value="rebuild"><span><strong style="font-size:12px">Rebuild Full History</strong><br><small style="color:var(--muted)">Recreate from uploaded files.</small></span></label>
+              <div>
+                <div class="run-title">Database Operation</div>
+                <div class="run-sub">Append new history for normal use. Rebuild only when loading the complete history again.</div>
+                <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:12px">
+                  <label style="display:flex;align-items:center;gap:8px;font-size:11px;font-weight:700">
+                    <input type="radio" name="frOperation" value="append" checked> Append New History
+                  </label>
+                  <label style="display:flex;align-items:center;gap:8px;font-size:11px;font-weight:700">
+                    <input type="radio" name="frOperation" value="rebuild"> Rebuild Full History
+                  </label>
+                </div>
+                <div class="file-meta" id="frTotalUploadMeta" style="margin-top:12px">Total selected upload size: 0 MB</div>
               </div>
             </div>
 
-            <button class="btn btn-purple" id="step1Button" type="submit" disabled style="margin-top:16px;width:100%">▶ Build Batch Master</button>
-            <div class="card progress-card" id="step1ProgressCard" style="box-shadow:none">
-              <div class="progress-head"><span id="step1ProgressLabel">Preparing Batch Master...</span><span id="step1ProgressPercent">0%</span></div>
-              <div class="progress-track"><div class="progress-bar" id="step1ProgressBar"></div></div>
+            <button class="btn btn-primary" id="frStep1Button" type="button" disabled style="margin-top:16px;width:100%">
+              ▶ Build Batch Master
+            </button>
+
+            <div class="card progress-card" id="frStep1Progress" style="box-shadow:none">
+              <div class="progress-head">
+                <span id="frStep1ProgressLabel">Preparing historical upload...</span>
+                <span id="frStep1ProgressPercent">0%</span>
+              </div>
+              <div class="progress-track"><div class="progress-bar" id="frStep1ProgressBar"></div></div>
               <div class="progress-steps">
-                <div class="progress-step" id="step1StepRead">○ Reading files</div>
-                <div class="progress-step" id="step1StepValidate">○ Validating data</div>
-                <div class="progress-step" id="step1StepBuild">○ Building master</div>
-                <div class="progress-step" id="step1StepSave">○ Saving outputs</div>
+                <div class="progress-step" id="frStep1Read">○ Uploading files</div>
+                <div class="progress-step" id="frStep1Validate">○ Validating data</div>
+                <div class="progress-step" id="frStep1Build">○ Building master</div>
+                <div class="progress-step" id="frStep1Save">○ Saving outputs</div>
               </div>
             </div>
-            <div class="status-banner" id="step1Status"></div>
-            <div class="summary-panel" id="step1Results">
-              <div class="grid kpi-grid" style="margin-top:16px">
-                <div class="card kpi"><div class="kpi-label">Receipt Events</div><div class="kpi-value" id="step1ReceiptCount">0</div><div class="kpi-icon green">⇩</div></div>
-                <div class="card kpi"><div class="kpi-label">Dispatch Events</div><div class="kpi-value" id="step1DispatchCount">0</div><div class="kpi-icon purple">⇢</div></div>
-                <div class="card kpi"><div class="kpi-label">Batch Master Rows</div><div class="kpi-value" id="step1MasterCount">0</div><div class="kpi-icon">◆</div></div>
-                <div class="card kpi"><div class="kpi-label">Generated Files</div><div class="kpi-value" id="step1FileCount">0</div><div class="kpi-icon amber">⇩</div></div>
-              </div>
-              <div class="file-list" id="step1FilesList" style="margin-top:16px"></div>
-            </div>
-          </form>
 
-          <form id="step2Form" class="card" style="padding:20px">
-            <div class="card-title" style="font-size:18px;color:#107c41">Step 2 — Reconciliation & Outputs</div>
-            <div class="card-subtitle" style="margin:6px 0 18px">Upload the latest Inventory and SFDA reports to generate the reconciliation report, Accept files, and Dispatch files.</div>
+            <div class="status-banner" id="frStep1Status"></div>
+
+            <div class="file-list" id="frBatchMasterDownloads" style="margin-top:16px">
+              <div class="empty"><strong>No Batch Master output yet</strong>Complete Step 1 to download the audit file.</div>
+            </div>
+          </div>
+
+          <!-- STEP 2 -->
+          <div class="card" style="padding:20px">
+            <div class="card-title" style="font-size:18px;color:#107c41">Step 2 — Initial Reconciliation</div>
+            <div class="card-subtitle" style="margin:6px 0 18px">
+              Use the latest Inventory and SFDA snapshots to generate the reconciliation report, Accept files, and Dispatch files.
+            </div>
 
             <div class="grid">
               <div class="file-card">
-                <div class="file-card-top"><div><div class="file-title">① Inventory Status Report</div><div class="file-sub">Latest current inventory snapshot.</div></div><span class="badge success">Required</span></div>
-                <div class="file-row"><input id="step2InventoryFile" name="inventory" type="file" accept=".xls,.xlsx" required></div>
-                <div class="file-meta" id="step2InventoryMeta">No file selected</div>
+                <div class="file-card-top">
+                  <div>
+                    <div class="file-title">① Latest Inventory Status Report</div>
+                    <div class="file-sub">Current warehouse inventory snapshot.</div>
+                  </div>
+                  <span class="badge success">Required</span>
+                </div>
+                <div class="file-row">
+                  <input id="frInventoryFile" type="file" accept=".xls,.xlsx">
+                </div>
+                <div class="file-meta" id="frInventoryMeta">No file selected</div>
               </div>
+
               <div class="file-card">
-                <div class="file-card-top"><div><div class="file-title">② Latest SFDA Drug Count</div><div class="file-sub">Latest SFDA snapshot for matching and calculations.</div></div><span class="badge success">Required</span></div>
-                <div class="file-row"><input id="step2SfdaFile" name="sfda" type="file" accept=".xls,.xlsx" required></div>
-                <div class="file-meta" id="step2SfdaMeta">No file selected</div>
+                <div class="file-card-top">
+                  <div>
+                    <div class="file-title">② Latest SFDA Drug Count</div>
+                    <div class="file-sub">Current SFDA quantities for reconciliation.</div>
+                  </div>
+                  <span class="badge success">Required</span>
+                </div>
+                <div class="file-row">
+                  <input id="frStep2SfdaFile" type="file" accept=".xls,.xlsx">
+                </div>
+                <div class="file-meta" id="frStep2SfdaMeta">No file selected</div>
               </div>
             </div>
 
-            <button class="btn btn-success" id="step2Button" type="submit" disabled style="margin-top:16px;width:100%">▶ Generate Reconciliation Files</button>
-            <div class="card progress-card" id="step2ProgressCard" style="box-shadow:none">
-              <div class="progress-head"><span id="step2ProgressLabel">Preparing reconciliation...</span><span id="step2ProgressPercent">0%</span></div>
-              <div class="progress-track"><div class="progress-bar" id="step2ProgressBar"></div></div>
+            <button class="btn btn-success" id="frStep2Button" type="button" disabled style="margin-top:16px;width:100%">
+              ▶ Run Initial Reconciliation
+            </button>
+
+            <div class="card progress-card" id="frStep2Progress" style="box-shadow:none">
+              <div class="progress-head">
+                <span id="frStep2ProgressLabel">Preparing reconciliation...</span>
+                <span id="frStep2ProgressPercent">0%</span>
+              </div>
+              <div class="progress-track"><div class="progress-bar" id="frStep2ProgressBar"></div></div>
               <div class="progress-steps">
-                <div class="progress-step" id="step2StepRead">○ Reading files</div>
-                <div class="progress-step" id="step2StepValidate">○ Validating data</div>
-                <div class="progress-step" id="step2StepMatch">○ Calculating reconciliation</div>
-                <div class="progress-step" id="step2StepGenerate">○ Generating outputs</div>
+                <div class="progress-step" id="frStep2Read">○ Uploading files</div>
+                <div class="progress-step" id="frStep2Validate">○ Validating data</div>
+                <div class="progress-step" id="frStep2Match">○ Matching Batch Master</div>
+                <div class="progress-step" id="frStep2Generate">○ Generating outputs</div>
               </div>
             </div>
-            <div class="status-banner" id="step2Status"></div>
-            <div class="summary-panel" id="step2Results">
-              <div class="grid kpi-grid" style="margin-top:16px">
-                <div class="card kpi"><div class="kpi-label">Reconciliation Rows</div><div class="kpi-value" id="step2ReportCount">0</div><div class="kpi-icon">≡</div></div>
-                <div class="card kpi"><div class="kpi-label">Accept Rows</div><div class="kpi-value" id="step2AcceptCount">0</div><div class="kpi-icon green">✓</div></div>
-                <div class="card kpi"><div class="kpi-label">Dispatch Rows</div><div class="kpi-value" id="step2DispatchCount">0</div><div class="kpi-icon purple">⇢</div></div>
-                <div class="card kpi"><div class="kpi-label">Generated Files</div><div class="kpi-value" id="step2FileCount">0</div><div class="kpi-icon amber">⇩</div></div>
-              </div>
-              <div style="display:flex;justify-content:flex-end;margin-top:16px"><button class="btn btn-purple" id="step2DownloadAll" type="button" disabled>⇩ Download All Results</button></div>
-              <div class="file-list" id="step2FilesList" style="margin-top:12px"></div>
+
+            <div class="status-banner" id="frStep2Status"></div>
+
+            <div class="file-list" id="frReconciliationDownloads" style="margin-top:16px">
+              <div class="empty"><strong>No reconciliation outputs yet</strong>Complete Step 2 to download the generated files.</div>
             </div>
-          </form>
+          </div>
+        </div>
+
+        <div class="summary-panel" id="frSummaryPanel">
+          <div class="page-head" style="margin:22px 0 12px">
+            <div>
+              <h1 style="font-size:21px">Full Reconciliation Summary</h1>
+              <p>Latest successful Step 1 and Step 2 results in this browser session.</p>
+            </div>
+            <button class="btn btn-purple" id="frDownloadAllButton" type="button" disabled>⇩ Download All Results</button>
+          </div>
+          <div class="grid kpi-grid">
+            <div class="card kpi"><div class="kpi-label">Receipt Events</div><div class="kpi-value" id="frReceiptEvents">0</div><div class="kpi-icon">R</div></div>
+            <div class="card kpi"><div class="kpi-label">Dispatch Events</div><div class="kpi-value" id="frDispatchEvents">0</div><div class="kpi-icon purple">D</div></div>
+            <div class="card kpi"><div class="kpi-label">Batch Master Rows</div><div class="kpi-value" id="frMasterRows">0</div><div class="kpi-icon green">M</div></div>
+            <div class="card kpi"><div class="kpi-label">Generated Files</div><div class="kpi-value" id="frGeneratedFiles">0</div><div class="kpi-icon amber">⇩</div></div>
+          </div>
         </div>
       </section>
 
+
+ 
       <section class="page" id="page-verification">
         <div class="page-head">
           <div><h1>SFDA Verification</h1><p>Verify the generated upload files against the latest SFDA Drug Count and portal notification results.</p></div>
@@ -984,6 +1433,165 @@
     $(buttonId).disabled=stageKeys.some(item=>!$(item.input).files.length);
   }
  
+ 
+  let fullResult = null;
+  let fullProgressTimer = null;
+ 
+  function updateFullFileInputs(){
+    const asnCount=$("fullAsnFiles").files.length;
+    const dispatchCount=$("fullDispatchFiles").files.length;
+    const sfdaFile=$("fullSfdaFile").files[0];
+ 
+    $("fullAsnMeta").textContent=asnCount
+      ? `✓ ${asnCount} ASN file${asnCount===1?"":"s"} selected`
+      : "No files selected";
+    $("fullAsnMeta").classList.toggle("ready",Boolean(asnCount));
+ 
+    $("fullDispatchMeta").textContent=dispatchCount
+      ? `✓ ${dispatchCount} Full Dispatch file${dispatchCount===1?"":"s"} selected`
+      : "No files selected";
+    $("fullDispatchMeta").classList.toggle("ready",Boolean(dispatchCount));
+ 
+    $("fullSfdaMeta").textContent=sfdaFile
+      ? `✓ ${sfdaFile.name} · ${(sfdaFile.size/1024/1024).toFixed(2)} MB`
+      : "No file selected";
+    $("fullSfdaMeta").classList.toggle("ready",Boolean(sfdaFile));
+ 
+    $("fullRunButton").disabled=!(asnCount&&dispatchCount&&sfdaFile);
+  }
+ 
+  ["fullAsnFiles","fullDispatchFiles","fullSfdaFile"].forEach(id=>{
+    $(id).addEventListener("change",updateFullFileInputs);
+  });
+ 
+  function setFullProgress(percent,label){
+    $("fullProgressCard").classList.add("show");
+    $("fullProgressBar").style.width=`${percent}%`;
+    $("fullProgressPercent").textContent=`${percent}%`;
+    $("fullProgressLabel").textContent=label;
+ 
+    const completed=
+      percent>=100?4:
+      percent>=80?3:
+      percent>=55?2:
+      percent>=20?1:0;
+ 
+    [
+      $("fullStepRead"),
+      $("fullStepNormalize"),
+      $("fullStepMaster"),
+      $("fullStepSave")
+    ].forEach((step,index)=>{
+      const done=index<completed;
+      step.classList.toggle("done",done);
+      step.textContent=(done?"✓":"○")+" "+step.textContent.replace(/^[✓○]\s*/,"");
+    });
+  }
+ 
+  function startFullProgress(){
+    clearInterval(fullProgressTimer);
+    setFullProgress(10,"Reading historical files...");
+ 
+    fullProgressTimer=setInterval(()=>{
+      const current=parseInt($("fullProgressPercent").textContent)||10;
+      const next=Math.min(90,current+5);
+      const label=
+        next<35?"Reading historical files...":
+        next<60?"Normalizing receipt and dispatch events...":
+        next<80?"Building cumulative Batch Master...":
+        "Saving events and Batch Master to Azure SQL...";
+ 
+      setFullProgress(next,label);
+    },1500);
+  }
+ 
+  function finishFullProgress(success){
+    clearInterval(fullProgressTimer);
+ 
+    if(success){
+      setFullProgress(100,"Full Reconciliation completed successfully.");
+    }else{
+      $("fullProgressCard").classList.add("show");
+      $("fullProgressBar").style.width="100%";
+      $("fullProgressPercent").textContent="Failed";
+      $("fullProgressLabel").textContent="Full Reconciliation failed.";
+    }
+  }
+ 
+  function showFullStatus(message,type){
+    const box=$("fullStatusBox");
+    box.className=`status-banner ${type} show`;
+    box.innerHTML=`<span>${type==="success"?"✓":"!"}</span><div>${message}</div>`;
+  }
+ 
+  function renderFullPreview(rows){
+    const body=$("fullPreviewBody");
+    body.innerHTML="";
+ 
+    (rows||[]).forEach(row=>{
+      const tr=document.createElement("tr");
+ 
+      const sfdaStatus=String(
+        row["Exists in SFDA"]
+        ?? row["SFDA Status"]
+        ?? ""
+      ).trim();
+ 
+      const sfdaStatusHtml=sfdaStatus==="Missing Batch"
+        ? '<span class="badge danger">Missing Batch</span>'
+        : '<span class="badge success">Yes</span>';
+ 
+      if(sfdaStatus==="Missing Batch"){
+        tr.style.background="#fff4f4";
+      }
+ 
+      tr.innerHTML=`
+        <td>${escapeHtml(row.BN)}</td>
+        <td>${escapeHtml(row["Expiry Month Key"])}</td>
+        <td>${escapeHtml(row.GTIN)}</td>
+        <td>${escapeHtml(row["Drug Name"])}</td>
+        <td>${escapeHtml(row["Generic Item Number"])}</td>
+        <td>${sfdaStatusHtml}</td>
+        <td>${formatNumber(row["Total Receive Qty"])}</td>
+        <td>${formatNumber(row["Total Dispatched Qty"])}</td>
+        <td>${formatNumber(row["Net Received Less Dispatch"])}</td>
+        <td>${formatNumber(row["Receive Runs"])}</td>
+        <td>${formatNumber(row["Dispatch Runs"])}</td>
+      `;
+      body.appendChild(tr);
+    });
+ 
+    if(!rows||!rows.length){
+      body.innerHTML='<tr><td colspan="11"><div class="empty"><strong>No Batch Master rows returned</strong>The request completed but the Batch Master preview is empty.</div></td></tr>';
+    }
+  }
+ 
+  function getBatchMasterOutput(outputs){
+    if(!outputs||typeof outputs!=="object") return null;
+ 
+    if(outputs["Batch_Master.xlsx"]){
+      return {
+        name:"Batch_Master.xlsx",
+        ...outputs["Batch_Master.xlsx"]
+      };
+    }
+ 
+    for(const [name,value] of Object.entries(outputs)){
+      if(
+        value
+        && typeof value==="object"
+        && typeof value.content==="string"
+      ){
+        return {
+          name,
+          ...value
+        };
+      }
+    }
+ 
+    return null;
+  }
+});
  
   const ACCEPT_INPUTS=[
     {input:"acceptAsn",meta:"acceptAsnName",field:"asn"},
@@ -1724,262 +2332,6 @@
   navigate(initialPage, {skipHash:true, instant:true});
  
  
-  // ============================================================
-  // FULL RECONCILIATION — STEP 1 & STEP 2
-  // ============================================================
-
-  let step1Result = null;
-  let step2Result = null;
-  let step2Files = [];
-
-  function setFileMeta(inputId, metaId, multiple=false){
-    const input=$(inputId), meta=$(metaId);
-    if(!input||!meta) return;
-    if(!input.files.length){ meta.textContent="No file selected"; meta.classList.remove("ready"); return; }
-    meta.textContent=multiple
-      ? `${input.files.length} file(s) selected`
-      : `${input.files[0].name} · ${(input.files[0].size/1024/1024).toFixed(2)} MB`;
-    meta.classList.add("ready");
-  }
-
-  function updateFullButtons(){
-    const step1Ready=$('step1AsnFiles').files.length>0&&$('step1DispatchFiles').files.length>0&&$('step1SfdaFile').files.length>0;
-    const step2Ready=$('step2InventoryFile').files.length>0&&$('step2SfdaFile').files.length>0;
-    $('step1Button').disabled=!step1Ready;
-    $('step2Button').disabled=!step2Ready;
-  }
-
-  function setOperationStatus(id,message,type){
-    const box=$(id);
-    box.className=`status-banner ${type} show`;
-    box.innerHTML=`<span>${type==='success'?'✓':type==='error'?'!':'ⓘ'}</span><div>${message}</div>`;
-  }
-
-  function progressConfig(prefix){
-    return {
-      card:$(`${prefix}ProgressCard`), bar:$(`${prefix}ProgressBar`),
-      percent:$(`${prefix}ProgressPercent`), label:$(`${prefix}ProgressLabel`),
-      steps:[
-        $(`${prefix}StepRead`),$(`${prefix}StepValidate`),
-        $(prefix==='step1'?`${prefix}StepBuild`:`${prefix}StepMatch`),
-        $(prefix==='step1'?`${prefix}StepSave`:`${prefix}StepGenerate`)
-      ]
-    };
-  }
-
-  function updateOperationProgress(config,value,label){
-    config.card.classList.add('show');
-    config.bar.style.width=`${value}%`;
-    config.percent.textContent=`${value}%`;
-    config.label.textContent=label;
-    config.steps.forEach((step,index)=>{
-      const thresholds=[15,38,65,92];
-      const done=value>=thresholds[index];
-      step.classList.toggle('done',done);
-      step.textContent=(done?'✓':'○')+step.textContent.slice(1);
-    });
-  }
-
-  function startOperationProgress(prefix,labels){
-    const config=progressConfig(prefix);
-    let value=8;
-    updateOperationProgress(config,value,labels[0]);
-    const timer=setInterval(()=>{
-      value=Math.min(90,value+Math.max(2,Math.round((90-value)/7)));
-      const label=value<30?labels[0]:value<55?labels[1]:value<78?labels[2]:labels[3];
-      updateOperationProgress(config,value,label);
-    },900);
-    return {timer,config};
-  }
-
-  function finishOperationProgress(state,success,message){
-    clearInterval(state.timer);
-    if(success){
-      updateOperationProgress(state.config,100,message);
-    }else{
-      state.config.card.classList.add('show');
-      state.config.bar.style.width='100%';
-      state.config.percent.textContent='Failed';
-      state.config.label.textContent=message;
-    }
-  }
-
-  function normalizeOutputFile(value,fallbackName){
-    if(!value) return null;
-    if(typeof value==='string') return {name:fallbackName||'output.txt',content:value,encoding:'text',mime:'text/plain'};
-    if(typeof value!=='object') return null;
-    if(typeof value.content==='string'||typeof value.data==='string'){
-      return {
-        name:value.name||value.file_name||fallbackName||'output.bin',
-        content:value.content??value.data??'',
-        encoding:value.encoding||'base64',
-        mime:value.mime_type||value.mime||'application/octet-stream'
-      };
-    }
-    return null;
-  }
-
-  function collectOutputFiles(group,prefix=''){
-    const files=[];
-    if(!group) return files;
-    const direct=normalizeOutputFile(group,prefix||undefined);
-    if(direct){ files.push(direct); return files; }
-    if(Array.isArray(group)){
-      group.forEach((item,index)=>{
-        const file=normalizeOutputFile(item,item?.name||`${prefix||'Output'}_${index+1}`);
-        if(file) files.push(file);
-      });
-      return files;
-    }
-    if(typeof group==='object'){
-      Object.entries(group).forEach(([name,value])=>{
-        const file=normalizeOutputFile(value,name);
-        if(file) files.push(file);
-        else if(value&&typeof value==='object') files.push(...collectOutputFiles(value,name));
-      });
-    }
-    return files;
-  }
-
-  function renderDownloadFiles(containerId,files,emptyMessage){
-    const container=$(containerId);
-    container.innerHTML='';
-    if(!files.length){
-      container.innerHTML=`<div class="empty"><strong>No files generated</strong>${escapeHtml(emptyMessage)}</div>`;
-      return;
-    }
-    files.forEach(file=>{
-      const ext=(file.name.split('.').pop()||'FILE').toUpperCase();
-      const row=document.createElement('div');
-      row.className='download-row';
-      row.innerHTML=`<div class="file-type ${ext==='XLSX'||ext==='XLS'?'xlsx':''}">${escapeHtml(ext.slice(0,4))}</div><div><div class="file-name">${escapeHtml(file.name)}</div><div class="file-info">Ready for download</div></div><button class="btn btn-secondary" type="button">Download</button>`;
-      row.querySelector('button').addEventListener('click',()=>downloadStructured(file));
-      container.appendChild(row);
-    });
-  }
-
-  async function downloadFilesZip(files,name){
-    const zip=new JSZip();
-    files.forEach(file=>{
-      if(file.encoding==='base64') zip.file(file.name,file.content,{base64:true});
-      else zip.file(file.name,file.content??'');
-    });
-    triggerBlob(name,await zip.generateAsync({type:'blob'}));
-  }
-
-  ['step1AsnFiles','step1DispatchFiles','step1SfdaFile','step2InventoryFile','step2SfdaFile'].forEach(id=>{
-    $(id)?.addEventListener('change',()=>{
-      if(id==='step1AsnFiles') setFileMeta(id,'step1AsnMeta',true);
-      if(id==='step1DispatchFiles') setFileMeta(id,'step1DispatchMeta',true);
-      if(id==='step1SfdaFile') setFileMeta(id,'step1SfdaMeta');
-      if(id==='step2InventoryFile') setFileMeta(id,'step2InventoryMeta');
-      if(id==='step2SfdaFile') setFileMeta(id,'step2SfdaMeta');
-      updateFullButtons();
-    });
-  });
-
-  $('step1Form')?.addEventListener('submit',async event=>{
-    event.preventDefault();
-    const button=$('step1Button');
-    const operation=document.querySelector('input[name="step1Operation"]:checked')?.value||'append';
-    if(operation==='rebuild'&&!window.confirm('Rebuild will clear the current Version 5 history and rebuild it from the selected files. Continue?')) return;
-
-    const formData=new FormData();
-    Array.from($('step1AsnFiles').files).forEach(file=>formData.append('asn_files',file,file.name));
-    Array.from($('step1DispatchFiles').files).forEach(file=>formData.append('dispatch_files',file,file.name));
-    formData.append('sfda',$('step1SfdaFile').files[0],$('step1SfdaFile').files[0].name);
-    formData.append('operation',operation);
-
-    button.disabled=true; button.textContent='Processing...';
-    $('step1Results').classList.remove('show');
-    $('step1Status').className='status-banner';
-    const progress=startOperationProgress('step1',['Reading historical files...','Validating and normalizing data...','Building cumulative Batch Master...','Saving database and Excel output...']);
-
-    try{
-      const response=await fetch('/api/batch-master/build',{method:'POST',body:formData,cache:'no-store'});
-      const text=await response.text();
-      let result; try{result=JSON.parse(text);}catch{throw new Error(`HTTP ${response.status}: Server response was not valid JSON. ${text.slice(0,220)}`);}
-      if(!response.ok||result.status!=='Completed') throw new Error(result.error||result.message||`Build failed with HTTP ${response.status}`);
-
-      step1Result=result;
-      finishOperationProgress(progress,true,'Batch Master completed successfully.');
-      const summary=result.summary||{};
-      const files=collectOutputFiles(result.outputs,'Batch_Master.xlsx');
-      $('step1ReceiptCount').textContent=formatNumber(summary.new_receipt_events??summary.prepared_receipt_events??0);
-      $('step1DispatchCount').textContent=formatNumber(summary.new_dispatch_events??summary.prepared_dispatch_events??0);
-      $('step1MasterCount').textContent=formatNumber(summary.batch_master_rows??0);
-      $('step1FileCount').textContent=formatNumber(files.length);
-      renderDownloadFiles('step1FilesList',files,'The API did not return a Batch Master file.');
-      $('step1Results').classList.add('show');
-      setOperationStatus('step1Status',`<strong>Batch Master ${operation==='rebuild'?'rebuilt':'updated'} successfully.</strong><br>${formatNumber(summary.batch_master_rows??0)} rows are stored in Azure SQL. The generated Batch Master file is available below.`,'success');
-      toast('Batch Master completed successfully.','success');
-    }catch(error){
-      finishOperationProgress(progress,false,'Batch Master failed.');
-      setOperationStatus('step1Status',escapeHtml(error.message||String(error)),'error');
-      toast(error.message||String(error),'error');
-    }finally{
-      button.textContent='▶ Build Batch Master';
-      updateFullButtons();
-    }
-  });
-
-  $('step2Form')?.addEventListener('submit',async event=>{
-    event.preventDefault();
-    const button=$('step2Button');
-    const formData=new FormData();
-    formData.append('inventory',$('step2InventoryFile').files[0],$('step2InventoryFile').files[0].name);
-    formData.append('sfda',$('step2SfdaFile').files[0],$('step2SfdaFile').files[0].name);
-
-    button.disabled=true; button.textContent='Processing...';
-    $('step2Results').classList.remove('show');
-    $('step2Status').className='status-banner';
-    $('step2DownloadAll').disabled=true;
-    const progress=startOperationProgress('step2',['Reading current files...','Validating Inventory and SFDA...','Matching Batch Master and calculating quantities...','Generating Excel and CSV outputs...']);
-
-    try{
-      const response=await fetch('/api/reconcile',{method:'POST',body:formData,cache:'no-store'});
-      const text=await response.text();
-      let result; try{result=JSON.parse(text);}catch{throw new Error(`HTTP ${response.status}: Server response was not valid JSON. ${text.slice(0,220)}`);}
-      if(!response.ok||result.status!=='Completed') throw new Error(result.error||result.message||`Reconciliation failed with HTTP ${response.status}`);
-
-      step2Result=result;
-      finishOperationProgress(progress,true,'Reconciliation and output generation completed.');
-      const summary=result.summary||{}, outputs=result.outputs||{};
-      step2Files=[];
-      step2Files.push(...collectOutputFiles(outputs.reconciliation_report,'Reconciliation_Report.xlsx'));
-      step2Files.push(...collectOutputFiles(outputs.accept_files,'Accept'));
-      step2Files.push(...collectOutputFiles(outputs.dispatch_files,'Dispatch'));
-      Object.entries(outputs).forEach(([key,value])=>{
-        if(['reconciliation_report','accept_files','dispatch_files'].includes(key)) return;
-        step2Files.push(...collectOutputFiles(value,key));
-      });
-      const unique=new Map(); step2Files.forEach(file=>unique.set(`${file.name}|${file.content?.length||0}`,file)); step2Files=[...unique.values()];
-
-      $('step2ReportCount').textContent=formatNumber(summary.reconciliation_rows??0);
-      $('step2AcceptCount').textContent=formatNumber(summary.accept_rows??0);
-      $('step2DispatchCount').textContent=formatNumber(summary.dispatch_allocation_rows??summary.dispatch_rows??0);
-      $('step2FileCount').textContent=formatNumber(step2Files.length);
-      renderDownloadFiles('step2FilesList',step2Files,'The reconciliation completed without downloadable files.');
-      $('step2DownloadAll').disabled=step2Files.length===0;
-      $('step2Results').classList.add('show');
-      setOperationStatus('step2Status',`<strong>Initial reconciliation completed successfully.</strong><br>${formatNumber(summary.reconciliation_rows??0)} reconciliation rows processed. Download the report and all generated SFDA upload files below.`,'success');
-      toast('Reconciliation files generated successfully.','success');
-    }catch(error){
-      finishOperationProgress(progress,false,'Reconciliation failed.');
-      setOperationStatus('step2Status',escapeHtml(error.message||String(error)),'error');
-      toast(error.message||String(error),'error');
-    }finally{
-      button.textContent='▶ Generate Reconciliation Files';
-      updateFullButtons();
-    }
-  });
-
-  $('step2DownloadAll')?.addEventListener('click',()=>{
-    if(step2Files.length) downloadFilesZip(step2Files,'SFDA_Full_Reconciliation_Results.zip');
-  });
-
-  updateFullButtons();
-
-</script>
+  </script>
 </body>
 </html>
