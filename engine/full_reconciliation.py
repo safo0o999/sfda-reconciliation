@@ -178,53 +178,39 @@ class FullReconciliationEngine:
         )
 
     def normalize(self) -> None:
-        self.asn = Normalizer.normalize_asn(
-            self.asn
-        )
+        if not self.asn.empty:
+            self.asn = Normalizer.normalize_asn(self.asn)
+            self.asn["Expiry Month Key"] = self._month_key(
+                self.asn["Expiry Date"]
+            )
+            self.asn["Received Quantity"] = self._normalize_quantity(
+                self.asn["Received Quantity"]
+            )
+        else:
+            self.asn = pd.DataFrame(columns=self.RECEIPT_EVENT_COLUMNS)
 
-        self.dispatch = Normalizer.normalize_dispatch(
-            self.dispatch
-        )
+        if not self.dispatch.empty:
+            self.dispatch = Normalizer.normalize_dispatch(self.dispatch)
+            self.dispatch["Expiry Month Key"] = self._month_key(
+                self.dispatch["Expiry Date"]
+            )
+            self.dispatch["Dispatched Quantity"] = self._normalize_quantity(
+                self.dispatch["Dispatched Quantity"]
+            )
+        else:
+            self.dispatch = pd.DataFrame(columns=self.DISPATCH_EVENT_COLUMNS)
 
-        self.sfda = Normalizer.normalize_sfda(
-            self.sfda
-        )
-
-        self.asn["Expiry Month Key"] = self._month_key(
-            self.asn["Expiry Date"]
-        )
-
-        self.dispatch["Expiry Month Key"] = self._month_key(
-            self.dispatch["Expiry Date"]
-        )
-
+        self.sfda = Normalizer.normalize_sfda(self.sfda)
         self.sfda["Expiry Month Key"] = self._month_key(
             self.sfda["Expiry Date"]
         )
 
-        self.asn["Received Quantity"] = self._normalize_quantity(
-            self.asn["Received Quantity"]
-        )
-
-        self.dispatch["Dispatched Quantity"] = self._normalize_quantity(
-            self.dispatch["Dispatched Quantity"]
-        )
-
     def validate(self) -> None:
-        Validator.validate(
-            self.asn,
-            "ASN",
-        )
-
-        Validator.validate(
-            self.dispatch,
-            "DISPATCH",
-        )
-
-        Validator.validate(
-            self.sfda,
-            "SFDA",
-        )
+        if not self.asn.empty:
+            Validator.validate(self.asn, "ASN")
+        if not self.dispatch.empty:
+            Validator.validate(self.dispatch, "DISPATCH")
+        Validator.validate(self.sfda, "SFDA")
 
     def _sfda_keys(self) -> pd.DataFrame:
         required = [
