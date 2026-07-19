@@ -401,7 +401,6 @@ class ReconciliationEngine:
             + [
                 "GTIN",
                 "Drug Name",
-                "Expiry Date",
                 "PackageSize",
                 "To Be Dispatched",
             ],
