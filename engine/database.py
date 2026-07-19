@@ -70,6 +70,40 @@ BEGIN
     );
 END;
 
+IF OBJECT_ID('dbo.BatchMaster', 'U') IS NOT NULL
+   AND COL_LENGTH('dbo.BatchMaster', 'FullRunID') IS NOT NULL
+BEGIN
+    DECLARE @LegacyTableName sysname;
+    DECLARE @LegacyObjectName nvarchar(300);
+    DECLARE @LegacySuffix int = 0;
+
+    SET @LegacyTableName =
+        N'BatchMaster_Legacy_'
+        + CONVERT(char(8), SYSUTCDATETIME(), 112)
+        + N'_'
+        + REPLACE(CONVERT(char(8), SYSUTCDATETIME(), 108), ':', '');
+
+    SET @LegacyObjectName = N'dbo.' + @LegacyTableName;
+
+    WHILE OBJECT_ID(@LegacyObjectName, 'U') IS NOT NULL
+    BEGIN
+        SET @LegacySuffix = @LegacySuffix + 1;
+        SET @LegacyTableName =
+            N'BatchMaster_Legacy_'
+            + CONVERT(char(8), SYSUTCDATETIME(), 112)
+            + N'_'
+            + REPLACE(CONVERT(char(8), SYSUTCDATETIME(), 108), ':', '')
+            + N'_'
+            + CONVERT(nvarchar(10), @LegacySuffix);
+        SET @LegacyObjectName = N'dbo.' + @LegacyTableName;
+    END;
+
+    EXEC sys.sp_rename
+        @objname = N'dbo.BatchMaster',
+        @newname = @LegacyTableName,
+        @objtype = N'OBJECT';
+END;
+
 IF OBJECT_ID('dbo.BatchMaster', 'U') IS NULL
 BEGIN
     CREATE TABLE dbo.BatchMaster
@@ -83,22 +117,22 @@ BEGIN
         GTIN nvarchar(20) NULL,
         DrugName nvarchar(500) NULL,
         TotalReceiveQty decimal(19,4) NOT NULL
-            CONSTRAINT DF_BatchMaster_TotalReceiveQty DEFAULT 0,
+            CONSTRAINT DF_BatchMasterV5_TotalReceiveQty DEFAULT 0,
         TotalDispatchedQty decimal(19,4) NOT NULL
-            CONSTRAINT DF_BatchMaster_TotalDispatchedQty DEFAULT 0,
+            CONSTRAINT DF_BatchMasterV5_TotalDispatchedQty DEFAULT 0,
         ReceiveRuns int NOT NULL
-            CONSTRAINT DF_BatchMaster_ReceiveRuns DEFAULT 0,
+            CONSTRAINT DF_BatchMasterV5_ReceiveRuns DEFAULT 0,
         DispatchRuns int NOT NULL
-            CONSTRAINT DF_BatchMaster_DispatchRuns DEFAULT 0,
+            CONSTRAINT DF_BatchMasterV5_DispatchRuns DEFAULT 0,
         FirstReceivedDate datetime2 NULL,
         LastReceivedDate datetime2 NULL,
         FirstDispatchDate datetime2 NULL,
         LastDispatchDate datetime2 NULL,
         GenericExistsInSFDA nvarchar(30) NOT NULL
-            CONSTRAINT DF_BatchMaster_GenericExistsInSFDA DEFAULT 'Yes',
+            CONSTRAINT DF_BatchMasterV5_GenericExistsInSFDA DEFAULT 'Yes',
         LastUpdated datetime2 NOT NULL
-            CONSTRAINT DF_BatchMaster_LastUpdated DEFAULT SYSUTCDATETIME(),
-        CONSTRAINT PK_BatchMaster PRIMARY KEY
+            CONSTRAINT DF_BatchMasterV5_LastUpdated DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_BatchMasterV5 PRIMARY KEY
         (
             BN,
             ExpiryMonthKey,
@@ -106,7 +140,6 @@ BEGIN
         )
     );
 END;
-
 
 IF COL_LENGTH('dbo.ReceiptEvents', 'ExpiryDate') IS NULL
 BEGIN
