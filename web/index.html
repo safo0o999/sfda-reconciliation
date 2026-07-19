@@ -560,7 +560,7 @@
       <!-- UPLOAD -->
       <section class="page" id="page-upload">
         <div class="page-head">
-          <div><h1>Upload & Run Reconciliation</h1><p>Upload the four required Excel reports and execute the reconciliation workflow.</p></div>
+          <div><h1>Upload & Run Reconciliation</h1><p>Run Accept first using ASN + SFDA, upload the result to SFDA, then run Dispatch using Full Dispatch + Inventory + the refreshed SFDA report.</p></div>
           <div class="actions"><button class="btn btn-secondary" id="resetButton">↻ Reset</button></div>
         </div>
  
@@ -570,8 +570,7 @@
             <div class="card-subtitle" style="margin:6px 0 18px">Generate Accept files from actual ASN receipts and current SFDA receive pending quantities.</div>
             <div class="grid">
               <div class="file-card"><div class="file-title">① ASN Receipt Detailed Report</div><div class="file-row"><input id="acceptAsn" name="asn" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="acceptAsnName">No file selected</div></div>
-              <div class="file-card"><div class="file-title">② Inventory Status Report</div><div class="file-row"><input id="acceptInventory" name="inventory" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="acceptInventoryName">No file selected</div></div>
-              <div class="file-card"><div class="file-title">③ SFDA Drug Count — Before Accept</div><div class="file-row"><input id="acceptSfda" name="sfda" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="acceptSfdaName">No file selected</div></div>
+              <div class="file-card"><div class="file-title">② SFDA Drug Count — Before Accept</div><div class="file-row"><input id="acceptSfda" name="sfda" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="acceptSfdaName">No file selected</div></div>
             </div>
             <button class="btn btn-success" id="acceptRunButton" type="submit" disabled style="margin-top:16px;width:100%">▶ Generate Accept Files</button>
             <div class="card progress-card" id="acceptProgressCard" style="box-shadow:none">
@@ -677,7 +676,7 @@
         <div class="status-banner info show">
           <span>ⓘ</span>
           <div>
-            <strong>Two-Step Process:</strong> Step 1: Upload all historical files to build Batch Master. Step 2: Upload inventory for initial reconciliation. After this, use "Upload & Run" daily.
+            <strong>Independent Processes:</strong> Full Reconciliation builds the historical Batch Master. Upload & Run remains independent and works even when Batch Master has not been created.
           </div>
         </div>
  
@@ -709,7 +708,7 @@
                   <span class="badge info">Multiple</span>
                 </div>
                 <div class="file-row">
-                  <input id="step1AsnFiles" name="asn_files" type="file" accept=".xls,.xlsx" multiple required>
+                  <input id="step1AsnFiles" name="asn_files" type="file" accept=".xls,.xlsx" multiple>
                 </div>
                 <div class="file-meta" id="step1AsnMeta">No files selected</div>
               </div>
@@ -723,7 +722,7 @@
                   <span class="badge info">Multiple</span>
                 </div>
                 <div class="file-row">
-                  <input id="step1DispatchFiles" name="dispatch_files" type="file" accept=".xls,.xlsx" multiple required>
+                  <input id="step1DispatchFiles" name="dispatch_files" type="file" accept=".xls,.xlsx" multiple>
                 </div>
                 <div class="file-meta" id="step1DispatchMeta">No files selected</div>
               </div>
@@ -786,7 +785,8 @@
         </div>
  
         <!-- STEP 2: INITIAL RECONCILIATION -->
-        <div style="margin:32px 0">
+        <div id="legacyInitialReconciliation" style="display:none">
+<div style="margin:32px 0">
           <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
             <div style="width:40px;height:40px;border-radius:50%;background:#D85A30;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:18px">2</div>
             <div>
@@ -852,6 +852,7 @@
           </div>
         </div>
  
+</div>
         <!-- RESULTS SECTION -->
         <div class="inline-results result-anchor" id="fullReconciliationResults" style="display:none;margin-top:32px">
           <div class="result-head"><div><h2>Full Reconciliation Results</h2><p>Download the Batch Master and reconciliation files below.</p></div><button class="btn btn-purple" id="fullDownloadAllButton">⇩ Download All Results</button></div>
@@ -970,12 +971,12 @@
 <div class="toast-wrap" id="toastWrap"></div>
  
 <script>
-  const ACCEPT_API_URL = "/api/reconcile";
-  const DISPATCH_API_URL = "/api/reconcile";
+  const ACCEPT_API_URL = "/api/process-accept";
+  const DISPATCH_API_URL = "/api/process-dispatch";
   const VERIFY_URL = "/api/verify";
   const HEALTH_URL = "/api/health";
   const VERSION_URL = "/api/version";
-  const ACCEPT_FILE_KEYS = ["acceptAsn","acceptInventory","acceptSfda"];
+  const ACCEPT_FILE_KEYS = ["acceptAsn","acceptSfda"];
   const DISPATCH_FILE_KEYS = ["dispatchReport","dispatchInventory","dispatchSfda"];
   const HISTORY_URL = "/api/history";
   const DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v1";
@@ -1081,7 +1082,6 @@
  
   const ACCEPT_INPUTS=[
     {input:"acceptAsn",meta:"acceptAsnName",field:"asn"},
-    {input:"acceptInventory",meta:"acceptInventoryName",field:"inventory"},
     {input:"acceptSfda",meta:"acceptSfdaName",field:"sfda"}
   ];
   const DISPATCH_INPUTS=[
@@ -1868,9 +1868,9 @@
 
   function updateFullSetupButtons(){
     const step1Ready=
-      element("step1AsnFiles")?.files.length>0 &&
-      element("step1DispatchFiles")?.files.length>0 &&
-      element("step1SfdaFile")?.files.length>0;
+      ((element("step1AsnFiles")?.files.length||0)>0 ||
+       (element("step1DispatchFiles")?.files.length||0)>0) &&
+      (element("step1SfdaFile")?.files.length||0)>0;
     const step2Ready=
       element("step2InventoryFile")?.files.length>0 &&
       element("step2SfdaFile")?.files.length>0;
@@ -2031,8 +2031,8 @@
     const asn=element("step1AsnFiles");
     const dispatch=element("step1DispatchFiles");
     const sfda=element("step1SfdaFile");
-    if(!asn?.files.length||!dispatch?.files.length||!sfda?.files.length){
-      showSetupError("Please select all Step 1 files.");
+    if((!asn?.files.length&&!dispatch?.files.length)||!sfda?.files.length){
+      showSetupError("Select ASN and/or Full Dispatch files, plus the latest SFDA report.");
       return;
     }
 
@@ -2040,8 +2040,8 @@
     if(operation==="rebuild"&&!window.confirm("Rebuild Full History will delete the current Version 5 history and rebuild it from the selected files. Continue?")) return;
 
     const formData=new FormData();
-    Array.from(asn.files).forEach(file=>formData.append("asn_files",file,file.name));
-    Array.from(dispatch.files).forEach(file=>formData.append("dispatch_files",file,file.name));
+    Array.from(asn?.files||[]).forEach(file=>formData.append("asn_files",file,file.name));
+    Array.from(dispatch?.files||[]).forEach(file=>formData.append("dispatch_files",file,file.name));
     formData.append("sfda",sfda.files[0],sfda.files[0].name);
     formData.append("operation",operation);
 
