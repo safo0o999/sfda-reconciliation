@@ -16,6 +16,28 @@ class Exporter:
     GTIN_LENGTH = 14
     DUMMY_GLN = "9999999999999"
 
+    ACCEPT_DETAILS_COLUMNS = [
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "PackageSize",
+        "Active",
+        "Quantity sent pending",
+        "Quantity Receive Pending",
+        "Generic Item Number",
+        "Received Quantity Each",
+        "Received Quantity Pack",
+        "Description",
+        "Inbound Shipment",
+        "Supplier Name",
+        "Supplier Code",
+        "Item Family Group",
+        "To Be Accept",
+        "Package Size Status",
+        "Batch Master Status",
+    ]
+
     @staticmethod
     def _normalize_identifier(value):
         if pd.isna(value):
@@ -332,6 +354,17 @@ class Exporter:
         return output
 
     @staticmethod
+    def _is_accept_details_report(file_name, sheet_name):
+        file_text = str(file_name or "").strip().lower()
+        sheet_text = str(sheet_name or "").strip().lower()
+
+        return (
+            "accept_details" in file_text
+            or "accept details" in file_text
+            or sheet_text == "accept details"
+        )
+
+    @staticmethod
     def build_formatted_excel_file(
         df,
         file_name,
@@ -346,7 +379,19 @@ class Exporter:
             else pd.DataFrame()
         )
 
-        if columns:
+        is_accept_details = Exporter._is_accept_details_report(
+            file_name,
+            sheet_name,
+        )
+
+        if is_accept_details:
+            # Accept Details has a fixed operational layout. Trade Name and
+            # any other non-approved columns are intentionally excluded.
+            report = report.reindex(
+                columns=Exporter.ACCEPT_DETAILS_COLUMNS
+            )
+
+        if columns and not is_accept_details:
             report = report[
                 [
                     column
@@ -382,24 +427,66 @@ class Exporter:
             column_count
         )
 
-        worksheet.merge_cells(
-            f"A1:{last_column}1"
-        )
-        worksheet["A1"] = title
-        worksheet["A1"].font = Font(
-            bold=True,
-            color="FFFFFF",
-            size=16,
-        )
-        worksheet["A1"].fill = PatternFill(
-            fill_type="solid",
-            fgColor="0F6CBD",
-        )
-        worksheet["A1"].alignment = Alignment(
-            horizontal="center"
-        )
+        if is_accept_details:
+            # Row 1 contains only the three source/decision groups.
+            # The old "SFDA Accept Details" title row is intentionally removed.
+            group_definitions = [
+                (1, 8, "SFDA Report", "5B9BD5"),
+                (9, 16, "WMS Receiving Report", "4472C4"),
+                (17, 19, "Decision", "70AD47"),
+            ]
 
-        header_row = 3
+            for start_column, end_column, group_title, fill_color in group_definitions:
+                start_letter = get_column_letter(start_column)
+                end_letter = get_column_letter(end_column)
+                worksheet.merge_cells(
+                    f"{start_letter}1:{end_letter}1"
+                )
+                group_cell = worksheet.cell(
+                    row=1,
+                    column=start_column,
+                    value=group_title,
+                )
+                group_cell.font = Font(
+                    bold=True,
+                    color="FFFFFF",
+                    size=11,
+                )
+                group_cell.fill = PatternFill(
+                    fill_type="solid",
+                    fgColor=fill_color,
+                )
+                group_cell.alignment = Alignment(
+                    horizontal="center",
+                    vertical="center",
+                )
+
+                for column_index in range(start_column, end_column + 1):
+                    worksheet.cell(row=1, column=column_index).fill = PatternFill(
+                        fill_type="solid",
+                        fgColor=fill_color,
+                    )
+
+            worksheet.row_dimensions[1].height = 22
+            header_row = 2
+        else:
+            worksheet.merge_cells(
+                f"A1:{last_column}1"
+            )
+            worksheet["A1"] = title
+            worksheet["A1"].font = Font(
+                bold=True,
+                color="FFFFFF",
+                size=16,
+            )
+            worksheet["A1"].fill = PatternFill(
+                fill_type="solid",
+                fgColor="0F6CBD",
+            )
+            worksheet["A1"].alignment = Alignment(
+                horizontal="center"
+            )
+            header_row = 3
         border = Border(
             left=Side(
                 style="thin",
@@ -432,12 +519,21 @@ class Exporter:
                 bold=True,
                 color="FFFFFF",
             )
+            if is_accept_details and column_index >= 17:
+                header_fill = "548235"
+            elif is_accept_details and column_index >= 9:
+                header_fill = "2F5597"
+            else:
+                header_fill = "17365D"
+
             cell.fill = PatternFill(
                 fill_type="solid",
-                fgColor="17365D",
+                fgColor=header_fill,
             )
             cell.alignment = Alignment(
-                horizontal="center"
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
             )
             cell.border = border
 
@@ -538,21 +634,27 @@ class Exporter:
                     )
 
         if len(report) > 0:
-            table = Table(
-                displayName="ReportTable",
-                ref=(
-                    f"A{header_row}:"
-                    f"{last_column}"
-                    f"{header_row + len(report)}"
-                ),
+            report_range = (
+                f"A{header_row}:"
+                f"{last_column}"
+                f"{header_row + len(report)}"
             )
-            table.tableStyleInfo = (
-                TableStyleInfo(
-                    name="TableStyleMedium2",
-                    showRowStripes=False,
+
+            if is_accept_details:
+                # Preserve the custom three-group header colors exactly.
+                worksheet.auto_filter.ref = report_range
+            else:
+                table = Table(
+                    displayName="ReportTable",
+                    ref=report_range,
                 )
-            )
-            worksheet.add_table(table)
+                table.tableStyleInfo = (
+                    TableStyleInfo(
+                        name="TableStyleMedium2",
+                        showRowStripes=False,
+                    )
+                )
+                worksheet.add_table(table)
 
         worksheet.freeze_panes = (
             f"A{header_row + 1}"
