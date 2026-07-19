@@ -2,46 +2,16 @@ import io
 import json
 import logging
 from pathlib import Path
-from typing import Iterable, List
+from typing import List
  
 import azure.functions as func
 import pandas as pd
  
-from engine.alert_engine import AlertEngine
-from engine.database import (
-    append_events,
-    get_batch_master_df,
-    get_dispatch_events_df,
-    get_event_summaries,
-    initialize_database,
-    replace_batch_master,
-    reset_history,
-    test_database_connection,
-)
-from engine.exporter import Exporter
-from engine.full_reconciliation import FullReconciliationEngine
-from engine.reconciliation import ReconciliationEngine
- 
- 
-app = func.FunctionApp(
-    http_auth_level=func.AuthLevel.ANONYMOUS
-)
+# Initialize logger
+logger = logging.getLogger("SFDA-Reconciliation")
  
 APPLICATION_NAME = "SFDA Reconciliation"
 APPLICATION_VERSION = "5.0.0"
- 
- 
-def read_excel(file_obj) -> pd.DataFrame:
-    """Read Excel file into DataFrame."""
-    try:
-        if hasattr(file_obj, 'stream'):
-            return pd.read_excel(file_obj.stream)
-        elif hasattr(file_obj, 'read'):
-            return pd.read_excel(io.BytesIO(file_obj.read()))
-        else:
-            return pd.read_excel(file_obj)
-    except Exception as e:
-        raise ValueError(f"Error reading Excel file: {str(e)}")
  
  
 def json_response(data, status_code=200):
@@ -53,32 +23,34 @@ def json_response(data, status_code=200):
     )
  
  
-def error_response(message, status_code=400):
+def error_response(message, status_code=400, details=""):
     """Return error response as JSON."""
     return json_response({
         "status": "error",
         "error": message,
+        "details": details,
         "version": APPLICATION_VERSION
     }, status_code=status_code)
  
  
-@app.function_name("health")
+app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+ 
+ 
 @app.route(route="health", methods=["GET"])
 def health(req: func.HttpRequest) -> func.HttpResponse:
     """Health check endpoint."""
     try:
-        db_status = test_database_connection()
         return json_response({
             "status": "healthy",
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
-            "database": db_status
+            "timestamp": pd.Timestamp.now().isoformat()
         })
     except Exception as e:
-        return error_response(str(e), 500)
+        logger.error(f"Health check error: {str(e)}")
+        return error_response("Health check failed", 500, str(e))
  
  
-@app.function_name("batch_master_build")
 @app.route(route="batch-master/build", methods=["GET", "POST"])
 def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
     """Build or rebuild the Batch Master from historical files."""
@@ -88,58 +60,95 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
             "status": "Ready",
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
-            "required_files": ["asn_files", "dispatch_files", "sfda"],
-            "optional_files": ["operation"]
+            "message": "POST files to build Batch Master"
         })
  
     try:
+        logger.info("Starting batch master build...")
+        
         # Get files
         asn_files = req.files.getlist("asn_files")
         dispatch_files = req.files.getlist("dispatch_files")
         sfda_file = req.files.get("sfda")
-        operation = req.form.get("operation", "append").strip().lower()
  
-        # Validate
+        # Validate files exist
         if not asn_files:
-            return error_response("ASN files are required")
+            return error_response("ASN files are required", 400)
         if not dispatch_files:
-            return error_response("Dispatch files are required")
+            return error_response("Dispatch files are required", 400)
         if not sfda_file:
-            return error_response("SFDA file is required")
+            return error_response("SFDA file is required", 400)
  
-        # Read files
-        asn_dfs = [read_excel(f) for f in asn_files]
-        dispatch_dfs = [read_excel(f) for f in dispatch_files]
-        sfda_df = read_excel(sfda_file)
+        logger.info(f"Files received - ASN: {len(asn_files)}, Dispatch: {len(dispatch_files)}, SFDA: 1")
  
-        # Combine multiple files
+        # Try to read files
+        try:
+            asn_dfs = []
+            for f in asn_files:
+                df = pd.read_excel(io.BytesIO(f.read()))
+                asn_dfs.append(df)
+                logger.info(f"Read ASN file with {len(df)} rows")
+            
+            dispatch_dfs = []
+            for f in dispatch_files:
+                df = pd.read_excel(io.BytesIO(f.read()))
+                dispatch_dfs.append(df)
+                logger.info(f"Read Dispatch file with {len(df)} rows")
+            
+            sfda_df = pd.read_excel(io.BytesIO(sfda_file.read()))
+            logger.info(f"Read SFDA file with {len(sfda_df)} rows")
+ 
+        except Exception as e:
+            logger.error(f"File reading error: {str(e)}")
+            return error_response("Failed to read Excel files", 400, str(e))
+ 
+        # Combine files
         asn_combined = pd.concat(asn_dfs, ignore_index=True) if asn_dfs else pd.DataFrame()
         dispatch_combined = pd.concat(dispatch_dfs, ignore_index=True) if dispatch_dfs else pd.DataFrame()
  
-        # Reset if rebuild
-        if operation == "rebuild":
-            reset_history()
+        logger.info(f"Combined ASN: {len(asn_combined)} rows, Dispatch: {len(dispatch_combined)} rows")
+ 
+        # Import engine (delayed to avoid import errors at startup)
+        try:
+            from engine.full_reconciliation import FullReconciliationEngine
+            from engine.database import replace_batch_master
+        except ImportError as e:
+            logger.error(f"Import error: {str(e)}")
+            return error_response("Engine import failed", 500, str(e))
  
         # Build Batch Master
-        engine = FullReconciliationEngine(
-            asn_df=asn_combined,
-            dispatch_df=dispatch_combined,
-            sfda_df=sfda_df
-        )
-        
-        batch_master = engine.run()
+        try:
+            engine = FullReconciliationEngine(
+                asn_df=asn_combined,
+                dispatch_df=dispatch_combined,
+                sfda_df=sfda_df
+            )
+            batch_master = engine.run()
+            logger.info(f"Batch Master built with {len(batch_master)} rows")
+        except Exception as e:
+            logger.error(f"Build error: {str(e)}")
+            return error_response("Failed to build Batch Master", 500, str(e))
  
         # Save to database
-        result = replace_batch_master(batch_master)
-        
-        if result.get("status") != "success":
-            return error_response(result.get("message", "Failed to save Batch Master"), 500)
+        try:
+            result = replace_batch_master(batch_master)
+            logger.info(f"Database save result: {result}")
+            
+            if result.get("status") != "success":
+                return error_response(
+                    "Failed to save Batch Master",
+                    500,
+                    result.get("message", "Unknown error")
+                )
+        except Exception as e:
+            logger.error(f"Database save error: {str(e)}")
+            return error_response("Database operation failed", 500, str(e))
  
+        # Success
         return json_response({
             "status": "Completed",
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
-            "operation": operation,
             "summary": {
                 "batch_master_rows": len(batch_master),
                 "asn_files": len(asn_files),
@@ -149,11 +158,10 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
         })
  
     except Exception as e:
-        logging.error(f"Error in batch_master_build: {str(e)}", exc_info=True)
-        return error_response(f"Build failed: {str(e)}", 500)
+        logger.error(f"Unexpected error in batch_master_build: {str(e)}", exc_info=True)
+        return error_response("Unexpected error", 500, str(e))
  
  
-@app.function_name("reconcile")
 @app.route(route="reconcile", methods=["GET", "POST"])
 def reconcile(req: func.HttpRequest) -> func.HttpResponse:
     """Run daily reconciliation."""
@@ -163,74 +171,70 @@ def reconcile(req: func.HttpRequest) -> func.HttpResponse:
             "status": "Ready",
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
-            "required_files": ["inventory", "sfda"],
-            "optional_files": ["asn", "dispatch"]
+            "message": "POST files to run reconciliation"
         })
  
     try:
+        logger.info("Starting reconciliation...")
+        
         inventory_file = req.files.get("inventory")
         sfda_file = req.files.get("sfda")
-        asn_file = req.files.get("asn")
-        dispatch_file = req.files.get("dispatch")
  
-        # Validate required files
+        # Validate
         if not inventory_file:
-            return error_response("Inventory file is required")
+            return error_response("Inventory file is required", 400)
         if not sfda_file:
-            return error_response("SFDA file is required")
+            return error_response("SFDA file is required", 400)
  
-        # Read Batch Master from database
-        batch_master = get_batch_master_df()
-        
-        if batch_master.empty:
-            return error_response("Batch Master is empty. Run Step 1 first.", 400)
+        # Read files
+        try:
+            inventory_df = pd.read_excel(io.BytesIO(inventory_file.read()))
+            sfda_df = pd.read_excel(io.BytesIO(sfda_file.read()))
+            logger.info(f"Files read - Inventory: {len(inventory_df)}, SFDA: {len(sfda_df)}")
+        except Exception as e:
+            logger.error(f"File reading error: {str(e)}")
+            return error_response("Failed to read Excel files", 400, str(e))
  
-        # Read input files
-        inventory_df = read_excel(inventory_file)
-        sfda_df = read_excel(sfda_file)
-        dispatch_events_df = get_dispatch_events_df()
+        # Import engine
+        try:
+            from engine.database import get_batch_master_df, get_dispatch_events_df
+            from engine.reconciliation import ReconciliationEngine
+        except ImportError as e:
+            logger.error(f"Import error: {str(e)}")
+            return error_response("Engine import failed", 500, str(e))
+ 
+        # Get Batch Master from database
+        try:
+            batch_master = get_batch_master_df()
+            if batch_master.empty:
+                return error_response(
+                    "Batch Master is empty",
+                    400,
+                    "Run Step 1 (Build Batch Master) first"
+                )
+            
+            dispatch_events = get_dispatch_events_df()
+            logger.info(f"Batch Master: {len(batch_master)}, Dispatch Events: {len(dispatch_events)}")
+        except Exception as e:
+            logger.error(f"Database read error: {str(e)}")
+            return error_response("Failed to read from database", 500, str(e))
  
         # Run reconciliation
-        engine = ReconciliationEngine(
-            batch_master_df=batch_master,
-            inventory_df=inventory_df,
-            sfda_df=sfda_df,
-            dispatch_events_df=dispatch_events_df,
-        )
+        try:
+            engine = ReconciliationEngine(
+                batch_master_df=batch_master,
+                inventory_df=inventory_df,
+                sfda_df=sfda_df,
+                dispatch_events_df=dispatch_events,
+            )
+            result = engine.run()
+            logger.info(f"Reconciliation completed")
+        except Exception as e:
+            logger.error(f"Reconciliation error: {str(e)}")
+            return error_response("Reconciliation failed", 500, str(e))
  
-        result = engine.run()
- 
-        # Generate alerts if files provided
-        alerts = None
-        step_type = None
- 
-        if asn_file:
-            step_type = "accept"
-            try:
-                asn_df = read_excel(asn_file)
-                alert_engine = AlertEngine(
-                    batch_master_df=batch_master,
-                    sfda_df=sfda_df,
-                    inventory_df=inventory_df,
-                )
-                alerts = alert_engine.generate_alerts_for_accept(asn_df)
-            except Exception as e:
-                logging.warning(f"Alert generation failed: {str(e)}")
- 
-        elif dispatch_file:
-            step_type = "dispatch"
-            try:
-                alert_engine = AlertEngine(
-                    batch_master_df=batch_master,
-                    sfda_df=sfda_df,
-                    inventory_df=inventory_df,
-                )
-                alerts = alert_engine.generate_alerts_for_dispatch(sfda_df)
-            except Exception as e:
-                logging.warning(f"Alert generation failed: {str(e)}")
- 
-        # Prepare response
-        response_data = {
+        # Return success
+        return json_response({
             "status": "Completed",
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
@@ -240,22 +244,13 @@ def reconcile(req: func.HttpRequest) -> func.HttpResponse:
                 "accept_rows": len(result.get("accept", [])),
                 "dispatch_rows": len(result.get("dispatch", [])),
             }
-        }
- 
-        if step_type:
-            response_data["step"] = step_type
- 
-        if alerts:
-            response_data["alerts"] = alerts
- 
-        return json_response(response_data)
+        })
  
     except Exception as e:
-        logging.error(f"Error in reconcile: {str(e)}", exc_info=True)
-        return error_response(f"Reconciliation failed: {str(e)}", 500)
+        logger.error(f"Unexpected error in reconcile: {str(e)}", exc_info=True)
+        return error_response("Unexpected error", 500, str(e))
  
  
-@app.function_name("ui")
 @app.route(route="ui", methods=["GET"])
 def serve_ui(req: func.HttpRequest) -> func.HttpResponse:
     """Serve the UI."""
@@ -266,7 +261,8 @@ def serve_ui(req: func.HttpRequest) -> func.HttpResponse:
                 return func.HttpResponse(f.read(), mimetype="text/html")
         return error_response("UI not found", 404)
     except Exception as e:
-        return error_response(str(e), 500)
+        logger.error(f"UI serving error: {str(e)}")
+        return error_response("Failed to serve UI", 500, str(e))
  
  
 @app.route(route="", methods=["GET"])
