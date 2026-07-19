@@ -10,18 +10,24 @@ from engine.validator import Validator
 
 
 class ReconciliationEngine:
-    """Daily reconciliation engine.
+    """Daily SFDA reconciliation engine.
 
-    Accept mode:
-        latest ASN/ASDT + current SFDA
+    Accept:
+        ASN/ASDT + SFDA
 
-    Dispatch mode:
-        latest Full Dispatch + latest Inventory + refreshed SFDA
+    Dispatch:
+        Full Dispatch + SFDA
 
-    Batch Master is optional enrichment. Its absence never blocks either mode.
+    Package size is always mapped in this order:
+        SFDA[Drug Name] -> Pack Size[Trade Name] -> PackageSize
+
+    After that, SFDA is matched to ASN / Full Dispatch by:
+        BN + Expiry Date
+
+    Batch Master is optional enrichment and never blocks daily processing.
     """
 
-    MATCH_KEYS = ["BN", "Expiry Month Key"]
+    MATCH_KEYS = ["BN", "Expiry Date"]
     DUMMY_GLN = "9999999999999"
 
     def __init__(
@@ -41,7 +47,11 @@ class ReconciliationEngine:
         self.sfda = sfda_df.copy() if sfda_df is not None else pd.DataFrame()
         self.asn = asn_df.copy() if asn_df is not None else pd.DataFrame()
         self.dispatch = dispatch_df.copy() if dispatch_df is not None else pd.DataFrame()
+
+        # Kept only for backward compatibility with older function_app.py calls.
+        # Inventory is intentionally not used by the current Dispatch logic.
         self.inventory = inventory_df.copy() if inventory_df is not None else pd.DataFrame()
+
         self.batch_master = (
             batch_master_df.copy()
             if batch_master_df is not None
@@ -49,6 +59,7 @@ class ReconciliationEngine:
         )
 
         config_dir = Path(__file__).resolve().parent.parent / "config"
+
         self.packsize = pd.read_excel(
             config_dir / "pack_size.xlsx",
             engine="openpyxl",
@@ -61,17 +72,16 @@ class ReconciliationEngine:
         )
 
     @staticmethod
-    def _month_key(series: pd.Series) -> pd.Series:
-        return Normalizer.date(series).dt.strftime("%Y-%m").fillna("")
-
-    @staticmethod
     def _safe_int(value: Any) -> int:
-        number = pd.to_numeric(pd.Series([value]), errors="coerce").fillna(0).iloc[0]
+        number = pd.to_numeric(
+            pd.Series([value]),
+            errors="coerce",
+        ).fillna(0).iloc[0]
+
         return max(0, int(number))
 
     @staticmethod
     def _join_unique(values: pd.Series) -> str:
-        """Join unique non-empty values without losing multi-shipment details."""
         unique_values = []
         seen = set()
 
@@ -80,7 +90,12 @@ class ReconciliationEngine:
                 continue
 
             text = str(value).strip()
-            if not text or text.lower() == "nan" or text in seen:
+
+            if (
+                not text
+                or text.lower() == "nan"
+                or text in seen
+            ):
                 continue
 
             seen.add(text)
@@ -94,59 +109,109 @@ class ReconciliationEngine:
         target: str,
         candidates: list[str],
     ) -> None:
-        """Create a normalized target column from the first available ASN alias."""
         for candidate in candidates:
             if candidate in frame.columns:
-                frame[target] = Normalizer.text(frame[candidate])
+                frame[target] = Normalizer.text(
+                    frame[candidate]
+                )
                 return
 
         frame[target] = ""
 
     def _normalize_common(self) -> None:
-        self.sfda = Normalizer.normalize_sfda(self.sfda)
-        self.sfda["Expiry Month Key"] = self._month_key(self.sfda["Expiry Date"])
-        self.packsize = Normalizer.normalize_packsize(self.packsize)
-        self.gln = Normalizer.normalize_gln(self.gln)
+        self.sfda = Normalizer.normalize_sfda(
+            self.sfda
+        )
+        self.packsize = Normalizer.normalize_packsize(
+            self.packsize
+        )
+        self.gln = Normalizer.normalize_gln(
+            self.gln
+        )
 
         if not self.batch_master.empty:
             if "BN" in self.batch_master.columns:
-                self.batch_master["BN"] = Normalizer.text(self.batch_master["BN"])
-            if "Expiry Month Key" not in self.batch_master.columns:
-                if "Expiry Date" in self.batch_master.columns:
-                    self.batch_master["Expiry Month Key"] = self._month_key(
-                        self.batch_master["Expiry Date"]
-                    )
-                else:
-                    self.batch_master["Expiry Month Key"] = ""
+                self.batch_master["BN"] = Normalizer.text(
+                    self.batch_master["BN"]
+                )
+
+            if "Expiry Date" in self.batch_master.columns:
+                self.batch_master["Expiry Date"] = Normalizer.date(
+                    self.batch_master["Expiry Date"]
+                )
 
     def _validate_common(self) -> None:
-        Validator.validate(self.sfda, "SFDA")
-        Validator.validate(self.packsize, "PACKSIZE")
+        Validator.validate(
+            self.sfda,
+            "SFDA",
+        )
+        Validator.validate(
+            self.packsize,
+            "PACKSIZE",
+        )
 
     def _pack_lookup(self) -> pd.DataFrame:
-        lookup = self.packsize[["Trade Name", "PackageSize"]].copy()
-        lookup["Trade Name"] = Normalizer.text(lookup["Trade Name"])
-        lookup["PackageSize"] = pd.to_numeric(
-            lookup["PackageSize"], errors="coerce"
+        """Prepare the single approved Drug Name -> PackageSize mapping."""
+        lookup = self.packsize[
+            ["Trade Name", "PackageSize"]
+        ].copy()
+
+        lookup["Drug Name"] = Normalizer.text(
+            lookup["Trade Name"]
         )
+        lookup["PackageSize"] = pd.to_numeric(
+            lookup["PackageSize"],
+            errors="coerce",
+        )
+
         lookup = lookup[
-            lookup["Trade Name"].ne("")
+            lookup["Drug Name"].ne("")
             & lookup["PackageSize"].notna()
             & lookup["PackageSize"].gt(0)
-        ]
-        return lookup.drop_duplicates("Trade Name", keep="first")
+        ].copy()
+
+        return (
+            lookup[
+                ["Drug Name", "PackageSize"]
+            ]
+            .drop_duplicates(
+                subset=["Drug Name"],
+                keep="first",
+            )
+            .reset_index(drop=True)
+        )
 
     def _sfda_summary(self) -> pd.DataFrame:
-        return (
-            self.sfda.groupby(self.MATCH_KEYS, dropna=False)
+        """Aggregate SFDA by exact batch and expiry, then attach PackageSize.
+
+        Important:
+        PackageSize is mapped from SFDA Drug Name only.
+        It is never mapped from ASN/Dispatch Trade Name.
+        """
+        sfda_summary = (
+            self.sfda.groupby(
+                self.MATCH_KEYS,
+                dropna=False,
+            )
             .agg(
                 GTIN=("GTIN", "first"),
                 **{
-                    "Drug Name": ("Drug Name", "first"),
-                    "Expiry Date": ("Expiry Date", "first"),
-                    "Quantity": ("Quantity", "sum"),
-                    "Active": ("Active", "sum"),
-                    "Quantity sent pending": ("Quantity sent pending", "sum"),
+                    "Drug Name": (
+                        "Drug Name",
+                        "first",
+                    ),
+                    "Quantity": (
+                        "Quantity",
+                        "sum",
+                    ),
+                    "Active": (
+                        "Active",
+                        "sum",
+                    ),
+                    "Quantity sent pending": (
+                        "Quantity sent pending",
+                        "sum",
+                    ),
                     "Quantity Receive Pending": (
                         "Quantity Receive Pending",
                         "sum",
@@ -156,118 +221,251 @@ class ReconciliationEngine:
             .reset_index()
         )
 
-    def _enrich_with_master(self, report: pd.DataFrame) -> pd.DataFrame:
+        sfda_summary = sfda_summary.merge(
+            self._pack_lookup(),
+            on="Drug Name",
+            how="left",
+            validate="many_to_one",
+        )
+
+        sfda_summary["PackageSize"] = pd.to_numeric(
+            sfda_summary["PackageSize"],
+            errors="coerce",
+        )
+
+        valid_package = (
+            sfda_summary["PackageSize"].notna()
+            & sfda_summary["PackageSize"].gt(0)
+        )
+
+        sfda_summary["Package Size Status"] = (
+            valid_package.map(
+                {
+                    True: "Mapped",
+                    False: "Missing",
+                }
+            )
+        )
+
+        return sfda_summary
+
+    def _enrich_with_master(
+        self,
+        report: pd.DataFrame,
+    ) -> pd.DataFrame:
         report = report.copy()
         report["Batch Master Status"] = "Not Available"
+
         if self.batch_master.empty:
             return report
 
         master = self.batch_master.copy()
+
         keep = [
             column
             for column in [
                 "BN",
-                "Expiry Month Key",
+                "Expiry Date",
                 "Generic Item Number",
+                "Total Received Qty",
                 "Total Receive Qty",
                 "Total Dispatched Qty",
                 "Generic Exists in SFDA",
             ]
             if column in master.columns
         ]
-        if not {"BN", "Expiry Month Key"}.issubset(keep):
+
+        if not set(self.MATCH_KEYS).issubset(keep):
             return report
 
-        master = master[keep].drop_duplicates(self.MATCH_KEYS, keep="first")
+        master = (
+            master[keep]
+            .drop_duplicates(
+                subset=self.MATCH_KEYS,
+                keep="first",
+            )
+        )
+
         report = report.merge(
             master,
             on=self.MATCH_KEYS,
             how="left",
             suffixes=("", " Master"),
         )
-        matched = report.get("Generic Exists in SFDA").notna() if "Generic Exists in SFDA" in report.columns else report.get("Total Receive Qty").notna()
-        report["Batch Master Status"] = matched.map({True: "Matched", False: "Not Found"})
+
+        candidate_columns = [
+            "Generic Exists in SFDA",
+            "Total Received Qty",
+            "Total Receive Qty",
+            "Total Dispatched Qty",
+        ]
+
+        matched = pd.Series(
+            False,
+            index=report.index,
+        )
+
+        for column in candidate_columns:
+            if column in report.columns:
+                matched = matched | report[column].notna()
+
+        report["Batch Master Status"] = matched.map(
+            {
+                True: "Matched",
+                False: "Not Found",
+            }
+        )
+
         return report
 
     def _run_accept(self) -> Dict[str, pd.DataFrame]:
         if self.asn.empty:
-            raise ValueError("ASN/ASDT file is required for Accept reconciliation.")
+            raise ValueError(
+                "ASN/ASDT file is required for Accept reconciliation."
+            )
 
-        self.asn = Normalizer.normalize_asn(self.asn)
-        Validator.validate(self.asn, "ASN")
-        self.asn["Expiry Month Key"] = self._month_key(self.asn["Expiry Date"])
+        self.asn = Normalizer.normalize_asn(
+            self.asn
+        )
+        Validator.validate(
+            self.asn,
+            "ASN",
+        )
 
-        # Keep the operational receiving fields required in Accept Details.
-        # Exact source names are preferred, with common aliases accepted.
         self._copy_first_available_column(
             self.asn,
             "Description",
-            ["Description", "Item Description", "Generic Item Description"],
+            [
+                "Description",
+                "Item Description",
+                "Generic Item Description",
+            ],
         )
         self._copy_first_available_column(
             self.asn,
             "Supplier Code",
-            ["Supplier Code", "Vendor Code", "Supplier Number"],
+            [
+                "Supplier Code",
+                "Vendor Code",
+                "Supplier Number",
+            ],
         )
         self._copy_first_available_column(
             self.asn,
             "Item Family Group",
-            ["Item Family Group", "Item Family", "Family Group"],
+            [
+                "Item Family Group",
+                "Item Family",
+                "Family Group",
+            ],
         )
 
         receiving = (
-            self.asn.groupby(self.MATCH_KEYS, dropna=False)
+            self.asn.groupby(
+                self.MATCH_KEYS,
+                dropna=False,
+            )
             .agg(
                 **{
-                    "Generic Item Number": ("Generic Item Number", "first"),
-                    "Trade Name": ("Trade Name", "first"),
-                    "Received Quantity Each": ("Received Quantity", "sum"),
-                    "ASN Expiry Date": ("Expiry Date", "first"),
-                    "Description": ("Description", self._join_unique),
-                    "Inbound Shipment": ("Inbound Shipment", self._join_unique),
-                    "Supplier Name": ("Supplier Name", self._join_unique),
-                    "Supplier Code": ("Supplier Code", self._join_unique),
-                    "Item Family Group": ("Item Family Group", self._join_unique),
+                    "Generic Item Number": (
+                        "Generic Item Number",
+                        "first",
+                    ),
+                    "Trade Name": (
+                        "Trade Name",
+                        "first",
+                    ),
+                    "Received Quantity Each": (
+                        "Received Quantity",
+                        "sum",
+                    ),
+                    "Description": (
+                        "Description",
+                        self._join_unique,
+                    ),
+                    "Inbound Shipment": (
+                        "Inbound Shipment",
+                        self._join_unique,
+                    ),
+                    "Supplier Name": (
+                        "Supplier Name",
+                        self._join_unique,
+                    ),
+                    "Supplier Code": (
+                        "Supplier Code",
+                        self._join_unique,
+                    ),
+                    "Item Family Group": (
+                        "Item Family Group",
+                        self._join_unique,
+                    ),
                 }
             )
             .reset_index()
         )
 
+        # Match WMS to the already-enriched SFDA table only by BN + Expiry Date.
         report = receiving.merge(
             self._sfda_summary(),
             on=self.MATCH_KEYS,
             how="inner",
             validate="one_to_one",
         )
-        report = report.merge(
-            self._pack_lookup(),
-            on="Trade Name",
-            how="left",
-            validate="many_to_one",
-        )
-        report["PackageSize"] = pd.to_numeric(report["PackageSize"], errors="coerce")
-        report["Package Size Status"] = report["PackageSize"].apply(
-            lambda value: "Mapped" if pd.notna(value) and float(value) > 0 else "Missing"
-        )
-        report["PackageSize"] = report["PackageSize"].fillna(1)
-        report.loc[report["PackageSize"] <= 0, "PackageSize"] = 1
 
-        report["Received Quantity Pack"] = (
-            pd.to_numeric(report["Received Quantity Each"], errors="coerce").fillna(0)
-            / report["PackageSize"]
+        valid_package = (
+            report["PackageSize"].notna()
+            & report["PackageSize"].gt(0)
         )
-        report["To Be Accept"] = report.apply(
+
+        report["Received Quantity Pack"] = 0.0
+        report.loc[
+            valid_package,
+            "Received Quantity Pack",
+        ] = (
+            pd.to_numeric(
+                report.loc[
+                    valid_package,
+                    "Received Quantity Each",
+                ],
+                errors="coerce",
+            ).fillna(0)
+            / report.loc[
+                valid_package,
+                "PackageSize",
+            ]
+        )
+
+        report["To Be Accept"] = 0
+
+        report.loc[
+            valid_package,
+            "To Be Accept",
+        ] = report.loc[
+            valid_package
+        ].apply(
             lambda row: min(
-                self._safe_int(row["Quantity Receive Pending"]),
-                self._safe_int(row["Received Quantity Pack"]),
+                self._safe_int(
+                    row["Quantity Receive Pending"]
+                ),
+                self._safe_int(
+                    row["Received Quantity Pack"]
+                ),
             ),
             axis=1,
         )
-        report = self._enrich_with_master(report)
+
+        report = self._enrich_with_master(
+            report
+        )
 
         accept = report.loc[
             report["To Be Accept"] > 0,
-            ["GTIN", "To Be Accept", "BN", "Expiry Date"],
+            [
+                "GTIN",
+                "To Be Accept",
+                "BN",
+                "Expiry Date",
+            ],
         ].copy()
 
         details_columns = [
@@ -291,120 +489,278 @@ class ReconciliationEngine:
             "Package Size Status",
             "Batch Master Status",
         ]
-        details = report[[column for column in details_columns if column in report.columns]].copy()
-        return {"report": details, "accept": accept, "dispatch": pd.DataFrame()}
+
+        details = report[
+            [
+                column
+                for column in details_columns
+                if column in report.columns
+            ]
+        ].copy()
+
+        return {
+            "report": details,
+            "accept": accept,
+            "dispatch": pd.DataFrame(),
+        }
 
     def _run_dispatch(self) -> Dict[str, pd.DataFrame]:
         if self.dispatch.empty:
-            raise ValueError("Full Dispatch file is required for Dispatch reconciliation.")
-        if self.inventory.empty:
-            raise ValueError("Inventory file is required for Dispatch reconciliation.")
+            raise ValueError(
+                "Full Dispatch file is required for Dispatch reconciliation."
+            )
 
-        self.dispatch = Normalizer.normalize_dispatch(self.dispatch)
-        self.inventory = Normalizer.normalize_inventory(self.inventory)
-        Validator.validate(self.dispatch, "DISPATCH")
-        Validator.validate(self.inventory, "INVENTORY")
-        self.dispatch["Expiry Month Key"] = self._month_key(self.dispatch["Expiry Date"])
-        self.inventory["Expiry Month Key"] = self._month_key(self.inventory["Expiry Date"])
+        # Inventory is intentionally not required and not used.
+        self.dispatch = Normalizer.normalize_dispatch(
+            self.dispatch
+        )
+        Validator.validate(
+            self.dispatch,
+            "DISPATCH",
+        )
 
-        inventory = (
-            self.inventory.groupby(self.MATCH_KEYS, dropna=False)
+        dispatch_summary = (
+            self.dispatch.groupby(
+                self.MATCH_KEYS,
+                dropna=False,
+            )
             .agg(
                 **{
-                    "Generic Item Number": ("Generic Item Number", "first"),
-                    "Trade Name": ("Trade Name", "first"),
-                    "Inventory Available Each": ("Available Quantity", "sum"),
+                    "Generic Item Number": (
+                        "Generic Item Number",
+                        "first",
+                    ),
+                    "Trade Name": (
+                        "Trade Name",
+                        "first",
+                    ),
+                    "Total Full Dispatch Each": (
+                        "Dispatched Quantity",
+                        "sum",
+                    ),
                 }
             )
             .reset_index()
         )
-        report = inventory.merge(
+
+        # PackageSize already comes from SFDA Drug Name -> Pack Size Trade Name.
+        # Full Dispatch is matched only by BN + Expiry Date.
+        report = dispatch_summary.merge(
             self._sfda_summary(),
             on=self.MATCH_KEYS,
             how="inner",
             validate="one_to_one",
         )
-        report = report.merge(
-            self._pack_lookup(),
-            on="Trade Name",
-            how="left",
-            validate="many_to_one",
+
+        valid_package = (
+            report["PackageSize"].notna()
+            & report["PackageSize"].gt(0)
         )
-        report["PackageSize"] = pd.to_numeric(report["PackageSize"], errors="coerce")
-        report["Package Size Status"] = report["PackageSize"].apply(
-            lambda value: "Mapped" if pd.notna(value) and float(value) > 0 else "Missing"
+
+        report["Total Full Dispatch Pack"] = 0.0
+        report.loc[
+            valid_package,
+            "Total Full Dispatch Pack",
+        ] = (
+            pd.to_numeric(
+                report.loc[
+                    valid_package,
+                    "Total Full Dispatch Each",
+                ],
+                errors="coerce",
+            ).fillna(0)
+            / report.loc[
+                valid_package,
+                "PackageSize",
+            ]
         )
-        report["PackageSize"] = report["PackageSize"].fillna(1)
-        report.loc[report["PackageSize"] <= 0, "PackageSize"] = 1
-        report["Inventory Available Pack"] = (
-            pd.to_numeric(report["Inventory Available Each"], errors="coerce").fillna(0)
-            / report["PackageSize"]
-        )
-        report["To Be Dispatched"] = report.apply(
-            lambda row: max(
-                0,
-                self._safe_int(row["Active"])
-                - self._safe_int(row["Inventory Available Pack"]),
+
+        report["To Be Dispatched"] = 0
+
+        report.loc[
+            valid_package,
+            "To Be Dispatched",
+        ] = report.loc[
+            valid_package
+        ].apply(
+            lambda row: min(
+                self._safe_int(
+                    row["Total Full Dispatch Pack"]
+                ),
+                self._safe_int(
+                    row["Active"]
+                ),
             ),
             axis=1,
         )
-        report = self._enrich_with_master(report)
 
+        report["Expected Active After Dispatch"] = (
+            pd.to_numeric(
+                report["Active"],
+                errors="coerce",
+            ).fillna(0)
+            - pd.to_numeric(
+                report["To Be Dispatched"],
+                errors="coerce",
+            ).fillna(0)
+        ).clip(lower=0)
+
+        report["Full Dispatch Status"] = (
+            pd.to_numeric(
+                report["Total Full Dispatch Each"],
+                errors="coerce",
+            ).fillna(0)
+            .gt(0)
+            .map(
+                {
+                    True: "Available",
+                    False: "No Dispatch",
+                }
+            )
+        )
+
+        report = self._enrich_with_master(
+            report
+        )
+
+        # Do not repeat Expiry Date in the merge payload because it is already
+        # part of MATCH_KEYS. This prevents Expiry Date_x / Expiry Date_y.
         targets = report.loc[
             report["To Be Dispatched"] > 0,
             self.MATCH_KEYS
             + [
                 "GTIN",
                 "Drug Name",
-                "Expiry Date",
                 "PackageSize",
                 "To Be Dispatched",
             ],
         ].copy()
 
-        evidence = self.dispatch.copy().reset_index(drop=True)
-        evidence["_Source Order"] = range(len(evidence))
+        evidence = self.dispatch.copy().reset_index(
+            drop=True
+        )
+        evidence["_Source Order"] = range(
+            len(evidence)
+        )
+
         evidence = evidence.merge(
             targets,
             on=self.MATCH_KEYS,
             how="inner",
             validate="many_to_one",
         )
-        evidence["Evidence Packages"] = (
-            pd.to_numeric(evidence["Dispatched Quantity"], errors="coerce").fillna(0)
-            / evidence["PackageSize"]
+
+        valid_evidence_package = (
+            evidence["PackageSize"].notna()
+            & evidence["PackageSize"].gt(0)
+        )
+
+        evidence["Evidence Packages"] = 0
+
+        evidence.loc[
+            valid_evidence_package,
+            "Evidence Packages",
+        ] = (
+            pd.to_numeric(
+                evidence.loc[
+                    valid_evidence_package,
+                    "Dispatched Quantity",
+                ],
+                errors="coerce",
+            ).fillna(0)
+            / evidence.loc[
+                valid_evidence_package,
+                "PackageSize",
+            ]
         ).astype(int)
+
         evidence = evidence.sort_values(
-            ["BN", "Expiry Month Key", "Dispatch Date", "_Source Order"],
+            [
+                "BN",
+                "Expiry Date",
+                "Dispatch Date",
+                "_Source Order",
+            ],
             kind="stable",
         )
 
         allocated_rows = []
-        for _, group in evidence.groupby(self.MATCH_KEYS, sort=False, dropna=False):
-            remaining = self._safe_int(group["To Be Dispatched"].iloc[0])
+
+        for _, group in evidence.groupby(
+            self.MATCH_KEYS,
+            sort=False,
+            dropna=False,
+        ):
+            remaining = self._safe_int(
+                group["To Be Dispatched"].iloc[0]
+            )
+
             for _, row in group.iterrows():
                 if remaining <= 0:
                     break
-                allocated = min(remaining, self._safe_int(row["Evidence Packages"]))
+
+                allocated = min(
+                    remaining,
+                    self._safe_int(
+                        row["Evidence Packages"]
+                    ),
+                )
+
                 if allocated <= 0:
                     continue
+
                 item = row.to_dict()
-                item["Allocated To Be Dispatch"] = allocated
+                item[
+                    "Allocated To Be Dispatch"
+                ] = allocated
                 allocated_rows.append(item)
                 remaining -= allocated
 
-        allocated = pd.DataFrame(allocated_rows)
+        allocated = pd.DataFrame(
+            allocated_rows
+        )
+
         if not allocated.empty:
-            gln = self.gln[["To Address", "GLN"]].drop_duplicates("To Address", keep="first")
-            allocated = allocated.merge(gln, on="To Address", how="left")
-            missing = allocated["GLN"].isna() | allocated["GLN"].astype(str).str.strip().eq("")
-            allocated["Customer Status"] = "REGISTERED"
-            allocated.loc[missing, "Customer Status"] = "DUMMY"
-            allocated.loc[missing, "GLN"] = self.DUMMY_GLN
+            gln = (
+                self.gln[
+                    ["To Address", "GLN"]
+                ]
+                .drop_duplicates(
+                    subset=["To Address"],
+                    keep="first",
+                )
+            )
+
+            allocated = allocated.merge(
+                gln,
+                on="To Address",
+                how="left",
+            )
+
+            missing_gln = (
+                allocated["GLN"].isna()
+                | allocated["GLN"]
+                .astype(str)
+                .str.strip()
+                .eq("")
+            )
+
+            allocated["Customer Status"] = (
+                "REGISTERED"
+            )
+            allocated.loc[
+                missing_gln,
+                "Customer Status",
+            ] = "DUMMY"
+            allocated.loc[
+                missing_gln,
+                "GLN",
+            ] = self.DUMMY_GLN
         else:
             allocated = pd.DataFrame(
                 columns=[
                     "GTIN",
+                    "Drug Name",
                     "BN",
                     "Expiry Date",
                     "To Address",
@@ -415,28 +771,43 @@ class ReconciliationEngine:
             )
 
         details_columns = [
-            "BN",
-            "Expiry Date",
             "GTIN",
             "Drug Name",
-            "Generic Item Number",
-            "Trade Name",
+            "BN",
+            "Expiry Date",
             "PackageSize",
-            "Inventory Available Each",
-            "Inventory Available Pack",
             "Active",
             "Quantity sent pending",
             "Quantity Receive Pending",
+            "Generic Item Number",
+            "Total Full Dispatch Each",
+            "Total Full Dispatch Pack",
             "To Be Dispatched",
+            "Expected Active After Dispatch",
+            "Full Dispatch Status",
             "Package Size Status",
             "Batch Master Status",
         ]
-        details = report[[column for column in details_columns if column in report.columns]].copy()
-        return {"report": details, "accept": pd.DataFrame(), "dispatch": allocated}
+
+        details = report[
+            [
+                column
+                for column in details_columns
+                if column in report.columns
+            ]
+        ].copy()
+
+        return {
+            "report": details,
+            "accept": pd.DataFrame(),
+            "dispatch": allocated,
+        }
 
     def run(self) -> Dict[str, pd.DataFrame]:
         self._normalize_common()
         self._validate_common()
+
         if self.mode == "accept":
             return self._run_accept()
+
         return self._run_dispatch()
