@@ -3,10 +3,10 @@ import json
 import logging
 from pathlib import Path
 from typing import Iterable, List
-
+ 
 import azure.functions as func
 import pandas as pd
-
+ 
 from engine.alert_engine import AlertEngine
 from engine.database import (
     append_events,
@@ -21,622 +21,258 @@ from engine.database import (
 from engine.exporter import Exporter
 from engine.full_reconciliation import FullReconciliationEngine
 from engine.reconciliation import ReconciliationEngine
-
-
+ 
+ 
 app = func.FunctionApp(
     http_auth_level=func.AuthLevel.ANONYMOUS
 )
-
+ 
 APPLICATION_NAME = "SFDA Reconciliation"
 APPLICATION_VERSION = "5.0.0"
-
-
-# -----------------------------------------------------------------------------
-# Response helpers
-# -----------------------------------------------------------------------------
-
-
-def json_response(data, status_code=200):
-    return func.HttpResponse(
-        json.dumps(
-            data,
-            ensure_ascii=False,
-            default=str,
-        ),
-        status_code=status_code,
-        mimetype="application/json",
-        charset="utf-8",
-    )
-
-
-def error_response(message, status_code=500, error_type=None):
-    payload = {
-        "status": "Failed",
-        "version": APPLICATION_VERSION,
-        "error": str(message),
-    }
-
-    if error_type:
-        payload["error_type"] = error_type
-
-    return json_response(
-        payload,
-        status_code=status_code,
-    )
-
-
-# -----------------------------------------------------------------------------
-# Upload and Excel helpers
-# -----------------------------------------------------------------------------
-
-
-def _uploaded_file_name(uploaded):
-    return (
-        getattr(uploaded, "filename", None)
-        or "uploaded.xlsx"
-    )
-
-
-def _read_uploaded_bytes(uploaded):
-    file_name = _uploaded_file_name(uploaded)
-
-    raw = uploaded.read()
-
-    if not raw:
-        raise ValueError(
-            f"Uploaded file is empty: {file_name}"
-        )
-
-    return file_name, raw
-
-
-def read_excel(uploaded):
-    file_name, raw = _read_uploaded_bytes(uploaded)
-
-    lower_name = file_name.lower()
-
-    if lower_name.endswith(".xls"):
-        engine = "xlrd"
-    elif lower_name.endswith(".xlsx"):
-        engine = "openpyxl"
-    else:
-        raise ValueError(
-            "Unsupported file type. Only .xls and .xlsx files "
-            f"are accepted: {file_name}"
-        )
-
+ 
+ 
+def read_excel(file_obj) -> pd.DataFrame:
+    """Read Excel file into DataFrame."""
     try:
-        return pd.read_excel(
-            io.BytesIO(raw),
-            engine=engine,
-            dtype=object,
-        )
-    except Exception as ex:
-        raise ValueError(
-            f"Unable to read Excel file '{file_name}': {ex}"
-        ) from ex
-
-
-def read_many(files: Iterable):
-    frames: List[pd.DataFrame] = []
-
-    for uploaded in files:
-        file_name = _uploaded_file_name(uploaded)
-        frame = read_excel(uploaded)
-        frame["_Source File"] = file_name
-        frames.append(frame)
-
-    if not frames:
-        return pd.DataFrame()
-
-    return pd.concat(
-        frames,
-        ignore_index=True,
-        sort=False,
-    )
-
-
-def excel_payload(df, file_name, title):
-    return Exporter.build_formatted_excel_file(
-        df=df,
-        file_name=file_name,
-        sheet_name=title[:31],
-        title=title,
-    )
-
-
-def safe_preview(df, rows=100):
-    preview = df.head(rows).copy()
-    preview = preview.astype(object).where(
-        pd.notna(preview),
-        None,
-    )
-    return preview.to_dict(orient="records")
-
-
-def _get_files(req, plural_name, singular_name):
-    files = list(req.files.getlist(plural_name))
-
-    if not files:
-        files = list(req.files.getlist(singular_name))
-
-    return [
-        uploaded
-        for uploaded in files
-        if uploaded is not None
-    ]
-
-
-# -----------------------------------------------------------------------------
-# UI and service status
-# -----------------------------------------------------------------------------
-
-
-@app.route(route="", methods=["GET"])
-def home(req: func.HttpRequest) -> func.HttpResponse:
+        if hasattr(file_obj, 'stream'):
+            return pd.read_excel(file_obj.stream)
+        elif hasattr(file_obj, 'read'):
+            return pd.read_excel(io.BytesIO(file_obj.read()))
+        else:
+            return pd.read_excel(file_obj)
+    except Exception as e:
+        raise ValueError(f"Error reading Excel file: {str(e)}")
+ 
+ 
+def json_response(data, status_code=200):
+    """Return JSON response."""
     return func.HttpResponse(
-        status_code=302,
-        headers={
-            "Location": "/api/ui"
-        },
+        json.dumps(data),
+        status_code=status_code,
+        mimetype="application/json"
     )
-
-
-@app.route(route="ui", methods=["GET"])
-def ui(req: func.HttpRequest) -> func.HttpResponse:
-    path = (
-        Path(__file__).resolve().parent
-        / "web"
-        / "index.html"
-    )
-
-    if not path.exists():
-        return error_response(
-            "web/index.html was not found.",
-            status_code=404,
-            error_type="FileNotFoundError",
-        )
-
-    return func.HttpResponse(
-        path.read_text(encoding="utf-8"),
-        mimetype="text/html",
-        charset="utf-8",
-    )
-
-
+ 
+ 
+def error_response(message, status_code=400):
+    """Return error response as JSON."""
+    return json_response({
+        "status": "error",
+        "error": message,
+        "version": APPLICATION_VERSION
+    }, status_code=status_code)
+ 
+ 
+@app.function_name("health")
 @app.route(route="health", methods=["GET"])
 def health(req: func.HttpRequest) -> func.HttpResponse:
+    """Health check endpoint."""
     try:
-        database_status = test_database_connection()
-
+        db_status = test_database_connection()
         return json_response({
-            "status": "Healthy",
+            "status": "healthy",
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
-            "database": database_status,
+            "database": db_status
         })
-
-    except Exception as ex:
-        logging.exception("Health check failed")
-
-        return error_response(
-            ex,
-            status_code=500,
-            error_type=type(ex).__name__,
-        )
-
-
-# -----------------------------------------------------------------------------
-# Step 1 - Build or update cumulative Batch Master
-# -----------------------------------------------------------------------------
-
-
-@app.route(
-    route="batch-master/build",
-    methods=["GET", "POST"],
-)
-def build_batch_master(
-    req: func.HttpRequest,
-) -> func.HttpResponse:
-
+    except Exception as e:
+        return error_response(str(e), 500)
+ 
+ 
+@app.function_name("batch_master_build")
+@app.route(route="batch-master/build", methods=["GET", "POST"])
+def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
+    """Build or rebuild the Batch Master from historical files."""
+    
     if req.method == "GET":
         return json_response({
             "status": "Ready",
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
-            "required_files": [
-                "asn_files",
-                "dispatch_files",
-                "sfda",
-            ],
-            "operations": [
-                "append",
-                "rebuild",
-            ],
+            "required_files": ["asn_files", "dispatch_files", "sfda"],
+            "optional_files": ["operation"]
         })
-
+ 
     try:
-        asn_files = _get_files(
-            req,
-            "asn_files",
-            "asn",
-        )
-
-        dispatch_files = _get_files(
-            req,
-            "dispatch_files",
-            "dispatch",
-        )
-
+        # Get files
+        asn_files = req.files.getlist("asn_files")
+        dispatch_files = req.files.getlist("dispatch_files")
         sfda_file = req.files.get("sfda")
-
+        operation = req.form.get("operation", "append").strip().lower()
+ 
+        # Validate
         if not asn_files:
-            raise ValueError(
-                "At least one ASN Receipt file is required."
-            )
-
+            return error_response("ASN files are required")
         if not dispatch_files:
-            raise ValueError(
-                "At least one Full Dispatch file is required."
-            )
-
-        if sfda_file is None:
-            raise ValueError(
-                "Latest SFDA Drug report is required."
-            )
-
-        operation = str(
-            req.form.get("operation") or "append"
-        ).strip().lower()
-
-        if operation not in {
-            "append",
-            "rebuild",
-        }:
-            raise ValueError(
-                "operation must be append or rebuild."
-            )
-
-        asn_dataframe = read_many(asn_files)
-        dispatch_dataframe = read_many(dispatch_files)
-        sfda_dataframe = read_excel(sfda_file)
-
-        engine = FullReconciliationEngine(
-            asn_df=asn_dataframe,
-            dispatch_df=dispatch_dataframe,
-            sfda_df=sfda_dataframe,
-        )
-
-        prepared = engine.prepare_incremental()
-
-        initialize_database()
-
+            return error_response("Dispatch files are required")
+        if not sfda_file:
+            return error_response("SFDA file is required")
+ 
+        # Read files
+        asn_dfs = [read_excel(f) for f in asn_files]
+        dispatch_dfs = [read_excel(f) for f in dispatch_files]
+        sfda_df = read_excel(sfda_file)
+ 
+        # Combine multiple files
+        asn_combined = pd.concat(asn_dfs, ignore_index=True) if asn_dfs else pd.DataFrame()
+        dispatch_combined = pd.concat(dispatch_dfs, ignore_index=True) if dispatch_dfs else pd.DataFrame()
+ 
+        # Reset if rebuild
         if operation == "rebuild":
             reset_history()
-
-        saved = append_events(
-            prepared["receipt_records"],
-            prepared["dispatch_records"],
+ 
+        # Build Batch Master
+        engine = FullReconciliationEngine(
+            asn_df=asn_combined,
+            dispatch_df=dispatch_combined,
+            sfda_df=sfda_df
         )
-
-        receipt_summary, dispatch_summary = (
-            get_event_summaries()
-        )
-
-        master = engine.build_master_from_summaries(
-            receipt_summary=receipt_summary,
-            dispatch_summary=dispatch_summary,
-            sfda_summary=prepared["sfda_summary"],
-        )
-
-        replace_batch_master(master)
-
-        outputs = excel_payload(
-            master,
-            "Batch_Master.xlsx",
-            "Batch Master",
-        )
-
+        
+        batch_master = engine.run()
+ 
+        # Save to database
+        result = replace_batch_master(batch_master)
+        
+        if result.get("status") != "success":
+            return error_response(result.get("message", "Failed to save Batch Master"), 500)
+ 
         return json_response({
             "status": "Completed",
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
             "operation": operation,
             "summary": {
-                "uploaded_asn_files": len(asn_files),
-                "uploaded_dispatch_files": len(
-                    dispatch_files
-                ),
-                "prepared_receipt_events": len(
-                    prepared["receipt_records"]
-                ),
-                "prepared_dispatch_events": len(
-                    prepared["dispatch_records"]
-                ),
-                "new_receipt_events": saved[
-                    "receipt_events"
-                ],
-                "new_dispatch_events": saved[
-                    "dispatch_events"
-                ],
-                "batch_master_rows": len(master),
-            },
-            "outputs": outputs,
-            "preview": safe_preview(master),
+                "batch_master_rows": len(batch_master),
+                "asn_files": len(asn_files),
+                "dispatch_files": len(dispatch_files),
+                "rows_inserted": result.get("rows_inserted", 0)
+            }
         })
-
-    except ValueError as ex:
-        logging.exception("Batch Master input failed")
-
-        return error_response(
-            ex,
-            status_code=400,
-            error_type=type(ex).__name__,
-        )
-
-    except Exception as ex:
-        logging.exception("Batch Master build failed")
-
-        return error_response(
-            ex,
-            status_code=500,
-            error_type=type(ex).__name__,
-        )
-
-
-# -----------------------------------------------------------------------------
-# Step 2 and Step 3 - Reconcile and generate SFDA files
-# -----------------------------------------------------------------------------
-
-
-@app.route(
-    route="reconcile",
-    methods=["GET", "POST"],
-)
-def reconcile(
-    req: func.HttpRequest,
-) -> func.HttpResponse:
-
+ 
+    except Exception as e:
+        logging.error(f"Error in batch_master_build: {str(e)}", exc_info=True)
+        return error_response(f"Build failed: {str(e)}", 500)
+ 
+ 
+@app.function_name("reconcile")
+@app.route(route="reconcile", methods=["GET", "POST"])
+def reconcile(req: func.HttpRequest) -> func.HttpResponse:
+    """Run daily reconciliation."""
+ 
     if req.method == "GET":
         return json_response({
             "status": "Ready",
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
-            "required_files": [
-                "inventory",
-                "sfda",
-            ],
-            "optional_files": [
-                "asn",
-            ],
+            "required_files": ["inventory", "sfda"],
+            "optional_files": ["asn", "dispatch"]
         })
-
+ 
     try:
         inventory_file = req.files.get("inventory")
         sfda_file = req.files.get("sfda")
-        asn_file = req.files.get("asn")           # Optional - for Accept alerts
-        dispatch_file = req.files.get("dispatch")  # Optional - for Dispatch alerts
-
-        if inventory_file is None:
-            raise ValueError(
-                "Latest Inventory report is required."
-            )
-
-        if sfda_file is None:
-            raise ValueError(
-                "Latest SFDA Drug report is required."
-            )
-
+        asn_file = req.files.get("asn")
+        dispatch_file = req.files.get("dispatch")
+ 
+        # Validate required files
+        if not inventory_file:
+            return error_response("Inventory file is required")
+        if not sfda_file:
+            return error_response("SFDA file is required")
+ 
+        # Read Batch Master from database
         batch_master = get_batch_master_df()
-
+        
         if batch_master.empty:
-            raise ValueError(
-                "Batch Master is empty. Complete Step 1 first."
-            )
-
-        inventory_dataframe = read_excel(
-            inventory_file
-        )
-
-        sfda_dataframe = read_excel(
-            sfda_file
-        )
-
-        dispatch_events = get_dispatch_events_df()
-
+            return error_response("Batch Master is empty. Run Step 1 first.", 400)
+ 
+        # Read input files
+        inventory_df = read_excel(inventory_file)
+        sfda_df = read_excel(sfda_file)
+        dispatch_events_df = get_dispatch_events_df()
+ 
+        # Run reconciliation
         engine = ReconciliationEngine(
             batch_master_df=batch_master,
-            inventory_df=inventory_dataframe,
-            sfda_df=sfda_dataframe,
-            dispatch_events_df=dispatch_events,
+            inventory_df=inventory_df,
+            sfda_df=sfda_df,
+            dispatch_events_df=dispatch_events_df,
         )
-
+ 
         result = engine.run()
-
-        # Generate Alerts based on provided files
+ 
+        # Generate alerts if files provided
         alerts = None
         step_type = None
-
-        if asn_file is not None:
+ 
+        if asn_file:
             step_type = "accept"
             try:
-                asn_dataframe = read_excel(asn_file)
+                asn_df = read_excel(asn_file)
                 alert_engine = AlertEngine(
                     batch_master_df=batch_master,
-                    sfda_df=sfda_dataframe,
-                    inventory_df=inventory_dataframe,
+                    sfda_df=sfda_df,
+                    inventory_df=inventory_df,
                 )
-                alerts = alert_engine.generate_alerts_for_accept(
-                    asn_daily_df=asn_dataframe
-                )
-            except Exception as alert_ex:
-                logging.warning(
-                    f"Accept alert generation failed: {alert_ex}"
-                )
-                alerts = {
-                    "alert_count": 0,
-                    "alerts": [],
-                    "summary": {"error": str(alert_ex)},
-                }
-
-        elif dispatch_file is not None:
+                alerts = alert_engine.generate_alerts_for_accept(asn_df)
+            except Exception as e:
+                logging.warning(f"Alert generation failed: {str(e)}")
+ 
+        elif dispatch_file:
             step_type = "dispatch"
             try:
-                dispatch_dataframe = read_excel(dispatch_file)
                 alert_engine = AlertEngine(
                     batch_master_df=batch_master,
-                    sfda_df=sfda_dataframe,
-                    inventory_df=inventory_dataframe,
+                    sfda_df=sfda_df,
+                    inventory_df=inventory_df,
                 )
-                alerts = alert_engine.generate_alerts_for_dispatch(
-                    sfda_updated_df=sfda_dataframe
-                )
-            except Exception as alert_ex:
-                logging.warning(
-                    f"Dispatch alert generation failed: {alert_ex}"
-                )
-                alerts = {
-                    "alert_count": 0,
-                    "alerts": [],
-                    "summary": {"error": str(alert_ex)},
-                }
-
-        accept_files = (
-            Exporter.build_sfda_upload_files(
-                df=result["accept"],
-                quantity_column="To Be Accept",
-                file_prefix="Accept",
-            )
-        )
-
-        dispatch_files = (
-            Exporter.build_dispatch_files_by_customer(
-                result["dispatch"]
-            )
-        )
-
-        reconciliation_excel = excel_payload(
-            result["report"],
-            "Reconciliation_Report.xlsx",
-            "Reconciliation Report",
-        )
-
-        outputs = {
-            "reconciliation_report": (
-                reconciliation_excel
-            ),
-            "accept_files": accept_files,
-            "dispatch_files": dispatch_files,
-        }
-
+                alerts = alert_engine.generate_alerts_for_dispatch(sfda_df)
+            except Exception as e:
+                logging.warning(f"Alert generation failed: {str(e)}")
+ 
+        # Prepare response
         response_data = {
             "status": "Completed",
             "application": APPLICATION_NAME,
             "version": APPLICATION_VERSION,
             "summary": {
                 "batch_master_rows": len(batch_master),
-                "dispatch_history_rows": len(
-                    dispatch_events
-                ),
-                "reconciliation_rows": len(
-                    result["report"]
-                ),
-                "accept_rows": len(result["accept"]),
-                "dispatch_allocation_rows": len(
-                    result["dispatch"]
-                ),
-                "accept_files": len(accept_files),
-                "dispatch_files": len(dispatch_files),
-            },
-            "outputs": outputs,
-            "preview": safe_preview(
-                result["report"]
-            ),
+                "reconciliation_rows": len(result.get("report", [])),
+                "accept_rows": len(result.get("accept", [])),
+                "dispatch_rows": len(result.get("dispatch", [])),
+            }
         }
-
-        # Add step type and alerts if generated
-        if step_type is not None:
+ 
+        if step_type:
             response_data["step"] = step_type
-        if alerts is not None:
+ 
+        if alerts:
             response_data["alerts"] = alerts
-
+ 
         return json_response(response_data)
-
-    except ValueError as ex:
-        logging.exception("Reconciliation input failed")
-
-        return error_response(
-            ex,
-            status_code=400,
-            error_type=type(ex).__name__,
-        )
-
-    except Exception as ex:
-        logging.exception("Reconciliation failed")
-
-        return error_response(
-            ex,
-            status_code=500,
-            error_type=type(ex).__name__,
-        )
-
-
-# -----------------------------------------------------------------------------
-# Database inspection endpoints
-# -----------------------------------------------------------------------------
-
-
-@app.route(
-    route="batch-master",
-    methods=["GET"],
-)
-def batch_master(
-    req: func.HttpRequest,
-) -> func.HttpResponse:
+ 
+    except Exception as e:
+        logging.error(f"Error in reconcile: {str(e)}", exc_info=True)
+        return error_response(f"Reconciliation failed: {str(e)}", 500)
+ 
+ 
+@app.function_name("ui")
+@app.route(route="ui", methods=["GET"])
+def serve_ui(req: func.HttpRequest) -> func.HttpResponse:
+    """Serve the UI."""
     try:
-        frame = get_batch_master_df()
-
-        return json_response({
-            "status": "Completed",
-            "application": APPLICATION_NAME,
-            "version": APPLICATION_VERSION,
-            "count": len(frame),
-            "rows": safe_preview(
-                frame,
-                rows=500,
-            ),
-        })
-
-    except Exception as ex:
-        logging.exception("Batch Master read failed")
-
-        return error_response(
-            ex,
-            status_code=500,
-            error_type=type(ex).__name__,
-        )
-
-
-@app.route(
-    route="database/status",
-    methods=["GET"],
-)
-def database_status(
-    req: func.HttpRequest,
-) -> func.HttpResponse:
-    try:
-        return json_response({
-            "status": "Completed",
-            "application": APPLICATION_NAME,
-            "version": APPLICATION_VERSION,
-            "database": test_database_connection(),
-        })
-
-    except Exception as ex:
-        logging.exception("Database status failed")
-
-        return error_response(
-            ex,
-            status_code=500,
-            error_type=type(ex).__name__,
-        )
+        ui_path = Path(__file__).parent / "web" / "index.html"
+        if ui_path.exists():
+            with open(ui_path, "r", encoding="utf-8") as f:
+                return func.HttpResponse(f.read(), mimetype="text/html")
+        return error_response("UI not found", 404)
+    except Exception as e:
+        return error_response(str(e), 500)
+ 
+ 
+@app.route(route="", methods=["GET"])
+def root(req: func.HttpRequest) -> func.HttpResponse:
+    """Redirect to UI."""
+    return func.HttpResponse(
+        '<meta http-equiv="refresh" content="0; url=/api/ui" />',
+        mimetype="text/html"
+    )
