@@ -560,7 +560,7 @@
       <!-- UPLOAD -->
       <section class="page" id="page-upload">
         <div class="page-head">
-          <div><h1>Upload & Run Reconciliation</h1><p>Run Accept first using ASN + SFDA, upload the result to SFDA, then run Dispatch using Full Dispatch + Inventory + the refreshed SFDA report.</p></div>
+          <div><h1>Upload & Run Reconciliation</h1><p>Run Accept first using ASN + SFDA, upload the result to SFDA, then run Dispatch using Full Dispatch + the refreshed SFDA report.</p></div>
           <div class="actions"><button class="btn btn-secondary" id="resetButton">↻ Reset</button></div>
         </div>
  
@@ -595,8 +595,7 @@
             <div class="card-subtitle" style="margin:6px 0 18px">Run only after the Accept upload is completed and a refreshed SFDA report is downloaded.</div>
             <div class="grid">
               <div class="file-card"><div class="file-title">① Full Dispatch Report</div><div class="file-row"><input id="dispatchReport" name="dispatch" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="dispatchReportName">No file selected</div></div>
-              <div class="file-card"><div class="file-title">② Inventory Status Report</div><div class="file-row"><input id="dispatchInventory" name="inventory" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="dispatchInventoryName">No file selected</div></div>
-              <div class="file-card"><div class="file-title">③ Updated SFDA Drug Count — After Accept</div><div class="file-row"><input id="dispatchSfda" name="sfda" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="dispatchSfdaName">No file selected</div></div>
+              <div class="file-card"><div class="file-title">② Updated SFDA Drug Count — After Accept</div><div class="file-row"><input id="dispatchSfda" name="sfda" type="file" accept=".xls,.xlsx" required></div><div class="file-meta" id="dispatchSfdaName">No file selected</div></div>
             </div>
             <button class="btn btn-purple" id="dispatchRunButton" type="submit" disabled style="margin-top:16px;width:100%">▶ Generate Dispatch Files</button>
             <div class="card progress-card" id="dispatchProgressCard" style="box-shadow:none">
@@ -977,7 +976,7 @@
   const HEALTH_URL = "/api/health";
   const VERSION_URL = "/api/version";
   const ACCEPT_FILE_KEYS = ["acceptAsn","acceptSfda"];
-  const DISPATCH_FILE_KEYS = ["dispatchReport","dispatchInventory","dispatchSfda"];
+  const DISPATCH_FILE_KEYS = ["dispatchReport","dispatchSfda"];
   const HISTORY_URL = "/api/history";
   const DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v1";
   let currentResult = null;
@@ -1086,7 +1085,6 @@
   ];
   const DISPATCH_INPUTS=[
     {input:"dispatchReport",meta:"dispatchReportName",field:"dispatch"},
-    {input:"dispatchInventory",meta:"dispatchInventoryName",field:"inventory"},
     {input:"dispatchSfda",meta:"dispatchSfdaName",field:"sfda"}
   ];
  
@@ -1096,7 +1094,7 @@
   function validateStageFiles(items){
     for(const item of items){
       const input=$(item.input);
-      if(!input.files.length) throw new Error("Please select all three required Excel files.");
+      if(!input.files.length) throw new Error("Please select all required Excel files.");
       const name=input.files[0].name.toLowerCase();
       if(!name.endsWith(".xls")&&!name.endsWith(".xlsx")) throw new Error(`${input.files[0].name}: only .xls and .xlsx files are allowed.`);
     }
