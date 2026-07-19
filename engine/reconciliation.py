@@ -519,162 +519,60 @@ class ReconciliationEngine:
             "DISPATCH",
         )
 
-        dispatch_summary = (
-            self.dispatch.groupby(
-                self.MATCH_KEYS,
-                dropna=False,
-            )
-            .agg(
-                **{
-                    "Generic Item Number": (
-                        "Generic Item Number",
-                        "first",
-                    ),
-                    "Trade Name": (
-                        "Trade Name",
-                        "first",
-                    ),
-                    "Total Full Dispatch Each": (
-                        "Dispatched Quantity",
-                        "sum",
-                    ),
-                }
-            )
-            .reset_index()
-        )
+        # SFDA receives PackageSize first through:
+        # SFDA[Drug Name] -> Pack Size[Trade Name].
+        # Full Dispatch is then matched only by BN + Expiry Date.
+        sfda_batches = self._sfda_summary()
 
-        # PackageSize already comes from SFDA Drug Name -> Pack Size Trade Name.
-        # Full Dispatch is matched only by BN + Expiry Date.
-        report = dispatch_summary.merge(
-            self._sfda_summary(),
-            on=self.MATCH_KEYS,
-            how="inner",
-            validate="one_to_one",
-        )
-
-        valid_package = (
-            report["PackageSize"].notna()
-            & report["PackageSize"].gt(0)
-        )
-
-        report["Total Full Dispatch Pack"] = 0.0
-        report.loc[
-            valid_package,
-            "Total Full Dispatch Pack",
-        ] = (
-            pd.to_numeric(
-                report.loc[
-                    valid_package,
-                    "Total Full Dispatch Each",
-                ],
-                errors="coerce",
-            ).fillna(0)
-            / report.loc[
-                valid_package,
-                "PackageSize",
-            ]
-        )
-
-        report["To Be Dispatched"] = 0
-
-        report.loc[
-            valid_package,
-            "To Be Dispatched",
-        ] = report.loc[
-            valid_package
-        ].apply(
-            lambda row: min(
-                self._safe_int(
-                    row["Total Full Dispatch Pack"]
-                ),
-                self._safe_int(
-                    row["Active"]
-                ),
-            ),
-            axis=1,
-        )
-
-        report["Expected Active After Dispatch"] = (
-            pd.to_numeric(
-                report["Active"],
-                errors="coerce",
-            ).fillna(0)
-            - pd.to_numeric(
-                report["To Be Dispatched"],
-                errors="coerce",
-            ).fillna(0)
-        ).clip(lower=0)
-
-        report["Full Dispatch Status"] = (
-            pd.to_numeric(
-                report["Total Full Dispatch Each"],
-                errors="coerce",
-            ).fillna(0)
-            .gt(0)
-            .map(
-                {
-                    True: "Available",
-                    False: "No Dispatch",
-                }
-            )
-        )
-
-        report = self._enrich_with_master(
-            report
-        )
-
-        # Do not repeat Expiry Date in the merge payload because it is already
-        # part of MATCH_KEYS. This prevents Expiry Date_x / Expiry Date_y.
-        targets = report.loc[
-            report["To Be Dispatched"] > 0,
-            self.MATCH_KEYS
-            + [
-                "GTIN",
-                "Drug Name",
-                "PackageSize",
-                "To Be Dispatched",
-            ],
-        ].copy()
-
-        evidence = self.dispatch.copy().reset_index(
-            drop=True
-        )
-        evidence["_Source Order"] = range(
-            len(evidence)
-        )
-
-        evidence = evidence.merge(
-            targets,
+        details = self.dispatch.merge(
+            sfda_batches,
             on=self.MATCH_KEYS,
             how="inner",
             validate="many_to_one",
         )
 
-        valid_evidence_package = (
-            evidence["PackageSize"].notna()
-            & evidence["PackageSize"].gt(0)
+        details = details.reset_index(drop=True)
+        details["_Source Order"] = range(len(details))
+
+        valid_package = (
+            details["PackageSize"].notna()
+            & details["PackageSize"].gt(0)
         )
 
-        evidence["Evidence Packages"] = 0
+        # Keep every original Full Dispatch row without aggregation.
+        details["Dispatch Quantity Each"] = pd.to_numeric(
+            details["Dispatched Quantity"],
+            errors="coerce",
+        ).fillna(0)
 
-        evidence.loc[
-            valid_evidence_package,
-            "Evidence Packages",
+        details["Dispatch Quantity Pack"] = 0.0
+        details.loc[
+            valid_package,
+            "Dispatch Quantity Pack",
         ] = (
-            pd.to_numeric(
-                evidence.loc[
-                    valid_evidence_package,
-                    "Dispatched Quantity",
-                ],
-                errors="coerce",
-            ).fillna(0)
-            / evidence.loc[
-                valid_evidence_package,
+            details.loc[
+                valid_package,
+                "Dispatch Quantity Each",
+            ]
+            / details.loc[
+                valid_package,
                 "PackageSize",
             ]
-        ).astype(int)
+        )
 
-        evidence = evidence.sort_values(
+        # CSV quantities must be whole packs. Allocate chronologically per
+        # BN + Expiry Date and never exceed SFDA Active for that batch.
+        details["Eligible Dispatch Pack"] = (
+            pd.to_numeric(
+                details["Dispatch Quantity Pack"],
+                errors="coerce",
+            )
+            .fillna(0)
+            .clip(lower=0)
+            .astype(int)
+        )
+
+        details = details.sort_values(
             [
                 "BN",
                 "Expiry Date",
@@ -682,125 +580,130 @@ class ReconciliationEngine:
                 "_Source Order",
             ],
             kind="stable",
-        )
+        ).reset_index(drop=True)
 
-        allocated_rows = []
+        details["Allocated To Be Dispatch"] = 0
 
-        for _, group in evidence.groupby(
+        for _, indexes in details.groupby(
             self.MATCH_KEYS,
             sort=False,
             dropna=False,
-        ):
+        ).groups.items():
+            index_list = list(indexes)
             remaining = self._safe_int(
-                group["To Be Dispatched"].iloc[0]
+                details.loc[index_list[0], "Active"]
             )
 
-            for _, row in group.iterrows():
+            for row_index in index_list:
                 if remaining <= 0:
                     break
 
-                allocated = min(
-                    remaining,
-                    self._safe_int(
-                        row["Evidence Packages"]
-                    ),
+                eligible = self._safe_int(
+                    details.loc[
+                        row_index,
+                        "Eligible Dispatch Pack",
+                    ]
                 )
-
-                if allocated <= 0:
-                    continue
-
-                item = row.to_dict()
-                item[
-                    "Allocated To Be Dispatch"
+                allocated = min(eligible, remaining)
+                details.loc[
+                    row_index,
+                    "Allocated To Be Dispatch",
                 ] = allocated
-                allocated_rows.append(item)
                 remaining -= allocated
 
-        allocated = pd.DataFrame(
-            allocated_rows
+        # Add GLN at row level so the same detailed rows are used directly
+        # to generate customer CSV files.
+        gln = (
+            self.gln[
+                ["To Address", "GLN"]
+            ]
+            .drop_duplicates(
+                subset=["To Address"],
+                keep="first",
+            )
         )
 
-        if not allocated.empty:
-            gln = (
-                self.gln[
-                    ["To Address", "GLN"]
-                ]
-                .drop_duplicates(
-                    subset=["To Address"],
-                    keep="first",
-                )
-            )
+        details = details.merge(
+            gln,
+            on="To Address",
+            how="left",
+        )
 
-            allocated = allocated.merge(
-                gln,
-                on="To Address",
-                how="left",
-            )
+        missing_gln = (
+            details["GLN"].isna()
+            | details["GLN"]
+            .astype(str)
+            .str.strip()
+            .eq("")
+        )
 
-            missing_gln = (
-                allocated["GLN"].isna()
-                | allocated["GLN"]
-                .astype(str)
-                .str.strip()
-                .eq("")
-            )
+        details["Customer Status"] = "REGISTERED"
+        details.loc[
+            missing_gln,
+            "Customer Status",
+        ] = "DUMMY"
+        details.loc[
+            missing_gln,
+            "GLN",
+        ] = self.DUMMY_GLN
 
-            allocated["Customer Status"] = (
-                "REGISTERED"
-            )
-            allocated.loc[
-                missing_gln,
-                "Customer Status",
-            ] = "DUMMY"
-            allocated.loc[
-                missing_gln,
-                "GLN",
-            ] = self.DUMMY_GLN
-        else:
-            allocated = pd.DataFrame(
-                columns=[
-                    "GTIN",
-                    "Drug Name",
-                    "BN",
-                    "Expiry Date",
-                    "To Address",
-                    "GLN",
-                    "Customer Status",
-                    "Allocated To Be Dispatch",
-                ]
-            )
+        details = self._enrich_with_master(
+            details
+        )
 
+        # Dispatch Details is the only dispatch report. Every row represents
+        # an original WMS dispatch line; there is no batch summary report.
         details_columns = [
             "GTIN",
             "Drug Name",
             "BN",
             "Expiry Date",
-            "PackageSize",
             "Active",
             "Quantity sent pending",
             "Quantity Receive Pending",
+            "PackageSize",
             "Generic Item Number",
-            "Total Full Dispatch Each",
-            "Total Full Dispatch Pack",
-            "To Be Dispatched",
-            "Expected Active After Dispatch",
-            "Full Dispatch Status",
+            "Trade Name",
+            "Sales Order Number",
+            "Order Line",
+            "To Address",
+            "Dispatch Date",
+            "Dispatch Quantity Each",
+            "Dispatch Quantity Pack",
+            "Allocated To Be Dispatch",
+            "GLN",
+            "Customer Status",
             "Package Size Status",
             "Batch Master Status",
         ]
 
-        details = report[
+        report = details[
             [
                 column
                 for column in details_columns
-                if column in report.columns
+                if column in details.columns
             ]
         ].copy()
 
+        dispatch_upload = details.loc[
+            details["Allocated To Be Dispatch"] > 0,
+            [
+                "GTIN",
+                "Drug Name",
+                "BN",
+                "Expiry Date",
+                "To Address",
+                "GLN",
+                "Customer Status",
+                "Sales Order Number",
+                "Allocated To Be Dispatch",
+            ],
+        ].copy()
+
         return {
-            "report": details,
+            "report": report,
             "accept": pd.DataFrame(),
-            "dispatch": allocated,
+            "dispatch": dispatch_upload,
         }
 
     def run(self) -> Dict[str, pd.DataFrame]:
