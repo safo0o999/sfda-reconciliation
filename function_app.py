@@ -250,13 +250,9 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             asn_df = read_excel_upload(asn_file)
         else:
             dispatch_file = req.files.get("dispatch")
-            inventory_file = req.files.get("inventory")
             if dispatch_file is None:
                 return error_response("Full Dispatch file is required for Dispatch.")
-            if inventory_file is None:
-                return error_response("Inventory file is required for Dispatch.")
             dispatch_df = read_excel_upload(dispatch_file)
-            inventory_df = read_excel_upload(inventory_file)
 
         from engine.exporter import Exporter
         from engine.reconciliation import ReconciliationEngine
