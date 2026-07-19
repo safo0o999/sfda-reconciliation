@@ -1209,7 +1209,14 @@
       let result; try{ result=await response.json(); }catch{ throw new Error(`The server returned HTTP ${response.status} without valid JSON.`); }
       if(!response.ok||result.status==="Failed") throw new Error(result.error||result.message||`Request failed with HTTP ${response.status}.`);
       currentResult=result; finishProgress(label,true); setStatus("success",`${label} files generated successfully.`);
-      populateSummary(result); populateResults(result); await refreshAzureHistory({silent:true});
+      populateSummary(result); populateResults(result);
+      const metrics=getResultMetrics(result);
+      $("homeInputRows").textContent=formatNumber(metrics.inputRows);
+      $("homeAccept").innerHTML=`${formatNumber(metrics.acceptRows)}<span class="unit">Packs</span>`;
+      $("homeDispatch").innerHTML=`${formatNumber(metrics.dispatchRows)}<span class="unit">Packs</span>`;
+      $("homeVariance").innerHTML=`${formatNumber(metrics.varianceRows)}<span class="unit">Items</span>`;
+      $("homeGenerated").textContent=formatNumber(metrics.acceptFileCount+metrics.dispatchFileCount+metrics.reportFileCount);
+      await refreshAzureHistory({silent:true});
       $("inlineResults").classList.add("show"); setTimeout(()=>$("inlineResults").scrollIntoView({behavior:"smooth",block:"start"}),120);
       toast(`${label} files generated successfully.`,"success");
     }catch(error){
@@ -1239,14 +1246,32 @@
     $("summaryPanel").classList.remove("show"); $("inlineResults").classList.remove("show"); currentResult=null;
   });
  
+  function getResultMetrics(result){
+    const s=result?.summary||{}, outputs=result?.outputs||{};
+    const acceptFiles=normalizeFileGroup(outputs.accept_files).length;
+    const dispatchFiles=normalizeFileGroup(outputs.dispatch_files).length;
+    const reportFiles=countReports(outputs);
+    return {
+      files:s.files_count??s.input_files??s.uploaded_files??3,
+      inputRows:s.total_input_rows??s.input_rows??s.reconciliation_rows??0,
+      masterRows:s.master_rows??s.batch_master_rows??0,
+      acceptRows:s.accept_rows??s.accept_records??0,
+      dispatchRows:s.dispatch_rows??s.dispatch_allocation_rows??s.dispatch_records??0,
+      varianceRows:s.variance_rows??s.exception_rows??s.exceptions??0,
+      acceptFileCount:s.accept_files_count??s.accept_files??acceptFiles,
+      dispatchFileCount:s.dispatch_files_count??s.dispatch_files??dispatchFiles,
+      reportFileCount:reportFiles
+    };
+  }
+
   function populateSummary(result){
-    const s=result.summary||{};
-    $("sumFiles").textContent=formatNumber(s.files_count);
-    $("sumInputRows").textContent=formatNumber(s.total_input_rows);
-    $("sumMasterRows").textContent=formatNumber(s.master_rows);
-    $("sumAccept").textContent=formatNumber(s.accept_rows);
-    $("sumDispatch").textContent=formatNumber(s.dispatch_rows);
-    $("sumVariance").textContent=formatNumber(s.variance_rows);
+    const m=getResultMetrics(result);
+    $("sumFiles").textContent=formatNumber(m.files);
+    $("sumInputRows").textContent=formatNumber(m.inputRows);
+    $("sumMasterRows").textContent=formatNumber(m.masterRows);
+    $("sumAccept").textContent=formatNumber(m.acceptRows);
+    $("sumDispatch").textContent=formatNumber(m.dispatchRows);
+    $("sumVariance").textContent=formatNumber(m.varianceRows);
     $("summaryPanel").classList.add("show");
   }
  
@@ -1258,7 +1283,10 @@
       return {name,content:"",encoding:"text",mime:"application/octet-stream"};
     });
   }
-  function countReports(outputs){ return normalizeFileGroup(outputs.accept_details).length+normalizeFileGroup(outputs.dispatch_details).length+normalizeFileGroup(outputs.variance).length+normalizeFileGroup(outputs.details).length+normalizeFileGroup(outputs.reports).length; }
+  function reportGroups(outputs={}){
+    return [["Reconciliation Report",outputs.reconciliation_report],["Accept Details",outputs.accept_details],["Dispatch Details",outputs.dispatch_details],["Variance",outputs.variance],["Details",outputs.details],["Reports",outputs.reports]];
+  }
+  function countReports(outputs={}){ return reportGroups(outputs).reduce((t,[,g])=>t+normalizeFileGroup(g).length,0); }
   function firstFile(group){ const files=normalizeFileGroup(group); return files.length?files[0]:null; }
  
   function renderAlerts(alerts){
@@ -1288,59 +1316,49 @@
   }
  
   function populateResults(result){
-    const s=result.summary||{}, outputs=result.outputs||{};
-    $("resultAccept").textContent=formatNumber(s.accept_rows);
-    $("resultDispatch").textContent=formatNumber(s.dispatch_rows);
-    $("resultVariance").textContent=formatNumber(s.variance_rows);
-    $("varianceLatest").textContent=formatNumber(s.variance_rows);
-    $("resultFiles").textContent=formatNumber((s.accept_files_count||0)+(s.dispatch_files_count||0)+countReports(outputs));
+    const outputs=result.outputs||{}, m=getResultMetrics(result);
+    $("resultAccept").textContent=formatNumber(m.acceptRows);
+    $("resultDispatch").textContent=formatNumber(m.dispatchRows);
+    $("resultVariance").textContent=formatNumber(m.varianceRows);
+    $("varianceLatest").textContent=formatNumber(m.varianceRows);
+    $("resultFiles").textContent=formatNumber(m.acceptFileCount+m.dispatchFileCount+m.reportFileCount);
     $("resultsInfo").className="status-banner success show";
-    $("resultsInfo").innerHTML=`<span>✓</span><div><strong>Upload files generated successfully.</strong><br>Run ${escapeHtml(result.run_number||"—")} is now <strong>Pending Upload</strong> · Version ${escapeHtml(result.version||"—")} · ${formatNumber(s.total_input_rows)} input rows processed.</div>`;
+    $("resultsInfo").innerHTML=`<span>✓</span><div><strong>Reconciliation completed successfully.</strong><br>Run ${escapeHtml(result.run_number||"—")} · Version ${escapeHtml(result.version||"—")} · ${formatNumber(m.inputRows)} reconciliation rows processed.</div>`;
     renderCsvFiles("acceptFilesList",outputs.accept_files||{},"Accept");
     renderCsvFiles("dispatchFilesList",outputs.dispatch_files||{},"Dispatch");
     renderReportsFiles(outputs);
-    
-    // Render alerts if provided
-    if(result.alerts){
-      renderAlerts(result.alerts);
-    }
-    
-    const hasAccept=Object.keys(outputs.accept_files||{}).length>0;
-    const hasDispatch=Object.keys(outputs.dispatch_files||{}).length>0;
+    if(result.alerts) renderAlerts(result.alerts);
+    const hasAccept=normalizeFileGroup(outputs.accept_files).length>0;
+    const hasDispatch=normalizeFileGroup(outputs.dispatch_files).length>0;
     const hasReports=countReports(outputs)>0;
+    const varianceFile=firstFile(outputs.variance)||firstFile(outputs.reconciliation_report);
     $("downloadAcceptZip").disabled=!hasAccept;
     $("downloadDispatchZip").disabled=!hasDispatch;
-    $("downloadVariance").disabled=!firstFile(outputs.variance);
+    $("downloadVariance").disabled=!varianceFile;
     $("downloadReportsZip").disabled=!hasReports;
     $("downloadAllButton").disabled=!(hasAccept||hasDispatch||hasReports);
   }
- 
+
   function renderCsvFiles(containerId,files,label){
-    const container=$(containerId); container.innerHTML="";
-    const entries=Object.entries(files);
-    if(!entries.length){ container.innerHTML=`<div class="empty"><strong>No ${label} files generated</strong>The reconciliation returned no matching rows.</div>`; return; }
-    entries.forEach(([name,content])=>{
+    const container=$(containerId), entries=normalizeFileGroup(files); container.innerHTML="";
+    if(!entries.length){ container.innerHTML=`<div class="empty"><strong>No ${label} files generated</strong>The reconciliation returned no positive quantities for this stage.</div>`; return; }
+    entries.forEach(file=>{
       const row=document.createElement("div"); row.className="download-row";
-      row.innerHTML=`<div class="file-type">CSV</div><div><div class="file-name">${escapeHtml(name)}</div><div class="file-info">${formatNumber(String(content||"").length)} characters</div></div><button class="btn btn-secondary">Download</button>`;
-      row.querySelector("button").addEventListener("click",()=>downloadText(name,content,"text/csv;charset=utf-8"));
-      container.appendChild(row);
+      row.innerHTML=`<div class="file-type">CSV</div><div><div class="file-name">${escapeHtml(file.name)}</div><div class="file-info">${file.encoding==="base64"?"Generated file":formatNumber(String(file.content||"").length)+" characters"}</div></div><button class="btn btn-secondary">Download</button>`;
+      row.querySelector("button").addEventListener("click",()=>downloadStructured(file)); container.appendChild(row);
     });
   }
- 
+
   function renderReportsFiles(outputs){
-    const container=$("reportsFilesList"); container.innerHTML="";
-    const groups=[["Accept Details",outputs.accept_details],["Dispatch Details",outputs.dispatch_details],["Variance",outputs.variance],["Details",outputs.details],["Reports",outputs.reports]];
-    let total=0;
-    groups.forEach(([label,group])=>normalizeFileGroup(group).forEach(file=>{
-      total++;
-      const row=document.createElement("div"); row.className="download-row";
+    const container=$("reportsFilesList"); container.innerHTML=""; let total=0;
+    reportGroups(outputs).forEach(([label,group])=>normalizeFileGroup(group).forEach(file=>{
+      total++; const row=document.createElement("div"); row.className="download-row";
       row.innerHTML=`<div class="file-type xlsx">XLSX</div><div><div class="file-name">${escapeHtml(file.name)}</div><div class="file-info">${escapeHtml(label)} · ${escapeHtml(file.encoding)}</div></div><button class="btn btn-secondary">Download</button>`;
-      row.querySelector("button").addEventListener("click",()=>downloadStructured(file));
-      container.appendChild(row);
+      row.querySelector("button").addEventListener("click",()=>downloadStructured(file)); container.appendChild(row);
     }));
     if(!total) container.innerHTML=`<div class="empty"><strong>No Excel reports generated</strong>The API response did not include report files.</div>`;
   }
- 
+
   function downloadText(name,content,mime){ triggerBlob(name,new Blob([content??""],{type:mime})); }
   function downloadBase64(name,base64,mime){
     const cleaned=String(base64||"").replace(/^data:.*?;base64,/,"").replace(/\s/g,"");
@@ -1351,23 +1369,23 @@
   function downloadStructured(file){ file.encoding==="base64"?downloadBase64(file.name,file.content,file.mime):downloadText(file.name,file.content,file.mime); }
   function triggerBlob(name,blob){ const url=URL.createObjectURL(blob),a=document.createElement("a"); a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000); }
  
-  async function zipTextFiles(map,name){ const zip=new JSZip(); Object.entries(map||{}).forEach(([n,c])=>zip.file(n,c??"")); triggerBlob(name,await zip.generateAsync({type:"blob"})); }
+  async function zipTextFiles(map,name){ const zip=new JSZip(); normalizeFileGroup(map).forEach(file=>{ if(file.encoding==="base64") zip.file(file.name,file.content,{base64:true}); else zip.file(file.name,file.content??""); }); triggerBlob(name,await zip.generateAsync({type:"blob"})); }
   async function zipReports(outputs,name){
     const zip=new JSZip();
-    [outputs.accept_details,outputs.dispatch_details,outputs.variance,outputs.details,outputs.reports].flatMap(normalizeFileGroup).forEach(file=>{ if(file.encoding==="base64") zip.file(file.name,file.content,{base64:true}); else zip.file(file.name,file.content??""); });
+    reportGroups(outputs).flatMap(([,group])=>normalizeFileGroup(group)).forEach(file=>{ if(file.encoding==="base64") zip.file(file.name,file.content,{base64:true}); else zip.file(file.name,file.content??""); });
     triggerBlob(name,await zip.generateAsync({type:"blob"}));
   }
  
   $("downloadAcceptZip").addEventListener("click",()=>currentResult&&zipTextFiles(currentResult.outputs.accept_files,"SFDA_Accept_Files.zip"));
   $("downloadDispatchZip").addEventListener("click",()=>currentResult&&zipTextFiles(currentResult.outputs.dispatch_files,"SFDA_Dispatch_Files.zip"));
-  $("downloadVariance").addEventListener("click",()=>{ const file=currentResult&&firstFile(currentResult.outputs.variance); if(file) downloadStructured(file); });
+  $("downloadVariance").addEventListener("click",()=>{ const file=currentResult&&(firstFile(currentResult.outputs.variance)||firstFile(currentResult.outputs.reconciliation_report)); if(file) downloadStructured(file); });
   $("downloadReportsZip").addEventListener("click",()=>currentResult&&zipReports(currentResult.outputs,"SFDA_Excel_Reports.zip"));
   $("downloadAllButton").addEventListener("click",async()=>{
     if(!currentResult) return;
     const zip=new JSZip(),outputs=currentResult.outputs||{};
     Object.entries(outputs.accept_files||{}).forEach(([n,c])=>zip.file(`Accept/${n}`,c??""));
     Object.entries(outputs.dispatch_files||{}).forEach(([n,c])=>zip.file(`Dispatch/${n}`,c??""));
-    [outputs.accept_details,outputs.dispatch_details,outputs.variance,outputs.details,outputs.reports].flatMap(normalizeFileGroup).forEach(file=>{ if(file.encoding==="base64") zip.file(`Reports/${file.name}`,file.content,{base64:true}); else zip.file(`Reports/${file.name}`,file.content??""); });
+    reportGroups(outputs).flatMap(([,group])=>normalizeFileGroup(group)).forEach(file=>{ if(file.encoding==="base64") zip.file(`Reports/${file.name}`,file.content,{base64:true}); else zip.file(`Reports/${file.name}`,file.content??""); });
     triggerBlob("SFDA_Reconciliation_All_Results.zip",await zip.generateAsync({type:"blob"}));
   });
  
