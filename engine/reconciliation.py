@@ -16,7 +16,7 @@ class ReconciliationEngine:
         latest ASN/ASDT + current SFDA
 
     Dispatch mode:
-        latest Full Dispatch + refreshed SFDA
+        latest Full Dispatch + latest Inventory + refreshed SFDA
 
     Batch Master is optional enrichment. Its absence never blocks either mode.
     """
@@ -297,38 +297,29 @@ class ReconciliationEngine:
     def _run_dispatch(self) -> Dict[str, pd.DataFrame]:
         if self.dispatch.empty:
             raise ValueError("Full Dispatch file is required for Dispatch reconciliation.")
+        if self.inventory.empty:
+            raise ValueError("Inventory file is required for Dispatch reconciliation.")
 
         self.dispatch = Normalizer.normalize_dispatch(self.dispatch)
+        self.inventory = Normalizer.normalize_inventory(self.inventory)
         Validator.validate(self.dispatch, "DISPATCH")
-        self.dispatch["Expiry Month Key"] = self._month_key(
-            self.dispatch["Expiry Date"]
-        )
+        Validator.validate(self.inventory, "INVENTORY")
+        self.dispatch["Expiry Month Key"] = self._month_key(self.dispatch["Expiry Date"])
+        self.inventory["Expiry Month Key"] = self._month_key(self.inventory["Expiry Date"])
 
-        # Aggregate all physical dispatch movements for every SFDA batch.
-        # Full Dispatch quantities are stored as Each and converted to Pack
-        # after Package Size is mapped from Trade Name.
-        dispatch_summary = (
-            self.dispatch.groupby(self.MATCH_KEYS, dropna=False)
+        inventory = (
+            self.inventory.groupby(self.MATCH_KEYS, dropna=False)
             .agg(
                 **{
-                    "Generic Item Number": (
-                        "Generic Item Number",
-                        "first",
-                    ),
+                    "Generic Item Number": ("Generic Item Number", "first"),
                     "Trade Name": ("Trade Name", "first"),
-                    "Total Full Dispatch Each": (
-                        "Dispatched Quantity",
-                        "sum",
-                    ),
+                    "Inventory Available Each": ("Available Quantity", "sum"),
                 }
             )
             .reset_index()
         )
-
-        # Start from SFDA batches and retain only batches supported by an
-        # actual movement in the latest Full Dispatch report.
-        report = self._sfda_summary().merge(
-            dispatch_summary,
+        report = inventory.merge(
+            self._sfda_summary(),
             on=self.MATCH_KEYS,
             how="inner",
             validate="one_to_one",
@@ -339,57 +330,21 @@ class ReconciliationEngine:
             how="left",
             validate="many_to_one",
         )
-
-        report["PackageSize"] = pd.to_numeric(
-            report["PackageSize"],
-            errors="coerce",
-        )
+        report["PackageSize"] = pd.to_numeric(report["PackageSize"], errors="coerce")
         report["Package Size Status"] = report["PackageSize"].apply(
-            lambda value: (
-                "Mapped"
-                if pd.notna(value) and float(value) > 0
-                else "Missing"
-            )
+            lambda value: "Mapped" if pd.notna(value) and float(value) > 0 else "Missing"
         )
         report["PackageSize"] = report["PackageSize"].fillna(1)
         report.loc[report["PackageSize"] <= 0, "PackageSize"] = 1
-
-        report["Total Full Dispatch Each"] = pd.to_numeric(
-            report["Total Full Dispatch Each"],
-            errors="coerce",
-        ).fillna(0)
-        report["Total Full Dispatch Pack"] = (
-            report["Total Full Dispatch Each"]
+        report["Inventory Available Pack"] = (
+            pd.to_numeric(report["Inventory Available Each"], errors="coerce").fillna(0)
             / report["PackageSize"]
         )
-
-        # Never send more than the current Active quantity in SFDA.
-        # Both values are floored to whole packs before comparison.
         report["To Be Dispatched"] = report.apply(
-            lambda row: min(
-                self._safe_int(row["Total Full Dispatch Pack"]),
-                self._safe_int(row["Active"]),
-            ),
-            axis=1,
-        )
-        report["Expected Active After Dispatch"] = report.apply(
             lambda row: max(
                 0,
                 self._safe_int(row["Active"])
-                - self._safe_int(row["To Be Dispatched"]),
-            ),
-            axis=1,
-        )
-        report["Full Dispatch Status"] = report.apply(
-            lambda row: (
-                "No Dispatch Quantity"
-                if self._safe_int(row["Total Full Dispatch Pack"]) <= 0
-                else (
-                    "Limited by SFDA Active"
-                    if self._safe_int(row["Total Full Dispatch Pack"])
-                    > self._safe_int(row["Active"])
-                    else "Full Dispatch Used"
-                )
+                - self._safe_int(row["Inventory Available Pack"]),
             ),
             axis=1,
         )
@@ -401,13 +356,12 @@ class ReconciliationEngine:
             + [
                 "GTIN",
                 "Drug Name",
+                "Expiry Date",
                 "PackageSize",
                 "To Be Dispatched",
             ],
         ].copy()
 
-        # Allocate the approved quantity to the real customers recorded in
-        # Full Dispatch, oldest movement first, stopping at To Be Dispatched.
         evidence = self.dispatch.copy().reset_index(drop=True)
         evidence["_Source Order"] = range(len(evidence))
         evidence = evidence.merge(
@@ -417,43 +371,23 @@ class ReconciliationEngine:
             validate="many_to_one",
         )
         evidence["Evidence Packages"] = (
-            pd.to_numeric(
-                evidence["Dispatched Quantity"],
-                errors="coerce",
-            ).fillna(0)
+            pd.to_numeric(evidence["Dispatched Quantity"], errors="coerce").fillna(0)
             / evidence["PackageSize"]
-        ).apply(self._safe_int)
+        ).astype(int)
         evidence = evidence.sort_values(
-            [
-                "BN",
-                "Expiry Month Key",
-                "Dispatch Date",
-                "_Source Order",
-            ],
+            ["BN", "Expiry Month Key", "Dispatch Date", "_Source Order"],
             kind="stable",
         )
 
         allocated_rows = []
-        for _, group in evidence.groupby(
-            self.MATCH_KEYS,
-            sort=False,
-            dropna=False,
-        ):
-            remaining = self._safe_int(
-                group["To Be Dispatched"].iloc[0]
-            )
-
+        for _, group in evidence.groupby(self.MATCH_KEYS, sort=False, dropna=False):
+            remaining = self._safe_int(group["To Be Dispatched"].iloc[0])
             for _, row in group.iterrows():
                 if remaining <= 0:
                     break
-
-                allocated = min(
-                    remaining,
-                    self._safe_int(row["Evidence Packages"]),
-                )
+                allocated = min(remaining, self._safe_int(row["Evidence Packages"]))
                 if allocated <= 0:
                     continue
-
                 item = row.to_dict()
                 item["Allocated To Be Dispatch"] = allocated
                 allocated_rows.append(item)
@@ -461,47 +395,9 @@ class ReconciliationEngine:
 
         allocated = pd.DataFrame(allocated_rows)
         if not allocated.empty:
-            # Consolidate repeated movements for the same batch/customer into
-            # one Upload Dispatch row before GLN assignment.
-            group_columns = self.MATCH_KEYS + [
-                "GTIN",
-                "Drug Name",
-                "Expiry Date",
-                "To Address",
-            ]
-            allocated = (
-                allocated.groupby(
-                    group_columns,
-                    dropna=False,
-                    as_index=False,
-                )
-                .agg(
-                    **{
-                        "Allocated To Be Dispatch": (
-                            "Allocated To Be Dispatch",
-                            "sum",
-                        ),
-                        "Dispatch Date": (
-                            "Dispatch Date",
-                            "min",
-                        ),
-                    }
-                )
-            )
-
-            gln = self.gln[["To Address", "GLN"]].drop_duplicates(
-                "To Address",
-                keep="first",
-            )
-            allocated = allocated.merge(
-                gln,
-                on="To Address",
-                how="left",
-            )
-            missing = (
-                allocated["GLN"].isna()
-                | allocated["GLN"].astype(str).str.strip().eq("")
-            )
+            gln = self.gln[["To Address", "GLN"]].drop_duplicates("To Address", keep="first")
+            allocated = allocated.merge(gln, on="To Address", how="left")
+            missing = allocated["GLN"].isna() | allocated["GLN"].astype(str).str.strip().eq("")
             allocated["Customer Status"] = "REGISTERED"
             allocated.loc[missing, "Customer Status"] = "DUMMY"
             allocated.loc[missing, "GLN"] = self.DUMMY_GLN
@@ -519,36 +415,24 @@ class ReconciliationEngine:
             )
 
         details_columns = [
-            "GTIN",
-            "Drug Name",
             "BN",
             "Expiry Date",
+            "GTIN",
+            "Drug Name",
+            "Generic Item Number",
+            "Trade Name",
             "PackageSize",
+            "Inventory Available Each",
+            "Inventory Available Pack",
             "Active",
             "Quantity sent pending",
             "Quantity Receive Pending",
-            "Generic Item Number",
-            "Total Full Dispatch Each",
-            "Total Full Dispatch Pack",
             "To Be Dispatched",
-            "Expected Active After Dispatch",
-            "Full Dispatch Status",
             "Package Size Status",
             "Batch Master Status",
         ]
-        details = report[
-            [
-                column
-                for column in details_columns
-                if column in report.columns
-            ]
-        ].copy()
-
-        return {
-            "report": details,
-            "accept": pd.DataFrame(),
-            "dispatch": allocated,
-        }
+        details = report[[column for column in details_columns if column in report.columns]].copy()
+        return {"report": details, "accept": pd.DataFrame(), "dispatch": allocated}
 
     def run(self) -> Dict[str, pd.DataFrame]:
         self._normalize_common()
