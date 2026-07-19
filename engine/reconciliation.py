@@ -69,6 +69,39 @@ class ReconciliationEngine:
         number = pd.to_numeric(pd.Series([value]), errors="coerce").fillna(0).iloc[0]
         return max(0, int(number))
 
+    @staticmethod
+    def _join_unique(values: pd.Series) -> str:
+        """Join unique non-empty values without losing multi-shipment details."""
+        unique_values = []
+        seen = set()
+
+        for value in values:
+            if pd.isna(value):
+                continue
+
+            text = str(value).strip()
+            if not text or text.lower() == "nan" or text in seen:
+                continue
+
+            seen.add(text)
+            unique_values.append(text)
+
+        return " | ".join(unique_values)
+
+    @staticmethod
+    def _copy_first_available_column(
+        frame: pd.DataFrame,
+        target: str,
+        candidates: list[str],
+    ) -> None:
+        """Create a normalized target column from the first available ASN alias."""
+        for candidate in candidates:
+            if candidate in frame.columns:
+                frame[target] = Normalizer.text(frame[candidate])
+                return
+
+        frame[target] = ""
+
     def _normalize_common(self) -> None:
         self.sfda = Normalizer.normalize_sfda(self.sfda)
         self.sfda["Expiry Month Key"] = self._month_key(self.sfda["Expiry Date"])
@@ -164,6 +197,24 @@ class ReconciliationEngine:
         Validator.validate(self.asn, "ASN")
         self.asn["Expiry Month Key"] = self._month_key(self.asn["Expiry Date"])
 
+        # Keep the operational receiving fields required in Accept Details.
+        # Exact source names are preferred, with common aliases accepted.
+        self._copy_first_available_column(
+            self.asn,
+            "Description",
+            ["Description", "Item Description", "Generic Item Description"],
+        )
+        self._copy_first_available_column(
+            self.asn,
+            "Supplier Code",
+            ["Supplier Code", "Vendor Code", "Supplier Number"],
+        )
+        self._copy_first_available_column(
+            self.asn,
+            "Item Family Group",
+            ["Item Family Group", "Item Family", "Family Group"],
+        )
+
         receiving = (
             self.asn.groupby(self.MATCH_KEYS, dropna=False)
             .agg(
@@ -172,6 +223,11 @@ class ReconciliationEngine:
                     "Trade Name": ("Trade Name", "first"),
                     "Received Quantity Each": ("Received Quantity", "sum"),
                     "ASN Expiry Date": ("Expiry Date", "first"),
+                    "Description": ("Description", self._join_unique),
+                    "Inbound Shipment": ("Inbound Shipment", self._join_unique),
+                    "Supplier Name": ("Supplier Name", self._join_unique),
+                    "Supplier Code": ("Supplier Code", self._join_unique),
+                    "Item Family Group": ("Item Family Group", self._join_unique),
                 }
             )
             .reset_index()
@@ -215,18 +271,22 @@ class ReconciliationEngine:
         ].copy()
 
         details_columns = [
-            "BN",
-            "Expiry Date",
             "GTIN",
             "Drug Name",
-            "Generic Item Number",
-            "Trade Name",
+            "BN",
+            "Expiry Date",
             "PackageSize",
-            "Received Quantity Each",
-            "Received Quantity Pack",
-            "Quantity Receive Pending",
             "Active",
             "Quantity sent pending",
+            "Quantity Receive Pending",
+            "Generic Item Number",
+            "Received Quantity Each",
+            "Received Quantity Pack",
+            "Description",
+            "Inbound Shipment",
+            "Supplier Name",
+            "Supplier Code",
+            "Item Family Group",
             "To Be Accept",
             "Package Size Status",
             "Batch Master Status",
