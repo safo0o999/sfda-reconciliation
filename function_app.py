@@ -19,9 +19,32 @@ APPLICATION_VERSION = "5.0.0"
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 
 
+def sanitize_json(obj):
+    if isinstance(obj, dict):
+        return {k: sanitize_json(v) for k, v in obj.items()}
+
+    if isinstance(obj, list):
+        return [sanitize_json(v) for v in obj]
+
+    if isinstance(obj, tuple):
+        return [sanitize_json(v) for v in obj]
+
+    if pd.isna(obj):
+        return None
+
+    return obj
+
+
 def json_response(data: Dict[str, Any], status_code: int = 200) -> func.HttpResponse:
+    clean_data = sanitize_json(data)
+
     return func.HttpResponse(
-        body=json.dumps(data, ensure_ascii=False, default=str),
+        body=json.dumps(
+            clean_data,
+            ensure_ascii=False,
+            default=str,
+            allow_nan=False,
+        ),
         status_code=status_code,
         mimetype="application/json",
         charset="utf-8",
