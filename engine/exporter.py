@@ -43,6 +43,35 @@ class Exporter:
         "Batch Master Status",
     ]
 
+    DISPATCH_DETAILS_COLUMNS = [
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "PackageSize",
+        "Active",
+        "Quantity sent pending",
+        "Quantity Receive Pending",
+        "Generic Item Number",
+        "Trade Name",
+        "Sales Order Number",
+        "Order Line",
+        "To Address",
+        "Dispatch Date",
+        "Dispatch Quantity Each",
+        "Dispatch Quantity Pack",
+        "Allocated To Be Dispatch",
+        "Processing Status",
+        "Previous Run Date",
+        "Previous Quantity Each",
+        "Current Quantity Each",
+        "Quantity Difference",
+        "GLN",
+        "Customer Status",
+        "Package Size Status",
+        "Batch Master Status",
+    ]
+
     @staticmethod
     def _normalize_identifier(value):
         if pd.isna(value):
@@ -370,6 +399,17 @@ class Exporter:
         )
 
     @staticmethod
+    def _is_dispatch_details_report(file_name, sheet_name):
+        file_text = str(file_name or "").strip().lower()
+        sheet_text = str(sheet_name or "").strip().lower()
+
+        return (
+            "dispatch_details" in file_text
+            or "dispatch details" in file_text
+            or sheet_text == "dispatch details"
+        )
+
+    @staticmethod
     def build_formatted_excel_file(
         df,
         file_name,
@@ -388,15 +428,24 @@ class Exporter:
             file_name,
             sheet_name,
         )
+        is_dispatch_details = Exporter._is_dispatch_details_report(
+            file_name,
+            sheet_name,
+        )
 
         if is_accept_details:
-            # Accept Details has a fixed operational layout. Trade Name and
-            # any other non-approved columns are intentionally excluded.
             report = report.reindex(
                 columns=Exporter.ACCEPT_DETAILS_COLUMNS
             )
+        elif is_dispatch_details:
+            report = report.reindex(
+                columns=Exporter.DISPATCH_DETAILS_COLUMNS
+            )
 
-        if columns and not is_accept_details:
+        if columns and not (
+            is_accept_details
+            or is_dispatch_details
+        ):
             report = report[
                 [
                     column
@@ -432,14 +481,19 @@ class Exporter:
             column_count
         )
 
-        if is_accept_details:
-            # Row 1 contains only the three source/decision groups.
-            # The old "SFDA Accept Details" title row is intentionally removed.
-            group_definitions = [
-                (1, 8, "SFDA Report", "5B9BD5"),
-                (9, 16, "WMS Receiving Report", "4472C4"),
-                (17, 24, "Decision", "70AD47"),
-            ]
+        if is_accept_details or is_dispatch_details:
+            if is_accept_details:
+                group_definitions = [
+                    (1, 8, "SFDA Report", "5B9BD5"),
+                    (9, 16, "WMS Receiving Report", "4472C4"),
+                    (17, 24, "Decision", "70AD47"),
+                ]
+            else:
+                group_definitions = [
+                    (1, 8, "SFDA Report", "5B9BD5"),
+                    (9, 16, "WMS Dispatch Report", "4472C4"),
+                    (17, 26, "Decision", "70AD47"),
+                ]
 
             for start_column, end_column, group_title, fill_color in group_definitions:
                 start_letter = get_column_letter(start_column)
@@ -524,9 +578,15 @@ class Exporter:
                 bold=True,
                 color="FFFFFF",
             )
-            if is_accept_details and column_index >= 17:
+            if (
+                is_accept_details
+                or is_dispatch_details
+            ) and column_index >= 17:
                 header_fill = "548235"
-            elif is_accept_details and column_index >= 9:
+            elif (
+                is_accept_details
+                or is_dispatch_details
+            ) and column_index >= 9:
                 header_fill = "2F5597"
             else:
                 header_fill = "17365D"
@@ -645,8 +705,7 @@ class Exporter:
                 f"{header_row + len(report)}"
             )
 
-            if is_accept_details:
-                # Preserve the custom three-group header colors exactly.
+            if is_accept_details or is_dispatch_details:
                 worksheet.auto_filter.ref = report_range
             else:
                 table = Table(
