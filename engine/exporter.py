@@ -16,6 +16,33 @@ class Exporter:
     GTIN_LENGTH = 14
     DUMMY_GLN = "9999999999999"
 
+    BATCH_MASTER_COLUMNS = [
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "PackageSize",
+        "Quantity",
+        "Active",
+        "Quantity sent pending",
+        "Quantity Receive Pending",
+        "Generic Item Number",
+        "Description",
+        "Trade Name",
+        "Received Quantity Each",
+        "Received Quantity Pack",
+        "First Received Date",
+        "Last Received Date",
+        "Receive Runs",
+        "Total Dispatched Qty",
+        "First Dispatch Date",
+        "Last Dispatch Date",
+        "Dispatch Runs",
+        "Generic Exists in SFDA",
+        "Last Updated",
+        "Item Family Group",
+    ]
+
     ACCEPT_DETAILS_COLUMNS = [
         "GTIN",
         "Drug Name",
@@ -388,6 +415,16 @@ class Exporter:
         return output
 
     @staticmethod
+    def _is_batch_master_report(file_name, sheet_name):
+        file_text = str(file_name or "").strip().lower()
+        sheet_text = str(sheet_name or "").strip().lower()
+        return (
+            "batch_master" in file_text
+            or "batch master" in file_text
+            or sheet_text == "batch master"
+        )
+
+    @staticmethod
     def _is_accept_details_report(file_name, sheet_name):
         file_text = str(file_name or "").strip().lower()
         sheet_text = str(sheet_name or "").strip().lower()
@@ -424,6 +461,10 @@ class Exporter:
             else pd.DataFrame()
         )
 
+        is_batch_master = Exporter._is_batch_master_report(
+            file_name,
+            sheet_name,
+        )
         is_accept_details = Exporter._is_accept_details_report(
             file_name,
             sheet_name,
@@ -433,7 +474,11 @@ class Exporter:
             sheet_name,
         )
 
-        if is_accept_details:
+        if is_batch_master:
+            report = report.reindex(
+                columns=Exporter.BATCH_MASTER_COLUMNS
+            )
+        elif is_accept_details:
             report = report.reindex(
                 columns=Exporter.ACCEPT_DETAILS_COLUMNS
             )
@@ -443,7 +488,8 @@ class Exporter:
             )
 
         if columns and not (
-            is_accept_details
+            is_batch_master
+            or is_accept_details
             or is_dispatch_details
         ):
             report = report[
@@ -481,8 +527,13 @@ class Exporter:
             column_count
         )
 
-        if is_accept_details or is_dispatch_details:
-            if is_accept_details:
+        if is_batch_master or is_accept_details or is_dispatch_details:
+            if is_batch_master:
+                group_definitions = [
+                    (1, 9, "SFDA Report", "5B9BD5"),
+                    (10, 24, "WMS Report", "4472C4"),
+                ]
+            elif is_accept_details:
                 group_definitions = [
                     (1, 8, "SFDA Report", "5B9BD5"),
                     (9, 16, "WMS Receiving Report", "4472C4"),
@@ -578,7 +629,9 @@ class Exporter:
                 bold=True,
                 color="FFFFFF",
             )
-            if (
+            if is_batch_master:
+                header_fill = "2F5597" if column_index >= 10 else "17365D"
+            elif (
                 is_accept_details
                 or is_dispatch_details
             ) and column_index >= 17:
@@ -705,7 +758,7 @@ class Exporter:
                 f"{header_row + len(report)}"
             )
 
-            if is_accept_details or is_dispatch_details:
+            if is_batch_master or is_accept_details or is_dispatch_details:
                 worksheet.auto_filter.ref = report_range
             else:
                 table = Table(
