@@ -41,6 +41,9 @@ BEGIN
         InboundShipment nvarchar(150) NULL,
         ASNLine nvarchar(100) NULL,
         SupplierName nvarchar(500) NULL,
+        SupplierCode nvarchar(120) NULL,
+        Description nvarchar(1000) NULL,
+        ItemFamilyGroup nvarchar(500) NULL,
         ReceivedDate datetime2 NULL,
         CreatedAt datetime2 NOT NULL
             CONSTRAINT DF_ReceiptEvents_CreatedAt DEFAULT SYSUTCDATETIME(),
@@ -114,6 +117,10 @@ BEGIN
         GenericItemNumber nvarchar(120) NOT NULL,
         TradeItemNumber nvarchar(120) NULL,
         TradeName nvarchar(500) NULL,
+        Description nvarchar(1000) NULL,
+        SupplierName nvarchar(500) NULL,
+        SupplierCode nvarchar(120) NULL,
+        ItemFamilyGroup nvarchar(500) NULL,
         GTIN nvarchar(20) NULL,
         DrugName nvarchar(500) NULL,
         TotalReceiveQty decimal(19,4) NOT NULL
@@ -259,6 +266,41 @@ IF COL_LENGTH('dbo.BatchMaster', 'GenericExistsInSFDA') IS NOT NULL
 BEGIN
     ALTER TABLE dbo.BatchMaster
     ALTER COLUMN GenericExistsInSFDA nvarchar(30) NOT NULL;
+END;
+
+IF COL_LENGTH('dbo.ReceiptEvents', 'SupplierCode') IS NULL
+BEGIN
+    ALTER TABLE dbo.ReceiptEvents ADD SupplierCode nvarchar(120) NULL;
+END;
+
+IF COL_LENGTH('dbo.ReceiptEvents', 'Description') IS NULL
+BEGIN
+    ALTER TABLE dbo.ReceiptEvents ADD Description nvarchar(1000) NULL;
+END;
+
+IF COL_LENGTH('dbo.ReceiptEvents', 'ItemFamilyGroup') IS NULL
+BEGIN
+    ALTER TABLE dbo.ReceiptEvents ADD ItemFamilyGroup nvarchar(500) NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'Description') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster ADD Description nvarchar(1000) NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'SupplierName') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster ADD SupplierName nvarchar(500) NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'SupplierCode') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster ADD SupplierCode nvarchar(120) NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'ItemFamilyGroup') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster ADD ItemFamilyGroup nvarchar(500) NULL;
 END;
 
 IF NOT EXISTS
@@ -514,9 +556,12 @@ BEGIN
         InboundShipment,
         ASNLine,
         SupplierName,
+        SupplierCode,
+        Description,
+        ItemFamilyGroup,
         ReceivedDate
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
     SELECT CAST(1 AS int) AS Inserted;
 END;
@@ -718,6 +763,9 @@ def _receipt_parameters(row: Dict[str, Any]) -> Tuple[Any, ...]:
         _text(row, "Inbound Shipment"),
         _text(row, "ASN Line"),
         _text(row, "Supplier Name"),
+        _text(row, "Supplier Code"),
+        _text(row, "Description"),
+        _text(row, "Item Family Group"),
         _value(row, "Received Date"),
     )
 
@@ -815,7 +863,10 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             GenericItemNumber AS [Generic Item Number],
             MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
             MAX(NULLIF(TradeName, '')) AS [Trade Name],
-            COUNT_BIG(*) AS [Receive Runs],
+            MAX(NULLIF(Description, '')) AS [Description],
+            MAX(NULLIF(SupplierName, '')) AS [Supplier Name],
+            MAX(NULLIF(SupplierCode, '')) AS [Supplier Code],
+            MAX(NULLIF(ItemFamilyGroup, '')) AS [Item Family Group],
             SUM(ReceivedQuantity) AS [Total Receive Qty],
             MIN(ReceivedDate) AS [First Received Date],
             MAX(ReceivedDate) AS [Last Received Date]
@@ -833,7 +884,6 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             GenericItemNumber AS [Generic Item Number],
             MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
             MAX(NULLIF(TradeName, '')) AS [Trade Name],
-            COUNT_BIG(*) AS [Dispatch Runs],
             SUM(DispatchedQuantity) AS [Total Dispatched Qty],
             MIN(DispatchDate) AS [First Dispatch Date],
             MAX(DispatchDate) AS [Last Dispatch Date]
@@ -883,6 +933,10 @@ def replace_batch_master(master: pd.DataFrame) -> None:
             GenericItemNumber,
             TradeItemNumber,
             TradeName,
+            Description,
+            SupplierName,
+            SupplierCode,
+            ItemFamilyGroup,
             GTIN,
             DrugName,
             TotalReceiveQty,
@@ -896,7 +950,7 @@ def replace_batch_master(master: pd.DataFrame) -> None:
             GenericExistsInSFDA,
             LastUpdated
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     """
 
     rows: Iterable[Tuple[Any, ...]] = (
@@ -910,13 +964,17 @@ def replace_batch_master(master: pd.DataFrame) -> None:
                 "Trade Item Number",
                 _text(row, "Trade Item"),
             ),
-            _text(row, "Trade Name"),
+            _text(row, "Trade Description", _text(row, "Trade Name")),
+            _text(row, "Description"),
+            _text(row, "Supplier Name"),
+            _text(row, "Supplier Code"),
+            _text(row, "Item Family Group"),
             _text(row, "GTIN"),
             _text(row, "Drug Name"),
-            _number(row, "Total Receive Qty"),
+            _number(row, "Total Receive Qty", _number(row, "Received Quantity Each")),
             _number(row, "Total Dispatched Qty"),
-            _integer(row, "Receive Runs"),
-            _integer(row, "Dispatch Runs"),
+            0,
+            0,
             _value(row, "First Received Date"),
             _value(row, "Last Received Date"),
             _value(row, "First Dispatch Date"),
@@ -960,13 +1018,15 @@ def get_batch_master_df() -> pd.DataFrame:
             ExpiryDate AS [Expiry Date],
             GenericItemNumber AS [Generic Item Number],
             TradeItemNumber AS [Trade Item Number],
-            TradeName AS [Trade Name],
+            TradeName AS [Trade Description],
+            Description AS [Description],
+            SupplierName AS [Supplier Name],
+            SupplierCode AS [Supplier Code],
+            ItemFamilyGroup AS [Item Family Group],
             GTIN,
             DrugName AS [Drug Name],
             TotalReceiveQty AS [Total Receive Qty],
             TotalDispatchedQty AS [Total Dispatched Qty],
-            ReceiveRuns AS [Receive Runs],
-            DispatchRuns AS [Dispatch Runs],
             FirstReceivedDate AS [First Received Date],
             LastReceivedDate AS [Last Received Date],
             FirstDispatchDate AS [First Dispatch Date],
