@@ -1,19 +1,30 @@
+import os
+import pandas as pd  # تأكد من وجود هذا السطر في أعلى الملف
+import pyodbc
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+class Database:
+    """Azure SQL connection provider for SFDA Reconciliation v5."""
+    def __init__(self):
+        connection_string = os.getenv("SQL_CONNECTION_STRING", "").strip()
+        if not connection_string:
+            raise RuntimeError("SQL_CONNECTION_STRING is missing.")
+        self.connection_string = connection_string
+
+    def connect(self):
+        return pyodbc.connect(self.connection_string, autocommit=False)
+
+# ... (بقية دوال المساعدة مثل _text, _number, _integer تبقى كما هي) ...
+
 def replace_batch_master(master: pd.DataFrame) -> None:
     """Atomically replace Batch Master from cumulative event summaries."""
-
     initialize_database()
 
-    required_columns = [
-        "BN",
-        "Expiry Month Key",
-        "Generic Item Number",
-    ]
-
-    missing = [column for column in required_columns if column not in master.columns]
+    required_columns = ["BN", "Expiry Month Key", "Generic Item Number"]
+    missing = [col for col in required_columns if col not in master.columns]
     if missing:
         raise ValueError("Batch Master is missing required columns: " + ", ".join(missing))
 
-    # جملة SQL تحتوي على 26 عموداً
     insert_sql = r"""
         INSERT INTO dbo.BatchMaster
         (
@@ -27,8 +38,6 @@ def replace_batch_master(master: pd.DataFrame) -> None:
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     """
 
-    # تجهيز الصفوف (يجب أن تحتوي كل tuple على 25 قيمة لتطابق 25 علامة استفهام في insert_sql أعلاه)
-    # ملاحظة: تم التأكد من مطابقة الترتيب تماماً
     rows = [
         (
             _text(row, "BN"),
@@ -55,6 +64,7 @@ def replace_batch_master(master: pd.DataFrame) -> None:
             _value(row, "First Dispatch Date"),
             _value(row, "Last Dispatch Date"),
             _text(row, "Generic Exists in SFDA", "Yes"),
+            # استخدام pd هنا يتطلب أن يكون pandas مستورداً في أعلى الملف
             _value(row, "Last Updated", pd.Timestamp.utcnow().tz_localize(None)),
         )
         for row in master.to_dict(orient="records")
