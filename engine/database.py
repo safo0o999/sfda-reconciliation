@@ -403,6 +403,7 @@ BEGIN
     CREATE TABLE dbo.ReconciliationRunFiles
     (
         RunFileID bigint IDENTITY(1,1) NOT NULL,
+        RunID bigint NOT NULL,
         RunNumber nvarchar(80) NOT NULL,
         FileCategory varchar(20) NOT NULL,
         FileName nvarchar(500) NOT NULL,
@@ -414,8 +415,51 @@ BEGIN
         ETag nvarchar(200) NULL,
         CreatedAt datetime2 NOT NULL CONSTRAINT DF_ReconciliationRunFiles_Created DEFAULT SYSUTCDATETIME(),
         CONSTRAINT PK_ReconciliationRunFiles PRIMARY KEY (RunFileID),
-        CONSTRAINT UQ_ReconciliationRunFiles_Blob UNIQUE (ContainerName, BlobName)
+        CONSTRAINT UQ_ReconciliationRunFiles_Blob UNIQUE (ContainerName, BlobName),
+        CONSTRAINT FK_ReconciliationRunFiles_Run
+            FOREIGN KEY (RunID) REFERENCES dbo.ReconciliationRuns(RunID)
     );
+END;
+
+IF COL_LENGTH('dbo.ReconciliationRunFiles', 'RunID') IS NULL
+BEGIN
+    ALTER TABLE dbo.ReconciliationRunFiles
+    ADD RunID bigint NULL;
+
+    UPDATE run_file
+    SET RunID = run_header.RunID
+    FROM dbo.ReconciliationRunFiles AS run_file
+    INNER JOIN dbo.ReconciliationRuns AS run_header
+        ON run_header.RunNumber = run_file.RunNumber;
+
+    IF EXISTS
+    (
+        SELECT 1
+        FROM dbo.ReconciliationRunFiles
+        WHERE RunID IS NULL
+    )
+    BEGIN
+        THROW 50001,
+            'ReconciliationRunFiles contains rows that cannot be linked to ReconciliationRuns.',
+            1;
+    END;
+
+    ALTER TABLE dbo.ReconciliationRunFiles
+    ALTER COLUMN RunID bigint NOT NULL;
+END;
+
+IF NOT EXISTS
+(
+    SELECT 1
+    FROM sys.foreign_keys
+    WHERE name = 'FK_ReconciliationRunFiles_Run'
+      AND parent_object_id = OBJECT_ID('dbo.ReconciliationRunFiles')
+)
+BEGIN
+    ALTER TABLE dbo.ReconciliationRunFiles
+    ADD CONSTRAINT FK_ReconciliationRunFiles_Run
+        FOREIGN KEY (RunID)
+        REFERENCES dbo.ReconciliationRuns(RunID);
 END;
 
 IF NOT EXISTS
@@ -1204,11 +1248,34 @@ def save_reconciliation_run_file(
     size_bytes: int,
     etag: str = "",
 ) -> None:
+    """Save an input or output file and link it to its reconciliation run."""
+
+    normalized_run_number = str(run_number or "").strip()
+
+    if not normalized_run_number:
+        raise ValueError("run_number is required.")
+
+    initialize_database()
+
     sql = """
+    DECLARE @RunID bigint;
+
+    SELECT @RunID = RunID
+    FROM dbo.ReconciliationRuns
+    WHERE RunNumber = ?;
+
+    IF @RunID IS NULL
+    BEGIN
+        THROW 50002,
+            'Reconciliation run was not found for the supplied RunNumber.',
+            1;
+    END;
+
     MERGE dbo.ReconciliationRunFiles AS target
     USING
     (
         SELECT
+            @RunID AS RunID,
             ? AS RunNumber,
             ? AS FileCategory,
             ? AS FileName,
@@ -1223,6 +1290,7 @@ def save_reconciliation_run_file(
        AND target.BlobName = source.BlobName
     WHEN MATCHED THEN
         UPDATE SET
+            RunID = source.RunID,
             RunNumber = source.RunNumber,
             FileCategory = source.FileCategory,
             FileName = source.FileName,
@@ -1234,22 +1302,41 @@ def save_reconciliation_run_file(
     WHEN NOT MATCHED THEN
         INSERT
         (
-            RunNumber, FileCategory, FileName, FileType,
-            ContainerName, BlobName, ContentType, SizeBytes, ETag
+            RunID,
+            RunNumber,
+            FileCategory,
+            FileName,
+            FileType,
+            ContainerName,
+            BlobName,
+            ContentType,
+            SizeBytes,
+            ETag
         )
         VALUES
         (
-            source.RunNumber, source.FileCategory, source.FileName, source.FileType,
-            source.ContainerName, source.BlobName, source.ContentType, source.SizeBytes, source.ETag
+            source.RunID,
+            source.RunNumber,
+            source.FileCategory,
+            source.FileName,
+            source.FileType,
+            source.ContainerName,
+            source.BlobName,
+            source.ContentType,
+            source.SizeBytes,
+            source.ETag
         );
     """
+
     with Database().connect() as connection:
         cursor = connection.cursor()
+
         try:
             cursor.execute(
                 sql,
                 (
-                    run_number,
+                    normalized_run_number,
+                    normalized_run_number,
                     file_category,
                     file_name,
                     file_type,
@@ -1261,6 +1348,7 @@ def save_reconciliation_run_file(
                 ),
             )
             connection.commit()
+
         except Exception:
             connection.rollback()
             raise
@@ -1305,7 +1393,7 @@ def list_reconciliation_run_files(run_number: str) -> List[Dict[str, Any]]:
     initialize_database()
     sql = """
     SELECT
-        RunFileID, RunNumber, FileCategory, FileName, FileType,
+        RunFileID, RunID, RunNumber, FileCategory, FileName, FileType,
         ContainerName, BlobName, ContentType, SizeBytes, ETag, CreatedAt
     FROM dbo.ReconciliationRunFiles
     WHERE RunNumber = ?
