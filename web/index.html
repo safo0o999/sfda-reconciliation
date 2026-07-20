@@ -1398,6 +1398,11 @@
       runId: row.RunNumber || `RUN-${row.RunID ?? "—"}`,
       runNumber: row.RunNumber || "—",
       databaseRunId: row.RunID ?? null,
+      processType: row.ProcessType || "",
+      asnFiles: Number(row.ASNFiles || 0),
+      inventoryFiles: Number(row.InventoryFiles || 0),
+      dispatchFiles: Number(row.DispatchFiles || 0),
+      sfdaFiles: Number(row.SFDAFiles || 0),
       timestamp: row.StartedAt || row.RunDate || null,
       completedAt: row.CompletedAt || null,
       user: row.SubmittedBy || "Web User",
@@ -1431,7 +1436,7 @@
     const {silent=false} = options;
     if(historyLoading) return historyCache;
     historyLoading = true;
-    if(!silent) toast("Refreshing Azure SQL history...","info");
+    if(!silent) toast("Refreshing reconciliation history...","info");
     try{
       const response = await fetch(`${HISTORY_URL}?limit=500`, {cache:"no-store"});
       let payload;
@@ -1453,7 +1458,7 @@
       if(!silent) toast(`History refreshed: ${historyCache.length} run${historyCache.length===1?"":"s"}.`,"success");
       return historyCache;
     }catch(error){
-      console.error("Unable to load Azure SQL history.", error);
+      console.error("Unable to load reconciliation history.", error);
       historyLoaded = true;
       renderHistory(error);
       updateDashboard();
@@ -1473,7 +1478,7 @@
     body.innerHTML="";
  
     if(loadError && !historyCache.length){
-      body.innerHTML=`<tr><td colspan="11"><div class="empty"><strong>Unable to load Azure SQL history</strong>${escapeHtml(loadError.message || String(loadError))}</div></td></tr>`;
+      body.innerHTML=`<tr><td colspan="11"><div class="empty"><strong>Unable to load reconciliation history</strong>${escapeHtml(loadError.message || String(loadError))}</div></td></tr>`;
       $('historyCount').textContent="History unavailable";
       return;
     }
@@ -1489,10 +1494,10 @@
     });
  
     if(!rows.length){
-      const message=historyLoaded?"No matching database runs were found.":"Loading reconciliation history from Azure SQL...";
+      const message=historyLoaded?"No matching database runs were found.":"Loading reconciliation history...";
       body.innerHTML=`<tr><td colspan="11"><div class="empty"><strong>${historyLoaded?"No history found":"Loading history"}</strong>${message}</div></td></tr>`;
     }
-    $('historyCount').textContent=`${rows.length} database run${rows.length===1?"":"s"}`;
+    $('historyCount').textContent=`${rows.length} stored run${rows.length===1?"":"s"}`;
   }
  
   function formatBytes(value){
@@ -1785,7 +1790,12 @@
     const uploads=$("recentUploads");
     if(uploads){
       if(latest){
-        uploads.innerHTML=["SFDA Drug Count","WMS ASN Receive","WMS Inventory","WMS Dispatch Report"].map((name,i)=>`<div class="recent-upload-row"><div><div class="upload-type">${name}</div><div class="upload-time">${new Date(latest.timestamp).toLocaleString()}</div></div><span class="badge success">Success</span></div>`).join("");
+        const uploadedNames=[];
+        if(latest.sfdaFiles>0) uploadedNames.push("SFDA Drug Count");
+        if(latest.asnFiles>0) uploadedNames.push("WMS ASN Receive");
+        if(latest.inventoryFiles>0) uploadedNames.push("WMS Inventory");
+        if(latest.dispatchFiles>0) uploadedNames.push("WMS Dispatch Report");
+        uploads.innerHTML=(uploadedNames.length?uploadedNames:["Run metadata"]).map(name=>`<div class="recent-upload-row"><div><div class="upload-type">${name}</div><div class="upload-time">${new Date(latest.timestamp).toLocaleString()}</div></div><span class="badge success">Stored</span></div>`).join("");
       }else uploads.innerHTML=`<div class="empty"><strong>No uploads yet</strong>Selected files will appear after a run.</div>`;
     }
   }
@@ -1799,7 +1809,7 @@
     const total=Number(latest.accept||0)+Number(latest.dispatch||0)+Number(latest.variance||0);
     $("compositionContent").innerHTML=total?`<div class="status-line"><span>Accept Items</span><strong>${formatNumber(latest.accept)}</strong></div><div class="status-line"><span>Dispatch Items</span><strong>${formatNumber(latest.dispatch)}</strong></div><div class="status-line"><span>Variance Items</span><strong>${formatNumber(latest.variance)}</strong></div><div class="status-line"><span>Total Result Items</span><strong>${formatNumber(total)}</strong></div>`:`<div class="empty"><strong>No report data yet</strong>Run a reconciliation first.</div>`;
   }
-  $("exportHistoryButton").addEventListener("click",()=>downloadText("SFDA_Reconciliation_Azure_SQL_History.json",JSON.stringify(getHistory(),null,2),"application/json;charset=utf-8"));
+  $("exportHistoryButton").addEventListener("click",()=>downloadText("SFDA_Reconciliation_History.json",JSON.stringify(getHistory(),null,2),"application/json;charset=utf-8"));
  
   async function checkHealth(){
     try{
