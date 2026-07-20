@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import logging
+import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List, Sequence
 
 import pandas as pd
 
 from engine.normalizer import Normalizer
 from engine.validator import Validator
+
+
+logger = logging.getLogger("SFDA-Reconciliation.FullReconciliation")
 
 
 class FullReconciliationEngine:
@@ -141,9 +146,27 @@ class FullReconciliationEngine:
         return text.upper()
 
     @classmethod
-    def _event_key(cls, parts: List[Any]) -> str:
+    def _event_key(cls, parts: Sequence[Any]) -> str:
         raw_key = "|".join(cls._clean_key_part(part) for part in parts)
         return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _build_event_keys(
+        cls,
+        event_type: str,
+        columns: Iterable[pd.Series],
+    ) -> List[str]:
+        """Build deterministic hashes without the high overhead of DataFrame.apply."""
+
+        clean = cls._clean_key_part
+        prefix = clean(event_type)
+        keys: List[str] = []
+
+        for values in zip(*columns):
+            raw_key = "|".join([prefix, *(clean(value) for value in values)])
+            keys.append(hashlib.sha256(raw_key.encode("utf-8")).hexdigest())
+
+        return keys
 
     @staticmethod
     def _ensure_columns(dataframe: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
@@ -168,6 +191,14 @@ class FullReconciliationEngine:
         return ""
 
     def normalize(self) -> None:
+        started_at = time.perf_counter()
+        logger.info(
+            "Normalization started. asn_rows=%s dispatch_rows=%s sfda_rows=%s",
+            len(self.asn),
+            len(self.dispatch),
+            len(self.sfda),
+        )
+
         if not self.asn.empty:
             self.asn = Normalizer.normalize_asn(self.asn)
             self.asn["Expiry Month Key"] = self._month_key(self.asn["Expiry Date"])
@@ -191,14 +222,23 @@ class FullReconciliationEngine:
         self.sfda = Normalizer.normalize_sfda(self.sfda)
         self.sfda["Expiry Month Key"] = self._month_key(self.sfda["Expiry Date"])
         self.packsize = Normalizer.normalize_packsize(self.packsize)
+        logger.info(
+            "Normalization completed in %.2f seconds.",
+            time.perf_counter() - started_at,
+        )
 
     def validate(self) -> None:
+        started_at = time.perf_counter()
         if not self.asn.empty:
             Validator.validate(self.asn, "ASN")
         if not self.dispatch.empty:
             Validator.validate(self.dispatch, "DISPATCH")
         Validator.validate(self.sfda, "SFDA")
         Validator.validate(self.packsize, "PACKSIZE")
+        logger.info(
+            "Validation completed in %.2f seconds.",
+            time.perf_counter() - started_at,
+        )
 
     def _pack_lookup(self) -> pd.DataFrame:
         lookup = self.packsize[["Trade Name", "PackageSize"]].copy()
@@ -268,73 +308,102 @@ class FullReconciliationEngine:
         return sfda
 
     def _receipt_events(self) -> pd.DataFrame:
-        frame = self._ensure_columns(self.asn, self.RECEIPT_EVENT_COLUMNS)
-        frame = frame[
+        started_at = time.perf_counter()
+        source_columns = self.RECEIPT_EVENT_COLUMNS + ["_Source File"]
+        frame = self._ensure_columns(self.asn, source_columns)
+
+        received_quantity = pd.to_numeric(
+            frame["Received Quantity"],
+            errors="coerce",
+        ).fillna(0)
+
+        valid_mask = (
             frame["BN"].astype(str).str.strip().ne("")
             & frame["Expiry Month Key"].astype(str).str.strip().ne("")
             & frame["Generic Item Number"].astype(str).str.strip().ne("")
-            & pd.to_numeric(frame["Received Quantity"], errors="coerce").fillna(0).ne(0)
-        ].copy()
-
-        # Do not inner-join to SFDA here. Missing WMS batches must reach the
-        # final master so they can be classified as Missing Batch in SFDA.
-        frame["Event Key"] = frame.apply(
-            lambda row: self._event_key(
-                [
-                    "RECEIPT",
-                    row.get("Inbound Shipment"),
-                    row.get("ASN Line"),
-                    row.get("BN"),
-                    row.get("Expiry Month Key"),
-                    row.get("Generic Item Number"),
-                    row.get("Trade Item"),
-                    row.get("Received Date"),
-                    row.get("Received Quantity"),
-                    row.get("_Source File"),
-                ]
-            ),
-            axis=1,
+            & received_quantity.ne(0)
         )
-        frame = self._ensure_columns(frame, self.RECEIPT_EVENT_COLUMNS)
-        return (
+        frame = frame.loc[valid_mask].copy()
+        frame["Received Quantity"] = received_quantity.loc[valid_mask].to_numpy()
+
+        # Missing WMS batches must remain available for final SFDA classification.
+        frame["Event Key"] = self._build_event_keys(
+            "RECEIPT",
+            [
+                frame["Inbound Shipment"],
+                frame["ASN Line"],
+                frame["BN"],
+                frame["Expiry Month Key"],
+                frame["Generic Item Number"],
+                frame["Trade Item"],
+                frame["Received Date"],
+                frame["Received Quantity"],
+                frame["_Source File"],
+            ],
+        )
+
+        result = (
             frame[self.RECEIPT_EVENT_COLUMNS]
             .drop_duplicates(subset=["Event Key"], keep="first")
             .reset_index(drop=True)
         )
+        logger.info(
+            "Receipt events prepared in %.2f seconds. input_rows=%s valid_rows=%s unique_events=%s",
+            time.perf_counter() - started_at,
+            len(self.asn),
+            len(frame),
+            len(result),
+        )
+        return result
 
     def _dispatch_events(self) -> pd.DataFrame:
-        frame = self._ensure_columns(self.dispatch, self.DISPATCH_EVENT_COLUMNS)
-        frame = frame[
+        started_at = time.perf_counter()
+        source_columns = self.DISPATCH_EVENT_COLUMNS + ["_Source File"]
+        frame = self._ensure_columns(self.dispatch, source_columns)
+
+        dispatched_quantity = pd.to_numeric(
+            frame["Dispatched Quantity"],
+            errors="coerce",
+        ).fillna(0)
+
+        valid_mask = (
             frame["BN"].astype(str).str.strip().ne("")
             & frame["Expiry Month Key"].astype(str).str.strip().ne("")
             & frame["Generic Item Number"].astype(str).str.strip().ne("")
-            & pd.to_numeric(frame["Dispatched Quantity"], errors="coerce").fillna(0).ne(0)
-        ].copy()
-
-        frame["Event Key"] = frame.apply(
-            lambda row: self._event_key(
-                [
-                    "DISPATCH",
-                    row.get("Sales Order Number"),
-                    row.get("Order Line"),
-                    row.get("To Address"),
-                    row.get("BN"),
-                    row.get("Expiry Month Key"),
-                    row.get("Generic Item Number"),
-                    row.get("Trade Item Number"),
-                    row.get("Dispatch Date"),
-                    row.get("Dispatched Quantity"),
-                    row.get("_Source File"),
-                ]
-            ),
-            axis=1,
+            & dispatched_quantity.ne(0)
         )
-        frame = self._ensure_columns(frame, self.DISPATCH_EVENT_COLUMNS)
-        return (
+        frame = frame.loc[valid_mask].copy()
+        frame["Dispatched Quantity"] = dispatched_quantity.loc[valid_mask].to_numpy()
+
+        frame["Event Key"] = self._build_event_keys(
+            "DISPATCH",
+            [
+                frame["Sales Order Number"],
+                frame["Order Line"],
+                frame["To Address"],
+                frame["BN"],
+                frame["Expiry Month Key"],
+                frame["Generic Item Number"],
+                frame["Trade Item Number"],
+                frame["Dispatch Date"],
+                frame["Dispatched Quantity"],
+                frame["_Source File"],
+            ],
+        )
+
+        result = (
             frame[self.DISPATCH_EVENT_COLUMNS]
             .drop_duplicates(subset=["Event Key"], keep="first")
             .reset_index(drop=True)
         )
+        logger.info(
+            "Dispatch events prepared in %.2f seconds. input_rows=%s valid_rows=%s unique_events=%s",
+            time.perf_counter() - started_at,
+            len(self.dispatch),
+            len(frame),
+            len(result),
+        )
+        return result
 
     def build_master_from_summaries(
         self,
@@ -342,6 +411,7 @@ class FullReconciliationEngine:
         dispatch_summary: pd.DataFrame,
         sfda_summary: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
+        started_at = time.perf_counter()
         receipt = receipt_summary.copy() if receipt_summary is not None else pd.DataFrame()
         dispatch = dispatch_summary.copy() if dispatch_summary is not None else pd.DataFrame()
 
@@ -540,11 +610,19 @@ class FullReconciliationEngine:
             errors="ignore",
         )
         master = self._ensure_columns(master, self.MASTER_COLUMNS)
-        return (
+        result = (
             master[self.MASTER_COLUMNS]
             .sort_values(by=self.KEYS, kind="stable")
             .reset_index(drop=True)
         )
+        logger.info(
+            "Batch Master built in %.2f seconds. receipt_groups=%s dispatch_groups=%s master_rows=%s",
+            time.perf_counter() - started_at,
+            len(receipt),
+            len(dispatch),
+            len(result),
+        )
+        return result
 
     @staticmethod
     def _records(dataframe: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -572,16 +650,31 @@ class FullReconciliationEngine:
         return records
 
     def prepare_incremental(self) -> Dict[str, Any]:
+        started_at = time.perf_counter()
         self.normalize()
         self.validate()
+
         receipt_events = self._receipt_events()
         dispatch_events = self._dispatch_events()
+        sfda_summary = self._sfda_keys()
+
+        receipt_records = self._records(receipt_events)
+        dispatch_records = self._records(dispatch_events)
+
+        logger.info(
+            "Incremental preparation completed in %.2f seconds. receipt_events=%s dispatch_events=%s sfda_batches=%s",
+            time.perf_counter() - started_at,
+            len(receipt_events),
+            len(dispatch_events),
+            len(sfda_summary),
+        )
+
         return {
             "receipt_events": receipt_events,
             "dispatch_events": dispatch_events,
-            "receipt_records": self._records(receipt_events),
-            "dispatch_records": self._records(dispatch_events),
-            "sfda_summary": self._sfda_keys(),
+            "receipt_records": receipt_records,
+            "dispatch_records": dispatch_records,
+            "sfda_summary": sfda_summary,
         }
 
     def run(
@@ -589,6 +682,7 @@ class FullReconciliationEngine:
         receipt_summary: pd.DataFrame | None = None,
         dispatch_summary: pd.DataFrame | None = None,
     ) -> Dict[str, Any]:
+        started_at = time.perf_counter()
         prepared = self.prepare_incremental()
         if receipt_summary is not None and dispatch_summary is not None:
             master = self.build_master_from_summaries(
