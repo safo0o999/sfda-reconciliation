@@ -11,7 +11,21 @@ from engine.validator import Validator
 
 
 class FullReconciliationEngine:
-    """Build and update the cumulative historical Batch Master."""
+    """Build and update the cumulative historical Batch Master.
+
+    WMS history grain:
+        BN + Expiry Month + Generic Item Number
+
+    Exact SFDA batch matching:
+        BN + Expiry Month
+
+    A WMS batch is retained when either:
+        1. the exact BN + Expiry Month exists in SFDA; or
+        2. another batch for the same WMS Generic Item Number is proven in SFDA.
+
+    PackageSize is mapped only through:
+        SFDA Drug Name -> config/pack_size.xlsx Trade Name
+    """
 
     KEYS = [
         "BN",
@@ -81,6 +95,7 @@ class FullReconciliationEngine:
         "Generic Exists in SFDA",
         "Last Updated",
         "Item Family Group",
+        # Internal key retained for SQL and matching, but excluded by Batch Master exporter.
         "Expiry Month Key",
         "Trade Item Number",
     ]
@@ -140,6 +155,16 @@ class FullReconciliationEngine:
     @staticmethod
     def _normalize_quantity(series: pd.Series) -> pd.Series:
         return pd.to_numeric(series, errors="coerce").fillna(0)
+
+    @staticmethod
+    def _first_non_blank(values: pd.Series) -> str:
+        for value in values:
+            if pd.isna(value):
+                continue
+            text = str(value).strip()
+            if text and text.lower() != "nan":
+                return text
+        return ""
 
     def normalize(self) -> None:
         if not self.asn.empty:
@@ -250,6 +275,8 @@ class FullReconciliationEngine:
             & pd.to_numeric(frame["Received Quantity"], errors="coerce").fillna(0).ne(0)
         ].copy()
 
+        # Do not inner-join to SFDA here. Missing WMS batches must reach the
+        # final master so they can be classified as Missing Batch in SFDA.
         frame["Event Key"] = frame.apply(
             lambda row: self._event_key(
                 [
@@ -267,6 +294,7 @@ class FullReconciliationEngine:
             ),
             axis=1,
         )
+        frame = self._ensure_columns(frame, self.RECEIPT_EVENT_COLUMNS)
         return (
             frame[self.RECEIPT_EVENT_COLUMNS]
             .drop_duplicates(subset=["Event Key"], keep="first")
@@ -300,6 +328,7 @@ class FullReconciliationEngine:
             ),
             axis=1,
         )
+        frame = self._ensure_columns(frame, self.DISPATCH_EVENT_COLUMNS)
         return (
             frame[self.DISPATCH_EVENT_COLUMNS]
             .drop_duplicates(subset=["Event Key"], keep="first")
@@ -315,85 +344,211 @@ class FullReconciliationEngine:
         receipt = receipt_summary.copy() if receipt_summary is not None else pd.DataFrame()
         dispatch = dispatch_summary.copy() if dispatch_summary is not None else pd.DataFrame()
 
-        receipt = self._ensure_columns(receipt, self.KEYS + ["Trade Item Number", "Trade Name", "Description", "Item Family Group", "Receive Runs", "Total Receive Qty", "First Received Date", "Last Received Date"])
-        dispatch = self._ensure_columns(dispatch, self.KEYS + ["Trade Item Number", "Trade Name", "Dispatch Runs", "Total Dispatched Qty", "First Dispatch Date", "Last Dispatch Date"])
+        receipt = self._ensure_columns(
+            receipt,
+            self.KEYS
+            + [
+                "Trade Item Number",
+                "Trade Name",
+                "Description",
+                "Item Family Group",
+                "Receive Runs",
+                "Total Receive Qty",
+                "First Received Date",
+                "Last Received Date",
+            ],
+        )
+        dispatch = self._ensure_columns(
+            dispatch,
+            self.KEYS
+            + [
+                "Trade Item Number",
+                "Trade Name",
+                "Dispatch Runs",
+                "Total Dispatched Qty",
+                "First Dispatch Date",
+                "Last Dispatch Date",
+            ],
+        )
 
         if receipt.empty and dispatch.empty:
             return pd.DataFrame(columns=self.MASTER_COLUMNS)
 
-        receipt = receipt.rename(columns={"Trade Item Number": "Receipt Trade Item Number", "Trade Name": "Receipt Trade Name"})
-        dispatch = dispatch.rename(columns={"Trade Item Number": "Dispatch Trade Item Number", "Trade Name": "Dispatch Trade Name"})
+        receipt = receipt.rename(
+            columns={
+                "Trade Item Number": "Receipt Trade Item Number",
+                "Trade Name": "Receipt Trade Name",
+            }
+        )
+        dispatch = dispatch.rename(
+            columns={
+                "Trade Item Number": "Dispatch Trade Item Number",
+                "Trade Name": "Dispatch Trade Name",
+            }
+        )
 
         master = receipt.merge(dispatch, on=self.KEYS, how="outer", validate="one_to_one")
 
         sfda = self._sfda_keys() if sfda_summary is None else sfda_summary.copy()
-        sfda_columns = self.SFDA_KEYS + ["Expiry Date", "GTIN", "Drug Name", "PackageSize", "Quantity", "Active", "Quantity sent pending", "Quantity Receive Pending"]
+        sfda_columns = self.SFDA_KEYS + [
+            "Expiry Date",
+            "GTIN",
+            "Drug Name",
+            "PackageSize",
+            "Quantity",
+            "Active",
+            "Quantity sent pending",
+            "Quantity Receive Pending",
+        ]
         sfda = self._ensure_columns(sfda, sfda_columns)
         sfda = sfda.drop_duplicates(subset=self.SFDA_KEYS, keep="first")
         sfda_match = sfda[sfda_columns].copy()
         sfda_match["_Batch Exists in SFDA"] = True
 
-        master = master.merge(sfda_match, on=self.SFDA_KEYS, how="left", validate="many_to_one")
+        master = master.merge(
+            sfda_match,
+            on=self.SFDA_KEYS,
+            how="left",
+            validate="many_to_one",
+        )
 
         matched_generics = set(
-            master.loc[master["_Batch Exists in SFDA"].eq(True), "Generic Item Number"]
-            .dropna()
+            master.loc[
+                master["_Batch Exists in SFDA"].eq(True),
+                "Generic Item Number",
+            ]
+            .fillna("")
             .astype(str)
             .str.strip()
         )
         matched_generics.discard("")
 
         master["Generic Exists in SFDA"] = "Generic Not in SFDA"
-        master.loc[master["Generic Item Number"].isin(matched_generics), "Generic Exists in SFDA"] = "Missing Batch in SFDA"
-        master.loc[master["_Batch Exists in SFDA"].eq(True), "Generic Exists in SFDA"] = "Yes"
+        master.loc[
+            master["Generic Item Number"].isin(matched_generics),
+            "Generic Exists in SFDA",
+        ] = "Missing Batch in SFDA"
+        master.loc[
+            master["_Batch Exists in SFDA"].eq(True),
+            "Generic Exists in SFDA",
+        ] = "Yes"
 
-        master = master[master["Generic Exists in SFDA"].ne("Generic Not in SFDA")].copy()
+        master = master[
+            master["Generic Exists in SFDA"].ne("Generic Not in SFDA")
+        ].copy()
 
+        # Build a Generic-to-SFDA reference from exact matches. This allows a
+        # missing batch to show the correct drug and package size while its
+        # batch-level SFDA quantities remain zero.
         generic_reference = (
-            master.loc[master["_Batch Exists in SFDA"].eq(True), ["Generic Item Number", "GTIN", "Drug Name", "PackageSize"]]
+            master.loc[
+                master["_Batch Exists in SFDA"].eq(True),
+                ["Generic Item Number", "GTIN", "Drug Name", "PackageSize"],
+            ]
             .drop_duplicates(subset=["Generic Item Number"], keep="first")
-            .rename(columns={"GTIN": "_Generic GTIN", "Drug Name": "_Generic Drug Name", "PackageSize": "_Generic PackageSize"})
+            .rename(
+                columns={
+                    "GTIN": "_Generic GTIN",
+                    "Drug Name": "_Generic Drug Name",
+                    "PackageSize": "_Generic PackageSize",
+                }
+            )
         )
-        master = master.merge(generic_reference, on="Generic Item Number", how="left", validate="many_to_one")
+        master = master.merge(
+            generic_reference,
+            on="Generic Item Number",
+            how="left",
+            validate="many_to_one",
+        )
 
         batch_exists_mask = master["_Batch Exists in SFDA"].eq(True)
-        missing_batch_mask = ~batch_exists_mask
+        missing_batch_mask = batch_exists_mask.eq(False)
+        master.loc[missing_batch_mask, "GTIN"] = master.loc[
+            missing_batch_mask, "_Generic GTIN"
+        ]
+        master.loc[missing_batch_mask, "Drug Name"] = master.loc[
+            missing_batch_mask, "_Generic Drug Name"
+        ]
+        master.loc[missing_batch_mask, "PackageSize"] = master.loc[
+            missing_batch_mask, "_Generic PackageSize"
+        ]
 
-        master.loc[missing_batch_mask, "GTIN"] = master.loc[missing_batch_mask, "_Generic GTIN"]
-        master.loc[missing_batch_mask, "Drug Name"] = master.loc[missing_batch_mask, "_Generic Drug Name"]
-        master.loc[missing_batch_mask, "PackageSize"] = master.loc[missing_batch_mask, "_Generic PackageSize"]
-
-        for column in ["Quantity", "Active", "Quantity sent pending", "Quantity Receive Pending"]:
+        for column in [
+            "Quantity",
+            "Active",
+            "Quantity sent pending",
+            "Quantity Receive Pending",
+        ]:
             master[column] = pd.to_numeric(master[column], errors="coerce").fillna(0)
             master.loc[missing_batch_mask, column] = 0
 
-        master["Trade Item Number"] = master["Receipt Trade Item Number"].fillna("").astype(str).str.strip()
+        master["Trade Item Number"] = (
+            master["Receipt Trade Item Number"].fillna("").astype(str).str.strip()
+        )
         missing_trade_item = master["Trade Item Number"].eq("")
-        master.loc[missing_trade_item, "Trade Item Number"] = master.loc[missing_trade_item, "Dispatch Trade Item Number"].fillna("").astype(str).str.strip()
+        master.loc[missing_trade_item, "Trade Item Number"] = (
+            master.loc[missing_trade_item, "Dispatch Trade Item Number"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
 
-        master["Trade Name"] = master["Receipt Trade Name"].fillna("").astype(str).str.strip()
+        master["Trade Name"] = (
+            master["Receipt Trade Name"].fillna("").astype(str).str.strip()
+        )
         missing_trade_name = master["Trade Name"].eq("")
-        master.loc[missing_trade_name, "Trade Name"] = master.loc[missing_trade_name, "Dispatch Trade Name"].fillna("").astype(str).str.strip()
+        master.loc[missing_trade_name, "Trade Name"] = (
+            master.loc[missing_trade_name, "Dispatch Trade Name"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
 
-        for column in ["Total Receive Qty", "Total Dispatched Qty", "Receive Runs", "Dispatch Runs", "PackageSize"]:
+        for column in [
+            "Total Receive Qty",
+            "Total Dispatched Qty",
+            "Receive Runs",
+            "Dispatch Runs",
+            "PackageSize",
+        ]:
             master[column] = pd.to_numeric(master[column], errors="coerce").fillna(0)
 
         master["Received Quantity Each"] = master["Total Receive Qty"]
         valid_package = master["PackageSize"].gt(0)
         master["Received Quantity Pack"] = 0.0
-        master.loc[valid_package, "Received Quantity Pack"] = master.loc[valid_package, "Received Quantity Each"] / master.loc[valid_package, "PackageSize"]
+        master.loc[valid_package, "Received Quantity Pack"] = (
+            master.loc[valid_package, "Received Quantity Each"]
+            / master.loc[valid_package, "PackageSize"]
+        )
 
         master["Receive Runs"] = master["Receive Runs"].round(0).astype(int)
         master["Dispatch Runs"] = master["Dispatch Runs"].round(0).astype(int)
 
-        for column in ["Expiry Date", "First Received Date", "Last Received Date", "First Dispatch Date", "Last Dispatch Date"]:
+        for column in [
+            "Expiry Date",
+            "First Received Date",
+            "Last Received Date",
+            "First Dispatch Date",
+            "Last Dispatch Date",
+        ]:
             master[column] = pd.to_datetime(master[column], errors="coerce")
 
         master["Last Updated"] = pd.Timestamp.utcnow().tz_localize(None)
-        master = master.drop(columns=["_Batch Exists in SFDA", "_Generic GTIN", "_Generic Drug Name", "_Generic PackageSize"], errors="ignore")
-        
+        master = master.drop(
+            columns=[
+                "_Batch Exists in SFDA",
+                "_Generic GTIN",
+                "_Generic Drug Name",
+                "_Generic PackageSize",
+            ],
+            errors="ignore",
+        )
         master = self._ensure_columns(master, self.MASTER_COLUMNS)
-        return master[self.MASTER_COLUMNS].sort_values(by=self.KEYS, kind="stable").reset_index(drop=True)
+        return (
+            master[self.MASTER_COLUMNS]
+            .sort_values(by=self.KEYS, kind="stable")
+            .reset_index(drop=True)
+        )
 
     @staticmethod
     def _records(dataframe: pd.DataFrame) -> List[Dict[str, Any]]:
@@ -407,6 +562,7 @@ class FullReconciliationEngine:
                         continue
                 except (TypeError, ValueError):
                     pass
+
                 if isinstance(value, pd.Timestamp):
                     clean[key] = value.to_pydatetime()
                 elif hasattr(value, "item"):
