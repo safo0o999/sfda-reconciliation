@@ -1,8 +1,13 @@
+import base64
 import io
 import json
 import logging
+import mimetypes
+import uuid
+from datetime import datetime, timezone
+from urllib.parse import quote
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import azure.functions as func
 import pandas as pd
@@ -83,6 +88,195 @@ def build_excel(df: pd.DataFrame, file_name: str, sheet_name: str, title: str):
     )
 
 
+
+def read_uploaded_bytes(uploaded_file) -> Tuple[str, bytes, str]:
+    file_name = getattr(uploaded_file, "filename", None) or "uploaded.xlsx"
+    file_bytes = uploaded_file.read()
+    if not file_bytes:
+        raise ValueError(f"The uploaded file '{file_name}' is empty.")
+    content_type = (
+        getattr(uploaded_file, "content_type", None)
+        or mimetypes.guess_type(file_name)[0]
+        or "application/octet-stream"
+    )
+    return file_name, file_bytes, content_type
+
+
+def read_excel_bytes(file_name: str, file_bytes: bytes) -> pd.DataFrame:
+    engine = "xlrd" if file_name.lower().endswith(".xls") else "openpyxl"
+    return pd.read_excel(io.BytesIO(file_bytes), engine=engine, dtype=object)
+
+
+def build_run_number(mode: str) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    suffix = uuid.uuid4().hex[:6].upper()
+    return f"{mode.upper()}-{stamp}-{suffix}"
+
+
+def get_submitted_by(req: func.HttpRequest) -> str:
+    return (
+        req.headers.get("X-MS-CLIENT-PRINCIPAL-NAME")
+        or req.headers.get("X-User-Name")
+        or req.form.get("submitted_by")
+        or "Web User"
+    )
+
+
+def decode_generated_file(file_name: str, value: Any) -> Tuple[bytes, str, str]:
+    guessed_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+
+    if isinstance(value, str):
+        return value.encode("utf-8-sig"), guessed_type, "text"
+
+    if isinstance(value, dict):
+        content = value.get("content", value.get("data", ""))
+        encoding = str(value.get("encoding", "base64")).lower()
+        content_type = (
+            value.get("mime_type")
+            or value.get("mime")
+            or guessed_type
+        )
+
+        if encoding == "base64":
+            cleaned = str(content or "")
+            if "," in cleaned and cleaned.lower().startswith("data:"):
+                cleaned = cleaned.split(",", 1)[1]
+            return base64.b64decode(cleaned), content_type, "base64"
+
+        return str(content or "").encode("utf-8-sig"), content_type, encoding
+
+    return b"", guessed_type, "binary"
+
+
+def iter_generated_files(outputs: Dict[str, Any]):
+    for group_name, group in (outputs or {}).items():
+        if not isinstance(group, dict):
+            continue
+        for file_name, value in group.items():
+            yield group_name, str(file_name), value
+
+
+def file_type_from_name(file_name: str) -> str:
+    suffix = Path(file_name).suffix.lower().lstrip(".")
+    return suffix.upper() if suffix else "FILE"
+
+
+def save_run_file_record(
+    run_number: str,
+    category: str,
+    file_name: str,
+    file_type: str,
+    uploaded: Dict[str, Any],
+) -> None:
+    from engine.database import save_reconciliation_run_file
+
+    save_reconciliation_run_file(
+        run_number=run_number,
+        file_category=category,
+        file_name=file_name,
+        file_type=file_type,
+        container_name=uploaded["container"],
+        blob_name=uploaded["blob_name"],
+        content_type=uploaded["content_type"],
+        size_bytes=uploaded["size_bytes"],
+        etag=uploaded.get("etag", ""),
+    )
+
+
+def save_run_archive(
+    run_number: str,
+    mode: str,
+    input_files: List[Dict[str, Any]],
+    outputs: Dict[str, Any],
+    summary: Dict[str, Any],
+    submitted_by: str,
+) -> int:
+    from engine.blob_storage import BlobStorage
+
+    storage = BlobStorage()
+    storage.initialize_containers()
+    stored_files = 0
+
+    for item in input_files:
+        uploaded = storage.upload_input(
+            run_number,
+            item["file_name"],
+            item["data"],
+            item["content_type"],
+        )
+        save_run_file_record(
+            run_number,
+            "input",
+            item["file_name"],
+            file_type_from_name(item["file_name"]),
+            uploaded,
+        )
+        stored_files += 1
+
+    for _, file_name, value in iter_generated_files(outputs):
+        file_bytes, content_type, _ = decode_generated_file(file_name, value)
+        uploaded = storage.upload_output(
+            run_number,
+            file_name,
+            file_bytes,
+            content_type,
+        )
+        save_run_file_record(
+            run_number,
+            "output",
+            file_name,
+            file_type_from_name(file_name),
+            uploaded,
+        )
+        stored_files += 1
+
+    metadata = {
+        "run_number": run_number,
+        "process_type": mode,
+        "status": "Completed",
+        "submitted_by": submitted_by,
+        "application": APPLICATION_NAME,
+        "application_version": APPLICATION_VERSION,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "summary": summary,
+        "input_files": [
+            {
+                "file_name": item["file_name"],
+                "content_type": item["content_type"],
+                "size_bytes": len(item["data"]),
+            }
+            for item in input_files
+        ],
+        "output_files": [
+            file_name
+            for _, file_name, _ in iter_generated_files(outputs)
+        ],
+    }
+    metadata_bytes = json.dumps(
+        metadata,
+        ensure_ascii=False,
+        default=str,
+        indent=2,
+    ).encode("utf-8")
+    uploaded = storage.upload_metadata(run_number, metadata_bytes)
+    save_run_file_record(
+        run_number,
+        "metadata",
+        "run.json",
+        "JSON",
+        uploaded,
+    )
+    return stored_files + 1
+
+
+def build_download_url(run_number: str, category: str, file_name: str) -> str:
+    return (
+        f"/api/history/{quote(run_number, safe='')}/download"
+        f"?category={quote(category, safe='')}"
+        f"&file_name={quote(file_name, safe='')}"
+    )
+
+
 @app.route(route="health", methods=["GET"])
 def health(req: func.HttpRequest) -> func.HttpResponse:
     database_status = "Unavailable"
@@ -121,23 +315,251 @@ def version(req: func.HttpRequest) -> func.HttpResponse:
     )
 
 
+
+def load_blob_run_metadata(run_number: str) -> Optional[Dict[str, Any]]:
+    try:
+        from engine.blob_storage import BlobStorage, METADATA_CONTAINER
+
+        storage = BlobStorage()
+        downloaded = storage.download_blob(
+            METADATA_CONTAINER,
+            f"{run_number}/run.json",
+        )
+        return json.loads(downloaded["data"].decode("utf-8-sig"))
+    except Exception:
+        return None
+
+
+def blob_run_to_history_row(
+    run_number: str,
+    metadata: Optional[Dict[str, Any]],
+    files: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    data = metadata or {}
+    summary = data.get("summary") or {}
+    created = (
+        data.get("created_at_utc")
+        or data.get("started_at")
+        or data.get("timestamp")
+    )
+    categories = [str(item.get("category", "")) for item in files]
+    input_names = [
+        str(item.get("file_name", "")).lower()
+        for item in files
+        if item.get("category") == "input"
+    ]
+    process_type = str(
+        data.get("process_type")
+        or data.get("step")
+        or ("DISPATCH" if run_number.upper().startswith("DISPATCH") else "ACCEPT")
+    ).upper()
+
+    return {
+        "RunID": None,
+        "RunNumber": run_number,
+        "ProcessType": process_type,
+        "Status": data.get("status", "Completed"),
+        "StartedAt": created,
+        "CompletedAt": created,
+        "SubmittedBy": data.get("submitted_by", "Web User"),
+        "ASNFiles": sum("asn" in name or "asdt" in name for name in input_names),
+        "InventoryFiles": sum("inventory" in name for name in input_names),
+        "DispatchFiles": sum("dispatch" in name for name in input_names),
+        "SFDAFiles": sum("sfda" in name or "drug count" in name for name in input_names),
+        "TotalInputRows": summary.get(
+            "total_input_rows",
+            summary.get("reconciliation_rows", 0),
+        ),
+        "MasterRecords": summary.get("batch_master_rows", 0),
+        "AcceptRecords": summary.get("accept_rows", 0),
+        "DispatchRecords": summary.get("dispatch_rows", 0),
+        "ExceptionRecords": summary.get("variance_rows", 0),
+        "GeneratedFiles": sum(category in {"output", "metadata"} for category in categories),
+        "ApplicationVersion": data.get(
+            "application_version",
+            data.get("version", APPLICATION_VERSION),
+        ),
+        "ErrorMessage": data.get("error_message", ""),
+    }
+
+
+def blob_files_for_ui(run_number: str) -> List[Dict[str, Any]]:
+    from engine.blob_storage import BlobStorage
+
+    rows: List[Dict[str, Any]] = []
+    for item in BlobStorage().list_all_run_files(run_number):
+        category = str(item.get("category", ""))
+        file_name = str(item.get("file_name", ""))
+        rows.append(
+            {
+                "RunFileID": None,
+                "RunNumber": run_number,
+                "FileCategory": category,
+                "FileName": file_name,
+                "FileType": file_type_from_name(file_name),
+                "ContainerName": item.get("container"),
+                "BlobName": item.get("blob_name"),
+                "ContentType": item.get("content_type"),
+                "SizeBytes": item.get("size_bytes", 0),
+                "ETag": "",
+                "CreatedAt": item.get("last_modified"),
+                "download_url": build_download_url(
+                    run_number,
+                    category,
+                    file_name,
+                ),
+            }
+        )
+    return rows
+
+
 @app.route(route="history", methods=["GET"])
 def history(req: func.HttpRequest) -> func.HttpResponse:
-    """Return UI history without blocking the operational reconciliation routes.
+    try:
+        from engine.blob_storage import BlobStorage
+        from engine.database import list_reconciliation_runs
 
-    Reconciliation run history is not part of the daily processed-transaction
-    register. Until a dedicated ReconciliationRuns table is enabled, return an
-    empty successful payload instead of HTTP 500.
-    """
-    return json_response(
-        {
-            "status": "Success",
-            "application": APPLICATION_NAME,
-            "version": APPLICATION_VERSION,
-            "count": 0,
-            "history": [],
-        }
-    )
+        limit = int(req.params.get("limit", "500") or 500)
+        rows = list_reconciliation_runs(limit)
+        known = {str(row.get("RunNumber", "")) for row in rows}
+
+        storage = BlobStorage()
+        storage.initialize_containers()
+        for run_number in storage.list_run_numbers(limit):
+            if run_number in known:
+                continue
+            files = storage.list_all_run_files(run_number)
+            rows.append(
+                blob_run_to_history_row(
+                    run_number,
+                    load_blob_run_metadata(run_number),
+                    files,
+                )
+            )
+
+        rows.sort(
+            key=lambda row: str(
+                row.get("StartedAt")
+                or row.get("CompletedAt")
+                or row.get("RunNumber")
+                or ""
+            ),
+            reverse=True,
+        )
+        rows = rows[:limit]
+        return json_response(
+            {
+                "status": "Success",
+                "application": APPLICATION_NAME,
+                "version": APPLICATION_VERSION,
+                "count": len(rows),
+                "history": rows,
+            }
+        )
+    except Exception as exc:
+        logger.exception("History read failed")
+        return error_response("Failed to load reconciliation history.", 500, str(exc))
+
+
+@app.route(route="history/{run_number}", methods=["GET"])
+def history_run(req: func.HttpRequest) -> func.HttpResponse:
+    run_number = str(req.route_params.get("run_number", "")).strip()
+    if not run_number:
+        return error_response("Run number is required.", 400)
+
+    try:
+        from engine.database import (
+            get_reconciliation_run,
+            list_reconciliation_run_files,
+        )
+
+        run = get_reconciliation_run(run_number)
+        files = list_reconciliation_run_files(run_number)
+
+        if not files:
+            files = blob_files_for_ui(run_number)
+        else:
+            for file in files:
+                file["download_url"] = build_download_url(
+                    run_number,
+                    str(file.get("FileCategory", "")),
+                    str(file.get("FileName", "")),
+                )
+
+        if not run:
+            metadata = load_blob_run_metadata(run_number)
+            if not files and not metadata:
+                return error_response("Reconciliation run was not found.", 404)
+            run = blob_run_to_history_row(
+                run_number,
+                metadata,
+                [
+                    {
+                        "category": file.get("FileCategory"),
+                        "file_name": file.get("FileName"),
+                    }
+                    for file in files
+                ],
+            )
+
+        return json_response(
+            {
+                "status": "Success",
+                "application": APPLICATION_NAME,
+                "version": APPLICATION_VERSION,
+                "run": run,
+                "files": files,
+            }
+        )
+    except Exception as exc:
+        logger.exception("Run details read failed")
+        return error_response("Failed to load run details.", 500, str(exc))
+
+
+@app.route(route="history/{run_number}/download", methods=["GET"])
+def history_download(req: func.HttpRequest) -> func.HttpResponse:
+    run_number = str(req.route_params.get("run_number", "")).strip()
+    category = str(req.params.get("category", "")).strip().lower()
+    file_name = str(req.params.get("file_name", "")).strip()
+
+    if category not in {"input", "output", "metadata"}:
+        return error_response("category must be input, output, or metadata.", 400)
+    if not run_number or not file_name:
+        return error_response("Run number and file name are required.", 400)
+
+    try:
+        from engine.blob_storage import (
+            BlobStorage,
+            INPUTS_CONTAINER,
+            METADATA_CONTAINER,
+            OUTPUTS_CONTAINER,
+        )
+
+        container_name = {
+            "input": INPUTS_CONTAINER,
+            "output": OUTPUTS_CONTAINER,
+            "metadata": METADATA_CONTAINER,
+        }[category]
+        safe_name = BlobStorage.sanitize_file_name(file_name)
+        blob_name = f"{run_number}/{safe_name}"
+        downloaded = BlobStorage().download_blob(container_name, blob_name)
+
+        return func.HttpResponse(
+            body=downloaded["data"],
+            status_code=200,
+            mimetype=downloaded["content_type"],
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{safe_name.replace(chr(34), "")}"'
+                ),
+                "Cache-Control": "no-store",
+            },
+        )
+    except FileNotFoundError as exc:
+        return error_response("Stored file was not found.", 404, str(exc))
+    except Exception as exc:
+        logger.exception("History file download failed")
+        return error_response("Failed to download stored file.", 500, str(exc))
 
 
 @app.route(route="batch-master/build", methods=["GET", "POST"])
@@ -231,26 +653,78 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
 
 
 def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
+    run_number = build_run_number(mode)
+    submitted_by = get_submitted_by(req)
+    run_created = False
+
     try:
         sfda_file = req.files.get("sfda")
         if sfda_file is None:
             return error_response("SFDA file is required.")
 
-        sfda_df = read_excel_upload(sfda_file)
+        input_files: List[Dict[str, Any]] = []
+
+        sfda_name, sfda_bytes, sfda_content_type = read_uploaded_bytes(sfda_file)
+        sfda_df = read_excel_bytes(sfda_name, sfda_bytes)
+        input_files.append(
+            {
+                "file_name": sfda_name,
+                "data": sfda_bytes,
+                "content_type": sfda_content_type,
+            }
+        )
+
         asn_df = pd.DataFrame()
         dispatch_df = pd.DataFrame()
         inventory_df = pd.DataFrame()
+
+        asn_file_count = 0
+        dispatch_file_count = 0
 
         if mode == "accept":
             asn_file = req.files.get("asn")
             if asn_file is None:
                 return error_response("ASN/ASDT file is required for Accept.")
-            asn_df = read_excel_upload(asn_file)
+            asn_name, asn_bytes, asn_content_type = read_uploaded_bytes(asn_file)
+            asn_df = read_excel_bytes(asn_name, asn_bytes)
+            input_files.append(
+                {
+                    "file_name": asn_name,
+                    "data": asn_bytes,
+                    "content_type": asn_content_type,
+                }
+            )
+            asn_file_count = 1
         else:
             dispatch_file = req.files.get("dispatch")
             if dispatch_file is None:
                 return error_response("Full Dispatch file is required for Dispatch.")
-            dispatch_df = read_excel_upload(dispatch_file)
+            dispatch_name, dispatch_bytes, dispatch_content_type = read_uploaded_bytes(
+                dispatch_file
+            )
+            dispatch_df = read_excel_bytes(dispatch_name, dispatch_bytes)
+            input_files.append(
+                {
+                    "file_name": dispatch_name,
+                    "data": dispatch_bytes,
+                    "content_type": dispatch_content_type,
+                }
+            )
+            dispatch_file_count = 1
+
+        from engine.database import create_reconciliation_run
+
+        create_reconciliation_run(
+            run_number=run_number,
+            process_type=mode,
+            submitted_by=submitted_by,
+            application_version=APPLICATION_VERSION,
+            asn_files=asn_file_count,
+            inventory_files=0,
+            dispatch_files=dispatch_file_count,
+            sfda_files=1,
+        )
+        run_created = True
 
         from engine.exporter import Exporter
         from engine.reconciliation import ReconciliationEngine
@@ -315,37 +789,92 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
                 processed_rows.to_dict(orient="records"),
             )
 
+        accept_rows = count_positive_rows(accept, "To Be Accept")
+        dispatch_rows = count_positive_rows(
+            dispatch,
+            "Allocated To Be Dispatch",
+        )
+        generated_output_files = sum(
+            len(group) if isinstance(group, dict) else 0
+            for group in outputs.values()
+        )
+        total_input_rows = int(len(sfda_df) + len(asn_df) + len(dispatch_df))
+
+        summary = {
+            "batch_master_available": not batch_master.empty,
+            "batch_master_rows": len(batch_master),
+            "reconciliation_rows": len(report),
+            "total_input_rows": total_input_rows,
+            "accept_rows": accept_rows,
+            "dispatch_rows": dispatch_rows,
+            "accept_files": len(outputs.get("accept_files", {})),
+            "dispatch_files": len(outputs.get("dispatch_files", {})),
+            "generated_files": generated_output_files,
+            "processed_transactions_saved": saved_transactions,
+        }
+
+        archived_files = save_run_archive(
+            run_number=run_number,
+            mode=mode,
+            input_files=input_files,
+            outputs=outputs,
+            summary=summary,
+            submitted_by=submitted_by,
+        )
+
+        from engine.database import complete_reconciliation_run
+
+        complete_reconciliation_run(
+            run_number=run_number,
+            status="Completed",
+            total_input_rows=total_input_rows,
+            master_records=len(batch_master),
+            accept_records=accept_rows,
+            dispatch_records=dispatch_rows,
+            exception_records=0,
+            generated_files=archived_files,
+        )
+
+        summary["archived_files"] = archived_files
+
         return json_response(
             {
                 "status": "Completed",
                 "application": APPLICATION_NAME,
                 "version": APPLICATION_VERSION,
+                "run_number": run_number,
                 "step": mode,
-                "summary": {
-                    "batch_master_available": not batch_master.empty,
-                    "batch_master_rows": len(batch_master),
-                    "reconciliation_rows": len(report),
-                    "accept_rows": count_positive_rows(accept, "To Be Accept"),
-                    "dispatch_rows": count_positive_rows(
-                        dispatch,
-                        "Allocated To Be Dispatch",
-                    ),
-                    "accept_files": len(outputs.get("accept_files", {})),
-                    "dispatch_files": len(outputs.get("dispatch_files", {})),
-                    "generated_files": sum(
-                        len(group) if isinstance(group, dict) else 0
-                        for group in outputs.values()
-                    ),
-                    "processed_transactions_saved": saved_transactions,
-                },
+                "summary": summary,
                 "outputs": outputs,
             }
         )
     except ValueError as exc:
         logger.exception("Daily reconciliation validation failed")
+        if run_created:
+            try:
+                from engine.database import complete_reconciliation_run
+
+                complete_reconciliation_run(
+                    run_number=run_number,
+                    status="Failed",
+                    error_message=str(exc),
+                )
+            except Exception:
+                logger.exception("Failed to update failed run history")
         return error_response(f"{mode.title()} validation failed.", 400, str(exc))
     except Exception as exc:
         logger.exception("Daily reconciliation failed")
+        if run_created:
+            try:
+                from engine.database import complete_reconciliation_run
+
+                complete_reconciliation_run(
+                    run_number=run_number,
+                    status="Failed",
+                    error_message=str(exc),
+                )
+            except Exception:
+                logger.exception("Failed to update failed run history")
         return error_response(f"{mode.title()} reconciliation failed.", 500, str(exc))
 
 
