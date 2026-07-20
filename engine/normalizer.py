@@ -194,6 +194,12 @@ class Normalizer:
                 ["Supplier Name", "Vendor Name"],
             )
         )
+        df["Supplier Code"] = Normalizer.identifier(
+            Normalizer._optional_series(
+                df,
+                ["Supplier Code", "Vendor Code"],
+            )
+        )
         df["Description"] = Normalizer.text(
             Normalizer._optional_series(
                 df,
