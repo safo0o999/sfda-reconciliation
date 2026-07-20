@@ -320,6 +320,9 @@ class Normalizer:
             Normalizer._optional_series(
                 df,
                 [
+                    "Confirm Date",
+                    "Confirmed Date",
+                    "Confirmation Date",
                     "Dispatched Date",
                     "Dispatch Date",
                     "Actual Dispatch Date",
