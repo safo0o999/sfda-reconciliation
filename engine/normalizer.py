@@ -194,6 +194,26 @@ class Normalizer:
                 ["Supplier Name", "Vendor Name"],
             )
         )
+        df["Description"] = Normalizer.text(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Description",
+                    "Item Description",
+                    "Generic Description",
+                ],
+            )
+        )
+        df["Item Family Group"] = Normalizer.text(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Item Family Group",
+                    "Item Family",
+                    "Family Group",
+                ],
+            )
+        )
         df["Received Date"] = Normalizer.datetime(
             Normalizer._optional_series(
                 df,
