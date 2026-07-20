@@ -38,8 +38,16 @@ class BlobStorage:
                 container.create_container()
             except Exception as ex:
                 message = str(ex).lower()
-                if "containeralreadyexists" not in message and "already exists" not in message:
+                if (
+                    "containeralreadyexists" not in message
+                    and "already exists" not in message
+                ):
                     raise
+
+    @staticmethod
+    def sanitize_file_name(file_name: str) -> str:
+        name = str(file_name or "file").replace("\\", "_").replace("/", "_").strip()
+        return name or "file"
 
     def upload_bytes(
         self,
@@ -79,9 +87,10 @@ class BlobStorage:
         file_bytes: bytes,
         content_type: str = "application/octet-stream",
     ) -> Dict[str, Any]:
+        safe_name = self.sanitize_file_name(file_name)
         return self.upload_bytes(
             INPUTS_CONTAINER,
-            f"{run_number}/{file_name}",
+            f"{run_number}/{safe_name}",
             file_bytes,
             content_type,
             {"run_number": run_number, "category": "input"},
@@ -94,9 +103,10 @@ class BlobStorage:
         file_bytes: bytes,
         content_type: str = "application/octet-stream",
     ) -> Dict[str, Any]:
+        safe_name = self.sanitize_file_name(file_name)
         return self.upload_bytes(
             OUTPUTS_CONTAINER,
-            f"{run_number}/{file_name}",
+            f"{run_number}/{safe_name}",
             file_bytes,
             content_type,
             {"run_number": run_number, "category": "output"},
@@ -108,9 +118,10 @@ class BlobStorage:
         file_bytes: bytes,
         file_name: str = "run.json",
     ) -> Dict[str, Any]:
+        safe_name = self.sanitize_file_name(file_name)
         return self.upload_bytes(
             METADATA_CONTAINER,
-            f"{run_number}/{file_name}",
+            f"{run_number}/{safe_name}",
             file_bytes,
             "application/json; charset=utf-8",
             {"run_number": run_number, "category": "metadata"},
@@ -153,19 +164,55 @@ class BlobStorage:
         prefix = f"{run_number}/"
         rows: List[Dict[str, Any]] = []
         for blob in container.list_blobs(name_starts_with=prefix):
+            settings = getattr(blob, "content_settings", None)
             rows.append({
                 "container": container_name,
                 "blob_name": blob.name,
                 "file_name": blob.name[len(prefix):],
                 "size_bytes": int(blob.size or 0),
                 "content_type": (
-                    getattr(blob, "content_settings", None).content_type
-                    if getattr(blob, "content_settings", None)
+                    settings.content_type
+                    if settings and settings.content_type
                     else "application/octet-stream"
                 ),
                 "last_modified": blob.last_modified,
             })
         return rows
+
+    def list_all_run_files(self, run_number: str) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for category, container_name in (
+            ("input", INPUTS_CONTAINER),
+            ("output", OUTPUTS_CONTAINER),
+            ("metadata", METADATA_CONTAINER),
+        ):
+            for row in self.list_run_files(run_number, container_name):
+                row["category"] = category
+                rows.append(row)
+        return sorted(
+            rows,
+            key=lambda row: (
+                row.get("category", ""),
+                row.get("file_name", ""),
+            ),
+        )
+
+    def list_run_numbers(self, limit: int = 500) -> List[str]:
+        run_numbers = set()
+        for container_name in (
+            METADATA_CONTAINER,
+            OUTPUTS_CONTAINER,
+            INPUTS_CONTAINER,
+        ):
+            container = self.service.get_container_client(container_name)
+            for blob in container.list_blobs():
+                name = str(blob.name or "")
+                if "/" not in name:
+                    continue
+                run_number = name.split("/", 1)[0].strip()
+                if run_number:
+                    run_numbers.add(run_number)
+        return sorted(run_numbers, reverse=True)[: max(1, int(limit))]
 
     def health(self) -> Dict[str, Any]:
         self.initialize_containers()
