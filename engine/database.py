@@ -369,6 +369,79 @@ BEGIN
     INCLUDE(ProcessedQuantityEach, LastProcessedAt);
 END;
 
+
+IF OBJECT_ID('dbo.ReconciliationRuns', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.ReconciliationRuns
+    (
+        RunID bigint IDENTITY(1,1) NOT NULL,
+        RunNumber nvarchar(80) NOT NULL,
+        ProcessType varchar(20) NOT NULL,
+        Status nvarchar(40) NOT NULL,
+        StartedAt datetime2 NOT NULL CONSTRAINT DF_ReconciliationRuns_Started DEFAULT SYSUTCDATETIME(),
+        CompletedAt datetime2 NULL,
+        SubmittedBy nvarchar(200) NULL,
+        ASNFiles int NOT NULL CONSTRAINT DF_ReconciliationRuns_ASNFiles DEFAULT 0,
+        InventoryFiles int NOT NULL CONSTRAINT DF_ReconciliationRuns_InventoryFiles DEFAULT 0,
+        DispatchFiles int NOT NULL CONSTRAINT DF_ReconciliationRuns_DispatchFiles DEFAULT 0,
+        SFDAFiles int NOT NULL CONSTRAINT DF_ReconciliationRuns_SFDAFiles DEFAULT 0,
+        TotalInputRows int NOT NULL CONSTRAINT DF_ReconciliationRuns_TotalInputRows DEFAULT 0,
+        MasterRecords int NOT NULL CONSTRAINT DF_ReconciliationRuns_MasterRecords DEFAULT 0,
+        AcceptRecords int NOT NULL CONSTRAINT DF_ReconciliationRuns_AcceptRecords DEFAULT 0,
+        DispatchRecords int NOT NULL CONSTRAINT DF_ReconciliationRuns_DispatchRecords DEFAULT 0,
+        ExceptionRecords int NOT NULL CONSTRAINT DF_ReconciliationRuns_ExceptionRecords DEFAULT 0,
+        GeneratedFiles int NOT NULL CONSTRAINT DF_ReconciliationRuns_GeneratedFiles DEFAULT 0,
+        ApplicationVersion nvarchar(40) NULL,
+        ErrorMessage nvarchar(max) NULL,
+        CONSTRAINT PK_ReconciliationRuns PRIMARY KEY (RunID),
+        CONSTRAINT UQ_ReconciliationRuns_RunNumber UNIQUE (RunNumber)
+    );
+END;
+
+IF OBJECT_ID('dbo.ReconciliationRunFiles', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.ReconciliationRunFiles
+    (
+        RunFileID bigint IDENTITY(1,1) NOT NULL,
+        RunNumber nvarchar(80) NOT NULL,
+        FileCategory varchar(20) NOT NULL,
+        FileName nvarchar(500) NOT NULL,
+        FileType nvarchar(50) NULL,
+        ContainerName nvarchar(100) NOT NULL,
+        BlobName nvarchar(1000) NOT NULL,
+        ContentType nvarchar(200) NULL,
+        SizeBytes bigint NOT NULL CONSTRAINT DF_ReconciliationRunFiles_Size DEFAULT 0,
+        ETag nvarchar(200) NULL,
+        CreatedAt datetime2 NOT NULL CONSTRAINT DF_ReconciliationRunFiles_Created DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT PK_ReconciliationRunFiles PRIMARY KEY (RunFileID),
+        CONSTRAINT UQ_ReconciliationRunFiles_Blob UNIQUE (ContainerName, BlobName)
+    );
+END;
+
+IF NOT EXISTS
+(
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'IX_ReconciliationRuns_StartedAt'
+      AND object_id = OBJECT_ID('dbo.ReconciliationRuns')
+)
+BEGIN
+    CREATE INDEX IX_ReconciliationRuns_StartedAt
+    ON dbo.ReconciliationRuns(StartedAt DESC)
+    INCLUDE(RunNumber, ProcessType, Status, TotalInputRows, AcceptRecords, DispatchRecords, GeneratedFiles);
+END;
+
+IF NOT EXISTS
+(
+    SELECT 1 FROM sys.indexes
+    WHERE name = 'IX_ReconciliationRunFiles_RunNumber'
+      AND object_id = OBJECT_ID('dbo.ReconciliationRunFiles')
+)
+BEGIN
+    CREATE INDEX IX_ReconciliationRunFiles_RunNumber
+    ON dbo.ReconciliationRunFiles(RunNumber, FileCategory)
+    INCLUDE(FileName, ContainerName, BlobName, ContentType, SizeBytes);
+END;
+
 """
 
 
@@ -1027,3 +1100,219 @@ def save_daily_processed_transactions(transaction_type: str, rows: List[Dict[str
             connection.rollback()
             raise
     return saved
+
+def create_reconciliation_run(
+    run_number: str,
+    process_type: str,
+    submitted_by: str = "Web User",
+    application_version: str = "",
+    asn_files: int = 0,
+    inventory_files: int = 0,
+    dispatch_files: int = 0,
+    sfda_files: int = 0,
+) -> int:
+    initialize_database()
+    sql = """
+    INSERT INTO dbo.ReconciliationRuns
+    (
+        RunNumber, ProcessType, Status, SubmittedBy, ApplicationVersion,
+        ASNFiles, InventoryFiles, DispatchFiles, SFDAFiles
+    )
+    OUTPUT INSERTED.RunID
+    VALUES (?, ?, 'Running', ?, ?, ?, ?, ?, ?);
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                sql,
+                (
+                    run_number,
+                    process_type.upper(),
+                    submitted_by,
+                    application_version,
+                    int(asn_files),
+                    int(inventory_files),
+                    int(dispatch_files),
+                    int(sfda_files),
+                ),
+            )
+            run_id = int(cursor.fetchone()[0])
+            connection.commit()
+            return run_id
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def complete_reconciliation_run(
+    run_number: str,
+    status: str,
+    total_input_rows: int = 0,
+    master_records: int = 0,
+    accept_records: int = 0,
+    dispatch_records: int = 0,
+    exception_records: int = 0,
+    generated_files: int = 0,
+    error_message: str = "",
+) -> None:
+    sql = """
+    UPDATE dbo.ReconciliationRuns
+    SET
+        Status = ?,
+        CompletedAt = SYSUTCDATETIME(),
+        TotalInputRows = ?,
+        MasterRecords = ?,
+        AcceptRecords = ?,
+        DispatchRecords = ?,
+        ExceptionRecords = ?,
+        GeneratedFiles = ?,
+        ErrorMessage = NULLIF(?, '')
+    WHERE RunNumber = ?;
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                sql,
+                (
+                    status,
+                    int(total_input_rows),
+                    int(master_records),
+                    int(accept_records),
+                    int(dispatch_records),
+                    int(exception_records),
+                    int(generated_files),
+                    str(error_message or ""),
+                    run_number,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def save_reconciliation_run_file(
+    run_number: str,
+    file_category: str,
+    file_name: str,
+    file_type: str,
+    container_name: str,
+    blob_name: str,
+    content_type: str,
+    size_bytes: int,
+    etag: str = "",
+) -> None:
+    sql = """
+    MERGE dbo.ReconciliationRunFiles AS target
+    USING
+    (
+        SELECT
+            ? AS RunNumber,
+            ? AS FileCategory,
+            ? AS FileName,
+            ? AS FileType,
+            ? AS ContainerName,
+            ? AS BlobName,
+            ? AS ContentType,
+            ? AS SizeBytes,
+            ? AS ETag
+    ) AS source
+    ON target.ContainerName = source.ContainerName
+       AND target.BlobName = source.BlobName
+    WHEN MATCHED THEN
+        UPDATE SET
+            RunNumber = source.RunNumber,
+            FileCategory = source.FileCategory,
+            FileName = source.FileName,
+            FileType = source.FileType,
+            ContentType = source.ContentType,
+            SizeBytes = source.SizeBytes,
+            ETag = source.ETag,
+            CreatedAt = SYSUTCDATETIME()
+    WHEN NOT MATCHED THEN
+        INSERT
+        (
+            RunNumber, FileCategory, FileName, FileType,
+            ContainerName, BlobName, ContentType, SizeBytes, ETag
+        )
+        VALUES
+        (
+            source.RunNumber, source.FileCategory, source.FileName, source.FileType,
+            source.ContainerName, source.BlobName, source.ContentType, source.SizeBytes, source.ETag
+        );
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                sql,
+                (
+                    run_number,
+                    file_category,
+                    file_name,
+                    file_type,
+                    container_name,
+                    blob_name,
+                    content_type,
+                    int(size_bytes),
+                    etag,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def list_reconciliation_runs(limit: int = 500) -> List[Dict[str, Any]]:
+    initialize_database()
+    safe_limit = max(1, min(int(limit or 500), 5000))
+    sql = f"""
+    SELECT TOP {safe_limit}
+        RunID, RunNumber, ProcessType, Status, StartedAt, CompletedAt,
+        SubmittedBy, ASNFiles, InventoryFiles, DispatchFiles, SFDAFiles,
+        TotalInputRows, MasterRecords, AcceptRecords, DispatchRecords,
+        ExceptionRecords, GeneratedFiles, ApplicationVersion, ErrorMessage
+    FROM dbo.ReconciliationRuns
+    ORDER BY StartedAt DESC, RunID DESC;
+    """
+    with Database().connect() as connection:
+        frame = pd.read_sql(sql, connection)
+    return frame.to_dict(orient="records")
+
+
+def get_reconciliation_run(run_number: str) -> Optional[Dict[str, Any]]:
+    initialize_database()
+    sql = """
+    SELECT TOP 1
+        RunID, RunNumber, ProcessType, Status, StartedAt, CompletedAt,
+        SubmittedBy, ASNFiles, InventoryFiles, DispatchFiles, SFDAFiles,
+        TotalInputRows, MasterRecords, AcceptRecords, DispatchRecords,
+        ExceptionRecords, GeneratedFiles, ApplicationVersion, ErrorMessage
+    FROM dbo.ReconciliationRuns
+    WHERE RunNumber = ?;
+    """
+    with Database().connect() as connection:
+        frame = pd.read_sql(sql, connection, params=[run_number])
+    if frame.empty:
+        return None
+    return frame.iloc[0].to_dict()
+
+
+def list_reconciliation_run_files(run_number: str) -> List[Dict[str, Any]]:
+    initialize_database()
+    sql = """
+    SELECT
+        RunFileID, RunNumber, FileCategory, FileName, FileType,
+        ContainerName, BlobName, ContentType, SizeBytes, ETag, CreatedAt
+    FROM dbo.ReconciliationRunFiles
+    WHERE RunNumber = ?
+    ORDER BY
+        CASE FileCategory WHEN 'input' THEN 1 WHEN 'output' THEN 2 ELSE 3 END,
+        FileName;
+    """
+    with Database().connect() as connection:
+        frame = pd.read_sql(sql, connection, params=[run_number])
+    return frame.to_dict(orient="records")
