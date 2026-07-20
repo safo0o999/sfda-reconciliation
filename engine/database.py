@@ -37,6 +37,8 @@ BEGIN
         GenericItemNumber nvarchar(120) NOT NULL,
         TradeItemNumber nvarchar(120) NULL,
         TradeName nvarchar(500) NULL,
+        Description nvarchar(1000) NULL,
+        ItemFamilyGroup nvarchar(500) NULL,
         ReceivedQuantity decimal(19,4) NOT NULL,
         InboundShipment nvarchar(150) NULL,
         ASNLine nvarchar(100) NULL,
@@ -116,6 +118,13 @@ BEGIN
         TradeName nvarchar(500) NULL,
         GTIN nvarchar(20) NULL,
         DrugName nvarchar(500) NULL,
+        PackageSize decimal(19,4) NULL,
+        SFDAQuantity decimal(19,4) NOT NULL CONSTRAINT DF_BatchMasterV5_SFDAQuantity DEFAULT 0,
+        Active decimal(19,4) NOT NULL CONSTRAINT DF_BatchMasterV5_Active DEFAULT 0,
+        QuantitySentPending decimal(19,4) NOT NULL CONSTRAINT DF_BatchMasterV5_QtySentPending DEFAULT 0,
+        QuantityReceivePending decimal(19,4) NOT NULL CONSTRAINT DF_BatchMasterV5_QtyReceivePending DEFAULT 0,
+        Description nvarchar(1000) NULL,
+        ItemFamilyGroup nvarchar(500) NULL,
         TotalReceiveQty decimal(19,4) NOT NULL
             CONSTRAINT DF_BatchMasterV5_TotalReceiveQty DEFAULT 0,
         TotalDispatchedQty decimal(19,4) NOT NULL
@@ -259,6 +268,55 @@ IF COL_LENGTH('dbo.BatchMaster', 'GenericExistsInSFDA') IS NOT NULL
 BEGIN
     ALTER TABLE dbo.BatchMaster
     ALTER COLUMN GenericExistsInSFDA nvarchar(30) NOT NULL;
+END;
+
+IF COL_LENGTH('dbo.ReceiptEvents', 'Description') IS NULL
+BEGIN
+    ALTER TABLE dbo.ReceiptEvents ADD Description nvarchar(1000) NULL;
+END;
+
+IF COL_LENGTH('dbo.ReceiptEvents', 'ItemFamilyGroup') IS NULL
+BEGIN
+    ALTER TABLE dbo.ReceiptEvents ADD ItemFamilyGroup nvarchar(500) NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'PackageSize') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster ADD PackageSize decimal(19,4) NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'SFDAQuantity') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster ADD SFDAQuantity decimal(19,4) NOT NULL
+        CONSTRAINT DF_BatchMaster_SFDAQuantity_Migration DEFAULT 0 WITH VALUES;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'Active') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster ADD Active decimal(19,4) NOT NULL
+        CONSTRAINT DF_BatchMaster_Active_Migration DEFAULT 0 WITH VALUES;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'QuantitySentPending') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster ADD QuantitySentPending decimal(19,4) NOT NULL
+        CONSTRAINT DF_BatchMaster_QtySentPending_Migration DEFAULT 0 WITH VALUES;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'QuantityReceivePending') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster ADD QuantityReceivePending decimal(19,4) NOT NULL
+        CONSTRAINT DF_BatchMaster_QtyReceivePending_Migration DEFAULT 0 WITH VALUES;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'Description') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster ADD Description nvarchar(1000) NULL;
+END;
+
+IF COL_LENGTH('dbo.BatchMaster', 'ItemFamilyGroup') IS NULL
+BEGIN
+    ALTER TABLE dbo.BatchMaster ADD ItemFamilyGroup nvarchar(500) NULL;
 END;
 
 IF NOT EXISTS
@@ -510,13 +568,15 @@ BEGIN
         GenericItemNumber,
         TradeItemNumber,
         TradeName,
+        Description,
+        ItemFamilyGroup,
         ReceivedQuantity,
         InboundShipment,
         ASNLine,
         SupplierName,
         ReceivedDate
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
     SELECT CAST(1 AS int) AS Inserted;
 END;
@@ -714,6 +774,8 @@ def _receipt_parameters(row: Dict[str, Any]) -> Tuple[Any, ...]:
         generic_item_number,
         _text(row, "Trade Item"),
         _text(row, "Trade Name"),
+        _text(row, "Description"),
+        _text(row, "Item Family Group"),
         _number(row, "Received Quantity"),
         _text(row, "Inbound Shipment"),
         _text(row, "ASN Line"),
@@ -815,6 +877,8 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             GenericItemNumber AS [Generic Item Number],
             MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
             MAX(NULLIF(TradeName, '')) AS [Trade Name],
+            MAX(NULLIF(Description, '')) AS [Description],
+            MAX(NULLIF(ItemFamilyGroup, '')) AS [Item Family Group],
             COUNT_BIG(*) AS [Receive Runs],
             SUM(ReceivedQuantity) AS [Total Receive Qty],
             MIN(ReceivedDate) AS [First Received Date],
@@ -885,6 +949,13 @@ def replace_batch_master(master: pd.DataFrame) -> None:
             TradeName,
             GTIN,
             DrugName,
+            PackageSize,
+            SFDAQuantity,
+            Active,
+            QuantitySentPending,
+            QuantityReceivePending,
+            Description,
+            ItemFamilyGroup,
             TotalReceiveQty,
             TotalDispatchedQty,
             ReceiveRuns,
@@ -896,7 +967,7 @@ def replace_batch_master(master: pd.DataFrame) -> None:
             GenericExistsInSFDA,
             LastUpdated
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     """
 
     rows: Iterable[Tuple[Any, ...]] = (
@@ -913,7 +984,14 @@ def replace_batch_master(master: pd.DataFrame) -> None:
             _text(row, "Trade Name"),
             _text(row, "GTIN"),
             _text(row, "Drug Name"),
-            _number(row, "Total Receive Qty"),
+            _number(row, "PackageSize"),
+            _number(row, "Quantity"),
+            _number(row, "Active"),
+            _number(row, "Quantity sent pending"),
+            _number(row, "Quantity Receive Pending"),
+            _text(row, "Description"),
+            _text(row, "Item Family Group"),
+            _number(row, "Received Quantity Each", _number(row, "Total Receive Qty")),
             _number(row, "Total Dispatched Qty"),
             _integer(row, "Receive Runs"),
             _integer(row, "Dispatch Runs"),
@@ -963,7 +1041,17 @@ def get_batch_master_df() -> pd.DataFrame:
             TradeName AS [Trade Name],
             GTIN,
             DrugName AS [Drug Name],
+            PackageSize,
+            SFDAQuantity AS [Quantity],
+            Active,
+            QuantitySentPending AS [Quantity sent pending],
+            QuantityReceivePending AS [Quantity Receive Pending],
+            Description,
+            ItemFamilyGroup AS [Item Family Group],
             TotalReceiveQty AS [Total Receive Qty],
+            TotalReceiveQty AS [Received Quantity Each],
+            CASE WHEN PackageSize IS NOT NULL AND PackageSize > 0
+                 THEN TotalReceiveQty / PackageSize ELSE 0 END AS [Received Quantity Pack],
             TotalDispatchedQty AS [Total Dispatched Qty],
             ReceiveRuns AS [Receive Runs],
             DispatchRuns AS [Dispatch Runs],
