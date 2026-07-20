@@ -34,6 +34,11 @@ class Exporter:
         "Supplier Code",
         "Item Family Group",
         "To Be Accept",
+        "Processing Status",
+        "Previous Run Date",
+        "Previous Quantity Each",
+        "Current Quantity Each",
+        "Quantity Difference",
         "Package Size Status",
         "Batch Master Status",
     ]
@@ -433,7 +438,7 @@ class Exporter:
             group_definitions = [
                 (1, 8, "SFDA Report", "5B9BD5"),
                 (9, 16, "WMS Receiving Report", "4472C4"),
-                (17, 19, "Decision", "70AD47"),
+                (17, 24, "Decision", "70AD47"),
             ]
 
             for start_column, end_column, group_title, fill_color in group_definitions:
