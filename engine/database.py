@@ -1,4 +1,6 @@
+import json
 import os
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -23,318 +25,28 @@ class Database:
         )
 
 
-_SCHEMA_SQL = r"""
-SET XACT_ABORT ON;
+def _load_schema_sql() -> str:
+    """Load the idempotent Version 5 SQL schema from the project SQL folder."""
 
-IF OBJECT_ID('dbo.ReceiptEvents', 'U') IS NULL
-BEGIN
-    CREATE TABLE dbo.ReceiptEvents
-    (
-        EventKey varchar(64) NOT NULL,
-        BN nvarchar(120) NOT NULL,
-        ExpiryMonthKey char(7) NOT NULL,
-        ExpiryDate date NULL,
-        GenericItemNumber nvarchar(120) NOT NULL,
-        TradeItemNumber nvarchar(120) NULL,
-        TradeName nvarchar(500) NULL,
-        ReceivedQuantity decimal(19,4) NOT NULL,
-        InboundShipment nvarchar(150) NULL,
-        ASNLine nvarchar(100) NULL,
-        SupplierName nvarchar(500) NULL,
-        ReceivedDate datetime2 NULL,
-        CreatedAt datetime2 NOT NULL
-            CONSTRAINT DF_ReceiptEvents_CreatedAt DEFAULT SYSUTCDATETIME(),
-        CONSTRAINT PK_ReceiptEvents PRIMARY KEY (EventKey)
-    );
-END;
+    schema_path = (
+        Path(__file__).resolve().parent.parent
+        / "sql"
+        / "001_initial_schema.sql"
+    )
 
-IF OBJECT_ID('dbo.DispatchEvents', 'U') IS NULL
-BEGIN
-    CREATE TABLE dbo.DispatchEvents
-    (
-        EventKey varchar(64) NOT NULL,
-        BN nvarchar(120) NOT NULL,
-        ExpiryMonthKey char(7) NOT NULL,
-        ExpiryDate date NULL,
-        GenericItemNumber nvarchar(120) NOT NULL,
-        TradeItemNumber nvarchar(120) NULL,
-        TradeName nvarchar(500) NULL,
-        DispatchedQuantity decimal(19,4) NOT NULL,
-        ToAddress nvarchar(500) NULL,
-        SalesOrderNumber nvarchar(150) NULL,
-        OrderLine nvarchar(100) NULL,
-        DispatchDate datetime2 NULL,
-        CreatedAt datetime2 NOT NULL
-            CONSTRAINT DF_DispatchEvents_CreatedAt DEFAULT SYSUTCDATETIME(),
-        CONSTRAINT PK_DispatchEvents PRIMARY KEY (EventKey)
-    );
-END;
-
-IF OBJECT_ID('dbo.BatchMaster', 'U') IS NOT NULL
-   AND COL_LENGTH('dbo.BatchMaster', 'FullRunID') IS NOT NULL
-BEGIN
-    DECLARE @LegacyTableName sysname;
-    DECLARE @LegacyObjectName nvarchar(300);
-    DECLARE @LegacySuffix int = 0;
-
-    SET @LegacyTableName =
-        N'BatchMaster_Legacy_'
-        + CONVERT(char(8), SYSUTCDATETIME(), 112)
-        + N'_'
-        + REPLACE(CONVERT(char(8), SYSUTCDATETIME(), 108), ':', '');
-
-    SET @LegacyObjectName = N'dbo.' + @LegacyTableName;
-
-    WHILE OBJECT_ID(@LegacyObjectName, 'U') IS NOT NULL
-    BEGIN
-        SET @LegacySuffix = @LegacySuffix + 1;
-        SET @LegacyTableName =
-            N'BatchMaster_Legacy_'
-            + CONVERT(char(8), SYSUTCDATETIME(), 112)
-            + N'_'
-            + REPLACE(CONVERT(char(8), SYSUTCDATETIME(), 108), ':', '')
-            + N'_'
-            + CONVERT(nvarchar(10), @LegacySuffix);
-        SET @LegacyObjectName = N'dbo.' + @LegacyTableName;
-    END;
-
-    EXEC sys.sp_rename
-        @objname = N'dbo.BatchMaster',
-        @newname = @LegacyTableName,
-        @objtype = N'OBJECT';
-END;
-
-IF OBJECT_ID('dbo.BatchMaster', 'U') IS NULL
-BEGIN
-    CREATE TABLE dbo.BatchMaster
-    (
-        BN nvarchar(120) NOT NULL,
-        ExpiryMonthKey char(7) NOT NULL,
-        ExpiryDate date NULL,
-        GenericItemNumber nvarchar(120) NOT NULL,
-        TradeItemNumber nvarchar(120) NULL,
-        TradeName nvarchar(500) NULL,
-        GTIN nvarchar(20) NULL,
-        DrugName nvarchar(500) NULL,
-        TotalReceiveQty decimal(19,4) NOT NULL
-            CONSTRAINT DF_BatchMasterV5_TotalReceiveQty DEFAULT 0,
-        TotalDispatchedQty decimal(19,4) NOT NULL
-            CONSTRAINT DF_BatchMasterV5_TotalDispatchedQty DEFAULT 0,
-        ReceiveRuns int NOT NULL
-            CONSTRAINT DF_BatchMasterV5_ReceiveRuns DEFAULT 0,
-        DispatchRuns int NOT NULL
-            CONSTRAINT DF_BatchMasterV5_DispatchRuns DEFAULT 0,
-        FirstReceivedDate datetime2 NULL,
-        LastReceivedDate datetime2 NULL,
-        FirstDispatchDate datetime2 NULL,
-        LastDispatchDate datetime2 NULL,
-        GenericExistsInSFDA nvarchar(30) NOT NULL
-            CONSTRAINT DF_BatchMasterV5_GenericExistsInSFDA DEFAULT 'Yes',
-        LastUpdated datetime2 NOT NULL
-            CONSTRAINT DF_BatchMasterV5_LastUpdated DEFAULT SYSUTCDATETIME(),
-        CONSTRAINT PK_BatchMasterV5 PRIMARY KEY
-        (
-            BN,
-            ExpiryMonthKey,
-            GenericItemNumber
+    if not schema_path.exists():
+        raise RuntimeError(
+            f"Database schema file is missing: {schema_path}"
         )
-    );
-END;
 
-IF COL_LENGTH('dbo.ReceiptEvents', 'ExpiryDate') IS NULL
-BEGIN
-    ALTER TABLE dbo.ReceiptEvents
-    ADD ExpiryDate date NULL;
-END;
+    schema_sql = schema_path.read_text(encoding="utf-8").strip()
 
-IF COL_LENGTH('dbo.DispatchEvents', 'ExpiryDate') IS NULL
-BEGIN
-    ALTER TABLE dbo.DispatchEvents
-    ADD ExpiryDate date NULL;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'ExpiryDate') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD ExpiryDate date NULL;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'GTIN') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD GTIN nvarchar(20) NULL;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'DrugName') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD DrugName nvarchar(500) NULL;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'TotalReceiveQty') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD TotalReceiveQty decimal(19,4) NOT NULL
-        CONSTRAINT DF_BatchMaster_TotalReceiveQty_Migration
-        DEFAULT 0 WITH VALUES;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'TotalDispatchedQty') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD TotalDispatchedQty decimal(19,4) NOT NULL
-        CONSTRAINT DF_BatchMaster_TotalDispatchedQty_Migration
-        DEFAULT 0 WITH VALUES;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'ReceiveRuns') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD ReceiveRuns int NOT NULL
-        CONSTRAINT DF_BatchMaster_ReceiveRuns_Migration
-        DEFAULT 0 WITH VALUES;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'DispatchRuns') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD DispatchRuns int NOT NULL
-        CONSTRAINT DF_BatchMaster_DispatchRuns_Migration
-        DEFAULT 0 WITH VALUES;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'FirstReceivedDate') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD FirstReceivedDate datetime2 NULL;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'LastReceivedDate') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD LastReceivedDate datetime2 NULL;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'FirstDispatchDate') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD FirstDispatchDate datetime2 NULL;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'LastDispatchDate') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD LastDispatchDate datetime2 NULL;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'GenericExistsInSFDA') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD GenericExistsInSFDA nvarchar(30) NOT NULL
-        CONSTRAINT DF_BatchMaster_GenericExistsInSFDA_Migration
-        DEFAULT 'Yes' WITH VALUES;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'LastUpdated') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD LastUpdated datetime2 NOT NULL
-        CONSTRAINT DF_BatchMaster_LastUpdated_Migration
-        DEFAULT SYSUTCDATETIME() WITH VALUES;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'TradeItemNumber') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD TradeItemNumber nvarchar(120) NULL;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'TradeName') IS NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ADD TradeName nvarchar(500) NULL;
-END;
-
-IF COL_LENGTH('dbo.BatchMaster', 'GenericExistsInSFDA') IS NOT NULL
-BEGIN
-    ALTER TABLE dbo.BatchMaster
-    ALTER COLUMN GenericExistsInSFDA nvarchar(30) NOT NULL;
-END;
-
-IF NOT EXISTS
-(
-    SELECT 1
-    FROM sys.indexes
-    WHERE name = 'IX_ReceiptEvents_Batch'
-      AND object_id = OBJECT_ID('dbo.ReceiptEvents')
-)
-BEGIN
-    CREATE INDEX IX_ReceiptEvents_Batch
-        ON dbo.ReceiptEvents
-        (
-            BN,
-            ExpiryMonthKey,
-            GenericItemNumber
+    if not schema_sql:
+        raise RuntimeError(
+            f"Database schema file is empty: {schema_path}"
         )
-        INCLUDE
-        (
-            ReceivedQuantity,
-            ReceivedDate,
-            TradeItemNumber,
-            TradeName
-        );
-END;
 
-IF NOT EXISTS
-(
-    SELECT 1
-    FROM sys.indexes
-    WHERE name = 'IX_DispatchEvents_Batch'
-      AND object_id = OBJECT_ID('dbo.DispatchEvents')
-)
-BEGIN
-    CREATE INDEX IX_DispatchEvents_Batch
-        ON dbo.DispatchEvents
-        (
-            BN,
-            ExpiryMonthKey,
-            GenericItemNumber
-        )
-        INCLUDE
-        (
-            DispatchedQuantity,
-            DispatchDate,
-            ToAddress,
-            TradeItemNumber,
-            TradeName
-        );
-END;
-
-IF NOT EXISTS
-(
-    SELECT 1
-    FROM sys.indexes
-    WHERE name = 'IX_DispatchEvents_Allocation'
-      AND object_id = OBJECT_ID('dbo.DispatchEvents')
-)
-BEGIN
-    CREATE INDEX IX_DispatchEvents_Allocation
-        ON dbo.DispatchEvents
-        (
-            BN,
-            ExpiryMonthKey,
-            GenericItemNumber,
-            DispatchDate
-        )
-        INCLUDE
-        (
-            DispatchedQuantity,
-            ToAddress,
-            SalesOrderNumber,
-            OrderLine
-        );
-END;
-"""
+    return schema_sql
 
 
 _RECEIPT_INSERT_SQL = r"""
@@ -447,7 +159,7 @@ def initialize_database() -> None:
         cursor = connection.cursor()
 
         try:
-            cursor.execute(_SCHEMA_SQL)
+            cursor.execute(_load_schema_sql())
             _consume_all_results(cursor)
             connection.commit()
 
@@ -699,7 +411,7 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
     return receipt, dispatch
 
 
-def replace_batch_master(master: pd.DataFrame) -> None:
+def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
     """Atomically replace Batch Master from cumulative event summaries."""
 
     initialize_database()
@@ -797,6 +509,11 @@ def replace_batch_master(master: pd.DataFrame) -> None:
             connection.rollback()
             raise
 
+    return {
+        "status": "Completed",
+        "rows_inserted": len(master),
+    }
+
 
 def get_batch_master_df() -> pd.DataFrame:
     initialize_database()
@@ -863,6 +580,112 @@ def get_dispatch_events_df() -> pd.DataFrame:
         return pd.read_sql(sql, connection)
 
 
+def record_run_history(
+    run_type: str,
+    status: str,
+    started_at: Any,
+    completed_at: Any = None,
+    summary: Optional[Dict[str, Any]] = None,
+    error_message: str = "",
+) -> str:
+    """Persist one auditable application run and return its RunID."""
+
+    initialize_database()
+
+    sql = r"""
+        DECLARE @RunID uniqueidentifier = NEWID();
+
+        INSERT INTO dbo.RunHistory
+        (
+            RunID,
+            RunType,
+            Status,
+            StartedAt,
+            CompletedAt,
+            SummaryJson,
+            ErrorMessage
+        )
+        VALUES (@RunID, ?, ?, ?, ?, ?, ?);
+
+        SELECT CONVERT(nvarchar(36), @RunID) AS RunID;
+    """
+
+    summary_json = (
+        json.dumps(summary or {}, ensure_ascii=False, default=str)
+        if summary is not None
+        else None
+    )
+
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+
+        try:
+            cursor.execute(
+                sql,
+                (
+                    run_type,
+                    status,
+                    started_at,
+                    completed_at,
+                    summary_json,
+                    error_message or None,
+                ),
+            )
+            row = cursor.fetchone()
+            connection.commit()
+
+        except Exception:
+            connection.rollback()
+            raise
+
+    return str(row[0]) if row is not None else ""
+
+
+def get_reconciliation_history(limit: int = 100) -> List[Dict[str, Any]]:
+    """Return the latest Batch Master and reconciliation runs."""
+
+    initialize_database()
+    safe_limit = max(1, min(int(limit), 1000))
+
+    sql = f"""
+        SELECT TOP ({safe_limit})
+            CONVERT(nvarchar(36), RunID) AS RunID,
+            RunType,
+            Status,
+            StartedAt,
+            CompletedAt,
+            SummaryJson,
+            ErrorMessage
+        FROM dbo.RunHistory
+        ORDER BY StartedAt DESC, CreatedAt DESC;
+    """
+
+    with Database().connect() as connection:
+        rows = connection.cursor().execute(sql).fetchall()
+
+    history: List[Dict[str, Any]] = []
+
+    for row in rows:
+        try:
+            summary = json.loads(row[5]) if row[5] else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            summary = {}
+
+        history.append(
+            {
+                "run_id": row[0],
+                "run_type": row[1],
+                "status": row[2],
+                "started_at": row[3],
+                "completed_at": row[4],
+                "summary": summary,
+                "error": row[6] or "",
+            }
+        )
+
+    return history
+
+
 def reset_history() -> None:
     """Delete all cumulative history and Batch Master rows for rebuild mode."""
 
@@ -877,6 +700,7 @@ def reset_history() -> None:
                 DELETE FROM dbo.BatchMaster;
                 DELETE FROM dbo.DispatchEvents;
                 DELETE FROM dbo.ReceiptEvents;
+                DELETE FROM dbo.RunHistory;
                 """
             )
             connection.commit()
@@ -896,7 +720,8 @@ def test_database_connection() -> Dict[str, Optional[Any]]:
             SYSUTCDATETIME() AS ServerUtcTime,
             (SELECT COUNT_BIG(*) FROM dbo.ReceiptEvents) AS ReceiptEvents,
             (SELECT COUNT_BIG(*) FROM dbo.DispatchEvents) AS DispatchEvents,
-            (SELECT COUNT_BIG(*) FROM dbo.BatchMaster) AS BatchMasterRows;
+            (SELECT COUNT_BIG(*) FROM dbo.BatchMaster) AS BatchMasterRows,
+            (SELECT COUNT_BIG(*) FROM dbo.RunHistory) AS RunHistoryRows;
     """
 
     with Database().connect() as connection:
@@ -910,4 +735,5 @@ def test_database_connection() -> Dict[str, Optional[Any]]:
         "receipt_events": int(row[3]),
         "dispatch_events": int(row[4]),
         "batch_master_rows": int(row[5]),
+        "run_history_rows": int(row[6]),
     }
