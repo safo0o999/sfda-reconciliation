@@ -52,6 +52,7 @@ class FullReconciliationEngine:
         "Inbound Shipment",
         "ASN Line",
         "Supplier Name",
+        "Supplier Code",
         "Received Date",
     ]
 
@@ -82,16 +83,16 @@ class FullReconciliationEngine:
         "Quantity Receive Pending",
         "Generic Item Number",
         "Description",
-        "Trade Name",
+        "Trade Description",
+        "Supplier Name",
+        "Supplier Code",
         "Received Quantity Each",
         "Received Quantity Pack",
         "First Received Date",
         "Last Received Date",
-        "Receive Runs",
         "Total Dispatched Qty",
         "First Dispatch Date",
         "Last Dispatch Date",
-        "Dispatch Runs",
         "Generic Exists in SFDA",
         "Last Updated",
         "Item Family Group",
@@ -351,8 +352,9 @@ class FullReconciliationEngine:
                 "Trade Item Number",
                 "Trade Name",
                 "Description",
+                "Supplier Name",
+                "Supplier Code",
                 "Item Family Group",
-                "Receive Runs",
                 "Total Receive Qty",
                 "First Received Date",
                 "Last Received Date",
@@ -364,7 +366,6 @@ class FullReconciliationEngine:
             + [
                 "Trade Item Number",
                 "Trade Name",
-                "Dispatch Runs",
                 "Total Dispatched Qty",
                 "First Dispatch Date",
                 "Last Dispatch Date",
@@ -493,12 +494,12 @@ class FullReconciliationEngine:
             .str.strip()
         )
 
-        master["Trade Name"] = (
+        master["Trade Description"] = (
             master["Receipt Trade Name"].fillna("").astype(str).str.strip()
         )
-        missing_trade_name = master["Trade Name"].eq("")
-        master.loc[missing_trade_name, "Trade Name"] = (
-            master.loc[missing_trade_name, "Dispatch Trade Name"]
+        missing_trade_description = master["Trade Description"].eq("")
+        master.loc[missing_trade_description, "Trade Description"] = (
+            master.loc[missing_trade_description, "Dispatch Trade Name"]
             .fillna("")
             .astype(str)
             .str.strip()
@@ -507,8 +508,6 @@ class FullReconciliationEngine:
         for column in [
             "Total Receive Qty",
             "Total Dispatched Qty",
-            "Receive Runs",
-            "Dispatch Runs",
             "PackageSize",
         ]:
             master[column] = pd.to_numeric(master[column], errors="coerce").fillna(0)
@@ -520,9 +519,6 @@ class FullReconciliationEngine:
             master.loc[valid_package, "Received Quantity Each"]
             / master.loc[valid_package, "PackageSize"]
         )
-
-        master["Receive Runs"] = master["Receive Runs"].round(0).astype(int)
-        master["Dispatch Runs"] = master["Dispatch Runs"].round(0).astype(int)
 
         for column in [
             "Expiry Date",
