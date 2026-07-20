@@ -191,6 +191,31 @@ class ReconciliationEngine:
         result["Effective Quantity Each"] = result["Quantity Difference"].clip(lower=0)
         return result
 
+
+    @staticmethod
+    def _ensure_output_columns(
+        frame: pd.DataFrame,
+        columns: list[str],
+    ) -> pd.DataFrame:
+        """Return output with every requested column present and in exact order."""
+        result = frame.copy()
+
+        defaults = {
+            "Processing Status": "New",
+            "Previous Run Date": pd.NaT,
+            "Previous Quantity Each": 0.0,
+            "Current Quantity Each": 0.0,
+            "Quantity Difference": 0.0,
+            "Package Size Status": "",
+            "Batch Master Status": "",
+        }
+
+        for column in columns:
+            if column not in result.columns:
+                result[column] = defaults.get(column, "")
+
+        return result.reindex(columns=columns)
+
     @staticmethod
     def _transaction_rows(
         frame: pd.DataFrame,
@@ -623,13 +648,10 @@ class ReconciliationEngine:
             "Batch Master Status",
         ]
 
-        details = report[
-            [
-                column
-                for column in details_columns
-                if column in report.columns
-            ]
-        ].copy()
+        details = self._ensure_output_columns(
+            report,
+            details_columns,
+        )
 
         accept_transactions = self.asn.copy()
         accept_transactions["Current Quantity Pack"] = 0.0
@@ -828,13 +850,10 @@ class ReconciliationEngine:
             "Batch Master Status",
         ]
 
-        report = details[
-            [
-                column
-                for column in details_columns
-                if column in details.columns
-            ]
-        ].copy()
+        report = self._ensure_output_columns(
+            details,
+            details_columns,
+        )
 
         dispatch_upload = details.loc[
             details["Allocated To Be Dispatch"] > 0,
