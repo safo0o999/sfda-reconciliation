@@ -414,7 +414,7 @@ class FullReconciliationEngine:
 
         matched_generics = set(
             master.loc[
-                master["_Batch Exists in SFDA"].fillna(False),
+                master["_Batch Exists in SFDA"].eq(True),
                 "Generic Item Number",
             ]
             .fillna("")
@@ -429,7 +429,7 @@ class FullReconciliationEngine:
             "Generic Exists in SFDA",
         ] = "Missing Batch in SFDA"
         master.loc[
-            master["_Batch Exists in SFDA"].fillna(False),
+            master["_Batch Exists in SFDA"].eq(True),
             "Generic Exists in SFDA",
         ] = "Yes"
 
@@ -442,7 +442,7 @@ class FullReconciliationEngine:
         # batch-level SFDA quantities remain zero.
         generic_reference = (
             master.loc[
-                master["_Batch Exists in SFDA"].fillna(False),
+                master["_Batch Exists in SFDA"].eq(True),
                 ["Generic Item Number", "GTIN", "Drug Name", "PackageSize"],
             ]
             .drop_duplicates(subset=["Generic Item Number"], keep="first")
@@ -461,7 +461,8 @@ class FullReconciliationEngine:
             validate="many_to_one",
         )
 
-        missing_batch_mask = ~master["_Batch Exists in SFDA"].fillna(False)
+        batch_exists_mask = master["_Batch Exists in SFDA"].eq(True)
+        missing_batch_mask = batch_exists_mask.eq(False)
         master.loc[missing_batch_mask, "GTIN"] = master.loc[
             missing_batch_mask, "_Generic GTIN"
         ]
