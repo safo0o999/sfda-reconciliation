@@ -36,6 +36,7 @@ class Exporter:
         "First Received Date",
         "Last Received Date",
         "Total Dispatched Qty",
+        "Total Dispatched Qty Pack",
         "First Dispatch Date",
         "Last Dispatch Date",
         "Generic Exists in SFDA",
@@ -531,7 +532,7 @@ class Exporter:
             if is_batch_master:
                 group_definitions = [
                     (1, 9, "SFDA Report", "5B9BD5"),
-                    (10, 24, "WMS Report", "4472C4"),
+                    (10, 25, "WMS Report", "4472C4"),
                 ]
             elif is_accept_details:
                 group_definitions = [
