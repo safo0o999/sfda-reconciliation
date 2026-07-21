@@ -730,6 +730,11 @@ def get_batch_master_df() -> pd.DataFrame:
             FirstReceivedDate AS [First Received Date],
             LastReceivedDate AS [Last Received Date],
             TotalDispatchedQty AS [Total Dispatched Qty],
+            CASE
+                WHEN ISNULL(PackageSize, 0) > 0
+                    THEN TotalDispatchedQty / PackageSize
+                ELSE 0
+            END AS [Total Dispatched Qty Pack],
             FirstDispatchDate AS [First Dispatch Date],
             LastDispatchDate AS [Last Dispatch Date],
             GenericExistsInSFDA AS [Generic Exists in SFDA],
