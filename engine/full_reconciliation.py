@@ -96,6 +96,7 @@ class FullReconciliationEngine:
         "First Received Date",
         "Last Received Date",
         "Total Dispatched Qty",
+        "Total Dispatched Qty Pack",
         "First Dispatch Date",
         "Last Dispatch Date",
         "Generic Exists in SFDA",
@@ -587,6 +588,12 @@ class FullReconciliationEngine:
         master["Received Quantity Pack"] = 0.0
         master.loc[valid_package, "Received Quantity Pack"] = (
             master.loc[valid_package, "Received Quantity Each"]
+            / master.loc[valid_package, "PackageSize"]
+        )
+
+        master["Total Dispatched Qty Pack"] = 0.0
+        master.loc[valid_package, "Total Dispatched Qty Pack"] = (
+            master.loc[valid_package, "Total Dispatched Qty"]
             / master.loc[valid_package, "PackageSize"]
         )
 
