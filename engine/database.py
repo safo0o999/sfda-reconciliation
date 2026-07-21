@@ -1,10 +1,18 @@
 import json
+import logging
 import os
+import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 import pyodbc
+
+
+logger = logging.getLogger("SFDA-Reconciliation.Database")
+
+_EVENT_KEY_LOOKUP_BATCH_SIZE = 1000
+_BULK_INSERT_BATCH_SIZE = 5000
 
 
 class Database:
@@ -49,74 +57,6 @@ def _load_schema_sql() -> str:
     return schema_sql
 
 
-_RECEIPT_INSERT_SQL = r"""
-IF EXISTS
-(
-    SELECT 1
-    FROM dbo.ReceiptEvents
-    WHERE EventKey = ?
-)
-BEGIN
-    SELECT CAST(0 AS int) AS Inserted;
-END
-ELSE
-BEGIN
-    INSERT INTO dbo.ReceiptEvents
-    (
-        EventKey,
-        BN,
-        ExpiryMonthKey,
-        ExpiryDate,
-        GenericItemNumber,
-        TradeItemNumber,
-        TradeName,
-        ReceivedQuantity,
-        InboundShipment,
-        ASNLine,
-        SupplierName,
-        ReceivedDate
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-
-    SELECT CAST(1 AS int) AS Inserted;
-END;
-"""
-
-
-_DISPATCH_INSERT_SQL = r"""
-IF EXISTS
-(
-    SELECT 1
-    FROM dbo.DispatchEvents
-    WHERE EventKey = ?
-)
-BEGIN
-    SELECT CAST(0 AS int) AS Inserted;
-END
-ELSE
-BEGIN
-    INSERT INTO dbo.DispatchEvents
-    (
-        EventKey,
-        BN,
-        ExpiryMonthKey,
-        ExpiryDate,
-        GenericItemNumber,
-        TradeItemNumber,
-        TradeName,
-        DispatchedQuantity,
-        ToAddress,
-        SalesOrderNumber,
-        OrderLine,
-        DispatchDate
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-
-    SELECT CAST(1 AS int) AS Inserted;
-END;
-"""
-
-
 def _consume_all_results(cursor: pyodbc.Cursor) -> None:
     """Consume all result sets and row-count messages from a SQL batch."""
 
@@ -133,27 +73,10 @@ def _consume_all_results(cursor: pyodbc.Cursor) -> None:
             break
 
 
-def _fetch_inserted_result(cursor: pyodbc.Cursor) -> int:
-    """Read the Inserted value returned by the event insert SQL batch."""
-
-    while True:
-        if cursor.description is not None:
-            row = cursor.fetchone()
-
-            if row is not None:
-                return int(row[0])
-
-        try:
-            has_next = cursor.nextset()
-        except pyodbc.ProgrammingError:
-            return 0
-
-        if not has_next:
-            return 0
-
-
 def initialize_database() -> None:
     """Create or safely upgrade all Version 5 database objects."""
+
+    started_at = time.perf_counter()
 
     with Database().connect() as connection:
         cursor = connection.cursor()
@@ -166,6 +89,11 @@ def initialize_database() -> None:
         except Exception:
             connection.rollback()
             raise
+
+    logger.info(
+        "Database schema check completed in %.2f seconds.",
+        time.perf_counter() - started_at,
+    )
 
 
 def _value(
@@ -221,12 +149,46 @@ def _number(
     return float(value)
 
 
+def _number_with_fallback(
+    row: Dict[str, Any],
+    primary_name: str,
+    fallback_name: str,
+    default: float = 0,
+) -> float:
+    primary_value = _value(row, primary_name)
+
+    if primary_value is not None:
+        parsed = pd.to_numeric(
+            pd.Series([primary_value]),
+            errors="coerce",
+        ).iloc[0]
+
+        if not pd.isna(parsed):
+            return float(parsed)
+
+    return _number(row, fallback_name, default)
+
+
 def _integer(
     row: Dict[str, Any],
     name: str,
     default: int = 0,
 ) -> int:
     return int(_number(row, name, default))
+
+
+def _text_with_fallback(
+    row: Dict[str, Any],
+    primary_name: str,
+    fallback_name: str,
+    default: str = "",
+) -> str:
+    primary = _text(row, primary_name, "")
+
+    if primary:
+        return primary
+
+    return _text(row, fallback_name, default)
 
 
 def _validate_event_identity(
@@ -266,7 +228,7 @@ def _receipt_parameters(row: Dict[str, Any]) -> Tuple[Any, ...]:
         generic_item_number,
     )
 
-    values = (
+    return (
         event_key,
         bn,
         expiry_month_key,
@@ -278,10 +240,11 @@ def _receipt_parameters(row: Dict[str, Any]) -> Tuple[Any, ...]:
         _text(row, "Inbound Shipment"),
         _text(row, "ASN Line"),
         _text(row, "Supplier Name"),
+        _text(row, "Supplier Code"),
+        _text(row, "Description"),
+        _text(row, "Item Family Group"),
         _value(row, "Received Date"),
     )
-
-    return (event_key, *values)
 
 
 def _dispatch_parameters(row: Dict[str, Any]) -> Tuple[Any, ...]:
@@ -297,7 +260,7 @@ def _dispatch_parameters(row: Dict[str, Any]) -> Tuple[Any, ...]:
         generic_item_number,
     )
 
-    values = (
+    return (
         event_key,
         bn,
         expiry_month_key,
@@ -312,50 +275,214 @@ def _dispatch_parameters(row: Dict[str, Any]) -> Tuple[Any, ...]:
         _value(row, "Dispatch Date"),
     )
 
-    return (event_key, *values)
+
+def _deduplicate_parameters(
+    rows: Sequence[Dict[str, Any]],
+    parameter_builder,
+) -> List[Tuple[Any, ...]]:
+    """Prepare rows once and de-duplicate them by EventKey in memory."""
+
+    unique: Dict[str, Tuple[Any, ...]] = {}
+
+    for row in rows or []:
+        parameters = parameter_builder(row)
+        event_key = str(parameters[0])
+        unique.setdefault(event_key, parameters)
+
+    return list(unique.values())
+
+
+def _chunks(
+    values: Sequence[Any],
+    size: int,
+) -> Iterable[Sequence[Any]]:
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
+def _existing_event_keys(
+    cursor: pyodbc.Cursor,
+    table_name: str,
+    event_keys: Sequence[str],
+) -> Set[str]:
+    """Fetch existing EventKeys using bounded IN queries.
+
+    SQL Server accepts at most 2100 parameters per statement, so keys are
+    checked in safe batches instead of one query per event.
+    """
+
+    existing: Set[str] = set()
+
+    for key_batch in _chunks(
+        list(event_keys),
+        _EVENT_KEY_LOOKUP_BATCH_SIZE,
+    ):
+        placeholders = ",".join("?" for _ in key_batch)
+        sql = (
+            f"SELECT EventKey FROM dbo.{table_name} "
+            f"WHERE EventKey IN ({placeholders});"
+        )
+
+        rows = cursor.execute(sql, tuple(key_batch)).fetchall()
+        existing.update(str(row[0]) for row in rows)
+
+    return existing
+
+
+def _bulk_insert_rows(
+    cursor: pyodbc.Cursor,
+    insert_sql: str,
+    rows: Sequence[Tuple[Any, ...]],
+) -> int:
+    """Insert rows in bounded fast_executemany batches."""
+
+    if not rows:
+        return 0
+
+    cursor.fast_executemany = True
+    inserted = 0
+
+    for row_batch in _chunks(
+        list(rows),
+        _BULK_INSERT_BATCH_SIZE,
+    ):
+        cursor.executemany(insert_sql, row_batch)
+        inserted += len(row_batch)
+
+    return inserted
 
 
 def append_events(
     receipt_rows: List[Dict[str, Any]],
     dispatch_rows: List[Dict[str, Any]],
 ) -> Dict[str, int]:
-    """Append only new receipt and dispatch events.
+    """Append only new receipt and dispatch events in bulk.
 
-    EventKey is the immutable de-duplication key. Existing rows are ignored.
+    EventKey is the immutable de-duplication key. Existing database events
+    and duplicate EventKeys inside the uploaded files are ignored.
     """
 
     initialize_database()
+    started_at = time.perf_counter()
 
-    inserted_receipts = 0
-    inserted_dispatches = 0
+    receipt_insert_sql = r"""
+        INSERT INTO dbo.ReceiptEvents
+        (
+            EventKey,
+            BN,
+            ExpiryMonthKey,
+            ExpiryDate,
+            GenericItemNumber,
+            TradeItemNumber,
+            TradeName,
+            ReceivedQuantity,
+            InboundShipment,
+            ASNLine,
+            SupplierName,
+            SupplierCode,
+            Description,
+            ItemFamilyGroup,
+            ReceivedDate
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """
+
+    dispatch_insert_sql = r"""
+        INSERT INTO dbo.DispatchEvents
+        (
+            EventKey,
+            BN,
+            ExpiryMonthKey,
+            ExpiryDate,
+            GenericItemNumber,
+            TradeItemNumber,
+            TradeName,
+            DispatchedQuantity,
+            ToAddress,
+            SalesOrderNumber,
+            OrderLine,
+            DispatchDate
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """
+
+    prepared_receipts = _deduplicate_parameters(
+        receipt_rows or [],
+        _receipt_parameters,
+    )
+    prepared_dispatches = _deduplicate_parameters(
+        dispatch_rows or [],
+        _dispatch_parameters,
+    )
+
+    logger.info(
+        "Bulk event save started. prepared_receipts=%s prepared_dispatches=%s",
+        len(prepared_receipts),
+        len(prepared_dispatches),
+    )
 
     with Database().connect() as connection:
         cursor = connection.cursor()
 
         try:
-            for row in receipt_rows or []:
-                cursor.execute(
-                    _RECEIPT_INSERT_SQL,
-                    _receipt_parameters(row),
-                )
-                inserted_receipts += _fetch_inserted_result(
-                    cursor
-                )
+            receipt_keys = [
+                str(row[0])
+                for row in prepared_receipts
+            ]
+            dispatch_keys = [
+                str(row[0])
+                for row in prepared_dispatches
+            ]
 
-            for row in dispatch_rows or []:
-                cursor.execute(
-                    _DISPATCH_INSERT_SQL,
-                    _dispatch_parameters(row),
-                )
-                inserted_dispatches += _fetch_inserted_result(
-                    cursor
-                )
+            existing_receipt_keys = _existing_event_keys(
+                cursor,
+                "ReceiptEvents",
+                receipt_keys,
+            )
+            existing_dispatch_keys = _existing_event_keys(
+                cursor,
+                "DispatchEvents",
+                dispatch_keys,
+            )
+
+            new_receipts = [
+                row
+                for row in prepared_receipts
+                if str(row[0]) not in existing_receipt_keys
+            ]
+            new_dispatches = [
+                row
+                for row in prepared_dispatches
+                if str(row[0]) not in existing_dispatch_keys
+            ]
+
+            inserted_receipts = _bulk_insert_rows(
+                cursor,
+                receipt_insert_sql,
+                new_receipts,
+            )
+            inserted_dispatches = _bulk_insert_rows(
+                cursor,
+                dispatch_insert_sql,
+                new_dispatches,
+            )
 
             connection.commit()
 
         except Exception:
             connection.rollback()
             raise
+
+    logger.info(
+        "Bulk event save completed in %.2f seconds. "
+        "new_receipts=%s existing_receipts=%s "
+        "new_dispatches=%s existing_dispatches=%s",
+        time.perf_counter() - started_at,
+        inserted_receipts,
+        len(existing_receipt_keys),
+        inserted_dispatches,
+        len(existing_dispatch_keys),
+    )
 
     return {
         "receipt_events": inserted_receipts,
@@ -367,6 +494,7 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Return cumulative receipt and dispatch summaries for Batch Master."""
 
     initialize_database()
+    started_at = time.perf_counter()
 
     receipt_sql = r"""
         SELECT
@@ -375,6 +503,10 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             GenericItemNumber AS [Generic Item Number],
             MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
             MAX(NULLIF(TradeName, '')) AS [Trade Name],
+            MAX(NULLIF(Description, '')) AS [Description],
+            MAX(NULLIF(SupplierName, '')) AS [Supplier Name],
+            MAX(NULLIF(SupplierCode, '')) AS [Supplier Code],
+            MAX(NULLIF(ItemFamilyGroup, '')) AS [Item Family Group],
             COUNT_BIG(*) AS [Receive Runs],
             SUM(ReceivedQuantity) AS [Total Receive Qty],
             MIN(ReceivedDate) AS [First Received Date],
@@ -408,6 +540,14 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
         receipt = pd.read_sql(receipt_sql, connection)
         dispatch = pd.read_sql(dispatch_sql, connection)
 
+    logger.info(
+        "Event summaries loaded in %.2f seconds. "
+        "receipt_groups=%s dispatch_groups=%s",
+        time.perf_counter() - started_at,
+        len(receipt),
+        len(dispatch),
+    )
+
     return receipt, dispatch
 
 
@@ -415,6 +555,7 @@ def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
     """Atomically replace Batch Master from cumulative event summaries."""
 
     initialize_database()
+    started_at = time.perf_counter()
 
     required_columns = [
         "BN",
@@ -445,6 +586,15 @@ def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
             TradeName,
             GTIN,
             DrugName,
+            PackageSize,
+            SFDAQuantity,
+            Active,
+            QuantitySentPending,
+            QuantityReceivePending,
+            Description,
+            ItemFamilyGroup,
+            SupplierName,
+            SupplierCode,
             TotalReceiveQty,
             TotalDispatchedQty,
             ReceiveRuns,
@@ -456,7 +606,11 @@ def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
             GenericExistsInSFDA,
             LastUpdated
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?, ?
+        );
     """
 
     rows: Iterable[Tuple[Any, ...]] = (
@@ -465,15 +619,36 @@ def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
             _text(row, "Expiry Month Key"),
             _value(row, "Expiry Date"),
             _text(row, "Generic Item Number"),
-            _text(
+            _text_with_fallback(
                 row,
                 "Trade Item Number",
-                _text(row, "Trade Item"),
+                "Trade Item",
             ),
-            _text(row, "Trade Name"),
+            _text_with_fallback(
+                row,
+                "Trade Description",
+                "Trade Name",
+            ),
             _text(row, "GTIN"),
             _text(row, "Drug Name"),
-            _number(row, "Total Receive Qty"),
+            _number(row, "PackageSize"),
+            _number_with_fallback(
+                row,
+                "Quantity",
+                "SFDA Quantity",
+            ),
+            _number(row, "Active"),
+            _number(row, "Quantity sent pending"),
+            _number(row, "Quantity Receive Pending"),
+            _text(row, "Description"),
+            _text(row, "Item Family Group"),
+            _text(row, "Supplier Name"),
+            _text(row, "Supplier Code"),
+            _number_with_fallback(
+                row,
+                "Received Quantity Each",
+                "Total Receive Qty",
+            ),
             _number(row, "Total Dispatched Qty"),
             _integer(row, "Receive Runs"),
             _integer(row, "Dispatch Runs"),
@@ -481,7 +656,11 @@ def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
             _value(row, "Last Received Date"),
             _value(row, "First Dispatch Date"),
             _value(row, "Last Dispatch Date"),
-            _text(row, "Generic Exists in SFDA", "Yes") or "Yes",
+            _text(
+                row,
+                "Generic Exists in SFDA",
+                "Yes",
+            ) or "Yes",
             _value(
                 row,
                 "Last Updated",
@@ -491,17 +670,19 @@ def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
         for row in master.to_dict(orient="records")
     )
 
+    prepared_rows = list(rows)
+
     with Database().connect() as connection:
         cursor = connection.cursor()
 
         try:
             cursor.execute("DELETE FROM dbo.BatchMaster;")
 
-            prepared_rows = list(rows)
-
-            if prepared_rows:
-                cursor.fast_executemany = True
-                cursor.executemany(insert_sql, prepared_rows)
+            inserted_rows = _bulk_insert_rows(
+                cursor,
+                insert_sql,
+                prepared_rows,
+            )
 
             connection.commit()
 
@@ -509,9 +690,15 @@ def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
             connection.rollback()
             raise
 
+    logger.info(
+        "Batch Master replacement completed in %.2f seconds. rows_inserted=%s",
+        time.perf_counter() - started_at,
+        inserted_rows,
+    )
+
     return {
         "status": "Completed",
-        "rows_inserted": len(master),
+        "rows_inserted": inserted_rows,
     }
 
 
@@ -520,24 +707,36 @@ def get_batch_master_df() -> pd.DataFrame:
 
     sql = r"""
         SELECT
-            BN,
-            ExpiryMonthKey AS [Expiry Month Key],
-            ExpiryDate AS [Expiry Date],
-            GenericItemNumber AS [Generic Item Number],
-            TradeItemNumber AS [Trade Item Number],
-            TradeName AS [Trade Name],
             GTIN,
             DrugName AS [Drug Name],
-            TotalReceiveQty AS [Total Receive Qty],
-            TotalDispatchedQty AS [Total Dispatched Qty],
-            ReceiveRuns AS [Receive Runs],
-            DispatchRuns AS [Dispatch Runs],
+            BN,
+            ExpiryDate AS [Expiry Date],
+            PackageSize,
+            SFDAQuantity AS [Quantity],
+            Active,
+            QuantitySentPending AS [Quantity sent pending],
+            QuantityReceivePending AS [Quantity Receive Pending],
+            GenericItemNumber AS [Generic Item Number],
+            Description,
+            TradeName AS [Trade Description],
+            SupplierName AS [Supplier Name],
+            SupplierCode AS [Supplier Code],
+            TotalReceiveQty AS [Received Quantity Each],
+            CASE
+                WHEN ISNULL(PackageSize, 0) > 0
+                    THEN TotalReceiveQty / PackageSize
+                ELSE 0
+            END AS [Received Quantity Pack],
             FirstReceivedDate AS [First Received Date],
             LastReceivedDate AS [Last Received Date],
+            TotalDispatchedQty AS [Total Dispatched Qty],
             FirstDispatchDate AS [First Dispatch Date],
             LastDispatchDate AS [Last Dispatch Date],
             GenericExistsInSFDA AS [Generic Exists in SFDA],
-            LastUpdated AS [Last Updated]
+            LastUpdated AS [Last Updated],
+            ItemFamilyGroup AS [Item Family Group],
+            ExpiryMonthKey AS [Expiry Month Key],
+            TradeItemNumber AS [Trade Item Number]
         FROM dbo.BatchMaster
         ORDER BY
             BN,
