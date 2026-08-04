@@ -573,18 +573,23 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
         GROUP BY SupplierName, SupplierCode, BN, ExpiryMonthKey, GenericItemNumber;
     """
     customer_sql = r"""
-        SELECT
-            ToAddress AS [To Address],
-            BN,
-            ExpiryMonthKey AS [Expiry Month Key],
-            GenericItemNumber AS [Generic Item Number],
-            MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
-            MAX(NULLIF(TradeName, '')) AS [Trade Name],
-            SUM(DispatchedQuantity) AS [Dispatch Quantity Each],
-            MIN(DispatchDate) AS [First Dispatch Date],
-            MAX(DispatchDate) AS [Last Dispatch Date]
-        FROM dbo.DispatchEvents
-        GROUP BY ToAddress, BN, ExpiryMonthKey, GenericItemNumber;
+       SELECT
+    ToAddress AS [To Address],
+    BN,
+    ExpiryMonthKey AS [Expiry Month Key],
+    MAX(ExpiryDate) AS [Expiry Date],
+    GenericItemNumber AS [Generic Item Number],
+    MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
+    MAX(NULLIF(TradeName, '')) AS [Trade Name],
+    SUM(DispatchedQuantity) AS [Dispatch Quantity Each],
+    MIN(DispatchDate) AS [First Dispatch Date],
+    MAX(DispatchDate) AS [Last Dispatch Date]
+FROM dbo.DispatchEvents
+GROUP BY
+    ToAddress,
+    BN,
+    ExpiryMonthKey,
+    GenericItemNumber;
     """
     with Database().connect() as connection:
         supplier = pd.read_sql(supplier_sql, connection)
