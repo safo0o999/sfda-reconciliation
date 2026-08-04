@@ -617,7 +617,10 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
         from engine.database import (
             append_events,
             get_event_summaries,
+            get_history_summaries,
             replace_batch_master,
+            replace_supplier_history,
+            replace_customer_history,
             reset_history,
         )
         from engine.exporter import Exporter
@@ -641,12 +644,33 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
         )
         replace_batch_master(master)
 
+        supplier_summary, customer_summary = get_history_summaries()
+        supplier_history = engine.build_supplier_history(supplier_summary, master)
+        customer_history = engine.build_customer_history(customer_summary, master)
+        replace_supplier_history(supplier_history)
+        replace_customer_history(customer_history)
+
         master_file = Exporter.build_formatted_excel_file(
             df=master,
             file_name="Batch_Master.xlsx",
             sheet_name="Batch Master",
             title="SFDA Historical Batch Master",
             sort_columns=["Generic Item Number", "BN", "Expiry Date"],
+        )
+
+        supplier_file = Exporter.build_formatted_excel_file(
+            df=supplier_history,
+            file_name="Supplier_History.xlsx",
+            sheet_name="Supplier History",
+            title="Historical Supplier Receipt History",
+            sort_columns=["Supplier Name", "Generic Item Number", "BN", "Expiry Date"],
+        )
+        customer_file = Exporter.build_formatted_excel_file(
+            df=customer_history,
+            file_name="Customer_History.xlsx",
+            sheet_name="Customer History",
+            title="Historical Customer Dispatch History",
+            sort_columns=["To Address", "Generic Item Number", "BN", "Expiry Date"],
         )
 
         return json_response(
@@ -663,8 +687,14 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
                     "inserted_receipt_events": inserted.get("receipt_events", 0),
                     "inserted_dispatch_events": inserted.get("dispatch_events", 0),
                     "batch_master_rows": len(master),
+                    "supplier_history_rows": len(supplier_history),
+                    "customer_history_rows": len(customer_history),
                 },
-                "outputs": {"batch_master": master_file},
+                "outputs": {
+                    "batch_master": master_file,
+                    "supplier_history": supplier_file,
+                    "customer_history": customer_file,
+                },
             }
         )
     except ValueError as exc:
