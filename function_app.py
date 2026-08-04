@@ -585,6 +585,29 @@ def history_download(req: func.HttpRequest) -> func.HttpResponse:
         return error_response("Failed to download stored file.", 500, str(exc))
 
 
+@app.route(route="historical/status", methods=["GET"])
+def historical_status(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        from engine.database import get_historical_status
+
+        status = get_historical_status()
+        return json_response(
+            {
+                "status": "Ready",
+                "application": APPLICATION_NAME,
+                "version": APPLICATION_VERSION,
+                **status,
+            }
+        )
+    except Exception as exc:
+        logger.exception("Historical status check failed")
+        return error_response(
+            "Failed to read historical data status.",
+            500,
+            str(exc),
+        )
+
+
 @app.route(route="batch-master/build", methods=["GET", "POST"])
 def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "GET":
