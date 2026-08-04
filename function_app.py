@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import azure.functions as func
 import pandas as pd
+from azure.storage.queue import QueueClient
 
 
 logger = logging.getLogger("SFDA-Reconciliation")
@@ -610,13 +611,18 @@ def historical_status(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="batch-master/build", methods=["GET", "POST"])
 def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
+    """Queue a long-running historical build and return immediately."""
+
     if req.method == "GET":
         return json_response(
             {
                 "status": "Ready",
                 "application": APPLICATION_NAME,
                 "version": APPLICATION_VERSION,
-                "message": "Upload historical ASN and/or Full Dispatch files plus the latest SFDA report.",
+                "message": (
+                    "Upload historical ASN and/or Full Dispatch files plus "
+                    "the latest SFDA report."
+                ),
             }
         )
 
@@ -624,108 +630,196 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
         asn_files = req.files.getlist("asn_files")
         dispatch_files = req.files.getlist("dispatch_files")
         sfda_file = req.files.get("sfda")
-        operation = str(req.form.get("operation", "append")).strip().lower()
+        operation = str(
+            req.form.get("operation", "append")
+        ).strip().lower()
 
         if not asn_files and not dispatch_files:
-            return error_response("At least one ASN or Full Dispatch file is required.")
+            return error_response(
+                "At least one ASN or Full Dispatch file is required."
+            )
         if sfda_file is None:
             return error_response("SFDA file is required.")
         if operation not in {"append", "rebuild"}:
-            return error_response("operation must be append or rebuild.")
+            return error_response(
+                "operation must be append or rebuild."
+            )
 
-        asn_df = read_excel_files(asn_files)
-        dispatch_df = read_excel_files(dispatch_files)
-        sfda_df = read_excel_upload(sfda_file)
+        from engine.blob_storage import BlobStorage
+        from engine.database import create_historical_build_job
 
-        from engine.database import (
-            append_events,
-            get_event_summaries,
-            get_history_summaries,
-            replace_batch_master,
-            replace_supplier_history,
-            replace_customer_history,
-            reset_history,
+        job_id = build_run_number("historical")
+        storage = BlobStorage()
+        storage.initialize_containers()
+
+        manifest: Dict[str, Any] = {
+            "asn_files": [],
+            "dispatch_files": [],
+            "sfda_files": [],
+        }
+
+        for category, uploaded_files in (
+            ("asn", asn_files),
+            ("dispatch", dispatch_files),
+            ("sfda", [sfda_file]),
+        ):
+            target_key = f"{category}_files"
+
+            for uploaded_file in uploaded_files:
+                file_name, file_bytes, content_type = read_uploaded_bytes(
+                    uploaded_file
+                )
+                saved = storage.upload_job_input(
+                    job_id,
+                    category,
+                    file_name,
+                    file_bytes,
+                    content_type,
+                )
+                manifest[target_key].append(
+                    {
+                        "file_name": saved["file_name"],
+                        "blob_name": saved["blob_name"],
+                        "content_type": saved["content_type"],
+                        "size_bytes": saved["size_bytes"],
+                    }
+                )
+
+        create_historical_build_job(
+            job_id,
+            operation,
+            manifest,
         )
-        from engine.exporter import Exporter
-        from engine.full_reconciliation import FullReconciliationEngine
 
-        engine = FullReconciliationEngine(asn_df, dispatch_df, sfda_df)
-        prepared = engine.prepare_incremental()
-
-        if operation == "rebuild":
-            reset_history()
-
-        inserted = append_events(
-            prepared["receipt_records"],
-            prepared["dispatch_records"],
+        connection_string = (
+            os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+            or os.getenv("AzureWebJobsStorage")
         )
-        receipt_summary, dispatch_summary = get_event_summaries()
-        master = engine.build_master_from_summaries(
-            receipt_summary,
-            dispatch_summary,
-            prepared["sfda_summary"],
-        )
-        replace_batch_master(master)
+        if not connection_string:
+            raise RuntimeError(
+                "AZURE_STORAGE_CONNECTION_STRING or AzureWebJobsStorage "
+                "is missing."
+            )
 
-        supplier_summary, customer_summary = get_history_summaries()
-        supplier_history = engine.build_supplier_history(supplier_summary, master)
-        customer_history = engine.build_customer_history(customer_summary, master)
-        replace_supplier_history(supplier_history)
-        replace_customer_history(customer_history)
-
-        master_file = Exporter.build_formatted_excel_file(
-            df=master,
-            file_name="Batch_Master.xlsx",
-            sheet_name="Batch Master",
-            title="SFDA Historical Batch Master",
-            sort_columns=["Generic Item Number", "BN", "Expiry Date"],
+        queue = QueueClient.from_connection_string(
+            connection_string,
+            "historical-build-jobs",
         )
-
-        supplier_file = Exporter.build_formatted_excel_file(
-            df=supplier_history,
-            file_name="Supplier_History.xlsx",
-            sheet_name="Supplier History",
-            title="Historical Supplier Receipt History",
-            sort_columns=["Supplier Name", "Generic Item Number", "BN", "Expiry Date"],
-        )
-        customer_file = Exporter.build_formatted_excel_file(
-            df=customer_history,
-            file_name="Customer_History.xlsx",
-            sheet_name="Customer History",
-            title="Historical Customer Dispatch History",
-            sort_columns=["To Address", "Generic Item Number", "BN", "Expiry Date"],
+        queue.create_queue()
+        queue.send_message(
+            json.dumps(
+                {
+                    "job_id": job_id,
+                    "operation": operation,
+                    "input_manifest": manifest,
+                },
+                ensure_ascii=False,
+            )
         )
 
         return json_response(
             {
-                "status": "Completed",
+                "status": "Accepted",
                 "application": APPLICATION_NAME,
                 "version": APPLICATION_VERSION,
+                "job_id": job_id,
                 "operation": operation,
-                "summary": {
-                    "asn_files": len(asn_files),
-                    "dispatch_files": len(dispatch_files),
-                    "prepared_receipt_events": len(prepared["receipt_events"]),
-                    "prepared_dispatch_events": len(prepared["dispatch_events"]),
-                    "inserted_receipt_events": inserted.get("receipt_events", 0),
-                    "inserted_dispatch_events": inserted.get("dispatch_events", 0),
-                    "batch_master_rows": len(master),
-                    "supplier_history_rows": len(supplier_history),
-                    "customer_history_rows": len(customer_history),
-                },
-                "outputs": {
-                    "batch_master": master_file,
-                    "supplier_history": supplier_file,
-                    "customer_history": customer_file,
-                },
+                "status_url": (
+                    f"/api/historical/build-status/{job_id}"
+                ),
+                "message": (
+                    "Historical build was queued and will continue "
+                    "in the background."
+                ),
+            },
+            202,
+        )
+
+    except ValueError as exc:
+        logger.exception("Historical build submission validation failed")
+        return error_response(
+            "Historical build submission failed.",
+            400,
+            str(exc),
+        )
+    except Exception as exc:
+        logger.exception("Historical build submission failed")
+        return error_response(
+            "Failed to queue historical build.",
+            500,
+            str(exc),
+        )
+
+
+@app.route(
+    route="historical/build-status/{job_id}",
+    methods=["GET"],
+)
+def historical_build_status(req: func.HttpRequest) -> func.HttpResponse:
+    job_id = str(
+        req.route_params.get("job_id", "")
+    ).strip()
+
+    if not job_id:
+        return error_response("job_id is required.", 400)
+
+    try:
+        from engine.database import get_historical_build_job
+
+        job = get_historical_build_job(job_id)
+        return json_response(
+            {
+                "status": "Success",
+                "application": APPLICATION_NAME,
+                "version": APPLICATION_VERSION,
+                "job": job,
             }
         )
-    except ValueError as exc:
-        logger.exception("Batch Master validation failed")
-        return error_response("Batch Master input validation failed.", 400, str(exc))
+    except KeyError as exc:
+        return error_response(
+            "Historical build job was not found.",
+            404,
+            str(exc),
+        )
     except Exception as exc:
-        logger.exception("Batch Master build failed")
-        return error_response("Failed to build Batch Master.", 500, str(exc))
+        logger.exception("Historical build status read failed")
+        return error_response(
+            "Failed to read historical build status.",
+            500,
+            str(exc),
+        )
+
+
+@app.queue_trigger(
+    arg_name="message",
+    queue_name="historical-build-jobs",
+    connection="AzureWebJobsStorage",
+)
+def historical_build_worker(
+    message: func.QueueMessage,
+) -> None:
+    payload = json.loads(
+        message.get_body().decode("utf-8")
+    )
+
+    job_id = str(payload.get("job_id", "")).strip()
+    operation = str(
+        payload.get("operation", "append")
+    ).strip().lower()
+    input_manifest = payload.get("input_manifest") or {}
+
+    if not job_id:
+        raise ValueError(
+            "Historical build queue message is missing job_id."
+        )
+
+    from engine.historical_jobs import process_historical_build_job
+
+    process_historical_build_job(
+        job_id,
+        input_manifest,
+        operation,
+    )
 
 
 def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
