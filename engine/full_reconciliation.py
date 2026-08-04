@@ -835,15 +835,19 @@ class FullReconciliationEngine:
             validate="many_to_one",
         )
         result["GLN"] = (
-    result["GLN"]
-    .astype(str)
-    .str.strip()
-)
+            result["GLN"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
 
-result.loc[
-    result["GLN"].isin(["", "nan", "None"]),
-    "GLN"
-] = "99999999999999"
+        missing_gln = result["GLN"].str.lower().isin(
+            ["", "nan", "none"]
+        )
+        result.loc[
+            missing_gln,
+            "GLN",
+        ] = "99999999999999"
 
         result["Trade Description"] = (
             result["Trade Description"].fillna("")
