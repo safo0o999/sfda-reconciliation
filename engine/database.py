@@ -551,6 +551,122 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
     return receipt, dispatch
 
 
+def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Return supplier and customer history at their operational grains."""
+
+    initialize_database()
+    supplier_sql = r"""
+        SELECT
+            SupplierName AS [Supplier Name],
+            SupplierCode AS [Supplier Code],
+            BN,
+            ExpiryMonthKey AS [Expiry Month Key],
+            GenericItemNumber AS [Generic Item Number],
+            MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
+            MAX(NULLIF(TradeName, '')) AS [Trade Name],
+            MAX(NULLIF(Description, '')) AS [Description],
+            MAX(NULLIF(ItemFamilyGroup, '')) AS [Item Family Group],
+            SUM(ReceivedQuantity) AS [Received Quantity Each],
+            MIN(ReceivedDate) AS [First Received Date],
+            MAX(ReceivedDate) AS [Last Received Date]
+        FROM dbo.ReceiptEvents
+        GROUP BY SupplierName, SupplierCode, BN, ExpiryMonthKey, GenericItemNumber;
+    """
+    customer_sql = r"""
+        SELECT
+            ToAddress AS [To Address],
+            BN,
+            ExpiryMonthKey AS [Expiry Month Key],
+            GenericItemNumber AS [Generic Item Number],
+            MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
+            MAX(NULLIF(TradeName, '')) AS [Trade Name],
+            SUM(DispatchedQuantity) AS [Dispatch Quantity Each],
+            MIN(DispatchDate) AS [First Dispatch Date],
+            MAX(DispatchDate) AS [Last Dispatch Date]
+        FROM dbo.DispatchEvents
+        GROUP BY ToAddress, BN, ExpiryMonthKey, GenericItemNumber;
+    """
+    with Database().connect() as connection:
+        supplier = pd.read_sql(supplier_sql, connection)
+        customer = pd.read_sql(customer_sql, connection)
+    return supplier, customer
+
+
+def _replace_history_table(
+    table_name: str,
+    insert_sql: str,
+    rows: Sequence[Tuple[Any, ...]],
+) -> int:
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(f"DELETE FROM dbo.{table_name};")
+            inserted = _bulk_insert_rows(cursor, insert_sql, list(rows))
+            connection.commit()
+            return inserted
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def replace_supplier_history(history: pd.DataFrame) -> Dict[str, Any]:
+    initialize_database()
+    insert_sql = r"""
+        INSERT INTO dbo.SupplierHistory
+        (SupplierName, SupplierCode, GTIN, DrugName, GenericItemNumber, Description,
+         TradeDescription, BN, ExpiryMonthKey, ExpiryDate, PackageSize,
+         ReceivedQuantityEach, ReceivedQuantityPack, FirstReceivedDate,
+         LastReceivedDate, ItemFamilyGroup, TradeItemNumber, LastUpdated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
+    """
+    rows = [(
+        _text(r, "Supplier Name"), _text(r, "Supplier Code"), _text(r, "GTIN"),
+        _text(r, "Drug Name"), _text(r, "Generic Item Number"), _text(r, "Description"),
+        _text(r, "Trade Description"), _text(r, "BN"), _text(r, "Expiry Month Key"),
+        _value(r, "Expiry Date"), _number(r, "PackageSize"),
+        _number(r, "Received Quantity Each"), _number(r, "Received Quantity Pack"),
+        _value(r, "First Received Date"), _value(r, "Last Received Date"),
+        _text(r, "Item Family Group"), _text(r, "Trade Item Number")
+    ) for r in history.to_dict(orient="records")]
+    inserted = _replace_history_table("SupplierHistory", insert_sql, rows)
+    return {"status": "Completed", "rows_inserted": inserted}
+
+
+def replace_customer_history(history: pd.DataFrame) -> Dict[str, Any]:
+    initialize_database()
+    insert_sql = r"""
+        INSERT INTO dbo.CustomerHistory
+        (ToAddress, GLN, GTIN, DrugName, GenericItemNumber, TradeDescription,
+         BN, ExpiryMonthKey, ExpiryDate, PackageSize, DispatchQuantityEach,
+         DispatchQuantityPack, FirstDispatchDate, LastDispatchDate,
+         TradeItemNumber, LastUpdated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
+    """
+    rows = [(
+        _text(r, "To Address"), _text(r, "GLN"), _text(r, "GTIN"),
+        _text(r, "Drug Name"), _text(r, "Generic Item Number"),
+        _text(r, "Trade Description"), _text(r, "BN"), _text(r, "Expiry Month Key"),
+        _value(r, "Expiry Date"), _number(r, "PackageSize"),
+        _number(r, "Dispatch Quantity Each"), _number(r, "Dispatch Quantity Pack"),
+        _value(r, "First Dispatch Date"), _value(r, "Last Dispatch Date"),
+        _text(r, "Trade Item Number")
+    ) for r in history.to_dict(orient="records")]
+    inserted = _replace_history_table("CustomerHistory", insert_sql, rows)
+    return {"status": "Completed", "rows_inserted": inserted}
+
+
+def get_supplier_history_df() -> pd.DataFrame:
+    initialize_database()
+    with Database().connect() as connection:
+        return pd.read_sql("SELECT * FROM dbo.SupplierHistory ORDER BY SupplierName, GenericItemNumber, BN, ExpiryDate", connection)
+
+
+def get_customer_history_df() -> pd.DataFrame:
+    initialize_database()
+    with Database().connect() as connection:
+        return pd.read_sql("SELECT * FROM dbo.CustomerHistory ORDER BY ToAddress, GenericItemNumber, BN, ExpiryDate", connection)
+
+
 def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
     """Atomically replace Batch Master from cumulative event summaries."""
 
@@ -901,6 +1017,8 @@ def reset_history() -> None:
         try:
             cursor.execute(
                 """
+                DELETE FROM dbo.CustomerHistory;
+                DELETE FROM dbo.SupplierHistory;
                 DELETE FROM dbo.BatchMaster;
                 DELETE FROM dbo.DispatchEvents;
                 DELETE FROM dbo.ReceiptEvents;
