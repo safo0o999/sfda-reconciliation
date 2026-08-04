@@ -107,6 +107,44 @@ class FullReconciliationEngine:
         "Trade Item Number",
     ]
 
+    SUPPLIER_HISTORY_COLUMNS = [
+        "Supplier Name",
+        "Supplier Code",
+        "GTIN",
+        "Drug Name",
+        "Generic Item Number",
+        "Description",
+        "Trade Description",
+        "BN",
+        "Expiry Date",
+        "PackageSize",
+        "Received Quantity Each",
+        "Received Quantity Pack",
+        "First Received Date",
+        "Last Received Date",
+        "Item Family Group",
+        "Expiry Month Key",
+        "Trade Item Number",
+    ]
+
+    CUSTOMER_HISTORY_COLUMNS = [
+        "To Address",
+        "GLN",
+        "GTIN",
+        "Drug Name",
+        "Generic Item Number",
+        "Trade Description",
+        "BN",
+        "Expiry Date",
+        "PackageSize",
+        "Dispatch Quantity Each",
+        "Dispatch Quantity Pack",
+        "First Dispatch Date",
+        "Last Dispatch Date",
+        "Expiry Month Key",
+        "Trade Item Number",
+    ]
+
     def __init__(
         self,
         asn_df: pd.DataFrame,
@@ -120,6 +158,12 @@ class FullReconciliationEngine:
         config_path = Path(__file__).resolve().parent.parent / "config" / "pack_size.xlsx"
         self.packsize = pd.read_excel(
             config_path,
+            engine="openpyxl",
+            dtype=object,
+        )
+        gln_path = Path(__file__).resolve().parent.parent / "config" / "gln.xlsx"
+        self.gln = pd.read_excel(
+            gln_path,
             engine="openpyxl",
             dtype=object,
         )
@@ -630,6 +674,101 @@ class FullReconciliationEngine:
             len(result),
         )
         return result
+
+    def build_supplier_history(
+        self,
+        supplier_summary: pd.DataFrame,
+        master: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Build one historical row per supplier and WMS batch."""
+
+        source = supplier_summary.copy() if supplier_summary is not None else pd.DataFrame()
+        required = [
+            "Supplier Name", "Supplier Code", *self.KEYS,
+            "Trade Item Number", "Trade Name", "Description", "Item Family Group",
+            "Received Quantity Each", "First Received Date", "Last Received Date",
+        ]
+        source = self._ensure_columns(source, required)
+        if source.empty:
+            return pd.DataFrame(columns=self.SUPPLIER_HISTORY_COLUMNS)
+
+        reference_columns = self.KEYS + [
+            "GTIN", "Drug Name", "Expiry Date", "PackageSize", "Trade Description",
+        ]
+        reference = self._ensure_columns(master, reference_columns)[reference_columns]
+        reference = reference.drop_duplicates(subset=self.KEYS, keep="first")
+        result = source.merge(reference, on=self.KEYS, how="left", validate="many_to_one")
+
+        result["Trade Description"] = result["Trade Description"].fillna("")
+        missing_trade = result["Trade Description"].astype(str).str.strip().eq("")
+        result.loc[missing_trade, "Trade Description"] = result.loc[missing_trade, "Trade Name"]
+        result["Received Quantity Each"] = pd.to_numeric(
+            result["Received Quantity Each"], errors="coerce"
+        ).fillna(0)
+        result["PackageSize"] = pd.to_numeric(result["PackageSize"], errors="coerce").fillna(0)
+        result["Received Quantity Pack"] = 0.0
+        valid_pack = result["PackageSize"].gt(0)
+        result.loc[valid_pack, "Received Quantity Pack"] = (
+            result.loc[valid_pack, "Received Quantity Each"]
+            / result.loc[valid_pack, "PackageSize"]
+        )
+        result = self._ensure_columns(result, self.SUPPLIER_HISTORY_COLUMNS)
+        return (
+            result[self.SUPPLIER_HISTORY_COLUMNS]
+            .sort_values(["Supplier Name", "Generic Item Number", "BN", "Expiry Date"], kind="stable")
+            .reset_index(drop=True)
+        )
+
+    def build_customer_history(
+        self,
+        customer_summary: pd.DataFrame,
+        master: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Build one historical row per customer and WMS batch, enriched with GLN."""
+
+        source = customer_summary.copy() if customer_summary is not None else pd.DataFrame()
+        required = [
+            "To Address", *self.KEYS, "Trade Item Number", "Trade Name",
+            "Dispatch Quantity Each", "First Dispatch Date", "Last Dispatch Date",
+        ]
+        source = self._ensure_columns(source, required)
+        if source.empty:
+            return pd.DataFrame(columns=self.CUSTOMER_HISTORY_COLUMNS)
+
+        reference_columns = self.KEYS + [
+            "GTIN", "Drug Name", "Expiry Date", "PackageSize", "Trade Description",
+        ]
+        reference = self._ensure_columns(master, reference_columns)[reference_columns]
+        reference = reference.drop_duplicates(subset=self.KEYS, keep="first")
+        result = source.merge(reference, on=self.KEYS, how="left", validate="many_to_one")
+
+        gln = self._ensure_columns(self.gln, ["To Address", "GLN"])[["To Address", "GLN"]].copy()
+        gln["_Address Key"] = Normalizer.text(gln["To Address"])
+        gln["GLN"] = gln["GLN"].map(self._clean_key_part)
+        gln = gln[gln["_Address Key"].ne("")].drop_duplicates("_Address Key", keep="first")
+        result["_Address Key"] = Normalizer.text(result["To Address"])
+        result = result.merge(gln[["_Address Key", "GLN"]], on="_Address Key", how="left", validate="many_to_one")
+        result["GLN"] = result["GLN"].fillna("")
+
+        result["Trade Description"] = result["Trade Description"].fillna("")
+        missing_trade = result["Trade Description"].astype(str).str.strip().eq("")
+        result.loc[missing_trade, "Trade Description"] = result.loc[missing_trade, "Trade Name"]
+        result["Dispatch Quantity Each"] = pd.to_numeric(
+            result["Dispatch Quantity Each"], errors="coerce"
+        ).fillna(0)
+        result["PackageSize"] = pd.to_numeric(result["PackageSize"], errors="coerce").fillna(0)
+        result["Dispatch Quantity Pack"] = 0.0
+        valid_pack = result["PackageSize"].gt(0)
+        result.loc[valid_pack, "Dispatch Quantity Pack"] = (
+            result.loc[valid_pack, "Dispatch Quantity Each"]
+            / result.loc[valid_pack, "PackageSize"]
+        )
+        result = self._ensure_columns(result, self.CUSTOMER_HISTORY_COLUMNS)
+        return (
+            result[self.CUSTOMER_HISTORY_COLUMNS]
+            .sort_values(["To Address", "Generic Item Number", "BN", "Expiry Date"], kind="stable")
+            .reset_index(drop=True)
+        )
 
     @staticmethod
     def _records(dataframe: pd.DataFrame) -> List[Dict[str, Any]]:
