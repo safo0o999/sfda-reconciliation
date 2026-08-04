@@ -697,7 +697,12 @@ class FullReconciliationEngine:
         ]
         reference = self._ensure_columns(master, reference_columns)[reference_columns]
         reference = reference.drop_duplicates(subset=self.KEYS, keep="first")
-        result = source.merge(reference, on=self.KEYS, how="left", validate="many_to_one")
+        result = source.merge(
+            reference,
+            on=self.KEYS,
+            how="inner",
+            validate="many_to_one",
+        )
 
         result["Trade Description"] = result["Trade Description"].fillna("")
         missing_trade = result["Trade Description"].astype(str).str.strip().eq("")
@@ -740,7 +745,12 @@ class FullReconciliationEngine:
         ]
         reference = self._ensure_columns(master, reference_columns)[reference_columns]
         reference = reference.drop_duplicates(subset=self.KEYS, keep="first")
-        result = source.merge(reference, on=self.KEYS, how="left", validate="many_to_one")
+        result = source.merge(
+            reference,
+            on=self.KEYS,
+            how="inner",
+            validate="many_to_one",
+        )
 
         gln = self._ensure_columns(self.gln, ["To Address", "GLN"])[["To Address", "GLN"]].copy()
         gln["_Address Key"] = Normalizer.text(gln["To Address"])
