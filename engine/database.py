@@ -500,8 +500,8 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
         SELECT
             BN,
             ExpiryMonthKey AS [Expiry Month Key],
-            GenericItemNumber AS [Generic Item Number],
             MAX(ExpiryDate) AS [Receipt Expiry Date],
+            GenericItemNumber AS [Generic Item Number],
             MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
             MAX(NULLIF(TradeName, '')) AS [Trade Name],
             MAX(NULLIF(Description, '')) AS [Description],
@@ -523,8 +523,8 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
         SELECT
             BN,
             ExpiryMonthKey AS [Expiry Month Key],
-            GenericItemNumber AS [Generic Item Number],
             MAX(ExpiryDate) AS [Dispatch Expiry Date],
+            GenericItemNumber AS [Generic Item Number],
             MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
             MAX(NULLIF(TradeName, '')) AS [Trade Name],
             COUNT_BIG(*) AS [Dispatch Runs],
