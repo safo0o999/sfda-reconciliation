@@ -703,18 +703,6 @@ class FullReconciliationEngine:
             how="inner",
             validate="many_to_one",
         )
-        
-# Keep Dispatch expiry if available
-if "Expiry Date_x" in result.columns:
-    result["Expiry Date"] = result["Expiry Date_x"].combine_first(
-        result["Expiry Date_y"]
-    )
-    result.drop(
-        columns=["Expiry Date_x", "Expiry Date_y"],
-        inplace=True,
-        errors="ignore",
-    )
-    
         result["Trade Description"] = result["Trade Description"].fillna("")
         missing_trade = result["Trade Description"].astype(str).str.strip().eq("")
         result.loc[missing_trade, "Trade Description"] = result.loc[missing_trade, "Trade Name"]
@@ -742,20 +730,55 @@ if "Expiry Date_x" in result.columns:
     ) -> pd.DataFrame:
         """Build one historical row per customer and WMS batch, enriched with GLN."""
 
-        source = customer_summary.copy() if customer_summary is not None else pd.DataFrame()
+        source = (
+            customer_summary.copy()
+            if customer_summary is not None
+            else pd.DataFrame()
+        )
         required = [
-            "To Address", *self.KEYS, "Trade Item Number", "Trade Name",
-            "Dispatch Quantity Each", "First Dispatch Date", "Last Dispatch Date",
+            "To Address",
+            *self.KEYS,
+            "Expiry Date",
+            "Trade Item Number",
+            "Trade Name",
+            "Dispatch Quantity Each",
+            "First Dispatch Date",
+            "Last Dispatch Date",
         ]
         source = self._ensure_columns(source, required)
+
         if source.empty:
             return pd.DataFrame(columns=self.CUSTOMER_HISTORY_COLUMNS)
 
+        # Best Before Date from Full Dispatch is normalized internally as
+        # Expiry Date. Keep it separate during Batch Master enrichment.
+        source = source.rename(
+            columns={
+                "Expiry Date": "Dispatch Expiry Date",
+            }
+        )
+
         reference_columns = self.KEYS + [
-            "GTIN", "Drug Name", "Expiry Date", "PackageSize", "Trade Description",
+            "GTIN",
+            "Drug Name",
+            "Expiry Date",
+            "PackageSize",
+            "Trade Description",
         ]
-        reference = self._ensure_columns(master, reference_columns)[reference_columns]
-        reference = reference.drop_duplicates(subset=self.KEYS, keep="first")
+        reference = self._ensure_columns(
+            master,
+            reference_columns,
+        )[reference_columns].copy()
+        reference = reference.rename(
+            columns={
+                "Expiry Date": "Master Expiry Date",
+            }
+        )
+        reference = reference.drop_duplicates(
+            subset=self.KEYS,
+            keep="first",
+        )
+
         result = source.merge(
             reference,
             on=self.KEYS,
@@ -763,31 +786,114 @@ if "Expiry Date_x" in result.columns:
             validate="many_to_one",
         )
 
-        gln = self._ensure_columns(self.gln, ["To Address", "GLN"])[["To Address", "GLN"]].copy()
-        gln["_Address Key"] = Normalizer.text(gln["To Address"])
-        gln["GLN"] = gln["GLN"].map(self._clean_key_part)
-        gln = gln[gln["_Address Key"].ne("")].drop_duplicates("_Address Key", keep="first")
-        result["_Address Key"] = Normalizer.text(result["To Address"])
-        result = result.merge(gln[["_Address Key", "GLN"]], on="_Address Key", how="left", validate="many_to_one")
+        # Full Dispatch Best Before Date is primary. Batch Master expiry is
+        # only the fallback for older records with a missing ExpiryDate.
+        dispatch_expiry = pd.to_datetime(
+            result["Dispatch Expiry Date"],
+            errors="coerce",
+        )
+        master_expiry = pd.to_datetime(
+            result["Master Expiry Date"],
+            errors="coerce",
+        )
+        result["Expiry Date"] = dispatch_expiry.combine_first(
+            master_expiry
+        )
+        result = result.drop(
+            columns=[
+                "Dispatch Expiry Date",
+                "Master Expiry Date",
+            ],
+            errors="ignore",
+        )
+
+        gln = self._ensure_columns(
+            self.gln,
+            ["To Address", "GLN"],
+        )[["To Address", "GLN"]].copy()
+        gln["_Address Key"] = Normalizer.text(
+            gln["To Address"]
+        )
+        gln["GLN"] = gln["GLN"].map(
+            self._clean_key_part
+        )
+        gln = (
+            gln[gln["_Address Key"].ne("")]
+            .drop_duplicates(
+                "_Address Key",
+                keep="first",
+            )
+        )
+
+        result["_Address Key"] = Normalizer.text(
+            result["To Address"]
+        )
+        result = result.merge(
+            gln[["_Address Key", "GLN"]],
+            on="_Address Key",
+            how="left",
+            validate="many_to_one",
+        )
         result["GLN"] = result["GLN"].fillna("")
 
-        result["Trade Description"] = result["Trade Description"].fillna("")
-        missing_trade = result["Trade Description"].astype(str).str.strip().eq("")
-        result.loc[missing_trade, "Trade Description"] = result.loc[missing_trade, "Trade Name"]
+        result["Trade Description"] = (
+            result["Trade Description"].fillna("")
+        )
+        missing_trade = (
+            result["Trade Description"]
+            .astype(str)
+            .str.strip()
+            .eq("")
+        )
+        result.loc[
+            missing_trade,
+            "Trade Description",
+        ] = result.loc[
+            missing_trade,
+            "Trade Name",
+        ]
+
         result["Dispatch Quantity Each"] = pd.to_numeric(
-            result["Dispatch Quantity Each"], errors="coerce"
+            result["Dispatch Quantity Each"],
+            errors="coerce",
         ).fillna(0)
-        result["PackageSize"] = pd.to_numeric(result["PackageSize"], errors="coerce").fillna(0)
+        result["PackageSize"] = pd.to_numeric(
+            result["PackageSize"],
+            errors="coerce",
+        ).fillna(0)
+
         result["Dispatch Quantity Pack"] = 0.0
         valid_pack = result["PackageSize"].gt(0)
-        result.loc[valid_pack, "Dispatch Quantity Pack"] = (
-            result.loc[valid_pack, "Dispatch Quantity Each"]
-            / result.loc[valid_pack, "PackageSize"]
+        result.loc[
+            valid_pack,
+            "Dispatch Quantity Pack",
+        ] = (
+            result.loc[
+                valid_pack,
+                "Dispatch Quantity Each",
+            ]
+            / result.loc[
+                valid_pack,
+                "PackageSize",
+            ]
         )
-        result = self._ensure_columns(result, self.CUSTOMER_HISTORY_COLUMNS)
+
+        result = self._ensure_columns(
+            result,
+            self.CUSTOMER_HISTORY_COLUMNS,
+        )
+
         return (
             result[self.CUSTOMER_HISTORY_COLUMNS]
-            .sort_values(["To Address", "Generic Item Number", "BN", "Expiry Date"], kind="stable")
+            .sort_values(
+                [
+                    "To Address",
+                    "Generic Item Number",
+                    "BN",
+                    "Expiry Date",
+                ],
+                kind="stable",
+            )
             .reset_index(drop=True)
         )
 
