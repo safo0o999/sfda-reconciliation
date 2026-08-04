@@ -684,8 +684,8 @@
           <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
             <div style="width:40px;height:40px;border-radius:50%;background:#0C447C;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:18px">1</div>
             <div>
-              <h2 style="margin:0;font-size:18px">Build Batch Master (Historical Data)</h2>
-              <p style="margin:6px 0 0;color:var(--muted);font-size:12px">Upload all historical ASN, Dispatch files and latest SFDA report to build the Batch Master</p>
+              <h2 style="margin:0;font-size:18px">Build Historical Data</h2>
+              <p style="margin:6px 0 0;color:var(--muted);font-size:12px">Build Batch Master, Supplier History, and Customer History from historical source files</p>
             </div>
           </div>
  
@@ -764,10 +764,10 @@
               </div>
             </div>
  
-            <button class="btn btn-purple" id="step1Button" type="button" style="margin-top:16px;width:100%">▶ Build Batch Master</button>
+            <button class="btn btn-purple" id="step1Button" type="button" style="margin-top:16px;width:100%">▶ Build Historical Data</button>
             <div class="card progress-card" id="step1ProgressCard" style="box-shadow:none;margin-top:16px;display:none">
               <div class="progress-head">
-                <span id="step1ProgressLabel">Building Batch Master...</span>
+                <span id="step1ProgressLabel">Building Historical Data...</span>
                 <span id="step1ProgressPercent">0%</span>
               </div>
               <div class="progress-track">
@@ -1925,7 +1925,7 @@
     const timer=setInterval(()=>{
       percent=Math.min(91,percent+5);
       const label=prefix==="step1"
-        ? (percent<30?"Reading historical files...":percent<52?"Validating and normalizing data...":percent<78?"Building cumulative Batch Master...":"Saving Batch Master to Azure SQL...")
+        ? (percent<30?"Reading historical files...":percent<52?"Validating and normalizing data...":percent<78?"Building cumulative Batch Master...":"Saving historical tables to Azure SQL...")
         : (percent<30?"Reading current files...":percent<52?"Validating inventory and SFDA data...":percent<78?"Matching against Batch Master...":"Generating reconciliation outputs...");
       configureProgress(prefix,percent,label);
     },1200);
@@ -1941,8 +1941,8 @@
       prefix,
       success?100:100,
       success
-        ? (prefix==="step1"?"Batch Master completed successfully.":"Initial reconciliation completed successfully.")
-        : (prefix==="step1"?"Batch Master build failed.":"Initial reconciliation failed."),
+        ? (prefix==="step1"?"Historical data completed successfully.":"Initial reconciliation completed successfully.")
+        : (prefix==="step1"?"Historical data build failed.":"Initial reconciliation failed."),
       !success
     );
   }
@@ -2064,17 +2064,17 @@
 
       const files=collectOutputFiles(result.outputs);
       fullSetupFiles.splice(0,fullSetupFiles.length,...files);
-      renderSetupFileList("fullBatchMasterFiles",files,"The Batch Master was saved to SQL, but no audit file was returned.");
-      renderSetupFileList("fullMasterPreview",files,"The Batch Master was saved to SQL.");
+      renderSetupFileList("fullBatchMasterFiles",files,"Historical tables were saved to SQL, but no audit files were returned.");
+      renderSetupFileList("fullMasterPreview",files,"Historical tables were saved to SQL.");
 
       const summary=result.summary||{};
-      showFullResults(`<strong>Step 1 completed.</strong> Batch Master rows: ${formatNumber(summary.batch_master_rows||0)} · New receipt events: ${formatNumber(summary.new_receipt_events||0)} · New dispatch events: ${formatNumber(summary.new_dispatch_events||0)}.`);
-      toast("Batch Master completed successfully.","success");
+      showFullResults(`<strong>Historical data completed.</strong> Batch Master: ${formatNumber(summary.batch_master_rows||0)} rows · Supplier History: ${formatNumber(summary.supplier_history_rows||0)} rows · Customer History: ${formatNumber(summary.customer_history_rows||0)} rows · New receipt events: ${formatNumber(summary.inserted_receipt_events||0)} · New dispatch events: ${formatNumber(summary.inserted_dispatch_events||0)}.`);
+      toast("Historical data completed successfully.","success");
     }catch(error){
       finishSetupProgress("step1",false);
       showSetupError(error.message||String(error));
     }finally{
-      button.textContent="▶ Build Batch Master";
+      button.textContent="▶ Build Historical Data";
       updateFullSetupButtons();
     }
   });
