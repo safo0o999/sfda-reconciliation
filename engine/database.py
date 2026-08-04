@@ -1045,6 +1045,35 @@ def reset_history() -> None:
             raise
 
 
+def get_historical_status() -> Dict[str, Any]:
+    """Return the readiness and latest build state of historical data."""
+
+    initialize_database()
+
+    sql = r"""
+        SELECT
+            (SELECT COUNT_BIG(*) FROM dbo.BatchMaster) AS BatchMasterRows,
+            (SELECT COUNT_BIG(*) FROM dbo.SupplierHistory) AS SupplierHistoryRows,
+            (SELECT COUNT_BIG(*) FROM dbo.CustomerHistory) AS CustomerHistoryRows,
+            (SELECT MAX(LastUpdated) FROM dbo.BatchMaster) AS LastBuildUtc;
+    """
+
+    with Database().connect() as connection:
+        row = connection.cursor().execute(sql).fetchone()
+
+    batch_rows = int(row[0] or 0)
+    supplier_rows = int(row[1] or 0)
+    customer_rows = int(row[2] or 0)
+
+    return {
+        "exists": batch_rows > 0,
+        "batch_master_rows": batch_rows,
+        "supplier_history_rows": supplier_rows,
+        "customer_history_rows": customer_rows,
+        "last_build_utc": row[3],
+    }
+
+
 def test_database_connection() -> Dict[str, Optional[Any]]:
     initialize_database()
 
