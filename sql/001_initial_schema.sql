@@ -178,6 +178,59 @@ BEGIN TRY
         ALTER TABLE dbo.BatchMaster ADD SupplierCode nvarchar(120) NULL;
 
     /* ================================================================
+       SupplierHistory and CustomerHistory
+       ================================================================ */
+    IF OBJECT_ID(N'dbo.SupplierHistory', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.SupplierHistory
+        (
+            SupplierHistoryID bigint IDENTITY(1,1) NOT NULL PRIMARY KEY,
+            SupplierName nvarchar(500) NULL,
+            SupplierCode nvarchar(120) NULL,
+            GTIN nvarchar(20) NULL,
+            DrugName nvarchar(500) NULL,
+            GenericItemNumber nvarchar(120) NOT NULL,
+            Description nvarchar(1000) NULL,
+            TradeDescription nvarchar(500) NULL,
+            BN nvarchar(120) NOT NULL,
+            ExpiryMonthKey char(7) NOT NULL,
+            ExpiryDate date NULL,
+            PackageSize decimal(20,4) NULL,
+            ReceivedQuantityEach decimal(20,4) NOT NULL DEFAULT (0),
+            ReceivedQuantityPack decimal(20,4) NOT NULL DEFAULT (0),
+            FirstReceivedDate datetime2(3) NULL,
+            LastReceivedDate datetime2(3) NULL,
+            ItemFamilyGroup nvarchar(500) NULL,
+            TradeItemNumber nvarchar(120) NULL,
+            LastUpdated datetime2(3) NOT NULL DEFAULT (SYSUTCDATETIME())
+        );
+    END;
+
+    IF OBJECT_ID(N'dbo.CustomerHistory', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.CustomerHistory
+        (
+            CustomerHistoryID bigint IDENTITY(1,1) NOT NULL PRIMARY KEY,
+            ToAddress nvarchar(500) NULL,
+            GLN nvarchar(30) NULL,
+            GTIN nvarchar(20) NULL,
+            DrugName nvarchar(500) NULL,
+            GenericItemNumber nvarchar(120) NOT NULL,
+            TradeDescription nvarchar(500) NULL,
+            BN nvarchar(120) NOT NULL,
+            ExpiryMonthKey char(7) NOT NULL,
+            ExpiryDate date NULL,
+            PackageSize decimal(20,4) NULL,
+            DispatchQuantityEach decimal(20,4) NOT NULL DEFAULT (0),
+            DispatchQuantityPack decimal(20,4) NOT NULL DEFAULT (0),
+            FirstDispatchDate datetime2(3) NULL,
+            LastDispatchDate datetime2(3) NULL,
+            TradeItemNumber nvarchar(120) NULL,
+            LastUpdated datetime2(3) NOT NULL DEFAULT (SYSUTCDATETIME())
+        );
+    END;
+
+    /* ================================================================
        RunHistory
        ================================================================ */
     IF OBJECT_ID(N'dbo.RunHistory', N'U') IS NULL
@@ -317,6 +370,12 @@ BEGIN TRY
         ON dbo.RunHistory (StartedAt DESC, CreatedAt DESC)
         INCLUDE (RunType, Status, CompletedAt);
     END;
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.SupplierHistory') AND name=N'IX_SupplierHistory_Lookup')
+        CREATE INDEX IX_SupplierHistory_Lookup ON dbo.SupplierHistory (SupplierCode, GenericItemNumber, BN, ExpiryMonthKey);
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.CustomerHistory') AND name=N'IX_CustomerHistory_Lookup')
+        CREATE INDEX IX_CustomerHistory_Lookup ON dbo.CustomerHistory (GLN, GenericItemNumber, BN, ExpiryMonthKey);
 
     COMMIT TRANSACTION;
 END TRY
