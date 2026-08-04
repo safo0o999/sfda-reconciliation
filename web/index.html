@@ -2023,6 +2023,64 @@
   element("step2InventoryFile")?.addEventListener("change",()=>{ setFileMeta("step2InventoryFile","step2InventoryMeta"); updateFullSetupButtons(); });
   element("step2SfdaFile")?.addEventListener("change",()=>{ setFileMeta("step2SfdaFile","step2SfdaMeta"); updateFullSetupButtons(); });
 
+  function historicalJobFiles(job){
+    const files=job?.output_manifest?.files;
+    if(!Array.isArray(files)) return [];
+    return files.map(file=>({
+      name:file.file_name||"output_file",
+      downloadUrl:file.download_url||"",
+      mime:file.content_type||"application/octet-stream",
+      size:file.size_bytes||0
+    }));
+  }
+
+  function renderHistoricalJobFiles(containerId,files,emptyMessage){
+    const container=element(containerId);
+    if(!container) return;
+    container.innerHTML="";
+
+    if(!files.length){
+      container.innerHTML=`<div class="empty"><strong>No files generated</strong>${escapeHtml(emptyMessage||"No downloadable output was returned.")}</div>`;
+      return;
+    }
+
+    files.forEach(file=>{
+      const row=document.createElement("div");
+      row.className="download-row";
+      const extension=(file.name.split(".").pop()||"FILE").toUpperCase();
+      row.innerHTML=`
+        <div class="file-type ${extension==="XLSX"?"xlsx":""}">${escapeHtml(extension)}</div>
+        <div><div class="file-name">${escapeHtml(file.name)}</div><div class="file-info">Ready to download</div></div>
+        <button class="btn btn-secondary" type="button">⇩ Download</button>`;
+      row.querySelector("button").addEventListener("click",()=>{
+        if(file.downloadUrl) window.location.href=file.downloadUrl;
+      });
+      container.appendChild(row);
+    });
+  }
+
+  async function waitForHistoricalJob(statusUrl){
+    while(true){
+      await new Promise(resolve=>setTimeout(resolve,3000));
+      const response=await fetch(statusUrl,{cache:"no-store"});
+      const result=await parseApiResponse(response);
+      const job=result.job||{};
+      const progress=Math.max(0,Math.min(Number(job.progress||0),100));
+      configureProgress(
+        "step1",
+        progress,
+        job.current_stage||"Historical build is running...",
+        String(job.status||"").toLowerCase()==="failed"
+      );
+
+      const status=String(job.status||"").toLowerCase();
+      if(status==="completed") return job;
+      if(status==="failed"){
+        throw new Error(job.error||"Historical data build failed.");
+      }
+    }
+  }
+
   element("step1Button")?.addEventListener("click",async event=>{
     event.preventDefault();
     const button=element("step1Button");
@@ -2045,19 +2103,22 @@
 
     button.disabled=true;
     button.textContent=operation==="rebuild"?"Rebuilding Batch Master...":"Updating Batch Master...";
-    startSetupProgress("step1");
+    configureProgress("step1",2,"Preparing historical upload...");
 
     try{
+      configureProgress("step1",5,"Uploading historical files...");
       const response=await fetch("/api/batch-master/build",{method:"POST",body:formData,cache:"no-store"});
-      const result=await parseApiResponse(response);
+      const accepted=await parseApiResponse(response);
+      configureProgress("step1",8,"Historical build queued...");
+
+      const job=await waitForHistoricalJob(accepted.status_url);
       finishSetupProgress("step1",true);
 
-      const files=collectOutputFiles(result.outputs);
-      fullSetupFiles.splice(0,fullSetupFiles.length,...files);
-      renderSetupFileList("fullBatchMasterFiles",files,"Historical tables were saved to SQL, but no audit files were returned.");
-      renderSetupFileList("fullMasterPreview",files,"Historical tables were saved to SQL.");
+      const files=historicalJobFiles(job);
+      renderHistoricalJobFiles("fullBatchMasterFiles",files,"Historical tables were saved to SQL, but no audit files were returned.");
+      renderHistoricalJobFiles("fullMasterPreview",files,"Historical tables were saved to SQL.");
 
-      const summary=result.summary||{};
+      const summary=job.summary||{};
       showFullResults(`<strong>Historical data completed.</strong> Batch Master: ${formatNumber(summary.batch_master_rows||0)} rows · Supplier History: ${formatNumber(summary.supplier_history_rows||0)} rows · Customer History: ${formatNumber(summary.customer_history_rows||0)} rows · New receipt events: ${formatNumber(summary.inserted_receipt_events||0)} · New dispatch events: ${formatNumber(summary.inserted_dispatch_events||0)}.`);
       await refreshHistoricalStatus({silent:true});
       toast("Historical data completed successfully.","success");
