@@ -703,7 +703,18 @@ class FullReconciliationEngine:
             how="inner",
             validate="many_to_one",
         )
-
+        
+# Keep Dispatch expiry if available
+if "Expiry Date_x" in result.columns:
+    result["Expiry Date"] = result["Expiry Date_x"].combine_first(
+        result["Expiry Date_y"]
+    )
+    result.drop(
+        columns=["Expiry Date_x", "Expiry Date_y"],
+        inplace=True,
+        errors="ignore",
+    )
+    
         result["Trade Description"] = result["Trade Description"].fillna("")
         missing_trade = result["Trade Description"].astype(str).str.strip().eq("")
         result.loc[missing_trade, "Trade Description"] = result.loc[missing_trade, "Trade Name"]
