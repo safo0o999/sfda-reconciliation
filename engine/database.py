@@ -12,7 +12,7 @@ import pyodbc
 logger = logging.getLogger("SFDA-Reconciliation.Database")
 
 _EVENT_KEY_LOOKUP_BATCH_SIZE = 1000
-_BULK_INSERT_BATCH_SIZE = 5000
+_BULK_INSERT_BATCH_SIZE = 10000
 
 
 class Database:
@@ -355,55 +355,77 @@ def _bulk_insert_rows(
 def append_events(
     receipt_rows: List[Dict[str, Any]],
     dispatch_rows: List[Dict[str, Any]],
+    *,
+    assume_empty: bool = False,
 ) -> Dict[str, int]:
-    """Append only new receipt and dispatch events in bulk.
+    """Append new receipt and dispatch events with server-side de-duplication.
 
-    EventKey is the immutable de-duplication key. Existing database events
-    and duplicate EventKeys inside the uploaded files are ignored.
+    The previous implementation first downloaded every matching EventKey from
+    SQL in many IN queries. For large historical files that lookup dominated
+    the runtime. This version sends rows in fast_executemany batches and lets
+    SQL Server perform the EventKey existence check through the clustered
+    primary key.
+
+    ``assume_empty`` is used immediately after ``reset_history()`` during a
+    rebuild, allowing direct bulk inserts without unnecessary NOT EXISTS
+    checks.
     """
 
     initialize_database()
     started_at = time.perf_counter()
 
-    receipt_insert_sql = r"""
+    direct_receipt_sql = r"""
         INSERT INTO dbo.ReceiptEvents
         (
-            EventKey,
-            BN,
-            ExpiryMonthKey,
-            ExpiryDate,
-            GenericItemNumber,
-            TradeItemNumber,
-            TradeName,
-            ReceivedQuantity,
-            InboundShipment,
-            ASNLine,
-            SupplierName,
-            SupplierCode,
-            Description,
-            ItemFamilyGroup,
+            EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+            TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
+            ASNLine, SupplierName, SupplierCode, Description, ItemFamilyGroup,
             ReceivedDate
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     """
 
-    dispatch_insert_sql = r"""
+    direct_dispatch_sql = r"""
         INSERT INTO dbo.DispatchEvents
         (
-            EventKey,
-            BN,
-            ExpiryMonthKey,
-            ExpiryDate,
-            GenericItemNumber,
-            TradeItemNumber,
-            TradeName,
-            DispatchedQuantity,
-            ToAddress,
-            SalesOrderNumber,
-            OrderLine,
-            DispatchDate
+            EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+            TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
+            SalesOrderNumber, OrderLine, DispatchDate
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """
+
+    missing_receipt_sql = r"""
+        INSERT INTO dbo.ReceiptEvents
+        (
+            EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+            TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
+            ASNLine, SupplierName, SupplierCode, Description, ItemFamilyGroup,
+            ReceivedDate
+        )
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE NOT EXISTS
+        (
+            SELECT 1
+            FROM dbo.ReceiptEvents WITH (UPDLOCK, HOLDLOCK)
+            WHERE EventKey = ?
+        );
+    """
+
+    missing_dispatch_sql = r"""
+        INSERT INTO dbo.DispatchEvents
+        (
+            EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+            TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
+            SalesOrderNumber, OrderLine, DispatchDate
+        )
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE NOT EXISTS
+        (
+            SELECT 1
+            FROM dbo.DispatchEvents WITH (UPDLOCK, HOLDLOCK)
+            WHERE EventKey = ?
+        );
     """
 
     prepared_receipts = _deduplicate_parameters(
@@ -416,55 +438,69 @@ def append_events(
     )
 
     logger.info(
-        "Bulk event save started. prepared_receipts=%s prepared_dispatches=%s",
+        "Optimized event save started. prepared_receipts=%s "
+        "prepared_dispatches=%s assume_empty=%s",
         len(prepared_receipts),
         len(prepared_dispatches),
+        assume_empty,
     )
 
     with Database().connect() as connection:
         cursor = connection.cursor()
 
         try:
-            receipt_keys = [
-                str(row[0])
-                for row in prepared_receipts
-            ]
-            dispatch_keys = [
-                str(row[0])
-                for row in prepared_dispatches
-            ]
-
-            existing_receipt_keys = _existing_event_keys(
-                cursor,
-                "ReceiptEvents",
-                receipt_keys,
+            before_receipts = int(
+                cursor.execute(
+                    "SELECT COUNT_BIG(*) FROM dbo.ReceiptEvents;"
+                ).fetchone()[0]
             )
-            existing_dispatch_keys = _existing_event_keys(
-                cursor,
-                "DispatchEvents",
-                dispatch_keys,
+            before_dispatches = int(
+                cursor.execute(
+                    "SELECT COUNT_BIG(*) FROM dbo.DispatchEvents;"
+                ).fetchone()[0]
             )
 
-            new_receipts = [
-                row
-                for row in prepared_receipts
-                if str(row[0]) not in existing_receipt_keys
-            ]
-            new_dispatches = [
-                row
-                for row in prepared_dispatches
-                if str(row[0]) not in existing_dispatch_keys
-            ]
+            if assume_empty:
+                _bulk_insert_rows(
+                    cursor,
+                    direct_receipt_sql,
+                    prepared_receipts,
+                )
+                _bulk_insert_rows(
+                    cursor,
+                    direct_dispatch_sql,
+                    prepared_dispatches,
+                )
+            else:
+                receipt_parameters = [
+                    tuple(row) + (row[0],)
+                    for row in prepared_receipts
+                ]
+                dispatch_parameters = [
+                    tuple(row) + (row[0],)
+                    for row in prepared_dispatches
+                ]
 
-            inserted_receipts = _bulk_insert_rows(
-                cursor,
-                receipt_insert_sql,
-                new_receipts,
+                _bulk_insert_rows(
+                    cursor,
+                    missing_receipt_sql,
+                    receipt_parameters,
+                )
+                _bulk_insert_rows(
+                    cursor,
+                    missing_dispatch_sql,
+                    dispatch_parameters,
+                )
+
+            after_receipts = int(
+                cursor.execute(
+                    "SELECT COUNT_BIG(*) FROM dbo.ReceiptEvents;"
+                ).fetchone()[0]
             )
-            inserted_dispatches = _bulk_insert_rows(
-                cursor,
-                dispatch_insert_sql,
-                new_dispatches,
+            after_dispatches = int(
+                cursor.execute(
+                    "SELECT COUNT_BIG(*) FROM dbo.DispatchEvents;"
+                ).fetchone()[0]
             )
 
             connection.commit()
@@ -473,15 +509,18 @@ def append_events(
             connection.rollback()
             raise
 
+    inserted_receipts = max(0, after_receipts - before_receipts)
+    inserted_dispatches = max(0, after_dispatches - before_dispatches)
+
     logger.info(
-        "Bulk event save completed in %.2f seconds. "
-        "new_receipts=%s existing_receipts=%s "
-        "new_dispatches=%s existing_dispatches=%s",
+        "Optimized event save completed in %.2f seconds. "
+        "new_receipts=%s duplicate_receipts=%s "
+        "new_dispatches=%s duplicate_dispatches=%s",
         time.perf_counter() - started_at,
         inserted_receipts,
-        len(existing_receipt_keys),
+        max(0, len(prepared_receipts) - inserted_receipts),
         inserted_dispatches,
-        len(existing_dispatch_keys),
+        max(0, len(prepared_dispatches) - inserted_dispatches),
     )
 
     return {
