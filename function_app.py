@@ -693,14 +693,13 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
             manifest,
         )
 
-        connection_string = (
-            os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-            or os.getenv("AzureWebJobsStorage")
-        )
+        # The producer must use the exact same storage account as the
+        # Queue Trigger binding below. Using a different optional storage
+        # connection can leave jobs permanently in Queued status.
+        connection_string = os.getenv("AzureWebJobsStorage")
         if not connection_string:
             raise RuntimeError(
-                "AZURE_STORAGE_CONNECTION_STRING or AzureWebJobsStorage "
-                "is missing."
+                "AzureWebJobsStorage is missing."
             )
 
         queue = QueueClient.from_connection_string(
@@ -807,6 +806,11 @@ def historical_build_status(req: func.HttpRequest) -> func.HttpResponse:
 def historical_build_worker(
     message: func.QueueMessage,
 ) -> None:
+    logger.info(
+        "Historical build queue message received. message_id=%s",
+        getattr(message, "id", ""),
+    )
+
     payload = json.loads(
         message.get_body().decode("utf-8")
     )
