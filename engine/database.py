@@ -561,6 +561,7 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             SupplierCode AS [Supplier Code],
             BN,
             ExpiryMonthKey AS [Expiry Month Key],
+            MAX(ExpiryDate) AS [Expiry Date],
             GenericItemNumber AS [Generic Item Number],
             MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
             MAX(NULLIF(TradeName, '')) AS [Trade Name],
@@ -570,7 +571,12 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             MIN(ReceivedDate) AS [First Received Date],
             MAX(ReceivedDate) AS [Last Received Date]
         FROM dbo.ReceiptEvents
-        GROUP BY SupplierName, SupplierCode, BN, ExpiryMonthKey, GenericItemNumber;
+        GROUP BY
+            SupplierName,
+            SupplierCode,
+            BN,
+            ExpiryMonthKey,
+            GenericItemNumber;
     """
     customer_sql = r"""
        SELECT
