@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import azure.functions as func
 import pandas as pd
+from azure.core.exceptions import ResourceExistsError
 from azure.storage.queue import QueueClient
 
 
@@ -706,7 +707,14 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
             connection_string,
             "historical-build-jobs",
         )
-        queue.create_queue()
+
+        try:
+            queue.create_queue()
+        except ResourceExistsError:
+            logger.info(
+                "Historical build queue already exists; continuing."
+            )
+
         queue.send_message(
             json.dumps(
                 {
