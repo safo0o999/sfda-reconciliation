@@ -496,14 +496,12 @@ class FullReconciliationEngine:
             columns={
                 "Trade Item Number": "Receipt Trade Item Number",
                 "Trade Name": "Receipt Trade Name",
-                "Receipt Expiry Date": "WMS Receipt Expiry Date",
             }
         )
         dispatch = dispatch.rename(
             columns={
                 "Trade Item Number": "Dispatch Trade Item Number",
                 "Trade Name": "Dispatch Trade Name",
-                "Dispatch Expiry Date": "WMS Dispatch Expiry Date",
             }
         )
 
@@ -523,11 +521,6 @@ class FullReconciliationEngine:
         sfda = self._ensure_columns(sfda, sfda_columns)
         sfda = sfda.drop_duplicates(subset=self.SFDA_KEYS, keep="first")
         sfda_match = sfda[sfda_columns].copy()
-        sfda_match = sfda_match.rename(
-            columns={
-                "Expiry Date": "SFDA Expiry Date",
-            }
-        )
         sfda_match["_Batch Exists in SFDA"] = True
 
         master = master.merge(
@@ -537,19 +530,20 @@ class FullReconciliationEngine:
             validate="many_to_one",
         )
 
-        # Expiry Date priority: exact SFDA date, then ASN Receipt date,
-        # then Full Dispatch Best Before Date. This preserves WMS expiry
-        # for missing batches while keeping exact SFDA matches authoritative.
+        # Expiry priority for Batch Master:
+        # 1. Exact SFDA expiry
+        # 2. ASN Receipt Expiration Date
+        # 3. Full Dispatch Best Before Date
         sfda_expiry = pd.to_datetime(
-            master.get("SFDA Expiry Date"),
+            master["Expiry Date"],
             errors="coerce",
         )
         receipt_expiry = pd.to_datetime(
-            master.get("WMS Receipt Expiry Date"),
+            master["Receipt Expiry Date"],
             errors="coerce",
         )
         dispatch_expiry = pd.to_datetime(
-            master.get("WMS Dispatch Expiry Date"),
+            master["Dispatch Expiry Date"],
             errors="coerce",
         )
         master["Expiry Date"] = (
@@ -687,9 +681,6 @@ class FullReconciliationEngine:
                 "_Generic GTIN",
                 "_Generic Drug Name",
                 "_Generic PackageSize",
-                "SFDA Expiry Date",
-                "WMS Receipt Expiry Date",
-                "WMS Dispatch Expiry Date",
             ],
             errors="ignore",
         )
