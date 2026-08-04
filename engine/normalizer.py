@@ -300,6 +300,8 @@ class Normalizer:
                 ["Batch/Lot", "BN", "Batch Number"],
             )
         )
+        # Full Dispatch expiry is sourced primarily from "Best Before Date".
+        # The fallback names are retained only for backward compatibility.
         df["Expiry Date"] = Normalizer.date(
             Normalizer._required_series(
                 df,
