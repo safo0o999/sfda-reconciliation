@@ -377,6 +377,49 @@ BEGIN TRY
     IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.CustomerHistory') AND name=N'IX_CustomerHistory_Lookup')
         CREATE INDEX IX_CustomerHistory_Lookup ON dbo.CustomerHistory (GLN, GenericItemNumber, BN, ExpiryMonthKey);
 
+
+
+    /* ================================================================
+       HistoricalBuildJobs
+       Background job state for long-running historical data builds.
+       ================================================================ */
+    IF OBJECT_ID(N'dbo.HistoricalBuildJobs', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.HistoricalBuildJobs
+        (
+            JobID               nvarchar(64)     NOT NULL,
+            Operation           nvarchar(20)     NOT NULL,
+            Status              nvarchar(30)     NOT NULL,
+            Progress            int              NOT NULL
+                CONSTRAINT DF_HistoricalBuildJobs_Progress DEFAULT (0),
+            CurrentStage        nvarchar(250)    NULL,
+            InputManifestJson   nvarchar(max)    NULL,
+            OutputManifestJson  nvarchar(max)    NULL,
+            SummaryJson         nvarchar(max)    NULL,
+            ErrorMessage        nvarchar(max)    NULL,
+            CreatedAt           datetime2(0)     NOT NULL
+                CONSTRAINT DF_HistoricalBuildJobs_CreatedAt DEFAULT (SYSUTCDATETIME()),
+            StartedAt           datetime2(0)     NULL,
+            CompletedAt         datetime2(0)     NULL,
+            UpdatedAt           datetime2(0)     NOT NULL
+                CONSTRAINT DF_HistoricalBuildJobs_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+
+            CONSTRAINT PK_HistoricalBuildJobs PRIMARY KEY (JobID)
+        );
+    END;
+
+    IF NOT EXISTS
+    (
+        SELECT 1
+        FROM sys.indexes
+        WHERE name = N'IX_HistoricalBuildJobs_StatusCreatedAt'
+          AND object_id = OBJECT_ID(N'dbo.HistoricalBuildJobs')
+    )
+    BEGIN
+        CREATE INDEX IX_HistoricalBuildJobs_StatusCreatedAt
+            ON dbo.HistoricalBuildJobs (Status, CreatedAt DESC);
+    END;
+
     COMMIT TRANSACTION;
 END TRY
 BEGIN CATCH
