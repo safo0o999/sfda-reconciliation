@@ -44,6 +44,21 @@ class Exporter:
         "Item Family Group",
     ]
 
+    SUPPLIER_HISTORY_COLUMNS = [
+        "Supplier Name", "Supplier Code", "GTIN", "Drug Name",
+        "Generic Item Number", "Description", "Trade Description", "BN",
+        "Expiry Date", "PackageSize", "Received Quantity Each",
+        "Received Quantity Pack", "First Received Date", "Last Received Date",
+        "Item Family Group",
+    ]
+
+    CUSTOMER_HISTORY_COLUMNS = [
+        "To Address", "GLN", "GTIN", "Drug Name", "Generic Item Number",
+        "Trade Description", "BN", "Expiry Date", "PackageSize",
+        "Dispatch Quantity Each", "Dispatch Quantity Pack",
+        "First Dispatch Date", "Last Dispatch Date",
+    ]
+
     ACCEPT_DETAILS_COLUMNS = [
         "GTIN",
         "Drug Name",
@@ -426,6 +441,16 @@ class Exporter:
         )
 
     @staticmethod
+    def _is_supplier_history_report(file_name, sheet_name):
+        text = f"{file_name or ''} {sheet_name or ''}".strip().lower()
+        return "supplier_history" in text or "supplier history" in text
+
+    @staticmethod
+    def _is_customer_history_report(file_name, sheet_name):
+        text = f"{file_name or ''} {sheet_name or ''}".strip().lower()
+        return "customer_history" in text or "customer history" in text
+
+    @staticmethod
     def _is_accept_details_report(file_name, sheet_name):
         file_text = str(file_name or "").strip().lower()
         sheet_text = str(sheet_name or "").strip().lower()
@@ -466,6 +491,8 @@ class Exporter:
             file_name,
             sheet_name,
         )
+        is_supplier_history = Exporter._is_supplier_history_report(file_name, sheet_name)
+        is_customer_history = Exporter._is_customer_history_report(file_name, sheet_name)
         is_accept_details = Exporter._is_accept_details_report(
             file_name,
             sheet_name,
@@ -476,9 +503,11 @@ class Exporter:
         )
 
         if is_batch_master:
-            report = report.reindex(
-                columns=Exporter.BATCH_MASTER_COLUMNS
-            )
+            report = report.reindex(columns=Exporter.BATCH_MASTER_COLUMNS)
+        elif is_supplier_history:
+            report = report.reindex(columns=Exporter.SUPPLIER_HISTORY_COLUMNS)
+        elif is_customer_history:
+            report = report.reindex(columns=Exporter.CUSTOMER_HISTORY_COLUMNS)
         elif is_accept_details:
             report = report.reindex(
                 columns=Exporter.ACCEPT_DETAILS_COLUMNS
