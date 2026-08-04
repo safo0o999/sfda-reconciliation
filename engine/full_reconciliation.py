@@ -682,44 +682,140 @@ class FullReconciliationEngine:
     ) -> pd.DataFrame:
         """Build one historical row per supplier and WMS batch."""
 
-        source = supplier_summary.copy() if supplier_summary is not None else pd.DataFrame()
+        source = (
+            supplier_summary.copy()
+            if supplier_summary is not None
+            else pd.DataFrame()
+        )
         required = [
-            "Supplier Name", "Supplier Code", *self.KEYS,
-            "Trade Item Number", "Trade Name", "Description", "Item Family Group",
-            "Received Quantity Each", "First Received Date", "Last Received Date",
+            "Supplier Name",
+            "Supplier Code",
+            *self.KEYS,
+            "Expiry Date",
+            "Trade Item Number",
+            "Trade Name",
+            "Description",
+            "Item Family Group",
+            "Received Quantity Each",
+            "First Received Date",
+            "Last Received Date",
         ]
         source = self._ensure_columns(source, required)
+
         if source.empty:
             return pd.DataFrame(columns=self.SUPPLIER_HISTORY_COLUMNS)
 
+        source = source.rename(
+            columns={
+                "Expiry Date": "Receipt Expiry Date",
+            }
+        )
+
         reference_columns = self.KEYS + [
-            "GTIN", "Drug Name", "Expiry Date", "PackageSize", "Trade Description",
+            "GTIN",
+            "Drug Name",
+            "Expiry Date",
+            "PackageSize",
+            "Trade Description",
         ]
-        reference = self._ensure_columns(master, reference_columns)[reference_columns]
-        reference = reference.drop_duplicates(subset=self.KEYS, keep="first")
+        reference = self._ensure_columns(
+            master,
+            reference_columns,
+        )[reference_columns].copy()
+        reference = reference.rename(
+            columns={
+                "Expiry Date": "Master Expiry Date",
+            }
+        )
+        reference = reference.drop_duplicates(
+            subset=self.KEYS,
+            keep="first",
+        )
+
         result = source.merge(
             reference,
             on=self.KEYS,
             how="inner",
             validate="many_to_one",
         )
-        result["Trade Description"] = result["Trade Description"].fillna("")
-        missing_trade = result["Trade Description"].astype(str).str.strip().eq("")
-        result.loc[missing_trade, "Trade Description"] = result.loc[missing_trade, "Trade Name"]
+
+        receipt_expiry = pd.to_datetime(
+            result["Receipt Expiry Date"],
+            errors="coerce",
+        )
+        master_expiry = pd.to_datetime(
+            result["Master Expiry Date"],
+            errors="coerce",
+        )
+        result["Expiry Date"] = receipt_expiry.combine_first(
+            master_expiry
+        )
+        result = result.drop(
+            columns=[
+                "Receipt Expiry Date",
+                "Master Expiry Date",
+            ],
+            errors="ignore",
+        )
+
+        result["Trade Description"] = (
+            result["Trade Description"].fillna("")
+        )
+        missing_trade = (
+            result["Trade Description"]
+            .astype(str)
+            .str.strip()
+            .eq("")
+        )
+        result.loc[
+            missing_trade,
+            "Trade Description",
+        ] = result.loc[
+            missing_trade,
+            "Trade Name",
+        ]
+
         result["Received Quantity Each"] = pd.to_numeric(
-            result["Received Quantity Each"], errors="coerce"
+            result["Received Quantity Each"],
+            errors="coerce",
         ).fillna(0)
-        result["PackageSize"] = pd.to_numeric(result["PackageSize"], errors="coerce").fillna(0)
+        result["PackageSize"] = pd.to_numeric(
+            result["PackageSize"],
+            errors="coerce",
+        ).fillna(0)
+
         result["Received Quantity Pack"] = 0.0
         valid_pack = result["PackageSize"].gt(0)
-        result.loc[valid_pack, "Received Quantity Pack"] = (
-            result.loc[valid_pack, "Received Quantity Each"]
-            / result.loc[valid_pack, "PackageSize"]
+        result.loc[
+            valid_pack,
+            "Received Quantity Pack",
+        ] = (
+            result.loc[
+                valid_pack,
+                "Received Quantity Each",
+            ]
+            / result.loc[
+                valid_pack,
+                "PackageSize",
+            ]
         )
-        result = self._ensure_columns(result, self.SUPPLIER_HISTORY_COLUMNS)
+
+        result = self._ensure_columns(
+            result,
+            self.SUPPLIER_HISTORY_COLUMNS,
+        )
+
         return (
             result[self.SUPPLIER_HISTORY_COLUMNS]
-            .sort_values(["Supplier Name", "Generic Item Number", "BN", "Expiry Date"], kind="stable")
+            .sort_values(
+                [
+                    "Supplier Name",
+                    "Generic Item Number",
+                    "BN",
+                    "Expiry Date",
+                ],
+                kind="stable",
+            )
             .reset_index(drop=True)
         )
 
