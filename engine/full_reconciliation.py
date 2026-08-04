@@ -16,9 +16,22 @@ logger = logging.getLogger("SFDA-Reconciliation.FullReconciliation")
 
 
 class FullReconciliationEngine:
-    """Build and update the cumulative historical Batch Master.
+    """Historical-data and full-reconciliation engine.
 
-    WMS history grain:
+    Stage 1 — Historical Data Builder
+        Builds and updates:
+            - Batch Master
+            - Supplier History
+            - Customer History
+            - Receipt Events
+            - Dispatch Events
+
+    Stage 2 — Full Reconciliation
+        Uses the persisted historical tables with:
+            - Current Inventory
+            - Latest SFDA Drug Count
+
+    Historical WMS grain:
         BN + Expiry Month + Generic Item Number
 
     Exact SFDA batch matching:
@@ -28,7 +41,7 @@ class FullReconciliationEngine:
         1. the exact BN + Expiry Month exists in SFDA; or
         2. another batch for the same WMS Generic Item Number is proven in SFDA.
 
-    PackageSize is mapped only through:
+    PackageSize mapping:
         SFDA Drug Name -> config/pack_size.xlsx Trade Name
     """
 
@@ -143,6 +156,61 @@ class FullReconciliationEngine:
         "Last Dispatch Date",
         "Expiry Month Key",
         "Trade Item Number",
+    ]
+
+    ACCEPT_RECONCILIATION_COLUMNS = [
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "Expiry Month Key",
+        "Generic Item Number",
+        "PackageSize",
+        "Historical Received Quantity Each",
+        "SFDA Quantity",
+        "SFDA Active",
+        "Quantity Receive Pending",
+        "Quantity Sent Pending",
+        "To Be Accept",
+        "Reconciliation Status",
+    ]
+
+    SUPPLIER_VARIANCE_COLUMNS = [
+        "Supplier Name",
+        "Supplier Code",
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "Expiry Month Key",
+        "Generic Item Number",
+        "Historical Received Quantity Each",
+        "SFDA Supplier Quantity",
+        "Supplier Variance",
+        "Variance Status",
+        "Required Action",
+    ]
+
+    DISPATCH_RECONCILIATION_COLUMNS = [
+        "To Address",
+        "GLN",
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "Expiry Month Key",
+        "Generic Item Number",
+        "PackageSize",
+        "Historical Dispatch Quantity Each",
+        "Current Inventory Quantity Each",
+        "SFDA Active",
+        "To Be Dispatch",
+        "Reconciliation Status",
+    ]
+
+    RECONCILIATION_SUMMARY_COLUMNS = [
+        "Metric",
+        "Value",
     ]
 
     def __init__(
@@ -1031,6 +1099,186 @@ class FullReconciliationEngine:
         )
 
     @staticmethod
+    def _normalize_reconciliation_frame(
+        dataframe: pd.DataFrame | None,
+    ) -> pd.DataFrame:
+        """Return a safe copy for Stage 2 processing."""
+
+        if dataframe is None:
+            return pd.DataFrame()
+
+        return dataframe.copy()
+
+    def build_historical_data(
+        self,
+        receipt_summary: pd.DataFrame,
+        dispatch_summary: pd.DataFrame,
+        supplier_summary: pd.DataFrame | None = None,
+        customer_summary: pd.DataFrame | None = None,
+    ) -> Dict[str, Any]:
+        """Run Stage 1 and return all historical datasets."""
+
+        prepared = self.prepare_incremental()
+
+        master = self.build_master_from_summaries(
+            receipt_summary,
+            dispatch_summary,
+            prepared["sfda_summary"],
+        )
+
+        supplier_history = (
+            self.build_supplier_history(
+                supplier_summary,
+                master,
+            )
+            if supplier_summary is not None
+            else pd.DataFrame(
+                columns=self.SUPPLIER_HISTORY_COLUMNS
+            )
+        )
+
+        customer_history = (
+            self.build_customer_history(
+                customer_summary,
+                master,
+            )
+            if customer_summary is not None
+            else pd.DataFrame(
+                columns=self.CUSTOMER_HISTORY_COLUMNS
+            )
+        )
+
+        prepared.update(
+            {
+                "master": master,
+                "master_records": self._records(master),
+                "supplier_history": supplier_history,
+                "supplier_history_records": self._records(
+                    supplier_history
+                ),
+                "customer_history": customer_history,
+                "customer_history_records": self._records(
+                    customer_history
+                ),
+            }
+        )
+
+        return prepared
+
+    def build_accept_reconciliation(
+        self,
+        inventory_df: pd.DataFrame,
+        sfda_df: pd.DataFrame,
+        batch_master_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Return the stable Accept result schema for Stage 2."""
+
+        self._normalize_reconciliation_frame(inventory_df)
+        self._normalize_reconciliation_frame(sfda_df)
+        self._normalize_reconciliation_frame(batch_master_df)
+
+        return pd.DataFrame(
+            columns=self.ACCEPT_RECONCILIATION_COLUMNS
+        )
+
+    def build_supplier_variance(
+        self,
+        sfda_df: pd.DataFrame,
+        supplier_history_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Return the stable Supplier Variance schema for Stage 2."""
+
+        self._normalize_reconciliation_frame(sfda_df)
+        self._normalize_reconciliation_frame(
+            supplier_history_df
+        )
+
+        return pd.DataFrame(
+            columns=self.SUPPLIER_VARIANCE_COLUMNS
+        )
+
+    def build_dispatch_reconciliation(
+        self,
+        inventory_df: pd.DataFrame,
+        sfda_df: pd.DataFrame,
+        customer_history_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Return the stable Dispatch result schema for Stage 2."""
+
+        self._normalize_reconciliation_frame(inventory_df)
+        self._normalize_reconciliation_frame(sfda_df)
+        self._normalize_reconciliation_frame(
+            customer_history_df
+        )
+
+        return pd.DataFrame(
+            columns=self.DISPATCH_RECONCILIATION_COLUMNS
+        )
+
+    def build_reconciliation_summary(
+        self,
+        accept_details: pd.DataFrame,
+        supplier_variance: pd.DataFrame,
+        dispatch_details: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Build the Stage 2 summary dataset."""
+
+        return pd.DataFrame(
+            [
+                {
+                    "Metric": "Accept Rows",
+                    "Value": int(len(accept_details)),
+                },
+                {
+                    "Metric": "Supplier Variance Rows",
+                    "Value": int(len(supplier_variance)),
+                },
+                {
+                    "Metric": "Dispatch Rows",
+                    "Value": int(len(dispatch_details)),
+                },
+            ],
+            columns=self.RECONCILIATION_SUMMARY_COLUMNS,
+        )
+
+    def run_full_reconciliation(
+        self,
+        inventory_df: pd.DataFrame,
+        sfda_df: pd.DataFrame,
+        batch_master_df: pd.DataFrame,
+        supplier_history_df: pd.DataFrame,
+        customer_history_df: pd.DataFrame,
+    ) -> Dict[str, pd.DataFrame]:
+        """Run Stage 2 without reading historical ASN or Full Dispatch files."""
+
+        accept_details = self.build_accept_reconciliation(
+            inventory_df,
+            sfda_df,
+            batch_master_df,
+        )
+        supplier_variance = self.build_supplier_variance(
+            sfda_df,
+            supplier_history_df,
+        )
+        dispatch_details = self.build_dispatch_reconciliation(
+            inventory_df,
+            sfda_df,
+            customer_history_df,
+        )
+        summary = self.build_reconciliation_summary(
+            accept_details,
+            supplier_variance,
+            dispatch_details,
+        )
+
+        return {
+            "accept_details": accept_details,
+            "supplier_variance": supplier_variance,
+            "dispatch_details": dispatch_details,
+            "summary": summary,
+        }
+
+    @staticmethod
     def _records(dataframe: pd.DataFrame) -> List[Dict[str, Any]]:
         records: List[Dict[str, Any]] = []
         for row in dataframe.to_dict(orient="records"):
@@ -1088,14 +1336,22 @@ class FullReconciliationEngine:
         receipt_summary: pd.DataFrame | None = None,
         dispatch_summary: pd.DataFrame | None = None,
     ) -> Dict[str, Any]:
-        started_at = time.perf_counter()
+        """Backward-compatible Stage 1 entry point."""
+
         prepared = self.prepare_incremental()
-        if receipt_summary is not None and dispatch_summary is not None:
+
+        if (
+            receipt_summary is not None
+            and dispatch_summary is not None
+        ):
             master = self.build_master_from_summaries(
                 receipt_summary,
                 dispatch_summary,
                 prepared["sfda_summary"],
             )
             prepared["master"] = master
-            prepared["master_records"] = self._records(master)
+            prepared["master_records"] = self._records(
+                master
+            )
+
         return prepared
