@@ -214,6 +214,60 @@ class BlobStorage:
                     run_numbers.add(run_number)
         return sorted(run_numbers, reverse=True)[: max(1, int(limit))]
 
+
+    def upload_job_input(
+        self,
+        job_id: str,
+        category: str,
+        file_name: str,
+        file_bytes: bytes,
+        content_type: str = "application/octet-stream",
+    ) -> Dict[str, Any]:
+        """Upload one historical-build input using a collision-safe path."""
+
+        safe_category = self.sanitize_file_name(category).lower()
+        safe_name = self.sanitize_file_name(file_name)
+        blob_name = f"{job_id}/{safe_category}/{safe_name}"
+
+        result = self.upload_bytes(
+            INPUTS_CONTAINER,
+            blob_name,
+            file_bytes,
+            content_type,
+            {
+                "job_id": str(job_id),
+                "category": safe_category,
+                "file_name": safe_name,
+            },
+        )
+        result["file_name"] = safe_name
+        result["category"] = safe_category
+        return result
+
+    def upload_job_output(
+        self,
+        job_id: str,
+        file_name: str,
+        file_bytes: bytes,
+        content_type: str = "application/octet-stream",
+    ) -> Dict[str, Any]:
+        """Upload one historical-build output."""
+
+        safe_name = self.sanitize_file_name(file_name)
+        result = self.upload_bytes(
+            OUTPUTS_CONTAINER,
+            f"{job_id}/{safe_name}",
+            file_bytes,
+            content_type,
+            {
+                "job_id": str(job_id),
+                "category": "historical-output",
+                "file_name": safe_name,
+            },
+        )
+        result["file_name"] = safe_name
+        return result
+
     def health(self) -> Dict[str, Any]:
         self.initialize_containers()
         account_name = self.service.account_name
