@@ -1074,6 +1074,174 @@ def get_historical_status() -> Dict[str, Any]:
     }
 
 
+
+def create_historical_build_job(
+    job_id: str,
+    operation: str,
+    input_manifest: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Create one queued historical-build job."""
+
+    initialize_database()
+
+    sql = r"""
+        INSERT INTO dbo.HistoricalBuildJobs
+        (
+            JobID,
+            Operation,
+            Status,
+            Progress,
+            CurrentStage,
+            InputManifestJson,
+            UpdatedAt
+        )
+        VALUES (?, ?, 'Queued', 0, 'Queued for processing', ?, SYSUTCDATETIME());
+    """
+
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                sql,
+                (
+                    str(job_id),
+                    str(operation),
+                    json.dumps(
+                        input_manifest or {},
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return get_historical_build_job(job_id)
+
+
+def update_historical_build_job(
+    job_id: str,
+    *,
+    status: Optional[str] = None,
+    progress: Optional[int] = None,
+    current_stage: Optional[str] = None,
+    output_manifest: Optional[Dict[str, Any]] = None,
+    summary: Optional[Dict[str, Any]] = None,
+    error_message: Optional[str] = None,
+    mark_started: bool = False,
+    mark_completed: bool = False,
+) -> None:
+    """Update job status without overwriting fields that were not supplied."""
+
+    initialize_database()
+
+    assignments = ["UpdatedAt = SYSUTCDATETIME()"]
+    parameters: List[Any] = []
+
+    if status is not None:
+        assignments.append("Status = ?")
+        parameters.append(str(status))
+    if progress is not None:
+        assignments.append("Progress = ?")
+        parameters.append(max(0, min(int(progress), 100)))
+    if current_stage is not None:
+        assignments.append("CurrentStage = ?")
+        parameters.append(str(current_stage))
+    if output_manifest is not None:
+        assignments.append("OutputManifestJson = ?")
+        parameters.append(
+            json.dumps(output_manifest, ensure_ascii=False, default=str)
+        )
+    if summary is not None:
+        assignments.append("SummaryJson = ?")
+        parameters.append(
+            json.dumps(summary, ensure_ascii=False, default=str)
+        )
+    if error_message is not None:
+        assignments.append("ErrorMessage = ?")
+        parameters.append(str(error_message))
+    if mark_started:
+        assignments.append("StartedAt = COALESCE(StartedAt, SYSUTCDATETIME())")
+    if mark_completed:
+        assignments.append("CompletedAt = SYSUTCDATETIME()")
+
+    parameters.append(str(job_id))
+
+    sql = f"""
+        UPDATE dbo.HistoricalBuildJobs
+        SET {", ".join(assignments)}
+        WHERE JobID = ?;
+    """
+
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(sql, tuple(parameters))
+            if cursor.rowcount == 0:
+                raise KeyError(f"Historical build job was not found: {job_id}")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def get_historical_build_job(job_id: str) -> Dict[str, Any]:
+    """Return one historical-build job as a JSON-safe dictionary."""
+
+    initialize_database()
+
+    sql = r"""
+        SELECT
+            JobID,
+            Operation,
+            Status,
+            Progress,
+            CurrentStage,
+            InputManifestJson,
+            OutputManifestJson,
+            SummaryJson,
+            ErrorMessage,
+            CreatedAt,
+            StartedAt,
+            CompletedAt,
+            UpdatedAt
+        FROM dbo.HistoricalBuildJobs
+        WHERE JobID = ?;
+    """
+
+    with Database().connect() as connection:
+        row = connection.cursor().execute(sql, (str(job_id),)).fetchone()
+
+    if row is None:
+        raise KeyError(f"Historical build job was not found: {job_id}")
+
+    def parse_json(value: Any) -> Dict[str, Any]:
+        if not value:
+            return {}
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+
+    return {
+        "job_id": row[0],
+        "operation": row[1],
+        "status": row[2],
+        "progress": int(row[3] or 0),
+        "current_stage": row[4] or "",
+        "input_manifest": parse_json(row[5]),
+        "output_manifest": parse_json(row[6]),
+        "summary": parse_json(row[7]),
+        "error": row[8] or "",
+        "created_at": row[9],
+        "started_at": row[10],
+        "completed_at": row[11],
+        "updated_at": row[12],
+    }
+
 def test_database_connection() -> Dict[str, Optional[Any]]:
     initialize_database()
 
