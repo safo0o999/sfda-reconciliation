@@ -664,205 +664,127 @@
       <section class="page" id="page-full-reconciliation">
         <div class="page-head">
           <div>
-            <h1>Full Reconciliation Setup</h1>
-            <p>Complete initial setup - Build Batch Master, then reconcile with inventory. Run this once to establish the historical baseline.</p>
+            <h1>Full Reconciliation</h1>
+            <p>Build the historical foundation once, then run the one-time reconciliation against current Inventory and SFDA data.</p>
           </div>
           <div class="actions">
-            <span class="badge warning">Initial Setup Only</span>
+            <span class="badge warning">Initial Setup & Alignment</span>
           </div>
         </div>
- 
-        <div class="status-banner info show">
+
+        <div class="status-banner info show" id="historicalStatusBanner">
           <span>ⓘ</span>
-          <div>
-            <strong>Independent Processes:</strong> Full Reconciliation builds the historical Batch Master. Upload & Run remains independent and works even when Batch Master has not been created.
-          </div>
+          <div><strong>Checking historical data...</strong><br>Please wait while the system reads Azure SQL.</div>
         </div>
- 
-        <!-- STEP 1: BUILD BATCH MASTER -->
-        <div style="margin:32px 0">
-          <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
-            <div style="width:40px;height:40px;border-radius:50%;background:#0C447C;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:18px">1</div>
-            <div>
-              <h2 style="margin:0;font-size:18px">Build Historical Data</h2>
-              <p style="margin:6px 0 0;color:var(--muted);font-size:12px">Build Batch Master, Supplier History, and Customer History from historical source files</p>
-            </div>
-          </div>
- 
+
+        <div class="grid two-equal" style="margin-top:18px;align-items:start">
+          <!-- STEP 1 -->
           <div class="card" style="padding:20px">
-            <div class="card-header">
-              <div>
-                <div class="card-title">Historical Source Files</div>
-                <div class="card-subtitle">Multiple ASN files + multiple Full Dispatch files + one latest SFDA report</div>
-              </div>
-            </div>
- 
+            <div class="card-title" style="font-size:18px;color:#107c41">Step 1 — Historical Data Builder</div>
+            <div class="card-subtitle" style="margin:6px 0 18px">Build Batch Master, Supplier History, and Customer History from historical warehouse activity.</div>
+
             <div class="grid">
               <div class="file-card">
-                <div class="file-card-top">
-                  <div>
-                    <div class="file-title">① Historical ASN Files</div>
-                    <div class="card-subtitle" style="margin-top:5px">Select all ASN receipt files from cutover date until today.</div>
-                  </div>
-                  <span class="badge info">Multiple</span>
-                </div>
-                <div class="file-row">
-                  <input id="step1AsnFiles" name="asn_files" type="file" accept=".xls,.xlsx" multiple>
-                </div>
+                <div class="file-card-top"><div><div class="file-title">① Historical ASN Receipt Files</div><div class="card-subtitle" style="margin-top:5px">Select one or multiple historical receipt reports.</div></div><span class="badge info">Multiple</span></div>
+                <div class="file-row"><input id="step1AsnFiles" name="asn_files" type="file" accept=".xls,.xlsx" multiple></div>
                 <div class="file-meta" id="step1AsnMeta">No files selected</div>
               </div>
- 
+
               <div class="file-card">
-                <div class="file-card-top">
-                  <div>
-                    <div class="file-title">② Historical Full Dispatch Files</div>
-                    <div class="card-subtitle" style="margin-top:5px">Select all Full Dispatch reports for the same historical period.</div>
-                  </div>
-                  <span class="badge info">Multiple</span>
-                </div>
-                <div class="file-row">
-                  <input id="step1DispatchFiles" name="dispatch_files" type="file" accept=".xls,.xlsx" multiple>
-                </div>
+                <div class="file-card-top"><div><div class="file-title">② Historical Full Dispatch Files</div><div class="card-subtitle" style="margin-top:5px">Select one or multiple historical dispatch reports.</div></div><span class="badge info">Multiple</span></div>
+                <div class="file-row"><input id="step1DispatchFiles" name="dispatch_files" type="file" accept=".xls,.xlsx" multiple></div>
                 <div class="file-meta" id="step1DispatchMeta">No files selected</div>
               </div>
- 
+
               <div class="file-card">
-                <div class="file-card-top">
-                  <div>
-                    <div class="file-title">③ Latest SFDA Drug Count</div>
-                    <div class="card-subtitle" style="margin-top:5px">Upload the latest SFDA snapshot to match against historical movements.</div>
-                  </div>
-                  <span class="badge success">Required</span>
-                </div>
-                <div class="file-row">
-                  <input id="step1SfdaFile" name="sfda" type="file" accept=".xls,.xlsx" required>
-                </div>
+                <div class="file-card-top"><div><div class="file-title">③ Latest SFDA Drug Count</div><div class="card-subtitle" style="margin-top:5px">Used to retain only SFDA-relevant generics and batches.</div></div><span class="badge success">Required</span></div>
+                <div class="file-row"><input id="step1SfdaFile" name="sfda" type="file" accept=".xls,.xlsx" required></div>
                 <div class="file-meta" id="step1SfdaMeta">No file selected</div>
               </div>
             </div>
- 
+
             <div class="card run-panel" style="margin-top:16px;box-shadow:none;align-items:flex-start">
               <div style="flex:1">
                 <div class="run-title">Database Operation</div>
-                <div class="run-sub">Choose to append new data or rebuild from scratch.</div>
+                <div class="run-sub">Append only new events or rebuild all historical data from the selected files.</div>
                 <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:12px">
-                  <label class="selection-card" style="flex:1;min-width:240px">
-                    <input type="radio" name="step1Operation" value="append" checked>
-                    <span>
-                      <strong>Append New History</strong><br>
-                      <small>Add only new receipt and dispatch events.</small>
-                    </span>
-                  </label>
-                  <label class="selection-card" style="flex:1;min-width:240px">
-                    <input type="radio" name="step1Operation" value="rebuild">
-                    <span>
-                      <strong>Rebuild Full History</strong><br>
-                      <small>Delete current and rebuild from uploaded files.</small>
-                    </span>
-                  </label>
+                  <label class="selection-card" style="flex:1;min-width:210px"><input type="radio" name="step1Operation" value="append" checked><span><strong>Append New History</strong><br><small>Ignore events already stored.</small></span></label>
+                  <label class="selection-card" style="flex:1;min-width:210px"><input type="radio" name="step1Operation" value="rebuild"><span><strong>Rebuild Full History</strong><br><small>Delete and recreate historical data.</small></span></label>
                 </div>
               </div>
             </div>
- 
-            <button class="btn btn-purple" id="step1Button" type="button" style="margin-top:16px;width:100%">▶ Build Historical Data</button>
+
+            <button class="btn btn-success" id="step1Button" type="button" disabled style="margin-top:16px;width:100%">▶ Build Historical Data</button>
             <div class="card progress-card" id="step1ProgressCard" style="box-shadow:none;margin-top:16px;display:none">
-              <div class="progress-head">
-                <span id="step1ProgressLabel">Building Historical Data...</span>
-                <span id="step1ProgressPercent">0%</span>
-              </div>
-              <div class="progress-track">
-                <div class="progress-bar" id="step1ProgressBar"></div>
-              </div>
+              <div class="progress-head"><span id="step1ProgressLabel">Building Historical Data...</span><span id="step1ProgressPercent">0%</span></div>
+              <div class="progress-track"><div class="progress-bar" id="step1ProgressBar"></div></div>
               <div class="progress-steps">
                 <div class="progress-step" id="step1StepRead">○ Reading files</div>
                 <div class="progress-step" id="step1StepValidate">○ Validating data</div>
-                <div class="progress-step" id="step1StepBuild">○ Building Master</div>
-                <div class="progress-step" id="step1StepSave">○ Saving to Database</div>
+                <div class="progress-step" id="step1StepBuild">○ Building historical tables</div>
+                <div class="progress-step" id="step1StepSave">○ Saving to Azure SQL</div>
               </div>
             </div>
           </div>
-        </div>
- 
-        <!-- STEP 2: INITIAL RECONCILIATION -->
-        <div id="legacyInitialReconciliation" style="display:none">
-<div style="margin:32px 0">
-          <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px">
-            <div style="width:40px;height:40px;border-radius:50%;background:#D85A30;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:bold;font-size:18px">2</div>
-            <div>
-              <h2 style="margin:0;font-size:18px">Initial Reconciliation (Current Inventory)</h2>
-              <p style="margin:6px 0 0;color:var(--muted);font-size:12px">Match current inventory against historical Batch Master to generate Accept and Dispatch files</p>
+
+          <!-- STEP 2 -->
+          <div class="card" id="step2Card" style="padding:20px">
+            <div class="card-title" style="font-size:18px;color:#6b4eff">Step 2 — Full Reconciliation</div>
+            <div class="card-subtitle" style="margin:6px 0 18px">Compare current Inventory and SFDA status against the historical database and generate alignment files.</div>
+
+            <div class="status-banner warning show" id="step2LockMessage" style="margin-bottom:16px">
+              <span>🔒</span><div><strong>Historical data required.</strong><br>Complete Step 1 before running Full Reconciliation.</div>
             </div>
-          </div>
- 
-          <div class="card" style="padding:20px">
-            <div class="card-header">
-              <div>
-                <div class="card-title">Current Status Files</div>
-                <div class="card-subtitle">Latest inventory report + latest SFDA drug count</div>
-              </div>
-            </div>
- 
+
             <div class="grid">
               <div class="file-card">
-                <div class="file-card-top">
-                  <div>
-                    <div class="file-title">① Inventory Status Report</div>
-                    <div class="card-subtitle" style="margin-top:5px">Current inventory snapshot for reconciliation.</div>
-                  </div>
-                  <span class="badge success">Required</span>
-                </div>
-                <div class="file-row">
-                  <input id="step2InventoryFile" name="inventory" type="file" accept=".xls,.xlsx" required>
-                </div>
+                <div class="file-card-top"><div><div class="file-title">① Current Inventory Report</div><div class="card-subtitle" style="margin-top:5px">Latest physical WMS inventory snapshot.</div></div><span class="badge success">Required</span></div>
+                <div class="file-row"><input id="step2InventoryFile" name="inventory" type="file" accept=".xls,.xlsx" required disabled></div>
                 <div class="file-meta" id="step2InventoryMeta">No file selected</div>
               </div>
- 
+
               <div class="file-card">
-                <div class="file-card-top">
-                  <div>
-                    <div class="file-title">② Latest SFDA Drug Count</div>
-                    <div class="card-subtitle" style="margin-top:5px">Current SFDA snapshot for matching.</div>
-                  </div>
-                  <span class="badge success">Required</span>
-                </div>
-                <div class="file-row">
-                  <input id="step2SfdaFile" name="sfda" type="file" accept=".xls,.xlsx" required>
-                </div>
+                <div class="file-card-top"><div><div class="file-title">② Latest SFDA Drug Count</div><div class="card-subtitle" style="margin-top:5px">Current SFDA status before the one-time alignment.</div></div><span class="badge success">Required</span></div>
+                <div class="file-row"><input id="step2SfdaFile" name="sfda" type="file" accept=".xls,.xlsx" required disabled></div>
                 <div class="file-meta" id="step2SfdaMeta">No file selected</div>
               </div>
             </div>
- 
-            <button class="btn btn-success" id="step2Button" type="button" style="margin-top:16px;width:100%">▶ Run Initial Reconciliation</button>
+
+            <div class="card" id="historicalReadyCard" style="box-shadow:none;margin-top:16px;display:none">
+              <div class="card-title" style="font-size:14px;color:#107c41">✓ Historical Database Ready</div>
+              <div class="grid three-col" style="margin-top:12px;gap:10px">
+                <div><div class="card-subtitle">Batch Master</div><strong id="historicalBatchCount">0</strong></div>
+                <div><div class="card-subtitle">Supplier Rows</div><strong id="historicalSupplierCount">0</strong></div>
+                <div><div class="card-subtitle">Customer Rows</div><strong id="historicalCustomerCount">0</strong></div>
+              </div>
+              <div class="file-info" style="margin-top:10px">Last build: <span id="historicalLastBuild">—</span></div>
+            </div>
+
+            <button class="btn btn-purple" id="step2Button" type="button" disabled style="margin-top:16px;width:100%">▶ Run Full Reconciliation</button>
             <div class="card progress-card" id="step2ProgressCard" style="box-shadow:none;margin-top:16px;display:none">
-              <div class="progress-head">
-                <span id="step2ProgressLabel">Running Reconciliation...</span>
-                <span id="step2ProgressPercent">0%</span>
-              </div>
-              <div class="progress-track">
-                <div class="progress-bar" id="step2ProgressBar"></div>
-              </div>
+              <div class="progress-head"><span id="step2ProgressLabel">Running Full Reconciliation...</span><span id="step2ProgressPercent">0%</span></div>
+              <div class="progress-track"><div class="progress-bar" id="step2ProgressBar"></div></div>
               <div class="progress-steps">
-                <div class="progress-step" id="step2StepRead">○ Reading files</div>
+                <div class="progress-step" id="step2StepRead">○ Reading current files</div>
                 <div class="progress-step" id="step2StepValidate">○ Validating data</div>
-                <div class="progress-step" id="step2StepMatch">○ Matching Batch Master</div>
+                <div class="progress-step" id="step2StepMatch">○ Matching historical data</div>
                 <div class="progress-step" id="step2StepGenerate">○ Generating outputs</div>
               </div>
             </div>
           </div>
         </div>
- 
-</div>
-        <!-- RESULTS SECTION -->
+
+        <!-- RESULTS -->
         <div class="inline-results result-anchor" id="fullReconciliationResults" style="display:none;margin-top:32px">
-          <div class="result-head"><div><h2>Full Reconciliation Results</h2><p>Download the Batch Master and reconciliation files below.</p></div><button class="btn btn-purple" id="fullDownloadAllButton">⇩ Download All Results</button></div>
-          <div class="status-banner info show" id="fullResultsInfo"><span>ⓘ</span><div>Setup completed successfully.</div></div>
-          <div class="tabs"><button class="tab-btn active" data-tab="full-summary">Overview</button><button class="tab-btn" data-tab="full-master">Batch Master</button><button class="tab-btn" data-tab="full-reports">Reports & Files</button></div>
-          <div class="tab-panel active" id="tab-full-summary"><div style="display:grid;gap:16px"><div class="card" style="padding:20px"><h3>Batch Master Created</h3><p>Successfully built and saved to database.</p><div class="file-list" id="fullMasterPreview"></div></div></div></div>
-          <div class="tab-panel" id="tab-full-master"><div class="file-list" id="fullBatchMasterFiles"></div></div>
-          <div class="tab-panel" id="tab-full-reports"><div class="file-list" id="fullReportFiles"></div></div>
+          <div class="result-head"><div><h2>Full Reconciliation Results</h2><p>Historical audit files and one-time reconciliation outputs.</p></div><button class="btn btn-purple" id="fullDownloadAllButton">⇩ Download All Results</button></div>
+          <div class="status-banner info show" id="fullResultsInfo"><span>ⓘ</span><div>No completed operation is loaded yet.</div></div>
+          <div class="tabs"><button class="tab-btn active" data-tab="full-summary">Overview</button><button class="tab-btn" data-tab="full-master">Historical Files</button><button class="tab-btn" data-tab="full-reports">Reconciliation Files</button></div>
+          <div class="tab-panel active" id="tab-full-summary"><div style="display:grid;gap:16px"><div class="card" style="padding:20px"><h3>Generated Files</h3><p>Files produced by the latest Step 1 or Step 2 operation.</p><div class="file-list" id="fullMasterPreview"></div></div></div></div>
+          <div class="tab-panel" id="tab-full-master"><div class="file-list" id="fullBatchMasterFiles"><div class="empty"><strong>No historical files loaded</strong>Run Step 1 to generate the historical audit files.</div></div></div>
+          <div class="tab-panel" id="tab-full-reports"><div class="file-list" id="fullReportFiles"><div class="empty"><strong>No reconciliation files loaded</strong>Run Step 2 after historical data is ready.</div></div></div>
         </div>
       </section>
- 
+
       <section class="page" id="page-verification">
         <div class="page-head">
           <div><h1>SFDA Verification</h1><p>Verify the generated upload files against the latest SFDA Drug Count and portal notification results.</p></div>
@@ -1034,6 +956,12 @@
       history.replaceState(null, "", `#${requestedPage}`);
     }
  
+    if (requestedPage === "full-reconciliation") {
+      Promise.resolve(refreshHistoricalStatus({silent:true})).catch(error=>{
+        console.error("Unable to refresh historical status.", error);
+      });
+    }
+
     if (requestedPage === "verification") {
       Promise.resolve(refreshVerificationRuns()).catch(error=>{
         console.error("Unable to refresh verification runs.", error);
@@ -1850,6 +1778,7 @@
   const fullSetupFiles = [];
   let step1ProgressTimer = null;
   let step2ProgressTimer = null;
+  let historicalDataReady = false;
 
   function element(id){ return document.getElementById(id); }
 
@@ -1879,12 +1808,73 @@
       ((element("step1AsnFiles")?.files.length||0)>0 ||
        (element("step1DispatchFiles")?.files.length||0)>0) &&
       (element("step1SfdaFile")?.files.length||0)>0;
-    const step2Ready=
-      element("step2InventoryFile")?.files.length>0 &&
-      element("step2SfdaFile")?.files.length>0;
+    const step2FilesReady=
+      (element("step2InventoryFile")?.files.length||0)>0 &&
+      (element("step2SfdaFile")?.files.length||0)>0;
 
     if(element("step1Button")) element("step1Button").disabled=!step1Ready;
-    if(element("step2Button")) element("step2Button").disabled=!step2Ready;
+    if(element("step2Button")) element("step2Button").disabled=!(historicalDataReady&&step2FilesReady);
+  }
+
+  function formatHistoricalDate(value){
+    if(!value) return "—";
+    const parsed=new Date(value);
+    if(Number.isNaN(parsed.getTime())) return String(value);
+    return parsed.toLocaleString("en-GB",{
+      day:"2-digit",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"
+    });
+  }
+
+  function applyHistoricalStatus(status){
+    historicalDataReady=Boolean(status?.exists);
+    const inventory=element("step2InventoryFile");
+    const sfda=element("step2SfdaFile");
+    const lock=element("step2LockMessage");
+    const readyCard=element("historicalReadyCard");
+    const banner=element("historicalStatusBanner");
+
+    if(inventory) inventory.disabled=!historicalDataReady;
+    if(sfda) sfda.disabled=!historicalDataReady;
+
+    if(historicalDataReady){
+      if(lock) lock.style.display="none";
+      if(readyCard) readyCard.style.display="block";
+      if(element("historicalBatchCount")) element("historicalBatchCount").textContent=formatNumber(status.batch_master_rows||0);
+      if(element("historicalSupplierCount")) element("historicalSupplierCount").textContent=formatNumber(status.supplier_history_rows||0);
+      if(element("historicalCustomerCount")) element("historicalCustomerCount").textContent=formatNumber(status.customer_history_rows||0);
+      if(element("historicalLastBuild")) element("historicalLastBuild").textContent=formatHistoricalDate(status.last_build_utc);
+      if(banner){
+        banner.className="status-banner success show";
+        banner.innerHTML=`<span>✓</span><div><strong>Historical data is ready.</strong><br>${formatNumber(status.batch_master_rows||0)} Batch Master rows · ${formatNumber(status.supplier_history_rows||0)} Supplier History rows · ${formatNumber(status.customer_history_rows||0)} Customer History rows.</div>`;
+      }
+    }else{
+      if(lock) lock.style.display="flex";
+      if(readyCard) readyCard.style.display="none";
+      if(banner){
+        banner.className="status-banner warning show";
+        banner.innerHTML='<span>!</span><div><strong>Historical data has not been built.</strong><br>Complete Step 1 to enable Full Reconciliation.</div>';
+      }
+    }
+    updateFullSetupButtons();
+  }
+
+  async function refreshHistoricalStatus({silent=false}={}){
+    try{
+      const response=await fetch("/api/historical/status",{cache:"no-store"});
+      const result=await parseApiResponse(response);
+      applyHistoricalStatus(result);
+      return result;
+    }catch(error){
+      historicalDataReady=false;
+      updateFullSetupButtons();
+      if(!silent) toast(error.message||String(error),"error");
+      const banner=element("historicalStatusBanner");
+      if(banner){
+        banner.className="status-banner error show";
+        banner.innerHTML=`<span>!</span><div><strong>Historical status could not be loaded.</strong><br>${escapeHtml(error.message||String(error))}</div>`;
+      }
+      return null;
+    }
   }
 
   function configureProgress(prefix, percent, label, failed=false){
@@ -1941,8 +1931,8 @@
       prefix,
       success?100:100,
       success
-        ? (prefix==="step1"?"Historical data completed successfully.":"Initial reconciliation completed successfully.")
-        : (prefix==="step1"?"Historical data build failed.":"Initial reconciliation failed."),
+        ? (prefix==="step1"?"Historical data completed successfully.":"Full Reconciliation completed successfully.")
+        : (prefix==="step1"?"Historical data build failed.":"Full Reconciliation failed."),
       !success
     );
   }
@@ -2069,6 +2059,7 @@
 
       const summary=result.summary||{};
       showFullResults(`<strong>Historical data completed.</strong> Batch Master: ${formatNumber(summary.batch_master_rows||0)} rows · Supplier History: ${formatNumber(summary.supplier_history_rows||0)} rows · Customer History: ${formatNumber(summary.customer_history_rows||0)} rows · New receipt events: ${formatNumber(summary.inserted_receipt_events||0)} · New dispatch events: ${formatNumber(summary.inserted_dispatch_events||0)}.`);
+      await refreshHistoricalStatus({silent:true});
       toast("Historical data completed successfully.","success");
     }catch(error){
       finishSetupProgress("step1",false);
@@ -2094,7 +2085,7 @@
     formData.append("sfda",sfda.files[0],sfda.files[0].name);
 
     button.disabled=true;
-    button.textContent="Running Initial Reconciliation...";
+    button.textContent="Running Full Reconciliation...";
     startSetupProgress("step2");
 
     try{
@@ -2108,12 +2099,12 @@
 
       const summary=result.summary||{};
       showFullResults(`<strong>Step 2 completed.</strong> Reconciliation rows: ${formatNumber(summary.reconciliation_rows||0)} · Accept rows: ${formatNumber(summary.accept_rows||0)} · Dispatch allocation rows: ${formatNumber(summary.dispatch_allocation_rows||0)} · Generated files: ${formatNumber(files.length)}.`);
-      toast("Initial reconciliation completed successfully.","success");
+      toast("Full Reconciliation completed successfully.","success");
     }catch(error){
       finishSetupProgress("step2",false);
       showSetupError(error.message||String(error));
     }finally{
-      button.textContent="▶ Run Initial Reconciliation";
+      button.textContent="▶ Run Full Reconciliation";
       updateFullSetupButtons();
     }
   });
@@ -2133,6 +2124,7 @@
   });
 
   updateFullSetupButtons();
+  refreshHistoricalStatus({silent:true});
 
 </script>
 </body>
