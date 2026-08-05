@@ -835,6 +835,198 @@ def historical_build_worker(
     )
 
 
+
+@app.route(
+    route="full-reconciliation/run",
+    methods=["GET", "POST"],
+)
+def full_reconciliation_run(req: func.HttpRequest) -> func.HttpResponse:
+    """Run the one-time Inventory/SFDA alignment against persisted history."""
+
+    if req.method == "GET":
+        return json_response(
+            {
+                "status": "Ready",
+                "application": APPLICATION_NAME,
+                "version": APPLICATION_VERSION,
+                "required_files": ["inventory", "sfda"],
+            }
+        )
+
+    try:
+        inventory_file = req.files.get("inventory")
+        sfda_file = req.files.get("sfda")
+
+        if inventory_file is None:
+            return error_response(
+                "Current Inventory file is required for Full Reconciliation."
+            )
+        if sfda_file is None:
+            return error_response(
+                "Latest SFDA file is required for Full Reconciliation."
+            )
+
+        inventory_name, inventory_bytes, inventory_content_type = (
+            read_uploaded_bytes(inventory_file)
+        )
+        sfda_name, sfda_bytes, sfda_content_type = read_uploaded_bytes(
+            sfda_file
+        )
+        inventory_df = read_excel_bytes(inventory_name, inventory_bytes)
+        sfda_df = read_excel_bytes(sfda_name, sfda_bytes)
+
+        from engine.database import (
+            get_batch_master_df,
+            get_customer_history_df,
+            get_supplier_history_df,
+        )
+        from engine.exporter import Exporter
+        from engine.full_reconciliation import FullReconciliationEngine
+
+        batch_master = get_batch_master_df()
+        supplier_history = get_supplier_history_df()
+        customer_history = get_customer_history_df()
+
+        if batch_master.empty:
+            return error_response(
+                "Historical Batch Master is empty. Complete Step 1 first.",
+                400,
+            )
+
+        engine = FullReconciliationEngine(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            sfda_df,
+        )
+        result = engine.run_full_reconciliation(
+            inventory_df=inventory_df,
+            sfda_df=sfda_df,
+            batch_master_df=batch_master,
+            supplier_history_df=supplier_history,
+            customer_history_df=customer_history,
+        )
+
+        accept_details = result["accept_details"]
+        supplier_variance = result["supplier_variance"]
+        dispatch_details = result["dispatch_details"]
+        summary_df = result["summary"]
+
+        accept_upload = accept_details.loc[
+            pd.to_numeric(
+                accept_details.get("To Be Accept", 0),
+                errors="coerce",
+            ).fillna(0).gt(0)
+        ].copy()
+
+        dispatch_upload = dispatch_details.loc[
+            pd.to_numeric(
+                dispatch_details.get("To Be Dispatch", 0),
+                errors="coerce",
+            ).fillna(0).gt(0)
+        ].copy()
+        dispatch_upload["Allocated To Be Dispatch"] = dispatch_upload[
+            "To Be Dispatch"
+        ]
+
+        outputs: Dict[str, Any] = {
+            "accept_details": Exporter.build_formatted_excel_file(
+                df=accept_details,
+                file_name="Full_Accept_Reconciliation.xlsx",
+                sheet_name="Full Accept",
+                title="One-Time Full Reconciliation - Accept",
+                columns=list(accept_details.columns),
+                sort_columns=["Generic Item Number", "BN", "Expiry Date"],
+            ),
+            "supplier_variance": Exporter.build_formatted_excel_file(
+                df=supplier_variance,
+                file_name="Supplier_Variance.xlsx",
+                sheet_name="Supplier Variance",
+                title="Supplier Quantity Variance",
+                columns=list(supplier_variance.columns),
+                sort_columns=["Supplier Name", "Generic Item Number", "BN"],
+            ),
+            "dispatch_details": Exporter.build_formatted_excel_file(
+                df=dispatch_details,
+                file_name="Full_Dispatch_Reconciliation.xlsx",
+                sheet_name="Full Dispatch",
+                title="One-Time Full Reconciliation - Dispatch",
+                columns=list(dispatch_details.columns),
+                sort_columns=["To Address", "Generic Item Number", "BN"],
+            ),
+            "summary": Exporter.build_formatted_excel_file(
+                df=summary_df,
+                file_name="Full_Reconciliation_Summary.xlsx",
+                sheet_name="Summary",
+                title="Full Reconciliation Summary",
+                columns=list(summary_df.columns),
+            ),
+            "accept_files": Exporter.build_sfda_upload_files(
+                accept_upload,
+                "To Be Accept",
+                "SFDA_Full_Accept",
+            ),
+            "dispatch_files": Exporter.build_dispatch_files_by_customer(
+                dispatch_upload
+            ),
+        }
+
+        accept_rows = int(len(accept_upload))
+        dispatch_rows = int(len(dispatch_upload))
+        variance_rows = int(
+            pd.to_numeric(
+                supplier_variance.get("Supplier Variance", 0),
+                errors="coerce",
+            ).fillna(0).ne(0).sum()
+        )
+        generated_files = sum(
+            len(group) if isinstance(group, dict) else 0
+            for group in outputs.values()
+        )
+
+        summary = {
+            "inventory_rows": int(len(inventory_df)),
+            "sfda_rows": int(len(sfda_df)),
+            "batch_master_rows": int(len(batch_master)),
+            "supplier_history_rows": int(len(supplier_history)),
+            "customer_history_rows": int(len(customer_history)),
+            "reconciliation_rows": int(
+                len(accept_details) + len(dispatch_details)
+            ),
+            "accept_rows": accept_rows,
+            "supplier_variance_rows": variance_rows,
+            "dispatch_allocation_rows": dispatch_rows,
+            "accept_files": len(outputs["accept_files"]),
+            "dispatch_files": len(outputs["dispatch_files"]),
+            "generated_files": generated_files,
+        }
+
+        return json_response(
+            {
+                "status": "Completed",
+                "application": APPLICATION_NAME,
+                "version": APPLICATION_VERSION,
+                "step": "full-reconciliation",
+                "summary": summary,
+                "outputs": outputs,
+            }
+        )
+
+    except ValueError as exc:
+        logger.exception("Full reconciliation validation failed")
+        return error_response(
+            "Full Reconciliation validation failed.",
+            400,
+            str(exc),
+        )
+    except Exception as exc:
+        logger.exception("Full reconciliation failed")
+        return error_response(
+            "Full Reconciliation failed.",
+            500,
+            str(exc),
+        )
+
+
 def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
     run_number = build_run_number(mode)
     submitted_by = get_submitted_by(req)
