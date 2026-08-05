@@ -2150,7 +2150,7 @@
     startSetupProgress("step2");
 
     try{
-      const response=await fetch("/api/reconcile",{method:"POST",body:formData,cache:"no-store"});
+      const response=await fetch("/api/full-reconciliation/run",{method:"POST",body:formData,cache:"no-store"});
       const result=await parseApiResponse(response);
       finishSetupProgress("step2",true);
 
