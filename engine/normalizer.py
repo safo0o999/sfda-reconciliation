@@ -78,7 +78,19 @@ class Normalizer:
         return result
 
     @staticmethod
-    def _safe_datetime(series):
+    def _safe_datetime(
+        series,
+        formats=None,
+        fallback_dayfirst=True,
+    ):
+        """Parse dates safely while respecting each report's source format.
+
+        Values already loaded by Excel as real date/datetime objects are
+        preserved. Text values are first parsed using the supplied explicit
+        formats, then a conservative mixed-format fallback is applied only to
+        values that remain unresolved.
+        """
+
         cleaned = series.copy()
 
         text_values = (
@@ -104,12 +116,45 @@ class Normalizer:
             None,
         )
 
+        # Preserve values already interpreted by Excel/pandas as datetimes.
         result = pd.to_datetime(
-            cleaned,
+            cleaned.where(
+                cleaned.map(
+                    lambda value: isinstance(
+                        value,
+                        (
+                            pd.Timestamp,
+                            __import__("datetime").datetime,
+                            __import__("datetime").date,
+                        ),
+                    )
+                )
+            ),
             errors="coerce",
-            dayfirst=True,
-            format="mixed",
         )
+
+        unresolved = result.isna() & cleaned.notna()
+
+        for date_format in formats or []:
+            if not unresolved.any():
+                break
+
+            parsed = pd.to_datetime(
+                cleaned.where(unresolved),
+                errors="coerce",
+                format=date_format,
+            )
+            result = result.fillna(parsed)
+            unresolved = result.isna() & cleaned.notna()
+
+        if unresolved.any():
+            parsed = pd.to_datetime(
+                cleaned.where(unresolved),
+                errors="coerce",
+                dayfirst=fallback_dayfirst,
+                format="mixed",
+            )
+            result = result.fillna(parsed)
 
         result = result.mask(
             (result > pd.Timestamp.max)
@@ -122,15 +167,31 @@ class Normalizer:
         )
 
     @staticmethod
-    def date(series):
+    def date(
+        series,
+        formats=None,
+        fallback_dayfirst=True,
+    ):
         return (
-            Normalizer._safe_datetime(series)
+            Normalizer._safe_datetime(
+                series,
+                formats=formats,
+                fallback_dayfirst=fallback_dayfirst,
+            )
             .dt.normalize()
         )
 
     @staticmethod
-    def datetime(series):
-        return Normalizer._safe_datetime(series)
+    def datetime(
+        series,
+        formats=None,
+        fallback_dayfirst=True,
+    ):
+        return Normalizer._safe_datetime(
+            series,
+            formats=formats,
+            fallback_dayfirst=fallback_dayfirst,
+        )
 
     @staticmethod
     def number(series):
@@ -156,7 +217,12 @@ class Normalizer:
             Normalizer._required_series(
                 df,
                 ["Expiration Date", "Expiry Date", "Best Before Date"],
-            )
+            ),
+            formats=[
+                "%d/%m/%Y",
+                "%d/%m/%Y %H:%M:%S",
+            ],
+            fallback_dayfirst=True,
         )
         df["Received Quantity"] = Normalizer.number(
             Normalizer._required_series(
@@ -306,7 +372,12 @@ class Normalizer:
             Normalizer._required_series(
                 df,
                 ["Best Before Date", "Expiry Date", "Expiration Date"],
-            )
+            ),
+            formats=[
+                "%Y-%m-%d",
+                "%Y-%m-%d %H:%M:%S",
+            ],
+            fallback_dayfirst=True,
         )
         df["Dispatched Quantity"] = Normalizer.number(
             Normalizer._required_series(
@@ -391,7 +462,12 @@ class Normalizer:
             Normalizer._required_series(
                 df,
                 ["Expiry Date", "Expiration Date"],
-            )
+            ),
+            formats=[
+                "%d-%m-%Y",
+                "%d-%m-%Y %H:%M:%S",
+            ],
+            fallback_dayfirst=True,
         )
         df["Drug Name"] = Normalizer.text(
             Normalizer._required_series(
