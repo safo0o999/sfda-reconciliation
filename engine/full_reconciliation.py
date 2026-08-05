@@ -167,10 +167,11 @@ class FullReconciliationEngine:
         "Generic Item Number",
         "PackageSize",
         "Historical Received Quantity Each",
+        "Historical Received Quantity Pack",
         "SFDA Quantity",
         "SFDA Active",
-        "Quantity Receive Pending",
         "Quantity Sent Pending",
+        "Quantity Receive Pending",
         "To Be Accept",
         "Reconciliation Status",
     ]
@@ -185,6 +186,7 @@ class FullReconciliationEngine:
         "Expiry Month Key",
         "Generic Item Number",
         "Historical Received Quantity Each",
+        "Historical Received Quantity Pack",
         "SFDA Supplier Quantity",
         "Supplier Variance",
         "Variance Status",
@@ -202,8 +204,13 @@ class FullReconciliationEngine:
         "Generic Item Number",
         "PackageSize",
         "Historical Dispatch Quantity Each",
+        "Historical Dispatch Quantity Pack",
         "Current Inventory Quantity Each",
+        "Current Inventory Quantity Pack",
+        "SFDA Quantity",
         "SFDA Active",
+        "Quantity Sent Pending",
+        "Quantity Receive Pending",
         "To Be Dispatch",
         "Reconciliation Status",
     ]
@@ -1463,8 +1470,13 @@ class FullReconciliationEngine:
                     "Expiry Month Key",
                     "GTIN",
                     "Drug Name",
+                    "Quantity",
                     "Active",
+                    "Quantity sent pending",
+                    "Quantity Receive Pending",
+                    "PackageSize",
                     "Current Inventory Quantity Each",
+                    "Current Inventory Quantity Pack",
                     "Required Dispatch Pack",
                 ]
             ],
@@ -1486,6 +1498,22 @@ class FullReconciliationEngine:
         elif "Drug Name_x" in details.columns:
             details["Drug Name"] = details["Drug Name_x"]
 
+        if "PackageSize_y" in details.columns:
+            details["PackageSize"] = pd.to_numeric(
+                details["PackageSize_y"],
+                errors="coerce",
+            ).fillna(
+                pd.to_numeric(
+                    details.get("PackageSize_x", 0),
+                    errors="coerce",
+                )
+            )
+        elif "PackageSize_x" in details.columns:
+            details["PackageSize"] = pd.to_numeric(
+                details["PackageSize_x"],
+                errors="coerce",
+            ).fillna(0)
+
         details = details.sort_values(
             ["BN", "Expiry Month Key", "First Dispatch Date", "To Address"],
             kind="stable",
@@ -1505,7 +1533,27 @@ class FullReconciliationEngine:
                 details.loc[row_index, "To Be Dispatch"] = allocated
                 remaining -= allocated
 
-        details["SFDA Active"] = details["Active"]
+        details["SFDA Quantity"] = pd.to_numeric(
+            details.get("Quantity", 0),
+            errors="coerce",
+        ).fillna(0)
+        details["SFDA Active"] = pd.to_numeric(
+            details.get("Active", 0),
+            errors="coerce",
+        ).fillna(0)
+        details["Quantity Sent Pending"] = pd.to_numeric(
+            details.get("Quantity sent pending", 0),
+            errors="coerce",
+        ).fillna(0)
+        details["Quantity Receive Pending"] = pd.to_numeric(
+            details.get("Quantity Receive Pending", 0),
+            errors="coerce",
+        ).fillna(0)
+        details["Current Inventory Quantity Pack"] = pd.to_numeric(
+            details.get("Current Inventory Quantity Pack", 0),
+            errors="coerce",
+        ).fillna(0)
+
         details["Reconciliation Status"] = "No Dispatch Required"
         details.loc[details["To Be Dispatch"].gt(0), "Reconciliation Status"] = (
             "Dispatch Required"
