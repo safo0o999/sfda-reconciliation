@@ -59,6 +59,63 @@ class Exporter:
         "First Dispatch Date", "Last Dispatch Date",
     ]
 
+    FULL_ACCEPT_RECONCILIATION_COLUMNS = [
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "Expiry Month Key",
+        "Generic Item Number",
+        "PackageSize",
+        "Historical Received Quantity Each",
+        "Historical Received Quantity Pack",
+        "SFDA Quantity",
+        "SFDA Active",
+        "Quantity Sent Pending",
+        "Quantity Receive Pending",
+        "To Be Accept",
+        "Reconciliation Status",
+    ]
+
+    FULL_DISPATCH_RECONCILIATION_COLUMNS = [
+        "To Address",
+        "GLN",
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "Expiry Month Key",
+        "Generic Item Number",
+        "PackageSize",
+        "Historical Dispatch Quantity Each",
+        "Historical Dispatch Quantity Pack",
+        "Current Inventory Quantity Each",
+        "Current Inventory Quantity Pack",
+        "SFDA Quantity",
+        "SFDA Active",
+        "Quantity Sent Pending",
+        "Quantity Receive Pending",
+        "To Be Dispatch",
+        "Reconciliation Status",
+    ]
+
+    SUPPLIER_VARIANCE_COLUMNS = [
+        "Supplier Name",
+        "Supplier Code",
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "Expiry Month Key",
+        "Generic Item Number",
+        "Historical Received Quantity Each",
+        "Historical Received Quantity Pack",
+        "SFDA Supplier Quantity",
+        "Supplier Variance",
+        "Variance Status",
+        "Required Action",
+    ]
+
     ACCEPT_DETAILS_COLUMNS = [
         "GTIN",
         "Drug Name",
@@ -407,10 +464,16 @@ class Exporter:
                 )
             )
 
+            quantity_column = (
+                "To Be Dispatch"
+                if "To Be Dispatch" in customer_df.columns
+                else "Allocated To Be Dispatch"
+            )
+
             groups = Exporter._split_into_files(
                 Exporter._prepare_records(
                     customer_df,
-                    "Allocated To Be Dispatch",
+                    quantity_column,
                 )
             )
 
@@ -449,6 +512,30 @@ class Exporter:
     def _is_customer_history_report(file_name, sheet_name):
         text = f"{file_name or ''} {sheet_name or ''}".strip().lower()
         return "customer_history" in text or "customer history" in text
+
+    @staticmethod
+    def _is_full_accept_reconciliation_report(file_name, sheet_name):
+        text = f"{file_name or ''} {sheet_name or ''}".strip().lower()
+        return (
+            "full_accept_reconciliation" in text
+            or "full accept reconciliation" in text
+        )
+
+    @staticmethod
+    def _is_full_dispatch_reconciliation_report(file_name, sheet_name):
+        text = f"{file_name or ''} {sheet_name or ''}".strip().lower()
+        return (
+            "full_dispatch_reconciliation" in text
+            or "full dispatch reconciliation" in text
+        )
+
+    @staticmethod
+    def _is_supplier_variance_report(file_name, sheet_name):
+        text = f"{file_name or ''} {sheet_name or ''}".strip().lower()
+        return (
+            "supplier_variance" in text
+            or "supplier variance" in text
+        )
 
     @staticmethod
     def _is_accept_details_report(file_name, sheet_name):
@@ -493,6 +580,22 @@ class Exporter:
         )
         is_supplier_history = Exporter._is_supplier_history_report(file_name, sheet_name)
         is_customer_history = Exporter._is_customer_history_report(file_name, sheet_name)
+        is_full_accept_reconciliation = (
+            Exporter._is_full_accept_reconciliation_report(
+                file_name,
+                sheet_name,
+            )
+        )
+        is_full_dispatch_reconciliation = (
+            Exporter._is_full_dispatch_reconciliation_report(
+                file_name,
+                sheet_name,
+            )
+        )
+        is_supplier_variance = Exporter._is_supplier_variance_report(
+            file_name,
+            sheet_name,
+        )
         is_accept_details = Exporter._is_accept_details_report(
             file_name,
             sheet_name,
@@ -508,6 +611,18 @@ class Exporter:
             report = report.reindex(columns=Exporter.SUPPLIER_HISTORY_COLUMNS)
         elif is_customer_history:
             report = report.reindex(columns=Exporter.CUSTOMER_HISTORY_COLUMNS)
+        elif is_full_accept_reconciliation:
+            report = report.reindex(
+                columns=Exporter.FULL_ACCEPT_RECONCILIATION_COLUMNS
+            )
+        elif is_full_dispatch_reconciliation:
+            report = report.reindex(
+                columns=Exporter.FULL_DISPATCH_RECONCILIATION_COLUMNS
+            )
+        elif is_supplier_variance:
+            report = report.reindex(
+                columns=Exporter.SUPPLIER_VARIANCE_COLUMNS
+            )
         elif is_accept_details:
             report = report.reindex(
                 columns=Exporter.ACCEPT_DETAILS_COLUMNS
@@ -521,6 +636,9 @@ class Exporter:
             is_batch_master
             or is_accept_details
             or is_dispatch_details
+            or is_full_accept_reconciliation
+            or is_full_dispatch_reconciliation
+            or is_supplier_variance
         ):
             report = report[
                 [
@@ -543,7 +661,7 @@ class Exporter:
                     kind="stable",
                 )
 
-        report = report.reset_index(drop=True)
+        report = report.dropna(how="all").reset_index(drop=True)
 
         workbook = Workbook()
         worksheet = workbook.active
@@ -557,11 +675,40 @@ class Exporter:
             column_count
         )
 
-        if is_batch_master or is_accept_details or is_dispatch_details:
+        is_stage2_report = (
+            is_full_accept_reconciliation
+            or is_full_dispatch_reconciliation
+            or is_supplier_variance
+        )
+
+        if (
+            is_batch_master
+            or is_accept_details
+            or is_dispatch_details
+            or is_stage2_report
+        ):
             if is_batch_master:
                 group_definitions = [
                     (1, 9, "SFDA Report", "5B9BD5"),
                     (10, 25, "WMS Report", "4472C4"),
+                ]
+            elif is_full_accept_reconciliation:
+                group_definitions = [
+                    (1, 7, "Batch Identification", "5B9BD5"),
+                    (8, 13, "Quantity Comparison", "4472C4"),
+                    (14, 15, "Decision", "70AD47"),
+                ]
+            elif is_full_dispatch_reconciliation:
+                group_definitions = [
+                    (1, 9, "Customer and Batch", "5B9BD5"),
+                    (10, 17, "Quantity Comparison", "4472C4"),
+                    (18, 19, "Decision", "70AD47"),
+                ]
+            elif is_supplier_variance:
+                group_definitions = [
+                    (1, 8, "Supplier and Batch", "5B9BD5"),
+                    (9, 12, "Quantity Comparison", "4472C4"),
+                    (13, 14, "Decision", "70AD47"),
                 ]
             elif is_accept_details:
                 group_definitions = [
@@ -661,6 +808,18 @@ class Exporter:
             )
             if is_batch_master:
                 header_fill = "2F5597" if column_index >= 10 else "17365D"
+            elif is_full_accept_reconciliation and column_index >= 14:
+                header_fill = "548235"
+            elif is_full_accept_reconciliation and column_index >= 8:
+                header_fill = "2F5597"
+            elif is_full_dispatch_reconciliation and column_index >= 18:
+                header_fill = "548235"
+            elif is_full_dispatch_reconciliation and column_index >= 10:
+                header_fill = "2F5597"
+            elif is_supplier_variance and column_index >= 13:
+                header_fill = "548235"
+            elif is_supplier_variance and column_index >= 9:
+                header_fill = "2F5597"
             elif (
                 is_accept_details
                 or is_dispatch_details
@@ -788,7 +947,12 @@ class Exporter:
                 f"{header_row + len(report)}"
             )
 
-            if is_batch_master or is_accept_details or is_dispatch_details:
+            if (
+                is_batch_master
+                or is_accept_details
+                or is_dispatch_details
+                or is_stage2_report
+            ):
                 worksheet.auto_filter.ref = report_range
             else:
                 table = Table(
