@@ -1165,37 +1165,225 @@ class FullReconciliationEngine:
 
         return prepared
 
+    @staticmethod
+    def _rename_history_columns(frame: pd.DataFrame) -> pd.DataFrame:
+        """Convert persisted SQL column names to the public report schema."""
+
+        result = frame.copy() if frame is not None else pd.DataFrame()
+        rename_map = {
+            "SupplierName": "Supplier Name",
+            "SupplierCode": "Supplier Code",
+            "GenericItemNumber": "Generic Item Number",
+            "TradeItemNumber": "Trade Item Number",
+            "TradeDescription": "Trade Description",
+            "DrugName": "Drug Name",
+            "ExpiryMonthKey": "Expiry Month Key",
+            "ExpiryDate": "Expiry Date",
+            "PackageSize": "PackageSize",
+            "ReceivedQuantityEach": "Received Quantity Each",
+            "ReceivedQuantityPack": "Received Quantity Pack",
+            "FirstReceivedDate": "First Received Date",
+            "LastReceivedDate": "Last Received Date",
+            "ItemFamilyGroup": "Item Family Group",
+            "ToAddress": "To Address",
+            "DispatchQuantityEach": "Dispatch Quantity Each",
+            "DispatchQuantityPack": "Dispatch Quantity Pack",
+            "FirstDispatchDate": "First Dispatch Date",
+            "LastDispatchDate": "Last Dispatch Date",
+        }
+        return result.rename(columns=rename_map)
+
+    @staticmethod
+    def _prepare_stage2_sfda(sfda_df: pd.DataFrame) -> pd.DataFrame:
+        sfda = Normalizer.normalize_sfda(sfda_df.copy())
+        sfda["Expiry Month Key"] = FullReconciliationEngine._month_key(
+            sfda["Expiry Date"]
+        )
+        for column in [
+            "Quantity",
+            "Active",
+            "Quantity sent pending",
+            "Quantity Receive Pending",
+        ]:
+            sfda[column] = pd.to_numeric(sfda[column], errors="coerce").fillna(0)
+
+        return (
+            sfda.groupby(["BN", "Expiry Month Key"], dropna=False)
+            .agg(
+                **{
+                    "Expiry Date": ("Expiry Date", "first"),
+                    "GTIN": ("GTIN", "first"),
+                    "Drug Name": ("Drug Name", "first"),
+                    "Quantity": ("Quantity", "sum"),
+                    "Active": ("Active", "sum"),
+                    "Quantity sent pending": ("Quantity sent pending", "sum"),
+                    "Quantity Receive Pending": ("Quantity Receive Pending", "sum"),
+                }
+            )
+            .reset_index()
+        )
+
+    @staticmethod
+    def _prepare_stage2_inventory(inventory_df: pd.DataFrame) -> pd.DataFrame:
+        inventory = Normalizer.normalize_inventory(inventory_df.copy())
+        Validator.validate(inventory, "INVENTORY")
+        inventory["Expiry Month Key"] = FullReconciliationEngine._month_key(
+            inventory["Expiry Date"]
+        )
+        inventory["Available Quantity"] = pd.to_numeric(
+            inventory["Available Quantity"], errors="coerce"
+        ).fillna(0)
+
+        return (
+            inventory.groupby(
+                ["BN", "Expiry Month Key", "Generic Item Number"],
+                dropna=False,
+            )
+            .agg(
+                **{
+                    "Inventory Expiry Date": ("Expiry Date", "first"),
+                    "Current Inventory Quantity Each": (
+                        "Available Quantity",
+                        "sum",
+                    ),
+                    "Inventory Trade Name": ("Trade Name", "first"),
+                }
+            )
+            .reset_index()
+        )
+
     def build_accept_reconciliation(
         self,
         inventory_df: pd.DataFrame,
         sfda_df: pd.DataFrame,
         batch_master_df: pd.DataFrame,
     ) -> pd.DataFrame:
-        """Return the stable Accept result schema for Stage 2."""
+        """Build the one-time Accept alignment by historical batch."""
 
-        self._normalize_reconciliation_frame(inventory_df)
-        self._normalize_reconciliation_frame(sfda_df)
-        self._normalize_reconciliation_frame(batch_master_df)
+        sfda = self._prepare_stage2_sfda(sfda_df)
+        master = batch_master_df.copy()
+        if master.empty:
+            return pd.DataFrame(columns=self.ACCEPT_RECONCILIATION_COLUMNS)
 
-        return pd.DataFrame(
-            columns=self.ACCEPT_RECONCILIATION_COLUMNS
+        for column in ["BN", "Generic Item Number", "Expiry Month Key"]:
+            master[column] = Normalizer.text(master[column])
+        master["Expiry Date"] = Normalizer.date(master["Expiry Date"])
+        master["PackageSize"] = pd.to_numeric(
+            master.get("PackageSize", 0), errors="coerce"
+        ).fillna(0)
+        master["Historical Received Quantity Each"] = pd.to_numeric(
+            master.get("Received Quantity Each", 0), errors="coerce"
+        ).fillna(0)
+        master["Historical Received Quantity Pack"] = 0.0
+        valid_pack = master["PackageSize"].gt(0)
+        master.loc[valid_pack, "Historical Received Quantity Pack"] = (
+            master.loc[valid_pack, "Historical Received Quantity Each"]
+            / master.loc[valid_pack, "PackageSize"]
         )
+
+        report = master.merge(
+            sfda,
+            on=["BN", "Expiry Month Key"],
+            how="left",
+            suffixes=("", " SFDA"),
+            validate="many_to_one",
+        )
+
+        for column in [
+            "Quantity",
+            "Active",
+            "Quantity sent pending",
+            "Quantity Receive Pending",
+        ]:
+            report[column] = pd.to_numeric(
+                report.get(column, 0), errors="coerce"
+            ).fillna(0)
+
+        report["SFDA Quantity"] = report["Quantity"]
+        report["SFDA Active"] = report["Active"]
+        report["Quantity Sent Pending"] = report["Quantity sent pending"]
+        report["To Be Accept"] = 0
+        eligible = report["PackageSize"].gt(0)
+        report.loc[eligible, "To Be Accept"] = report.loc[eligible].apply(
+            lambda row: max(
+                0,
+                min(
+                    int(max(row["Quantity Receive Pending"], 0)),
+                    int(max(row["Historical Received Quantity Pack"], 0)),
+                ),
+            ),
+            axis=1,
+        )
+        report["Reconciliation Status"] = "No Accept Required"
+        report.loc[report["To Be Accept"].gt(0), "Reconciliation Status"] = (
+            "Accept Required"
+        )
+        report.loc[~eligible, "Reconciliation Status"] = "Package Size Missing"
+
+        report = self._ensure_columns(
+            report,
+            self.ACCEPT_RECONCILIATION_COLUMNS,
+        )[self.ACCEPT_RECONCILIATION_COLUMNS]
+        return report.loc[report["To Be Accept"].gt(0)].reset_index(drop=True)
 
     def build_supplier_variance(
         self,
         sfda_df: pd.DataFrame,
         supplier_history_df: pd.DataFrame,
     ) -> pd.DataFrame:
-        """Return the stable Supplier Variance schema for Stage 2."""
+        """Compare supplier-reported SFDA quantity with physical receipts."""
 
-        self._normalize_reconciliation_frame(sfda_df)
-        self._normalize_reconciliation_frame(
-            supplier_history_df
-        )
+        sfda = self._prepare_stage2_sfda(sfda_df)
+        supplier = self._rename_history_columns(supplier_history_df)
+        if supplier.empty:
+            return pd.DataFrame(columns=self.SUPPLIER_VARIANCE_COLUMNS)
 
-        return pd.DataFrame(
-            columns=self.SUPPLIER_VARIANCE_COLUMNS
+        for column in ["BN", "Generic Item Number", "Expiry Month Key"]:
+            supplier[column] = Normalizer.text(supplier[column])
+        supplier["Expiry Date"] = Normalizer.date(supplier["Expiry Date"])
+        supplier["Historical Received Quantity Each"] = pd.to_numeric(
+            supplier.get("Received Quantity Each", 0), errors="coerce"
+        ).fillna(0)
+        supplier["Historical Received Quantity Pack"] = pd.to_numeric(
+            supplier.get("Received Quantity Pack", 0), errors="coerce"
+        ).fillna(0)
+
+        report = supplier.merge(
+            sfda,
+            on=["BN", "Expiry Month Key"],
+            how="left",
+            suffixes=("", " SFDA"),
+            validate="many_to_one",
         )
+        report["SFDA Supplier Quantity"] = pd.to_numeric(
+            report.get("Quantity", 0), errors="coerce"
+        ).fillna(0)
+        report["Supplier Variance"] = (
+            report["Historical Received Quantity Pack"]
+            - report["SFDA Supplier Quantity"]
+        )
+        report["Variance Status"] = "Matched"
+        report.loc[report["Supplier Variance"].gt(0), "Variance Status"] = (
+            "Supplier Reported Less"
+        )
+        report.loc[report["Supplier Variance"].lt(0), "Variance Status"] = (
+            "Supplier Reported More"
+        )
+        report["Required Action"] = "No Action"
+        report.loc[report["Supplier Variance"].gt(0), "Required Action"] = (
+            "Notify supplier to add missing quantity"
+        )
+        report.loc[report["Supplier Variance"].lt(0), "Required Action"] = (
+            "Investigate excess supplier quantity"
+        )
+        report["GTIN"] = report.get("GTIN", "")
+        report["Drug Name"] = report.get("Drug Name", "")
+
+        report = self._ensure_columns(
+            report,
+            self.SUPPLIER_VARIANCE_COLUMNS,
+        )[self.SUPPLIER_VARIANCE_COLUMNS]
+        return report.loc[report["Supplier Variance"].ne(0)].reset_index(drop=True)
 
     def build_dispatch_reconciliation(
         self,
@@ -1203,17 +1391,131 @@ class FullReconciliationEngine:
         sfda_df: pd.DataFrame,
         customer_history_df: pd.DataFrame,
     ) -> pd.DataFrame:
-        """Return the stable Dispatch result schema for Stage 2."""
+        """Allocate the SFDA Active minus current inventory variance by GLN."""
 
-        self._normalize_reconciliation_frame(inventory_df)
-        self._normalize_reconciliation_frame(sfda_df)
-        self._normalize_reconciliation_frame(
-            customer_history_df
+        sfda = self._prepare_stage2_sfda(sfda_df)
+        inventory = self._prepare_stage2_inventory(inventory_df)
+        customer = self._rename_history_columns(customer_history_df)
+        if customer.empty:
+            return pd.DataFrame(columns=self.DISPATCH_RECONCILIATION_COLUMNS)
+
+        for column in ["BN", "Generic Item Number", "Expiry Month Key"]:
+            customer[column] = Normalizer.text(customer[column])
+        customer["Expiry Date"] = Normalizer.date(customer["Expiry Date"])
+        customer["Historical Dispatch Quantity Each"] = pd.to_numeric(
+            customer.get("Dispatch Quantity Each", 0), errors="coerce"
+        ).fillna(0)
+        customer["Historical Dispatch Quantity Pack"] = pd.to_numeric(
+            customer.get("Dispatch Quantity Pack", 0), errors="coerce"
+        ).fillna(0)
+        customer["GLN"] = customer.get("GLN", "").fillna("").astype(str).str.strip()
+        missing_gln = customer["GLN"].eq("") | customer["GLN"].str.upper().eq("DUMMY")
+        customer.loc[missing_gln, "GLN"] = "9999999999999"
+        customer["Customer Status"] = "REGISTERED"
+        customer.loc[missing_gln, "Customer Status"] = "DUMMY"
+
+        batch_current = inventory.groupby(
+            ["BN", "Expiry Month Key"], dropna=False
+        )["Current Inventory Quantity Each"].sum().reset_index()
+        target = sfda.merge(
+            batch_current,
+            on=["BN", "Expiry Month Key"],
+            how="left",
+            validate="one_to_one",
+        )
+        target["Current Inventory Quantity Each"] = pd.to_numeric(
+            target["Current Inventory Quantity Each"], errors="coerce"
+        ).fillna(0)
+
+        # Use PackageSize stored in Customer History to convert WMS inventory
+        # to packs. The first valid package size per batch is sufficient because
+        # SFDA matching is at BN + expiry month grain.
+        pack_lookup = (
+            customer.loc[pd.to_numeric(customer.get("PackageSize", 0), errors="coerce").gt(0)]
+            .groupby(["BN", "Expiry Month Key"], dropna=False)["PackageSize"]
+            .first()
+            .reset_index()
+        )
+        target = target.merge(
+            pack_lookup,
+            on=["BN", "Expiry Month Key"],
+            how="left",
+            validate="one_to_one",
+        )
+        target["PackageSize"] = pd.to_numeric(
+            target.get("PackageSize", 0), errors="coerce"
+        ).fillna(0)
+        target["Current Inventory Quantity Pack"] = 0.0
+        valid_pack = target["PackageSize"].gt(0)
+        target.loc[valid_pack, "Current Inventory Quantity Pack"] = (
+            target.loc[valid_pack, "Current Inventory Quantity Each"]
+            / target.loc[valid_pack, "PackageSize"]
+        )
+        target["Required Dispatch Pack"] = (
+            pd.to_numeric(target["Active"], errors="coerce").fillna(0)
+            - target["Current Inventory Quantity Pack"]
+        ).clip(lower=0).astype(int)
+
+        details = customer.merge(
+            target[
+                [
+                    "BN",
+                    "Expiry Month Key",
+                    "GTIN",
+                    "Drug Name",
+                    "Active",
+                    "Current Inventory Quantity Each",
+                    "Required Dispatch Pack",
+                ]
+            ],
+            on=["BN", "Expiry Month Key"],
+            how="inner",
+            validate="many_to_one",
+        )
+        if "GTIN_y" in details.columns:
+            details["GTIN"] = details["GTIN_y"].fillna(
+                details.get("GTIN_x", "")
+            )
+        elif "GTIN_x" in details.columns:
+            details["GTIN"] = details["GTIN_x"]
+
+        if "Drug Name_y" in details.columns:
+            details["Drug Name"] = details["Drug Name_y"].fillna(
+                details.get("Drug Name_x", "")
+            )
+        elif "Drug Name_x" in details.columns:
+            details["Drug Name"] = details["Drug Name_x"]
+
+        details = details.sort_values(
+            ["BN", "Expiry Month Key", "First Dispatch Date", "To Address"],
+            kind="stable",
+        ).reset_index(drop=True)
+        details["To Be Dispatch"] = 0
+
+        for _, indexes in details.groupby(
+            ["BN", "Expiry Month Key"], sort=False, dropna=False
+        ).groups.items():
+            index_list = list(indexes)
+            remaining = int(details.loc[index_list[0], "Required Dispatch Pack"])
+            for row_index in index_list:
+                if remaining <= 0:
+                    break
+                available = int(max(details.loc[row_index, "Historical Dispatch Quantity Pack"], 0))
+                allocated = min(available, remaining)
+                details.loc[row_index, "To Be Dispatch"] = allocated
+                remaining -= allocated
+
+        details["SFDA Active"] = details["Active"]
+        details["Reconciliation Status"] = "No Dispatch Required"
+        details.loc[details["To Be Dispatch"].gt(0), "Reconciliation Status"] = (
+            "Dispatch Required"
         )
 
-        return pd.DataFrame(
-            columns=self.DISPATCH_RECONCILIATION_COLUMNS
-        )
+        details = self._ensure_columns(
+            details,
+            self.DISPATCH_RECONCILIATION_COLUMNS,
+        )[self.DISPATCH_RECONCILIATION_COLUMNS]
+        return details.loc[details["To Be Dispatch"].gt(0)].reset_index(drop=True)
 
     def build_reconciliation_summary(
         self,
@@ -1221,25 +1523,18 @@ class FullReconciliationEngine:
         supplier_variance: pd.DataFrame,
         dispatch_details: pd.DataFrame,
     ) -> pd.DataFrame:
-        """Build the Stage 2 summary dataset."""
+        """Build one concise summary for the one-time alignment."""
 
-        return pd.DataFrame(
-            [
-                {
-                    "Metric": "Accept Rows",
-                    "Value": int(len(accept_details)),
-                },
-                {
-                    "Metric": "Supplier Variance Rows",
-                    "Value": int(len(supplier_variance)),
-                },
-                {
-                    "Metric": "Dispatch Rows",
-                    "Value": int(len(dispatch_details)),
-                },
-            ],
-            columns=self.RECONCILIATION_SUMMARY_COLUMNS,
-        )
+        metrics = [
+            ("Accept detail rows", len(accept_details)),
+            ("Accept required rows", int((pd.to_numeric(accept_details.get("To Be Accept", 0), errors="coerce").fillna(0) > 0).sum())),
+            ("Accept quantity packs", float(pd.to_numeric(accept_details.get("To Be Accept", 0), errors="coerce").fillna(0).sum())),
+            ("Supplier variance rows", int((pd.to_numeric(supplier_variance.get("Supplier Variance", 0), errors="coerce").fillna(0) != 0).sum())),
+            ("Dispatch detail rows", len(dispatch_details)),
+            ("Dispatch allocation rows", int((pd.to_numeric(dispatch_details.get("To Be Dispatch", 0), errors="coerce").fillna(0) > 0).sum())),
+            ("Dispatch quantity packs", float(pd.to_numeric(dispatch_details.get("To Be Dispatch", 0), errors="coerce").fillna(0).sum())),
+        ]
+        return pd.DataFrame(metrics, columns=self.RECONCILIATION_SUMMARY_COLUMNS)
 
     def run_full_reconciliation(
         self,
@@ -1249,28 +1544,23 @@ class FullReconciliationEngine:
         supplier_history_df: pd.DataFrame,
         customer_history_df: pd.DataFrame,
     ) -> Dict[str, pd.DataFrame]:
-        """Run Stage 2 without reading historical ASN or Full Dispatch files."""
+        """Run Stage 2 using only Inventory, SFDA, and persisted history."""
 
+        Validator.validate(Normalizer.normalize_sfda(sfda_df.copy()), "SFDA")
         accept_details = self.build_accept_reconciliation(
-            inventory_df,
-            sfda_df,
-            batch_master_df,
+            inventory_df, sfda_df, batch_master_df
         )
         supplier_variance = self.build_supplier_variance(
-            sfda_df,
-            supplier_history_df,
+            sfda_df, supplier_history_df
         )
         dispatch_details = self.build_dispatch_reconciliation(
-            inventory_df,
-            sfda_df,
-            customer_history_df,
+            inventory_df, sfda_df, customer_history_df
         )
         summary = self.build_reconciliation_summary(
             accept_details,
             supplier_variance,
             dispatch_details,
         )
-
         return {
             "accept_details": accept_details,
             "supplier_variance": supplier_variance,
