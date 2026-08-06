@@ -14,7 +14,7 @@ class Exporter:
     MAX_ROWS_PER_FILE = 20
     MAX_QUANTITY_PER_FILE = 100000
     GTIN_LENGTH = 14
-    DUMMY_GLN = "9999999999999"
+    DUMMY_GLN = "99999999999999"
 
     BATCH_MASTER_COLUMNS = [
         "GTIN",
@@ -398,78 +398,31 @@ class Exporter:
         if dispatch_df is None or dispatch_df.empty:
             return output
 
-        customer_columns = [
-            "Customer Status",
-            "GLN",
-            "To Address",
-        ]
+        working = dispatch_df.copy()
+        if "GLN" not in working.columns:
+            working["GLN"] = ""
 
-        available_columns = [
-            column
-            for column in customer_columns
-            if column in dispatch_df.columns
-        ]
+        working["Export GLN"] = working["GLN"].apply(
+            Exporter._normalize_identifier
+        )
+        missing_gln = (
+            working["Export GLN"].eq("")
+            | working["Export GLN"].str.upper().eq("DUMMY")
+        )
+        working.loc[missing_gln, "Export GLN"] = Exporter.DUMMY_GLN
 
-        if not available_columns:
-            return output
+        quantity_column = (
+            "To Be Dispatch"
+            if "To Be Dispatch" in working.columns
+            else "Allocated To Be Dispatch"
+        )
 
-        for group_values, customer_df in (
-            dispatch_df.groupby(
-                available_columns,
-                dropna=False,
-                sort=True,
-            )
+        for customer_gln, customer_df in working.groupby(
+            "Export GLN",
+            dropna=False,
+            sort=True,
         ):
-            if not isinstance(
-                group_values,
-                tuple,
-            ):
-                group_values = (group_values,)
-
-            group_data = dict(
-                zip(
-                    available_columns,
-                    group_values,
-                )
-            )
-
-            customer_status = str(
-                group_data.get(
-                    "Customer Status",
-                    "",
-                )
-            ).strip().upper()
-
-            raw_gln = (
-                Exporter._normalize_identifier(
-                    group_data.get("GLN", "")
-                )
-            )
-
-            is_dummy = (
-                customer_status == "DUMMY"
-                or not raw_gln
-                or raw_gln.upper() == "DUMMY"
-            )
-
-            customer_gln = (
-                Exporter.DUMMY_GLN
-                if is_dummy
-                else raw_gln
-            )
-
-            customer_gln = (
-                Exporter._safe_file_name(
-                    customer_gln
-                )
-            )
-
-            quantity_column = (
-                "To Be Dispatch"
-                if "To Be Dispatch" in customer_df.columns
-                else "Allocated To Be Dispatch"
-            )
-
+            safe_gln = Exporter._safe_file_name(customer_gln)
             groups = Exporter._split_into_files(
                 Exporter._prepare_records(
                     customer_df,
@@ -477,18 +430,10 @@ class Exporter:
                 )
             )
 
-            for index, records_group in enumerate(
-                groups,
-                start=1,
-            ):
-                file_name = (
-                    f"{customer_gln}_"
-                    f"{index:03d}.csv"
-                )
-                output[file_name] = (
-                    Exporter._build_sfda_content(
-                        records_group
-                    )
+            for index, records_group in enumerate(groups, start=1):
+                file_name = f"{safe_gln}_{index:03d}.csv"
+                output[file_name] = Exporter._build_sfda_content(
+                    records_group
                 )
 
         return output
@@ -535,6 +480,15 @@ class Exporter:
         return (
             "supplier_variance" in text
             or "supplier variance" in text
+        )
+
+
+    @staticmethod
+    def _is_full_reconciliation_summary_report(file_name, sheet_name):
+        text = f"{file_name or ''} {sheet_name or ''}".strip().lower()
+        return (
+            "full_reconciliation_summary" in text
+            or "full reconciliation summary" in text
         )
 
     @staticmethod
@@ -595,6 +549,12 @@ class Exporter:
         is_supplier_variance = Exporter._is_supplier_variance_report(
             file_name,
             sheet_name,
+        )
+        is_full_reconciliation_summary = (
+            Exporter._is_full_reconciliation_summary_report(
+                file_name,
+                sheet_name,
+            )
         )
         is_accept_details = Exporter._is_accept_details_report(
             file_name,
@@ -679,13 +639,16 @@ class Exporter:
             is_full_accept_reconciliation
             or is_full_dispatch_reconciliation
             or is_supplier_variance
+            or is_full_reconciliation_summary
         )
 
         if (
             is_batch_master
             or is_accept_details
             or is_dispatch_details
-            or is_stage2_report
+            or is_full_accept_reconciliation
+            or is_full_dispatch_reconciliation
+            or is_supplier_variance
         ):
             if is_batch_master:
                 group_definitions = [
@@ -773,7 +736,11 @@ class Exporter:
             worksheet["A1"].alignment = Alignment(
                 horizontal="center"
             )
-            header_row = 3
+            header_row = (
+                2
+                if is_full_reconciliation_summary
+                else 3
+            )
         border = Border(
             left=Side(
                 style="thin",
