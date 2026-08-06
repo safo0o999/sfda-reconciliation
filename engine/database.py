@@ -710,13 +710,55 @@ def replace_customer_history(history: pd.DataFrame) -> Dict[str, Any]:
 def get_supplier_history_df() -> pd.DataFrame:
     initialize_database()
     with Database().connect() as connection:
-        return pd.read_sql("SELECT * FROM dbo.SupplierHistory ORDER BY SupplierName, GenericItemNumber, BN, ExpiryDate", connection)
+        return pd.read_sql(r"""
+            SELECT
+                SupplierName AS [Supplier Name],
+                SupplierCode AS [Supplier Code],
+                GTIN,
+                DrugName AS [Drug Name],
+                GenericItemNumber AS [Generic Item Number],
+                Description,
+                TradeDescription AS [Trade Description],
+                BN,
+                ExpiryMonthKey AS [Expiry Month Key],
+                ExpiryDate AS [Expiry Date],
+                PackageSize,
+                ReceivedQuantityEach AS [Received Quantity Each],
+                ReceivedQuantityPack AS [Received Quantity Pack],
+                FirstReceivedDate AS [First Received Date],
+                LastReceivedDate AS [Last Received Date],
+                ItemFamilyGroup AS [Item Family Group],
+                TradeItemNumber AS [Trade Item Number],
+                LastUpdated AS [Last Updated]
+            FROM dbo.SupplierHistory
+            ORDER BY SupplierName, GenericItemNumber, BN, ExpiryDate;
+        """, connection)
 
 
 def get_customer_history_df() -> pd.DataFrame:
     initialize_database()
     with Database().connect() as connection:
-        return pd.read_sql("SELECT * FROM dbo.CustomerHistory ORDER BY ToAddress, GenericItemNumber, BN, ExpiryDate", connection)
+        return pd.read_sql(r"""
+            SELECT
+                ToAddress AS [To Address],
+                GLN,
+                GTIN,
+                DrugName AS [Drug Name],
+                GenericItemNumber AS [Generic Item Number],
+                TradeDescription AS [Trade Description],
+                BN,
+                ExpiryMonthKey AS [Expiry Month Key],
+                ExpiryDate AS [Expiry Date],
+                PackageSize,
+                DispatchQuantityEach AS [Dispatch Quantity Each],
+                DispatchQuantityPack AS [Dispatch Quantity Pack],
+                FirstDispatchDate AS [First Dispatch Date],
+                LastDispatchDate AS [Last Dispatch Date],
+                TradeItemNumber AS [Trade Item Number],
+                LastUpdated AS [Last Updated]
+            FROM dbo.CustomerHistory
+            ORDER BY ToAddress, GenericItemNumber, BN, ExpiryDate;
+        """, connection)
 
 
 def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
