@@ -1330,10 +1330,40 @@ class FullReconciliationEngine:
             historical_received_pack - already_accepted_in_sfda
         ).clip(lower=0)
 
+        quantity_receive_pending = pd.to_numeric(
+            report["Quantity Receive Pending"],
+            errors="coerce",
+        ).fillna(0).clip(lower=0)
+
+        # The requested Accept quantity must never exceed the quantity that SFDA
+        # currently allows in Quantity Receive Pending. Apply both limits:
+        #   1. Remaining historical quantity not yet reflected in SFDA.
+        #   2. Current SFDA Quantity Receive Pending.
+        # Apply the cap directly and explicitly. This guarantees that a zero
+        # Quantity Receive Pending always produces a zero To Be Accept, even if
+        # the historical balance is still positive.
+        capped_accept = remaining_accept.clip(
+            upper=quantity_receive_pending,
+        ).clip(lower=0)
+        capped_accept = capped_accept.where(
+            quantity_receive_pending.gt(0),
+            0,
+        )
+
         report.loc[eligible, "To Be Accept"] = (
-            remaining_accept.loc[eligible]
+            capped_accept.loc[eligible]
             .fillna(0)
             .astype(int)
+        )
+        report.loc[
+            quantity_receive_pending.le(0),
+            "To Be Accept",
+        ] = 0
+
+        logger.info(
+            "Full Accept logic v2026.08.06.2 applied. rows=%s positive_accept_rows=%s",
+            len(report),
+            int(pd.to_numeric(report["To Be Accept"], errors="coerce").fillna(0).gt(0).sum()),
         )
         report["Reconciliation Status"] = "No Accept Required"
         report.loc[report["To Be Accept"].gt(0), "Reconciliation Status"] = (
