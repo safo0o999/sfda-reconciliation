@@ -1417,7 +1417,7 @@ class FullReconciliationEngine:
         ).fillna(0)
         customer["GLN"] = customer.get("GLN", "").fillna("").astype(str).str.strip()
         missing_gln = customer["GLN"].eq("") | customer["GLN"].str.upper().eq("DUMMY")
-        customer.loc[missing_gln, "GLN"] = "9999999999999"
+        customer.loc[missing_gln, "GLN"] = "99999999999999"
         customer["Customer Status"] = "REGISTERED"
         customer.loc[missing_gln, "Customer Status"] = "DUMMY"
 
