@@ -1310,15 +1310,30 @@ class FullReconciliationEngine:
         report["Quantity Sent Pending"] = report["Quantity sent pending"]
         report["To Be Accept"] = 0
         eligible = report["PackageSize"].gt(0)
-        report.loc[eligible, "To Be Accept"] = report.loc[eligible].apply(
-            lambda row: max(
-                0,
-                min(
-                    int(max(row["Quantity Receive Pending"], 0)),
-                    int(max(row["Historical Received Quantity Pack"], 0)),
-                ),
-            ),
-            axis=1,
+
+        # Full Accept is a historical alignment. Quantities already reflected in
+        # SFDA must be deducted from the historical received quantity so that a
+        # newly downloaded SFDA report does not generate the same Accept files
+        # again after a successful upload.
+        historical_received_pack = pd.to_numeric(
+            report["Historical Received Quantity Pack"],
+            errors="coerce",
+        ).fillna(0)
+        already_accepted_in_sfda = (
+            pd.to_numeric(report["SFDA Active"], errors="coerce").fillna(0)
+            + pd.to_numeric(
+                report["Quantity Sent Pending"],
+                errors="coerce",
+            ).fillna(0)
+        )
+        remaining_accept = (
+            historical_received_pack - already_accepted_in_sfda
+        ).clip(lower=0)
+
+        report.loc[eligible, "To Be Accept"] = (
+            remaining_accept.loc[eligible]
+            .fillna(0)
+            .astype(int)
         )
         report["Reconciliation Status"] = "No Accept Required"
         report.loc[report["To Be Accept"].gt(0), "Reconciliation Status"] = (
