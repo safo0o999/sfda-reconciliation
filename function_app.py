@@ -911,22 +911,8 @@ def full_reconciliation_run(req: func.HttpRequest) -> func.HttpResponse:
         dispatch_details = result["dispatch_details"]
         summary_df = result["summary"]
 
-        accept_upload = accept_details.loc[
-            pd.to_numeric(
-                accept_details.get("To Be Accept", 0),
-                errors="coerce",
-            ).fillna(0).gt(0)
-        ].copy()
-
-        dispatch_upload = dispatch_details.loc[
-            pd.to_numeric(
-                dispatch_details.get("To Be Dispatch", 0),
-                errors="coerce",
-            ).fillna(0).gt(0)
-        ].copy()
-        dispatch_upload["Allocated To Be Dispatch"] = dispatch_upload[
-            "To Be Dispatch"
-        ]
+        accept_upload = result["accept_upload"]
+        dispatch_upload = result["dispatch_upload"]
 
         outputs: Dict[str, Any] = {
             "accept_details": Exporter.build_formatted_excel_file(
