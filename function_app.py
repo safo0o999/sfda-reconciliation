@@ -611,6 +611,47 @@ def historical_status(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
+@app.route(route="historical/export-current", methods=["GET"])
+def historical_export_current(req: func.HttpRequest) -> func.HttpResponse:
+    """Export the current persisted historical tables on demand."""
+    try:
+        from engine.database import (
+            get_batch_master_df,
+            get_customer_history_df,
+            get_supplier_history_df,
+        )
+        from engine.exporter import Exporter
+
+        batch_master = get_batch_master_df()
+        supplier_history = get_supplier_history_df()
+        customer_history = get_customer_history_df()
+        if batch_master.empty:
+            return error_response(
+                "Historical Batch Master is empty. Complete Step 1 first.", 400
+            )
+
+        outputs = {}
+        outputs.update(Exporter.build_formatted_excel_file(
+            df=batch_master, file_name="Batch_Master.xlsx",
+            sheet_name="Batch Master", title="SFDA Historical Batch Master",
+            sort_columns=["Generic Item Number", "BN", "Expiry Date"],
+        ))
+        outputs.update(Exporter.build_formatted_excel_file(
+            df=supplier_history, file_name="Supplier_History.xlsx",
+            sheet_name="Supplier History", title="Historical Supplier Receipt History",
+            sort_columns=["Supplier Name", "Generic Item Number", "BN", "Expiry Date"],
+        ))
+        outputs.update(Exporter.build_formatted_excel_file(
+            df=customer_history, file_name="Customer_History.xlsx",
+            sheet_name="Customer History", title="Historical Customer Dispatch History",
+            sort_columns=["To Address", "Generic Item Number", "BN", "Expiry Date"],
+        ))
+        return json_response({"status": "Completed", "outputs": outputs})
+    except Exception as exc:
+        logger.exception("Current historical export failed")
+        return error_response("Failed to export current historical files.", 500, str(exc))
+
+
 @app.route(route="batch-master/build", methods=["GET", "POST"])
 def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
     """Queue a long-running historical build and return immediately."""
@@ -834,6 +875,121 @@ def historical_build_worker(
         operation,
     )
 
+
+
+@app.route(route="full-reconciliation/accept", methods=["GET", "POST"])
+def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "GET":
+        return json_response({"status": "Ready", "required_files": ["sfda"]})
+    try:
+        sfda_file = req.files.get("sfda")
+        if sfda_file is None:
+            return error_response("Latest SFDA file is required for Full Accept Reconciliation.")
+        sfda_name, sfda_bytes, _ = read_uploaded_bytes(sfda_file)
+        sfda_df = read_excel_bytes(sfda_name, sfda_bytes)
+        from engine.database import get_batch_master_df, get_supplier_history_df
+        from engine.exporter import Exporter
+        from engine.full_reconciliation import FullReconciliationEngine
+        batch_master = get_batch_master_df()
+        supplier_history = get_supplier_history_df()
+        if batch_master.empty:
+            return error_response("Historical Batch Master is empty. Complete Step 1 first.", 400)
+        result = FullReconciliationEngine(pd.DataFrame(), pd.DataFrame(), sfda_df).run_accept_reconciliation(
+            sfda_df, batch_master, supplier_history
+        )
+        accept_details = result["accept_details"]
+        supplier_variance = result["supplier_variance"]
+        accept_upload = result["accept_upload"]
+        outputs = {
+            "accept_details": Exporter.build_formatted_excel_file(
+                df=accept_details, file_name="Full_Accept_Reconciliation.xlsx",
+                sheet_name="Full Accept", title="One-Time Full Reconciliation - Accept",
+                columns=list(accept_details.columns),
+                sort_columns=["Generic Item Number", "BN", "Expiry Date"],
+            ),
+            "supplier_variance": Exporter.build_formatted_excel_file(
+                df=supplier_variance, file_name="Supplier_Variance.xlsx",
+                sheet_name="Supplier Variance", title="Supplier Quantity Variance",
+                columns=list(supplier_variance.columns),
+                sort_columns=["Supplier Name", "Generic Item Number", "BN"],
+            ),
+            "accept_files": Exporter.build_sfda_upload_files(
+                accept_upload, "To Be Accept", "SFDA_Full_Accept"
+            ),
+        }
+        return json_response({
+            "status": "Completed", "step": "full-accept", "outputs": outputs,
+            "summary": {
+                "sfda_rows": int(len(sfda_df)),
+                "accept_rows": int(len(accept_upload)),
+                "supplier_variance_rows": int(len(supplier_variance)),
+                "accept_files": len(outputs["accept_files"]),
+            },
+        })
+    except ValueError as exc:
+        logger.exception("Full Accept validation failed")
+        return error_response("Full Accept Reconciliation validation failed.", 400, str(exc))
+    except Exception as exc:
+        logger.exception("Full Accept reconciliation failed")
+        return error_response("Full Accept Reconciliation failed.", 500, str(exc))
+
+
+@app.route(route="full-reconciliation/dispatch", methods=["GET", "POST"])
+def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "GET":
+        return json_response({"status": "Ready", "required_files": ["inventory", "sfda"]})
+    try:
+        inventory_file = req.files.get("inventory")
+        sfda_file = req.files.get("sfda")
+        if inventory_file is None:
+            return error_response("Current Inventory file is required for Full Dispatch Reconciliation.")
+        if sfda_file is None:
+            return error_response("Updated SFDA file is required for Full Dispatch Reconciliation.")
+        inventory_name, inventory_bytes, _ = read_uploaded_bytes(inventory_file)
+        sfda_name, sfda_bytes, _ = read_uploaded_bytes(sfda_file)
+        inventory_df = read_excel_bytes(inventory_name, inventory_bytes)
+        sfda_df = read_excel_bytes(sfda_name, sfda_bytes)
+        from engine.database import get_customer_history_df
+        from engine.exporter import Exporter
+        from engine.full_reconciliation import FullReconciliationEngine
+        customer_history = get_customer_history_df()
+        if customer_history.empty:
+            return error_response("Customer History is empty. Complete Step 1 first.", 400)
+        result = FullReconciliationEngine(pd.DataFrame(), pd.DataFrame(), sfda_df).run_dispatch_reconciliation(
+            inventory_df, sfda_df, customer_history
+        )
+        dispatch_details = result["dispatch_details"]
+        summary_df = result["summary"]
+        dispatch_upload = result["dispatch_upload"]
+        outputs = {
+            "dispatch_details": Exporter.build_formatted_excel_file(
+                df=dispatch_details, file_name="Full_Dispatch_Reconciliation.xlsx",
+                sheet_name="Full Dispatch", title="One-Time Full Reconciliation - Dispatch",
+                columns=list(dispatch_details.columns),
+                sort_columns=["To Address", "Generic Item Number", "BN"],
+            ),
+            "summary": Exporter.build_formatted_excel_file(
+                df=summary_df, file_name="Full_Reconciliation_Summary.xlsx",
+                sheet_name="Summary", title="Full Reconciliation Summary",
+                columns=list(summary_df.columns),
+            ),
+            "dispatch_files": Exporter.build_dispatch_files_by_customer(dispatch_upload),
+        }
+        return json_response({
+            "status": "Completed", "step": "full-dispatch", "outputs": outputs,
+            "summary": {
+                "inventory_rows": int(len(inventory_df)),
+                "sfda_rows": int(len(sfda_df)),
+                "dispatch_allocation_rows": int(len(dispatch_upload)),
+                "dispatch_files": len(outputs["dispatch_files"]),
+            },
+        })
+    except ValueError as exc:
+        logger.exception("Full Dispatch validation failed")
+        return error_response("Full Dispatch Reconciliation validation failed.", 400, str(exc))
+    except Exception as exc:
+        logger.exception("Full Dispatch reconciliation failed")
+        return error_response("Full Dispatch Reconciliation failed.", 500, str(exc))
 
 
 @app.route(
