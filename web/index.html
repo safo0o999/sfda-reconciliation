@@ -781,7 +781,25 @@
           <div class="tabs"><button class="tab-btn active" data-tab="full-summary">Overview</button><button class="tab-btn" data-tab="full-master">Historical Files</button><button class="tab-btn" data-tab="full-reports">Reconciliation Files</button></div>
           <div class="tab-panel active" id="tab-full-summary"><div style="display:grid;gap:16px"><div class="card" style="padding:20px"><h3>Generated Files</h3><p>Files produced by the latest Step 1 or Step 2 operation.</p><div class="file-list" id="fullMasterPreview"></div></div></div></div>
           <div class="tab-panel" id="tab-full-master"><div class="file-list" id="fullBatchMasterFiles"><div class="empty"><strong>No historical files loaded</strong>Run Step 1 to generate the historical audit files.</div></div></div>
-          <div class="tab-panel" id="tab-full-reports"><div class="file-list" id="fullReportFiles"><div class="empty"><strong>No reconciliation files loaded</strong>Run Step 2 after historical data is ready.</div></div></div>
+          <div class="tab-panel" id="tab-full-reports">
+            <div style="display:grid;gap:18px">
+              <div class="card" style="padding:20px">
+                <h3>Excel Reports</h3>
+                <p>Full Accept, Supplier Variance, Full Dispatch, and Summary reports.</p>
+                <div class="file-list" id="fullReportFiles"><div class="empty"><strong>No reconciliation reports loaded</strong>Run Step 2 after historical data is ready.</div></div>
+              </div>
+              <div class="card" style="padding:20px">
+                <h3>Accept CSV Files</h3>
+                <p>SFDA Accept upload files generated with the 20-row and 100,000-quantity limits.</p>
+                <div class="file-list" id="fullAcceptCsvFiles"><div class="empty"><strong>No Accept CSV files loaded</strong>Run Step 2 to generate Accept upload files.</div></div>
+              </div>
+              <div class="card" style="padding:20px">
+                <h3>Dispatch CSV Files</h3>
+                <p>SFDA Dispatch upload files grouped by GLN.</p>
+                <div class="file-list" id="fullDispatchCsvFiles"><div class="empty"><strong>No Dispatch CSV files loaded</strong>Run Step 2 to generate Dispatch upload files.</div></div>
+              </div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -2154,9 +2172,32 @@
       const result=await parseApiResponse(response);
       finishSetupProgress("step2",true);
 
-      const files=collectOutputFiles(result.outputs);
+      const excelFiles=collectOutputFiles({
+        accept_details:result.outputs?.accept_details,
+        supplier_variance:result.outputs?.supplier_variance,
+        dispatch_details:result.outputs?.dispatch_details,
+        summary:result.outputs?.summary
+      });
+      const acceptCsvFiles=collectOutputFiles(result.outputs?.accept_files||{});
+      const dispatchCsvFiles=collectOutputFiles(result.outputs?.dispatch_files||{});
+      const files=[...excelFiles,...acceptCsvFiles,...dispatchCsvFiles];
+
       fullSetupFiles.push(...files);
-      renderSetupFileList("fullReportFiles",files,"The reconciliation completed, but no downloadable files were returned.");
+      renderSetupFileList(
+        "fullReportFiles",
+        excelFiles,
+        "The reconciliation completed, but no Excel reports were returned."
+      );
+      renderSetupFileList(
+        "fullAcceptCsvFiles",
+        acceptCsvFiles,
+        "No Accept quantity was required, so no Accept CSV files were generated."
+      );
+      renderSetupFileList(
+        "fullDispatchCsvFiles",
+        dispatchCsvFiles,
+        "No Dispatch quantity was required, so no Dispatch CSV files were generated."
+      );
 
       const summary=result.summary||{};
       showFullResults(`<strong>Step 2 completed.</strong> Reconciliation rows: ${formatNumber(summary.reconciliation_rows||0)} · Accept rows: ${formatNumber(summary.accept_rows||0)} · Dispatch allocation rows: ${formatNumber(summary.dispatch_allocation_rows||0)} · Generated files: ${formatNumber(files.length)}.`);
