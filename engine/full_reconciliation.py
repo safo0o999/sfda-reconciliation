@@ -1609,11 +1609,31 @@ class FullReconciliationEngine:
             supplier_variance,
             dispatch_details,
         )
+
+        accept_upload = accept_details.loc[
+            pd.to_numeric(
+                accept_details.get("To Be Accept", 0),
+                errors="coerce",
+            ).fillna(0).gt(0)
+        ].copy()
+
+        dispatch_upload = dispatch_details.loc[
+            pd.to_numeric(
+                dispatch_details.get("To Be Dispatch", 0),
+                errors="coerce",
+            ).fillna(0).gt(0)
+        ].copy()
+        dispatch_upload["Allocated To Be Dispatch"] = dispatch_upload[
+            "To Be Dispatch"
+        ]
+
         return {
             "accept_details": accept_details,
             "supplier_variance": supplier_variance,
             "dispatch_details": dispatch_details,
             "summary": summary,
+            "accept_upload": accept_upload,
+            "dispatch_upload": dispatch_upload,
         }
 
     @staticmethod
