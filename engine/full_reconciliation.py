@@ -1261,7 +1261,6 @@ class FullReconciliationEngine:
 
     def build_accept_reconciliation(
         self,
-        inventory_df: pd.DataFrame,
         sfda_df: pd.DataFrame,
         batch_master_df: pd.DataFrame,
     ) -> pd.DataFrame:
@@ -1584,32 +1583,21 @@ class FullReconciliationEngine:
         ]
         return pd.DataFrame(metrics, columns=self.RECONCILIATION_SUMMARY_COLUMNS)
 
-    def run_full_reconciliation(
+    def run_accept_reconciliation(
         self,
-        inventory_df: pd.DataFrame,
         sfda_df: pd.DataFrame,
         batch_master_df: pd.DataFrame,
         supplier_history_df: pd.DataFrame,
-        customer_history_df: pd.DataFrame,
     ) -> Dict[str, pd.DataFrame]:
-        """Run Stage 2 using only Inventory, SFDA, and persisted history."""
+        """Run the Full Accept stage using SFDA and persisted history only."""
 
         Validator.validate(Normalizer.normalize_sfda(sfda_df.copy()), "SFDA")
         accept_details = self.build_accept_reconciliation(
-            inventory_df, sfda_df, batch_master_df
+            sfda_df, batch_master_df
         )
         supplier_variance = self.build_supplier_variance(
             sfda_df, supplier_history_df
         )
-        dispatch_details = self.build_dispatch_reconciliation(
-            inventory_df, sfda_df, customer_history_df
-        )
-        summary = self.build_reconciliation_summary(
-            accept_details,
-            supplier_variance,
-            dispatch_details,
-        )
-
         accept_upload = accept_details.loc[
             pd.to_numeric(
                 accept_details.get("To Be Accept", 0),
@@ -1617,6 +1605,29 @@ class FullReconciliationEngine:
             ).fillna(0).gt(0)
         ].copy()
 
+        return {
+            "accept_details": accept_details,
+            "supplier_variance": supplier_variance,
+            "accept_upload": accept_upload,
+        }
+
+    def run_dispatch_reconciliation(
+        self,
+        inventory_df: pd.DataFrame,
+        sfda_df: pd.DataFrame,
+        customer_history_df: pd.DataFrame,
+    ) -> Dict[str, pd.DataFrame]:
+        """Run the Full Dispatch stage after Accept is completed in SFDA."""
+
+        Validator.validate(Normalizer.normalize_sfda(sfda_df.copy()), "SFDA")
+        dispatch_details = self.build_dispatch_reconciliation(
+            inventory_df, sfda_df, customer_history_df
+        )
+        empty_accept = pd.DataFrame(columns=self.ACCEPT_RECONCILIATION_COLUMNS)
+        empty_variance = pd.DataFrame(columns=self.SUPPLIER_VARIANCE_COLUMNS)
+        summary = self.build_reconciliation_summary(
+            empty_accept, empty_variance, dispatch_details
+        )
         dispatch_upload = dispatch_details.loc[
             pd.to_numeric(
                 dispatch_details.get("To Be Dispatch", 0),
@@ -1628,12 +1639,36 @@ class FullReconciliationEngine:
         ]
 
         return {
-            "accept_details": accept_details,
-            "supplier_variance": supplier_variance,
             "dispatch_details": dispatch_details,
             "summary": summary,
-            "accept_upload": accept_upload,
             "dispatch_upload": dispatch_upload,
+        }
+
+    def run_full_reconciliation(
+        self,
+        inventory_df: pd.DataFrame,
+        sfda_df: pd.DataFrame,
+        batch_master_df: pd.DataFrame,
+        supplier_history_df: pd.DataFrame,
+        customer_history_df: pd.DataFrame,
+    ) -> Dict[str, pd.DataFrame]:
+        """Backward-compatible combined Stage 2 entry point."""
+
+        accept_result = self.run_accept_reconciliation(
+            sfda_df, batch_master_df, supplier_history_df
+        )
+        dispatch_result = self.run_dispatch_reconciliation(
+            inventory_df, sfda_df, customer_history_df
+        )
+        summary = self.build_reconciliation_summary(
+            accept_result["accept_details"],
+            accept_result["supplier_variance"],
+            dispatch_result["dispatch_details"],
+        )
+        return {
+            **accept_result,
+            **dispatch_result,
+            "summary": summary,
         }
 
     @staticmethod
