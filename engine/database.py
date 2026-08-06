@@ -1308,3 +1308,143 @@ def test_database_connection() -> Dict[str, Optional[Any]]:
         "batch_master_rows": int(row[5]),
         "run_history_rows": int(row[6]),
     }
+
+
+def replace_latest_inventory_snapshot(
+    inventory_df: pd.DataFrame,
+    source_file_name: str = "",
+) -> int:
+    """Replace the latest Inventory snapshot used by Product Intelligence."""
+    initialize_database()
+    frame = inventory_df.copy() if inventory_df is not None else pd.DataFrame()
+    if frame.empty:
+        return 0
+
+    from engine.full_reconciliation import FullReconciliationEngine
+    from engine.normalizer import Normalizer
+
+    frame = Normalizer.normalize_inventory(frame)
+    frame["Expiry Month Key"] = FullReconciliationEngine._month_key(frame["Expiry Date"])
+    frame["Available Quantity"] = pd.to_numeric(frame["Available Quantity"], errors="coerce").fillna(0)
+
+    rows = [
+        (
+            _text(row, "BN"),
+            _text(row, "Expiry Month Key"),
+            _value(row, "Expiry Date"),
+            _text(row, "Generic Item Number"),
+            _text(row, "Trade Name"),
+            _number(row, "Available Quantity"),
+            source_file_name,
+        )
+        for row in frame.to_dict(orient="records")
+        if _text(row, "BN") and _text(row, "Expiry Month Key")
+    ]
+
+    sql = r"""
+        INSERT INTO dbo.LatestInventorySnapshot
+        (BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber, TradeName,
+         AvailableQuantity, SourceFileName)
+        VALUES (?, ?, ?, ?, ?, ?, ?);
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute("DELETE FROM dbo.LatestInventorySnapshot;")
+            _bulk_insert_rows(cursor, sql, rows)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return len(rows)
+
+
+def replace_latest_sfda_snapshot(
+    sfda_df: pd.DataFrame,
+    source_file_name: str = "",
+) -> int:
+    """Replace the latest SFDA snapshot used by Product Intelligence."""
+    initialize_database()
+    frame = sfda_df.copy() if sfda_df is not None else pd.DataFrame()
+    if frame.empty:
+        return 0
+
+    from engine.full_reconciliation import FullReconciliationEngine
+    from engine.normalizer import Normalizer
+
+    frame = Normalizer.normalize_sfda(frame)
+    frame["Expiry Month Key"] = FullReconciliationEngine._month_key(frame["Expiry Date"])
+    for column in ["Quantity", "Active", "Quantity sent pending", "Quantity Receive Pending"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0)
+
+    rows = [
+        (
+            _text(row, "GTIN"),
+            _text(row, "Drug Name"),
+            _text(row, "BN"),
+            _text(row, "Expiry Month Key"),
+            _value(row, "Expiry Date"),
+            _number(row, "Quantity"),
+            _number(row, "Active"),
+            _number(row, "Quantity sent pending"),
+            _number(row, "Quantity Receive Pending"),
+            source_file_name,
+        )
+        for row in frame.to_dict(orient="records")
+        if _text(row, "BN") and _text(row, "Expiry Month Key")
+    ]
+
+    sql = r"""
+        INSERT INTO dbo.LatestSFDASnapshot
+        (GTIN, DrugName, BN, ExpiryMonthKey, ExpiryDate, Quantity, Active,
+         QuantitySentPending, QuantityReceivePending, SourceFileName)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute("DELETE FROM dbo.LatestSFDASnapshot;")
+            _bulk_insert_rows(cursor, sql, rows)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return len(rows)
+
+
+def get_latest_inventory_snapshot_df() -> pd.DataFrame:
+    initialize_database()
+    sql = r"""
+        SELECT BN, ExpiryMonthKey AS [Expiry Month Key], ExpiryDate AS [Expiry Date],
+               GenericItemNumber AS [Generic Item Number], TradeName AS [Trade Name],
+               AvailableQuantity AS [Available Quantity], SourceFileName AS [Source File],
+               SnapshotUtc AS [Snapshot UTC]
+        FROM dbo.LatestInventorySnapshot;
+    """
+    with Database().connect() as connection:
+        return pd.read_sql(sql, connection)
+
+
+def get_latest_sfda_snapshot_df() -> pd.DataFrame:
+    initialize_database()
+    sql = r"""
+        SELECT GTIN, DrugName AS [Drug Name], BN,
+               ExpiryMonthKey AS [Expiry Month Key], ExpiryDate AS [Expiry Date],
+               Quantity, Active, QuantitySentPending AS [Quantity sent pending],
+               QuantityReceivePending AS [Quantity Receive Pending],
+               SourceFileName AS [Source File], SnapshotUtc AS [Snapshot UTC]
+        FROM dbo.LatestSFDASnapshot;
+    """
+    with Database().connect() as connection:
+        return pd.read_sql(sql, connection)
+
+
+def get_product_intelligence_sources() -> Dict[str, pd.DataFrame]:
+    """Load all persisted datasets required by Product Intelligence."""
+    return {
+        "batch_master": get_batch_master_df(),
+        "supplier_history": get_supplier_history_df(),
+        "customer_history": get_customer_history_df(),
+        "inventory_snapshot": get_latest_inventory_snapshot_df(),
+        "sfda_snapshot": get_latest_sfda_snapshot_df(),
+    }
