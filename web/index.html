@@ -443,7 +443,52 @@
     .pi-kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.pi-kpi{background:#fff;border:1px solid var(--line);border-radius:14px;padding:15px;display:flex;align-items:center;gap:12px;box-shadow:0 8px 24px rgba(20,42,75,.05)}.pi-kpi-icon{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;font-weight:900}.pi-kpi-icon.blue{background:#e7f2ff;color:#075fc8}.pi-kpi-icon.purple{background:#efeaff;color:#6b4eff}.pi-kpi-icon.cyan{background:#e5f8fb;color:#07889b}.pi-kpi-icon.green{background:#e8f7ee;color:#107c41}.pi-kpi-icon.amber{background:#fff3df;color:#d97706}.pi-kpi-icon.red{background:#feecec;color:#d13438}.pi-kpi-icon.orange{background:#fff0e6;color:#c65c13}.pi-kpi-icon.rose{background:#ffeaf1;color:#bc345b}.pi-kpi small{display:block;color:var(--muted);font-weight:700}.pi-kpi strong{display:inline-block;font-size:23px;margin-top:4px}.pi-kpi em{font-style:normal;font-size:10px;color:var(--muted);margin-left:4px}.pi-meta-strip{display:grid;grid-template-columns:repeat(6,1fr);gap:1px;background:var(--line);border:1px solid var(--line);border-radius:13px;overflow:hidden;margin:12px 0 16px}.pi-meta-strip>div{background:#fff;padding:11px 14px}.pi-meta-strip small{display:block;color:var(--muted);font-size:10px}.pi-meta-strip strong{display:block;margin-top:4px;font-size:13px}.pi-main-grid{display:grid;grid-template-columns:minmax(0,3fr) minmax(270px,1fr);gap:16px}.pi-table-card{min-width:0}.pi-batch-scroll{max-height:475px}.pi-batch-scroll td{white-space:nowrap}.pi-drug-cell strong{display:block;max-width:240px;overflow:hidden;text-overflow:ellipsis}.pi-drug-cell small{display:block;color:var(--muted);margin-top:3px}.pi-status-card .card-body{display:grid;place-items:center;gap:18px}.pi-donut{width:190px;height:190px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(#168a48 0 100%);position:relative}.pi-donut:after{content:"";position:absolute;width:116px;height:116px;background:#fff;border-radius:50%}.pi-donut>div{position:relative;z-index:1;text-align:center}.pi-donut strong{font-size:30px;display:block}.pi-donut small{color:var(--muted)}.pi-legend{width:100%;display:grid;gap:9px}.pi-legend-row{display:flex;align-items:center;justify-content:space-between;font-size:11px}.pi-legend-label{display:flex;align-items:center;gap:7px}.pi-legend-dot{width:9px;height:9px;border-radius:50%}.pi-secondary-grid{display:grid;grid-template-columns:1fr 1fr .8fr;gap:16px;margin-top:16px}.pi-small-scroll{max-height:310px}.pi-alert-list{display:grid;gap:9px}.pi-alert-row{display:flex;justify-content:space-between;align-items:center;border:1px solid var(--line);border-radius:10px;padding:10px 11px}.pi-alert-row strong{font-size:18px}.pi-alert-row small{color:var(--muted)}.pi-status{display:inline-flex;padding:5px 8px;border-radius:999px;font-size:10px;font-weight:800}.pi-status.balanced{background:#e8f7ee;color:#107c41}.pi-status.accept-required{background:#fff3df;color:#a95b00}.pi-status.dispatch-required{background:#ffeaf1;color:#b32650}.pi-status.missing-in-sfda,.pi-status.package-size-missing{background:#feecec;color:#b42328}
     @media(max-width:1250px){.pi-kpi-grid{grid-template-columns:repeat(2,1fr)}.pi-filter-grid{grid-template-columns:1fr 1fr}.pi-filter-grid input{grid-column:1/-1}.pi-main-grid,.pi-secondary-grid{grid-template-columns:1fr}.pi-meta-strip{grid-template-columns:repeat(3,1fr)}}
     @media(max-width:700px){.pi-kpi-grid,.pi-meta-strip,.pi-filter-grid{grid-template-columns:1fr}.pi-filter-grid input{grid-column:auto}}
-  </style>
+  
+
+    /* Product Intelligence — approved balanced dashboard layout */
+    .pi-page-head .actions{align-items:center}
+    .pi-last-updated{font-size:10px;color:var(--muted);white-space:nowrap}
+    .pi-overview-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;align-items:stretch}
+    .pi-overview-grid>.card,.pi-secondary-grid>.card{min-width:0}
+    .pi-compact-filters{display:grid;grid-template-columns:minmax(180px,1fr) 180px auto;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line);background:#fbfcfe}
+    .pi-batch-scroll{height:365px;max-height:365px;overflow:auto}
+    .pi-small-scroll{height:310px;max-height:310px;overflow:auto}
+    .pi-table-card table{min-width:760px}
+    .pi-table-card thead th{position:sticky;top:0;z-index:5;background:#f6f8fb;box-shadow:0 1px 0 var(--line)}
+    .pi-secondary-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;margin-top:16px}
+    .pi-quality-card{display:flex;flex-direction:column}
+    .pi-quality-body{padding:18px;display:flex;flex-direction:column;gap:22px;flex:1}
+    .pi-quality-kpis{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px}
+    .pi-quality-kpi{min-height:92px;border:1px solid var(--line);border-radius:12px;padding:12px;display:flex;align-items:center;gap:9px;background:#fff}
+    .pi-quality-kpi>span{width:34px;height:34px;display:grid;place-items:center;border-radius:10px;font-weight:900;flex:0 0 auto}
+    .pi-quality-kpi strong{display:block;font-size:22px;line-height:1}
+    .pi-quality-kpi small{display:block;margin-top:7px;color:var(--muted);font-size:9px;line-height:1.35}
+    .pi-quality-kpi.blue>span{background:#e7f2ff;color:#075fc8}.pi-quality-kpi.blue strong{color:#075fc8}
+    .pi-quality-kpi.amber>span{background:#fff3df;color:#d97706}.pi-quality-kpi.amber strong{color:#d97706}
+    .pi-quality-kpi.red>span{background:#feecec;color:#d13438}.pi-quality-kpi.red strong{color:#d13438}
+    .pi-quality-kpi.purple>span{background:#efeaff;color:#6b4eff}.pi-quality-kpi.purple strong{color:#6b4eff}
+    .pi-quality-kpi.cyan>span{background:#e5f8fb;color:#07889b}.pi-quality-kpi.cyan strong{color:#07889b}
+    .pi-status-overview{border-top:1px solid var(--line);padding-top:18px}
+    .pi-status-heading{font-size:12px;font-weight:800;margin-bottom:14px}
+    .pi-stacked-bar{height:42px;border-radius:6px;overflow:hidden;display:flex;background:#edf1f6}
+    .pi-status-segment{height:100%;display:flex;align-items:center;justify-content:center;color:#172033;font-size:9px;font-weight:900;min-width:0}
+    .pi-horizontal-legend{display:flex;flex-wrap:wrap;gap:10px 16px;margin-top:15px}
+    .pi-horizontal-legend .pi-legend-row{justify-content:flex-start;gap:5px;font-size:9px}
+    .pi-horizontal-legend .pi-legend-row strong{font-weight:800}
+    .pi-data-note{text-align:center;color:var(--muted);font-size:10px;padding:22px 12px 4px}
+    @media(max-width:1350px){
+      .pi-quality-kpis{grid-template-columns:repeat(3,1fr)}
+    }
+    @media(max-width:1100px){
+      .pi-overview-grid,.pi-secondary-grid{grid-template-columns:1fr}
+      .pi-batch-scroll{height:420px;max-height:420px}
+    }
+    @media(max-width:700px){
+      .pi-compact-filters{grid-template-columns:1fr}
+      .pi-quality-kpis{grid-template-columns:1fr 1fr}
+      .pi-last-updated{width:100%}
+    }
+</style>
 </head>
 <body>
 <div class="app">
@@ -884,60 +929,114 @@
       <!-- PRODUCT INTELLIGENCE -->
       <section class="page" id="page-intelligence">
         <div class="page-head pi-page-head">
-          <div><h1>Product Intelligence</h1><p>Unified intelligence across historical receipts, dispatches, current inventory, and the latest SFDA snapshot.</p></div>
-          <div class="actions"><button class="btn btn-secondary" id="piRefreshButton">↻ Refresh Data</button><button class="btn btn-primary" id="piExportButton">⇩ Export Batch View</button></div>
-        </div>
-
-        <div class="pi-filter-card">
-          <div class="pi-filter-title"><span>⌕</span><div><strong>Search & Filter</strong><small>Find a product, generic, GTIN, batch, supplier, or customer.</small></div></div>
-          <div class="pi-filter-grid">
-            <input class="control" id="piSearch" placeholder="Search GTIN, drug, generic, or batch...">
-            <select class="control" id="piStatusFilter"><option value="">All statuses</option></select>
-            <select class="control" id="piSupplierFilter"><option value="">All suppliers</option></select>
-            <select class="control" id="piCustomerFilter"><option value="">All customers</option></select>
-            <button class="btn btn-secondary" id="piResetButton">Reset</button>
+          <div>
+            <h1>Product Intelligence</h1>
+            <p>Real-time insights from the latest SFDA and Inventory snapshots.</p>
+          </div>
+          <div class="actions">
+            <span class="pi-last-updated">Last Updated: <strong id="piLastUpdated">—</strong></span>
+            <button class="btn btn-secondary" id="piRefreshButton">↻ Refresh Data</button>
+            <button class="btn btn-primary" id="piExportButton">⇩ Export Batch View</button>
           </div>
         </div>
 
-        <div class="pi-loading" id="piLoading"><span class="pi-spinner"></span><div><strong>Loading Product Intelligence...</strong><small>Reading Batch Master and latest snapshots.</small></div></div>
+        <div class="pi-loading" id="piLoading">
+          <span class="pi-spinner"></span>
+          <div><strong>Loading Product Intelligence...</strong><small>Reading Batch Master and latest snapshots.</small></div>
+        </div>
         <div class="status-banner error" id="piError"></div>
 
         <div id="piDashboard" hidden>
-          <div class="pi-kpi-grid">
-            <div class="pi-kpi"><span class="pi-kpi-icon blue">R</span><div><small>Historical Received</small><strong id="piReceived">0</strong><em>packs</em></div></div>
-            <div class="pi-kpi"><span class="pi-kpi-icon purple">D</span><div><small>Historical Dispatched</small><strong id="piDispatched">0</strong><em>packs</em></div></div>
-            <div class="pi-kpi"><span class="pi-kpi-icon cyan">I</span><div><small>Current Inventory</small><strong id="piInventory">0</strong><em>packs</em></div></div>
-            <div class="pi-kpi"><span class="pi-kpi-icon green">A</span><div><small>SFDA Active</small><strong id="piActive">0</strong><em>packs</em></div></div>
-            <div class="pi-kpi"><span class="pi-kpi-icon amber">↓</span><div><small>Receive Pending</small><strong id="piReceivePending">0</strong><em>packs</em></div></div>
-            <div class="pi-kpi"><span class="pi-kpi-icon red">↑</span><div><small>Sent Pending</small><strong id="piSentPending">0</strong><em>packs</em></div></div>
-            <div class="pi-kpi"><span class="pi-kpi-icon orange">!</span><div><small>Remaining Accept</small><strong id="piRemainingAccept">0</strong><em>packs</em></div></div>
-            <div class="pi-kpi"><span class="pi-kpi-icon rose">!</span><div><small>Remaining Dispatch</small><strong id="piRemainingDispatch">0</strong><em>packs</em></div></div>
-          </div>
-
-          <div class="pi-meta-strip">
-            <div><small>Batches</small><strong id="piBatchCount">0</strong></div><div><small>Generics</small><strong id="piGenericCount">0</strong></div><div><small>Suppliers</small><strong id="piSupplierCount">0</strong></div><div><small>Customers</small><strong id="piCustomerCount">0</strong></div><div><small>Inventory Snapshot</small><strong id="piInventorySnapshot">Missing</strong></div><div><small>SFDA Snapshot</small><strong id="piSfdaSnapshot">Missing</strong></div>
-          </div>
-
-          <div class="pi-main-grid">
+          <div class="pi-overview-grid">
             <div class="card pi-table-card">
-              <div class="card-header"><div><div class="card-title">Batch Intelligence</div><div class="card-subtitle" id="piBatchSubtitle">0 batches</div></div><span class="badge info" id="piFilteredCount">0 shown</span></div>
-              <div class="table-scroll pi-batch-scroll"><table><thead><tr><th>GTIN / Drug</th><th>Batch</th><th>Expiry</th><th>Received</th><th>Dispatched</th><th>Inventory</th><th>SFDA Active</th><th>Accept Gap</th><th>Dispatch Gap</th><th>Status</th></tr></thead><tbody id="piBatchBody"></tbody></table></div>
+              <div class="card-header">
+                <div>
+                  <div class="card-title">Batch Intelligence</div>
+                  <div class="card-subtitle" id="piBatchSubtitle">0 batches</div>
+                </div>
+                <span class="badge info" id="piFilteredCount">0 shown</span>
+              </div>
+              <div class="pi-compact-filters">
+                <input class="control" id="piSearch" placeholder="Search GTIN, drug, generic, or batch...">
+                <select class="control" id="piStatusFilter"><option value="">All statuses</option></select>
+                <button class="btn btn-secondary" id="piResetButton">Reset</button>
+              </div>
+              <select id="piSupplierFilter" hidden><option value=""></option></select>
+              <select id="piCustomerFilter" hidden><option value=""></option></select>
+              <div class="table-scroll pi-batch-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Drug Name / GTIN</th>
+                      <th>BN</th>
+                      <th>Expiry Date</th>
+                      <th>Pack Size</th>
+                      <th>Inventory Pack</th>
+                      <th>Active</th>
+                      <th>Sent Pending</th>
+                      <th>Receive Pending</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="piBatchBody"></tbody>
+                </table>
+              </div>
               <div class="table-footer"><span id="piBatchFooter">0 records</span><span>Source: Azure SQL + latest snapshots</span></div>
             </div>
-            <div class="card pi-status-card">
-              <div class="card-header"><div><div class="card-title">Status Distribution</div><div class="card-subtitle">Current batch reconciliation state</div></div></div>
-              <div class="card-body"><div class="pi-donut" id="piDonut"><div><strong id="piDonutTotal">0</strong><small>Total</small></div></div><div class="pi-legend" id="piStatusLegend"></div></div>
+
+            <div class="card pi-quality-card">
+              <div class="card-header">
+                <div>
+                  <div class="card-title">Data Quality &amp; Reconciliation Overview</div>
+                  <div class="card-subtitle">Real-time summary of reconciliation status</div>
+                </div>
+              </div>
+              <div class="pi-quality-body">
+                <div class="pi-quality-kpis">
+                  <div class="pi-quality-kpi blue"><span>▤</span><div><strong id="piOverviewBatches">0</strong><small>Batches</small></div></div>
+                  <div class="pi-quality-kpi amber"><span>↓</span><div><strong id="piOverviewAccept">0</strong><small>Accept Required</small></div></div>
+                  <div class="pi-quality-kpi red"><span>▣</span><div><strong id="piOverviewDispatch">0</strong><small>Dispatch Required</small></div></div>
+                  <div class="pi-quality-kpi purple"><span>◇</span><div><strong id="piOverviewPackMissing">0</strong><small>Package Size Missing</small></div></div>
+                  <div class="pi-quality-kpi cyan"><span>▥</span><div><strong id="piOverviewGlnMissing">0</strong><small>GLN Missing</small></div></div>
+                </div>
+                <div class="pi-status-overview">
+                  <div class="pi-status-heading">Batches by Status</div>
+                  <div class="pi-stacked-bar" id="piStatusBar"></div>
+                  <div class="pi-horizontal-legend" id="piStatusLegend"></div>
+                </div>
+              </div>
+              <div class="table-footer"><span></span><span>Source: Azure SQL + latest snapshots</span></div>
             </div>
           </div>
 
           <div class="pi-secondary-grid">
-            <div class="card"><div class="card-header"><div><div class="card-title">Supplier Intelligence</div><div class="card-subtitle">Historical received quantity by supplier</div></div></div><div class="table-scroll pi-small-scroll"><table><thead><tr><th>Supplier</th><th>Code</th><th>Received Pack</th><th>Last Receipt</th></tr></thead><tbody id="piSupplierBody"></tbody></table></div></div>
-            <div class="card"><div class="card-header"><div><div class="card-title">Customer Intelligence</div><div class="card-subtitle">Historical dispatch quantity by customer</div></div></div><div class="table-scroll pi-small-scroll"><table><thead><tr><th>Customer</th><th>GLN</th><th>Dispatched Pack</th><th>Last Dispatch</th></tr></thead><tbody id="piCustomerBody"></tbody></table></div></div>
-            <div class="card"><div class="card-header"><div><div class="card-title">Issues & Alerts</div><div class="card-subtitle">Items requiring review</div></div></div><div class="card-body pi-alert-list" id="piAlertList"></div></div>
+            <div class="card pi-table-card">
+              <div class="card-header"><div><div class="card-title">Supplier Intelligence</div><div class="card-subtitle">Historical supply performance by supplier</div></div></div>
+              <div class="table-scroll pi-small-scroll">
+                <table>
+                  <thead><tr><th>Supplier Name</th><th>Supplier Code</th><th>Received Pack</th><th>Last Receipt</th></tr></thead>
+                  <tbody id="piSupplierBody"></tbody>
+                </table>
+              </div>
+              <div class="table-footer"><span id="piSupplierFooter">0 records</span><span>Source: Azure SQL + latest snapshots</span></div>
+            </div>
+
+            <div class="card pi-table-card">
+              <div class="card-header"><div><div class="card-title">Customer Intelligence</div><div class="card-subtitle">Historical dispatch quantity by customer</div></div></div>
+              <div class="table-scroll pi-small-scroll">
+                <table>
+                  <thead><tr><th>Customer</th><th>GLN</th><th>Dispatched Pack</th><th>Last Dispatch</th></tr></thead>
+                  <tbody id="piCustomerBody"></tbody>
+                </table>
+              </div>
+              <div class="table-footer"><span id="piCustomerFooter">0 records</span><span>Source: Azure SQL + latest snapshots</span></div>
+            </div>
           </div>
+
+          <div class="pi-data-note">All data is based on the latest successful snapshots from SFDA &amp; Inventory reconciliation.</div>
         </div>
       </section>
- 
+
       <!-- VARIANCE -->
       <section class="page" id="page-variance">
         <div class="page-head"><div><h1>Variance Management</h1><p>Investigate receiving discrepancies, missing SFDA registrations, dispatch evidence, and customer mapping issues.</p></div><div class="actions"><button class="btn btn-warning" disabled>Generate SFDA Discrepancy Report</button></div></div>
@@ -2376,22 +2475,86 @@
 
   function populateProductIntelligence(){
     const s=piData.summary||{},m=piData.metadata||{};
-    const map={piReceived:s.historical_received_pack,piDispatched:s.historical_dispatched_pack,piInventory:s.current_inventory_pack,piActive:s.sfda_active,piReceivePending:s.receive_pending,piSentPending:s.sent_pending,piRemainingAccept:s.remaining_accept,piRemainingDispatch:s.remaining_dispatch,piBatchCount:s.batch_count,piGenericCount:s.generic_count,piSupplierCount:s.supplier_count,piCustomerCount:s.customer_count};
-    Object.entries(map).forEach(([id,value])=>$(id).textContent=piNum(value));
-    $("piInventorySnapshot").textContent=m.has_inventory_snapshot?"Available":"Missing";$("piInventorySnapshot").style.color=m.has_inventory_snapshot?"#107c41":"#d13438";
-    $("piSfdaSnapshot").textContent=m.has_sfda_snapshot?"Available":"Missing";$("piSfdaSnapshot").style.color=m.has_sfda_snapshot?"#107c41":"#d13438";
-    fillPiSelect("piStatusFilter",Object.keys(piData.status_distribution||{}),"All statuses");
-    fillPiSelect("piSupplierFilter",(piData.suppliers||[]).map(x=>x["Supplier Name"]||x.SupplierName).filter(Boolean),"All suppliers");
-    fillPiSelect("piCustomerFilter",(piData.customers||[]).map(x=>x["To Address"]||x.ToAddress).filter(Boolean),"All customers");
-    renderPiSuppliers();renderPiCustomers();renderPiAlerts();renderPiStatus();applyProductFilters();
+    const dist=piData.status_distribution||{};
+    const alerts=piData.alerts||[];
+    const alertCount=label=>{
+      const match=alerts.find(item=>String(item.label||"").toLowerCase().includes(label));
+      return Number(match?.count||0);
+    };
+
+    $("piOverviewBatches").textContent=piNum(s.batch_count??Object.values(dist).reduce((total,value)=>total+Number(value||0),0));
+    $("piOverviewAccept").textContent=piNum(dist["Accept Required"]??s.accept_required??alertCount("accept"));
+    $("piOverviewDispatch").textContent=piNum(dist["Dispatch Required"]??s.dispatch_required??alertCount("dispatch"));
+    $("piOverviewPackMissing").textContent=piNum(dist["Package Size Missing"]??s.package_size_missing??alertCount("package"));
+    $("piOverviewGlnMissing").textContent=piNum(s.gln_missing??alertCount("gln"));
+
+    const updated=m.latest_snapshot_utc||m.sfda_snapshot_utc||m.inventory_snapshot_utc||m.last_updated_utc||"";
+    if(updated){
+      const updatedDate=new Date(updated);
+      $("piLastUpdated").textContent=Number.isNaN(updatedDate.getTime())?String(updated):`${updatedDate.toLocaleDateString("en-GB")} ${updatedDate.toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})}`;
+    }else{
+      $("piLastUpdated").textContent="—";
+    }
+
+    fillPiSelect("piStatusFilter",Object.keys(dist),"All statuses");
+    renderPiSuppliers();
+    renderPiCustomers();
+    renderPiStatus();
+    applyProductFilters();
   }
   function fillPiSelect(id,values,label){const el=$(id),current=el.value;el.innerHTML=`<option value="">${label}</option>`;[...new Set(values)].sort().forEach(v=>el.insertAdjacentHTML("beforeend",`<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`));el.value=current;}
-  function applyProductFilters(){if(!piData)return;const q=$("piSearch").value.trim().toLowerCase(),status=$("piStatusFilter").value;let rows=(piData.batches||[]).filter(r=>{const hay=[r.GTIN,r["Drug Name"],r.BN,r["Generic Item Number"]].join(" ").toLowerCase();return(!q||hay.includes(q))&&(!status||r.Status===status);});renderPiBatches(rows);}
-  function renderPiBatches(rows){const body=$("piBatchBody");body.innerHTML=rows.length?rows.map(r=>`<tr><td class="pi-drug-cell"><strong>${escapeHtml(r["Drug Name"]||"—")}</strong><small>${escapeHtml(r.GTIN||r["Generic Item Number"]||"—")}</small></td><td><strong>${escapeHtml(r.BN||"—")}</strong><div class="file-info">${escapeHtml(r["Generic Item Number"]||"")}</div></td><td>${piDate(r["Expiry Date"])}</td><td>${piNum(r["Historical Received Pack"])}</td><td>${piNum(r["Historical Dispatched Pack"])}</td><td>${piNum(r["Inventory Pack"])}</td><td>${piNum(r["SFDA Active"])}</td><td>${piNum(r["Remaining Accept"])}</td><td>${piNum(r["Remaining Dispatch"])}</td><td><span class="pi-status ${piStatusClass(r.Status)}">${escapeHtml(r.Status||"Unknown")}</span></td></tr>`).join(""):`<tr><td colspan="10" class="empty-cell">No matching batches.</td></tr>`;$("piFilteredCount").textContent=`${formatNumber(rows.length)} shown`;$("piBatchSubtitle").textContent=`${formatNumber((piData.batches||[]).length)} total batches`;$("piBatchFooter").textContent=`${formatNumber(rows.length)} records`;}
-  function renderPiSuppliers(){const rows=piData.suppliers||[];$("piSupplierBody").innerHTML=rows.length?rows.map(r=>`<tr><td><strong>${escapeHtml(r["Supplier Name"]||"—")}</strong></td><td>${escapeHtml(r["Supplier Code"]||"—")}</td><td>${piNum(r.received_pack)}</td><td>${piDate(r.last_receipt)}</td></tr>`).join(""):`<tr><td colspan="4" class="empty-cell">No supplier history.</td></tr>`;}
-  function renderPiCustomers(){const rows=piData.customers||[];$("piCustomerBody").innerHTML=rows.length?rows.map(r=>`<tr><td><strong>${escapeHtml(r["To Address"]||"—")}</strong></td><td>${escapeHtml(r.GLN||"—")}</td><td>${piNum(r.dispatched_pack)}</td><td>${piDate(r.last_dispatch)}</td></tr>`).join(""):`<tr><td colspan="4" class="empty-cell">No customer history.</td></tr>`;}
-  function renderPiAlerts(){const rows=piData.alerts||[];$("piAlertList").innerHTML=rows.map(r=>`<div class="pi-alert-row"><div><strong style="color:${r.count>0?'#d13438':'#107c41'}">${formatNumber(r.count)}</strong><small>${escapeHtml(r.label)}</small></div><span class="badge ${r.count>0?'warning':'success'}">${r.count>0?'Review':'Clear'}</span></div>`).join("");}
-  function renderPiStatus(){const dist=piData.status_distribution||{},entries=Object.entries(dist),total=entries.reduce((a,[,v])=>a+Number(v||0),0);$("piDonutTotal").textContent=formatNumber(total);let cursor=0,segments=[];entries.forEach(([name,count])=>{const start=total?cursor/total*100:0;cursor+=Number(count);const end=total?cursor/total*100:100;segments.push(`${PI_STATUS_COLORS[name]||'#8b95a8'} ${start}% ${end}%`);});$("piDonut").style.background=`conic-gradient(${segments.join(',')||'#e2e7ef 0 100%'})`;$("piStatusLegend").innerHTML=entries.map(([name,count])=>`<div class="pi-legend-row"><span class="pi-legend-label"><i class="pi-legend-dot" style="background:${PI_STATUS_COLORS[name]||'#8b95a8'}"></i>${escapeHtml(name)}</span><strong>${formatNumber(count)}</strong></div>`).join("");}
+  function applyProductFilters(){
+    if(!piData)return;
+    const q=$("piSearch").value.trim().toLowerCase();
+    const status=$("piStatusFilter").value;
+    const rows=(piData.batches||[]).filter(row=>{
+      const hay=[row.GTIN,row["Drug Name"],row.BN,row["Generic Item Number"]].join(" ").toLowerCase();
+      return(!q||hay.includes(q))&&(!status||row.Status===status);
+    });
+    renderPiBatches(rows);
+  }
+
+  function renderPiBatches(rows){
+    const body=$("piBatchBody");
+    body.innerHTML=rows.length?rows.map(row=>`<tr>
+      <td class="pi-drug-cell"><strong>${escapeHtml(row["Drug Name"]||"—")}</strong><small>${escapeHtml(row.GTIN||row["Generic Item Number"]||"—")}</small></td>
+      <td><strong>${escapeHtml(row.BN||"—")}</strong><div class="file-info">${escapeHtml(row["Generic Item Number"]||"")}</div></td>
+      <td>${piDate(row["Expiry Date"])}</td>
+      <td>${piNum(row.PackageSize??row["Package Size"])}</td>
+      <td>${piNum(row["Inventory Pack"])}</td>
+      <td>${piNum(row["SFDA Active"])}</td>
+      <td>${piNum(row["Quantity Sent Pending"]??row["Sent Pending"])}</td>
+      <td>${piNum(row["Quantity Receive Pending"]??row["Receive Pending"])}</td>
+      <td><span class="pi-status ${piStatusClass(row.Status)}">${escapeHtml(row.Status||"Unknown")}</span></td>
+    </tr>`).join(""):`<tr><td colspan="9" class="empty-cell">No matching batches.</td></tr>`;
+    $("piFilteredCount").textContent=`${formatNumber(rows.length)} shown`;
+    $("piBatchSubtitle").textContent=`${formatNumber((piData.batches||[]).length)} total batches`;
+    $("piBatchFooter").textContent=`${formatNumber(rows.length)} records`;
+  }
+
+  function renderPiSuppliers(){
+    const rows=piData.suppliers||[];
+    $("piSupplierBody").innerHTML=rows.length?rows.map(row=>`<tr><td><strong>${escapeHtml(row["Supplier Name"]||"—")}</strong></td><td>${escapeHtml(row["Supplier Code"]||"—")}</td><td>${piNum(row.received_pack)}</td><td>${piDate(row.last_receipt)}</td></tr>`).join(""):`<tr><td colspan="4" class="empty-cell">No supplier history.</td></tr>`;
+    $("piSupplierFooter").textContent=`${formatNumber(rows.length)} records`;
+  }
+
+  function renderPiCustomers(){
+    const rows=piData.customers||[];
+    $("piCustomerBody").innerHTML=rows.length?rows.map(row=>`<tr><td><strong>${escapeHtml(row["To Address"]||"—")}</strong></td><td>${escapeHtml(row.GLN||"—")}</td><td>${piNum(row.dispatched_pack)}</td><td>${piDate(row.last_dispatch)}</td></tr>`).join(""):`<tr><td colspan="4" class="empty-cell">No customer history.</td></tr>`;
+    $("piCustomerFooter").textContent=`${formatNumber(rows.length)} records`;
+  }
+
+  function renderPiStatus(){
+    const dist=piData.status_distribution||{};
+    const entries=Object.entries(dist).filter(([,count])=>Number(count||0)>0);
+    const total=entries.reduce((sum,[,count])=>sum+Number(count||0),0);
+    $("piStatusBar").innerHTML=entries.length?entries.map(([name,count])=>{
+      const percentage=total?Number(count||0)/total*100:0;
+      const label=percentage>=4?`${percentage.toFixed(1)}%`:"";
+      return `<div class="pi-status-segment" title="${escapeHtml(name)}: ${formatNumber(count)} (${percentage.toFixed(1)}%)" style="width:${percentage}%;background:${PI_STATUS_COLORS[name]||'#8b95a8'}">${label}</div>`;
+    }).join(""):`<div class="pi-status-segment" style="width:100%;background:#e2e7ef">No data</div>`;
+    $("piStatusLegend").innerHTML=entries.map(([name,count])=>`<div class="pi-legend-row"><span class="pi-legend-label"><i class="pi-legend-dot" style="background:${PI_STATUS_COLORS[name]||'#8b95a8'}"></i>${escapeHtml(name)}</span><strong>(${formatNumber(count)})</strong></div>`).join("");
+  }
   function exportPiBatchView(){if(!piData)return;const rows=piData.batches||[];if(!rows.length){toast("No Product Intelligence data to export.","error");return;}const headers=Object.keys(rows[0]);const csv=[headers.join(","),...rows.map(r=>headers.map(h=>`"${String(r[h]??"").replace(/"/g,'""')}"`).join(","))].join("\n");const blob=new Blob(["﻿"+csv],{type:"text/csv;charset=utf-8"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="Product_Intelligence_Batches.csv";a.click();URL.revokeObjectURL(a.href);}
   ["piSearch","piStatusFilter"].forEach(id=>$(id).addEventListener(id==="piSearch"?"input":"change",applyProductFilters));
   $("piSupplierFilter").addEventListener("change",()=>{const q=$("piSupplierFilter").value.toLowerCase();if(q)$("piSearch").value=q;applyProductFilters();});
