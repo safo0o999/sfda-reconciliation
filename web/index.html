@@ -1956,8 +1956,18 @@
   }
 
   function normalizeOutputFile(value, fallbackName){
+    if(typeof value==="string"){
+      return {
+        name:fallbackName||"output_file.csv",
+        content:value,
+        encoding:"text",
+        mime:"text/csv;charset=utf-8"
+      };
+    }
+
     if(!value||typeof value!=="object") return null;
     if(typeof value.content!=="string") return null;
+
     return {
       name:value.file_name||value.name||fallbackName||"output_file",
       content:value.content,
@@ -1973,9 +1983,14 @@
         value.forEach((item,index)=>visit(item,`${key||"file"}_${index+1}`));
         return;
       }
-      if(!value||typeof value!=="object") return;
+
       const file=normalizeOutputFile(value,key);
-      if(file){ files.push(file); return; }
+      if(file){
+        files.push(file);
+        return;
+      }
+
+      if(!value||typeof value!=="object") return;
       Object.entries(value).forEach(([childKey,child])=>visit(child,childKey));
     };
     visit(outputs,"output");
