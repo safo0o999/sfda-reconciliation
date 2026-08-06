@@ -887,11 +887,16 @@ def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
             return error_response("Latest SFDA file is required for Full Accept Reconciliation.")
         sfda_name, sfda_bytes, _ = read_uploaded_bytes(sfda_file)
         sfda_df = read_excel_bytes(sfda_name, sfda_bytes)
-        from engine.database import get_batch_master_df, get_supplier_history_df
+        from engine.database import (
+            get_batch_master_df,
+            get_supplier_history_df,
+            replace_latest_sfda_snapshot,
+        )
         from engine.exporter import Exporter
         from engine.full_reconciliation import FullReconciliationEngine
         batch_master = get_batch_master_df()
         supplier_history = get_supplier_history_df()
+        replace_latest_sfda_snapshot(sfda_df, sfda_name)
         if batch_master.empty:
             return error_response("Historical Batch Master is empty. Complete Step 1 first.", 400)
         result = FullReconciliationEngine(pd.DataFrame(), pd.DataFrame(), sfda_df).run_accept_reconciliation(
@@ -949,10 +954,16 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
         sfda_name, sfda_bytes, _ = read_uploaded_bytes(sfda_file)
         inventory_df = read_excel_bytes(inventory_name, inventory_bytes)
         sfda_df = read_excel_bytes(sfda_name, sfda_bytes)
-        from engine.database import get_customer_history_df
+        from engine.database import (
+            get_customer_history_df,
+            replace_latest_inventory_snapshot,
+            replace_latest_sfda_snapshot,
+        )
         from engine.exporter import Exporter
         from engine.full_reconciliation import FullReconciliationEngine
         customer_history = get_customer_history_df()
+        replace_latest_inventory_snapshot(inventory_df, inventory_name)
+        replace_latest_sfda_snapshot(sfda_df, sfda_name)
         if customer_history.empty:
             return error_response("Customer History is empty. Complete Step 1 first.", 400)
         result = FullReconciliationEngine(pd.DataFrame(), pd.DataFrame(), sfda_df).run_dispatch_reconciliation(
@@ -990,6 +1001,21 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as exc:
         logger.exception("Full Dispatch reconciliation failed")
         return error_response("Full Dispatch Reconciliation failed.", 500, str(exc))
+
+
+@app.route(route="product-intelligence", methods=["GET"])
+def product_intelligence(req: func.HttpRequest) -> func.HttpResponse:
+    """Return the consolidated Product Intelligence knowledge base."""
+    try:
+        from engine.database import get_product_intelligence_sources
+        from engine.product_intelligence import ProductIntelligenceEngine
+
+        sources = get_product_intelligence_sources()
+        result = ProductIntelligenceEngine().build(**sources)
+        return json_response(result)
+    except Exception as exc:
+        logger.exception("Product Intelligence failed")
+        return error_response("Product Intelligence failed.", 500, str(exc))
 
 
 @app.route(
