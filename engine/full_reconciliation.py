@@ -1295,15 +1295,46 @@ class FullReconciliationEngine:
             validate="many_to_one",
         )
 
-        for column in [
+        # Batch Master stores the SFDA values that existed when history was
+        # built. After the merge, those older values keep their original names,
+        # while the values from the newly uploaded SFDA report receive the
+        # `` SFDA`` suffix. Stage 2 must always use the newly uploaded report.
+        latest_sfda_columns = [
             "Quantity",
             "Active",
             "Quantity sent pending",
             "Quantity Receive Pending",
-        ]:
+        ]
+        for column in latest_sfda_columns:
+            uploaded_column = f"{column} SFDA"
+            source = (
+                report[uploaded_column]
+                if uploaded_column in report.columns
+                else report.get(column, 0)
+            )
             report[column] = pd.to_numeric(
-                report.get(column, 0), errors="coerce"
+                source,
+                errors="coerce",
             ).fillna(0)
+
+        # Use the latest SFDA identifiers when an exact batch exists, while
+        # retaining Batch Master identifiers as a fallback for missing batches.
+        for column in ["GTIN", "Drug Name", "Expiry Date"]:
+            uploaded_column = f"{column} SFDA"
+            if uploaded_column not in report.columns:
+                continue
+
+            uploaded_values = report[uploaded_column]
+            if column == "Expiry Date":
+                uploaded_values = Normalizer.date(uploaded_values)
+                existing_values = Normalizer.date(report[column])
+                report[column] = uploaded_values.combine_first(existing_values)
+            else:
+                uploaded_text = uploaded_values.fillna("").astype(str).str.strip()
+                existing_text = report[column].fillna("").astype(str).str.strip()
+                valid_uploaded = ~uploaded_text.str.lower().isin(["", "nan", "none"])
+                report[column] = existing_text
+                report.loc[valid_uploaded, column] = uploaded_text.loc[valid_uploaded]
 
         report["SFDA Quantity"] = report["Quantity"]
         report["SFDA Active"] = report["Active"]
@@ -1361,7 +1392,7 @@ class FullReconciliationEngine:
         ] = 0
 
         logger.info(
-            "Full Accept logic v2026.08.06.2 applied. rows=%s positive_accept_rows=%s",
+            "Full Accept logic v2026.08.06.3 applied. rows=%s positive_accept_rows=%s",
             len(report),
             int(pd.to_numeric(report["To Be Accept"], errors="coerce").fillna(0).gt(0).sum()),
         )
