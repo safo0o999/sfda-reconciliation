@@ -5,7 +5,7 @@ import logging
 import mimetypes
 import uuid
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -881,40 +881,65 @@ def historical_build_worker(
 def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "GET":
         return json_response({"status": "Ready", "required_files": ["sfda"]})
+
+    run_number = build_run_number("FULL-ACCEPT")
+    submitted_by = get_submitted_by(req)
+    run_created = False
     try:
         sfda_file = req.files.get("sfda")
         if sfda_file is None:
             return error_response("Latest SFDA file is required for Full Accept Reconciliation.")
+
         sfda_name, sfda_bytes, _ = read_uploaded_bytes(sfda_file)
         sfda_df = read_excel_bytes(sfda_name, sfda_bytes)
         from engine.database import (
+            complete_reconciliation_run,
+            create_reconciliation_run,
             get_batch_master_df,
             get_supplier_history_df,
             replace_latest_sfda_snapshot,
         )
         from engine.exporter import Exporter
         from engine.full_reconciliation import FullReconciliationEngine
+
+        create_reconciliation_run(
+            run_number=run_number,
+            process_type="FULL_ACCEPT",
+            submitted_by=submitted_by,
+            application_version=APPLICATION_VERSION,
+            asn_files=0,
+            inventory_files=0,
+            dispatch_files=0,
+            sfda_files=1,
+        )
+        run_created = True
+
         batch_master = get_batch_master_df()
         supplier_history = get_supplier_history_df()
         replace_latest_sfda_snapshot(sfda_df, sfda_name)
         if batch_master.empty:
-            return error_response("Historical Batch Master is empty. Complete Step 1 first.", 400)
-        result = FullReconciliationEngine(pd.DataFrame(), pd.DataFrame(), sfda_df).run_accept_reconciliation(
-            sfda_df, batch_master, supplier_history
-        )
+            raise ValueError("Historical Batch Master is empty. Complete Step 1 first.")
+
+        result = FullReconciliationEngine(
+            pd.DataFrame(), pd.DataFrame(), sfda_df
+        ).run_accept_reconciliation(sfda_df, batch_master, supplier_history)
         accept_details = result["accept_details"]
         supplier_variance = result["supplier_variance"]
         accept_upload = result["accept_upload"]
         outputs = {
             "accept_details": Exporter.build_formatted_excel_file(
-                df=accept_details, file_name="Full_Accept_Reconciliation.xlsx",
-                sheet_name="Full Accept", title="One-Time Full Reconciliation - Accept",
+                df=accept_details,
+                file_name="Full_Accept_Reconciliation.xlsx",
+                sheet_name="Full Accept",
+                title="One-Time Full Reconciliation - Accept",
                 columns=list(accept_details.columns),
                 sort_columns=["Generic Item Number", "BN", "Expiry Date"],
             ),
             "supplier_variance": Exporter.build_formatted_excel_file(
-                df=supplier_variance, file_name="Supplier_Variance.xlsx",
-                sheet_name="Supplier Variance", title="Supplier Quantity Variance",
+                df=supplier_variance,
+                file_name="Supplier_Variance.xlsx",
+                sheet_name="Supplier Variance",
+                title="Supplier Quantity Variance",
                 columns=list(supplier_variance.columns),
                 sort_columns=["Supplier Name", "Generic Item Number", "BN"],
             ),
@@ -922,8 +947,25 @@ def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
                 accept_upload, "To Be Accept", "SFDA_Full_Accept"
             ),
         }
+        generated_files = sum(
+            len(group) if isinstance(group, dict) else 0
+            for group in outputs.values()
+        )
+        complete_reconciliation_run(
+            run_number=run_number,
+            status="Completed",
+            total_input_rows=int(len(sfda_df)),
+            master_records=int(len(batch_master)),
+            accept_records=int(len(accept_upload)),
+            dispatch_records=0,
+            exception_records=int(len(supplier_variance)),
+            generated_files=generated_files,
+        )
         return json_response({
-            "status": "Completed", "step": "full-accept", "outputs": outputs,
+            "status": "Completed",
+            "step": "full-accept",
+            "run_number": run_number,
+            "outputs": outputs,
             "summary": {
                 "sfda_rows": int(len(sfda_df)),
                 "accept_rows": int(len(accept_upload)),
@@ -933,9 +975,29 @@ def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
         })
     except ValueError as exc:
         logger.exception("Full Accept validation failed")
+        if run_created:
+            try:
+                from engine.database import complete_reconciliation_run
+                complete_reconciliation_run(
+                    run_number=run_number,
+                    status="Failed",
+                    error_message=str(exc),
+                )
+            except Exception:
+                logger.exception("Unable to mark Full Accept run as failed")
         return error_response("Full Accept Reconciliation validation failed.", 400, str(exc))
     except Exception as exc:
         logger.exception("Full Accept reconciliation failed")
+        if run_created:
+            try:
+                from engine.database import complete_reconciliation_run
+                complete_reconciliation_run(
+                    run_number=run_number,
+                    status="Failed",
+                    error_message=str(exc),
+                )
+            except Exception:
+                logger.exception("Unable to mark Full Accept run as failed")
         return error_response("Full Accept Reconciliation failed.", 500, str(exc))
 
 
@@ -943,6 +1005,10 @@ def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
 def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "GET":
         return json_response({"status": "Ready", "required_files": ["inventory", "sfda"]})
+
+    run_number = build_run_number("FULL-DISPATCH")
+    submitted_by = get_submitted_by(req)
+    run_created = False
     try:
         inventory_file = req.files.get("inventory")
         sfda_file = req.files.get("sfda")
@@ -950,44 +1016,82 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
             return error_response("Current Inventory file is required for Full Dispatch Reconciliation.")
         if sfda_file is None:
             return error_response("Updated SFDA file is required for Full Dispatch Reconciliation.")
+
         inventory_name, inventory_bytes, _ = read_uploaded_bytes(inventory_file)
         sfda_name, sfda_bytes, _ = read_uploaded_bytes(sfda_file)
         inventory_df = read_excel_bytes(inventory_name, inventory_bytes)
         sfda_df = read_excel_bytes(sfda_name, sfda_bytes)
         from engine.database import (
+            complete_reconciliation_run,
+            create_reconciliation_run,
             get_customer_history_df,
             replace_latest_inventory_snapshot,
             replace_latest_sfda_snapshot,
         )
         from engine.exporter import Exporter
         from engine.full_reconciliation import FullReconciliationEngine
+
+        create_reconciliation_run(
+            run_number=run_number,
+            process_type="FULL_DISPATCH",
+            submitted_by=submitted_by,
+            application_version=APPLICATION_VERSION,
+            asn_files=0,
+            inventory_files=1,
+            dispatch_files=0,
+            sfda_files=1,
+        )
+        run_created = True
+
         customer_history = get_customer_history_df()
         replace_latest_inventory_snapshot(inventory_df, inventory_name)
         replace_latest_sfda_snapshot(sfda_df, sfda_name)
         if customer_history.empty:
-            return error_response("Customer History is empty. Complete Step 1 first.", 400)
-        result = FullReconciliationEngine(pd.DataFrame(), pd.DataFrame(), sfda_df).run_dispatch_reconciliation(
-            inventory_df, sfda_df, customer_history
-        )
+            raise ValueError("Customer History is empty. Complete Step 1 first.")
+
+        result = FullReconciliationEngine(
+            pd.DataFrame(), pd.DataFrame(), sfda_df
+        ).run_dispatch_reconciliation(inventory_df, sfda_df, customer_history)
         dispatch_details = result["dispatch_details"]
         summary_df = result["summary"]
         dispatch_upload = result["dispatch_upload"]
         outputs = {
             "dispatch_details": Exporter.build_formatted_excel_file(
-                df=dispatch_details, file_name="Full_Dispatch_Reconciliation.xlsx",
-                sheet_name="Full Dispatch", title="One-Time Full Reconciliation - Dispatch",
+                df=dispatch_details,
+                file_name="Full_Dispatch_Reconciliation.xlsx",
+                sheet_name="Full Dispatch",
+                title="One-Time Full Reconciliation - Dispatch",
                 columns=list(dispatch_details.columns),
                 sort_columns=["To Address", "Generic Item Number", "BN"],
             ),
             "summary": Exporter.build_formatted_excel_file(
-                df=summary_df, file_name="Full_Reconciliation_Summary.xlsx",
-                sheet_name="Summary", title="Full Reconciliation Summary",
+                df=summary_df,
+                file_name="Full_Reconciliation_Summary.xlsx",
+                sheet_name="Summary",
+                title="Full Reconciliation Summary",
                 columns=list(summary_df.columns),
             ),
             "dispatch_files": Exporter.build_dispatch_files_by_customer(dispatch_upload),
         }
+        generated_files = sum(
+            len(group) if isinstance(group, dict) else 0
+            for group in outputs.values()
+        )
+        complete_reconciliation_run(
+            run_number=run_number,
+            status="Completed",
+            total_input_rows=int(len(inventory_df) + len(sfda_df)),
+            master_records=0,
+            accept_records=0,
+            dispatch_records=int(len(dispatch_upload)),
+            exception_records=0,
+            generated_files=generated_files,
+        )
         return json_response({
-            "status": "Completed", "step": "full-dispatch", "outputs": outputs,
+            "status": "Completed",
+            "step": "full-dispatch",
+            "run_number": run_number,
+            "outputs": outputs,
             "summary": {
                 "inventory_rows": int(len(inventory_df)),
                 "sfda_rows": int(len(sfda_df)),
@@ -997,10 +1101,194 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
         })
     except ValueError as exc:
         logger.exception("Full Dispatch validation failed")
+        if run_created:
+            try:
+                from engine.database import complete_reconciliation_run
+                complete_reconciliation_run(
+                    run_number=run_number,
+                    status="Failed",
+                    error_message=str(exc),
+                )
+            except Exception:
+                logger.exception("Unable to mark Full Dispatch run as failed")
         return error_response("Full Dispatch Reconciliation validation failed.", 400, str(exc))
     except Exception as exc:
         logger.exception("Full Dispatch reconciliation failed")
+        if run_created:
+            try:
+                from engine.database import complete_reconciliation_run
+                complete_reconciliation_run(
+                    run_number=run_number,
+                    status="Failed",
+                    error_message=str(exc),
+                )
+            except Exception:
+                logger.exception("Unable to mark Full Dispatch run as failed")
         return error_response("Full Dispatch Reconciliation failed.", 500, str(exc))
+
+
+def _variance_management_result() -> Dict[str, Any]:
+    from engine.database import (
+        get_customer_history_df,
+        get_latest_inventory_snapshot_df,
+        get_latest_sfda_snapshot_df,
+        get_supplier_history_df,
+    )
+    from engine.variance_management import VarianceManagementEngine
+
+    return VarianceManagementEngine().build(
+        supplier_history=get_supplier_history_df(),
+        customer_history=get_customer_history_df(),
+        sfda_snapshot=get_latest_sfda_snapshot_df(),
+        inventory_snapshot=get_latest_inventory_snapshot_df(),
+    )
+
+
+def _build_variance_report(selected_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+    from engine.exporter import Exporter
+    from engine.variance_management import VarianceManagementEngine
+
+    result = _variance_management_result()
+    report = VarianceManagementEngine().report_frame(result, selected_ids)
+    if report.empty:
+        raise ValueError("No SFDA-reportable variance items were selected.")
+
+    saudi_now = datetime.now(timezone.utc).astimezone(
+        timezone(timedelta(hours=3))
+    )
+    file_name = f"SFDA_Discrepancy_Report_{saudi_now.strftime('%Y%m%d_%H%M')}.xlsx"
+    return Exporter.build_formatted_excel_file(
+        df=report,
+        file_name=file_name,
+        sheet_name="SFDA Discrepancies",
+        title="SFDA Receiving Discrepancy Report",
+        columns=list(report.columns),
+        sort_columns=["Severity", "Supplier Name", "BN", "Expiry Date"],
+    )
+
+
+@app.route(route="variance-management", methods=["GET"])
+def variance_management(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        result = _variance_management_result()
+        result["email"] = {
+            "configured": bool(
+                os.getenv("VARIANCE_SMTP_HOST", "").strip()
+                and os.getenv("VARIANCE_EMAIL_FROM", "").strip()
+                and os.getenv("SFDA_VARIANCE_EMAIL", "").strip()
+            ),
+            "default_recipient": os.getenv("SFDA_VARIANCE_EMAIL", "").strip(),
+        }
+        return json_response(result)
+    except Exception as exc:
+        logger.exception("Variance Management failed")
+        return error_response("Variance Management failed.", 500, str(exc))
+
+
+@app.route(route="variance-management/report", methods=["POST"])
+def variance_management_report(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        payload = req.get_json() or {}
+        selected_ids = payload.get("selected_ids") or []
+        output = _build_variance_report(selected_ids)
+        return json_response({
+            "status": "Completed",
+            "application": APPLICATION_NAME,
+            "version": APPLICATION_VERSION,
+            "output": output,
+        })
+    except ValueError as exc:
+        return error_response("Unable to generate SFDA discrepancy report.", 400, str(exc))
+    except Exception as exc:
+        logger.exception("Variance report generation failed")
+        return error_response("Unable to generate SFDA discrepancy report.", 500, str(exc))
+
+
+@app.route(route="variance-management/email", methods=["POST"])
+def variance_management_email(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        import smtplib
+        from email.message import EmailMessage
+        from email.utils import parseaddr
+
+        payload = req.get_json() or {}
+        selected_ids = payload.get("selected_ids") or []
+        recipient = str(
+            payload.get("recipient")
+            or os.getenv("SFDA_VARIANCE_EMAIL", "")
+        ).strip()
+        subject = str(
+            payload.get("subject")
+            or "SFDA Receiving Discrepancy Report"
+        ).strip()
+        body = str(
+            payload.get("message")
+            or (
+                "Dear SFDA Team,\n\n"
+                "Please find attached the latest receiving discrepancy report "
+                "showing missing batch registrations and quantity differences "
+                "between WMS receipts and the latest SFDA report.\n\n"
+                "Regards,\nDrug Traceability Reconciliation Platform"
+            )
+        )
+
+        host = os.getenv("VARIANCE_SMTP_HOST", "").strip()
+        port = int(os.getenv("VARIANCE_SMTP_PORT", "587") or 587)
+        username = os.getenv("VARIANCE_SMTP_USERNAME", "").strip()
+        password = os.getenv("VARIANCE_SMTP_PASSWORD", "")
+        sender = os.getenv("VARIANCE_EMAIL_FROM", "").strip()
+        use_ssl = os.getenv("VARIANCE_SMTP_SSL", "false").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        use_tls = os.getenv("VARIANCE_SMTP_STARTTLS", "true").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+
+        if not host or not sender or not recipient:
+            raise RuntimeError(
+                "Email is not configured. Set VARIANCE_SMTP_HOST, "
+                "VARIANCE_EMAIL_FROM, and SFDA_VARIANCE_EMAIL in Azure Function "
+                "App environment variables."
+            )
+        if not parseaddr(recipient)[1] or "@" not in parseaddr(recipient)[1]:
+            raise ValueError("A valid SFDA recipient email address is required.")
+
+        output = _build_variance_report(selected_ids)
+        file_name, file_value = next(iter(output.items()))
+        file_bytes, content_type, _ = decode_generated_file(file_name, file_value)
+
+        message = EmailMessage()
+        message["From"] = sender
+        message["To"] = recipient
+        message["Subject"] = subject
+        message.set_content(body)
+        maintype, subtype = (content_type.split("/", 1) + ["octet-stream"])[:2]
+        message.add_attachment(
+            file_bytes,
+            maintype=maintype,
+            subtype=subtype,
+            filename=file_name,
+        )
+
+        smtp_class = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
+        with smtp_class(host, port, timeout=30) as server:
+            if not use_ssl and use_tls:
+                server.starttls()
+            if username:
+                server.login(username, password)
+            server.send_message(message)
+
+        return json_response({
+            "status": "Completed",
+            "message": "SFDA discrepancy report email sent successfully.",
+            "recipient": recipient,
+            "file_name": file_name,
+        })
+    except ValueError as exc:
+        return error_response("Unable to send SFDA discrepancy report.", 400, str(exc))
+    except Exception as exc:
+        logger.exception("Variance email failed")
+        return error_response("Unable to send SFDA discrepancy report.", 500, str(exc))
 
 
 @app.route(route="product-intelligence", methods=["GET"])
