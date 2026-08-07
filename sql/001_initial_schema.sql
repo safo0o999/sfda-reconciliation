@@ -250,6 +250,118 @@ BEGIN TRY
         );
     END;
 
+
+
+    /* ================================================================
+       Latest Product Intelligence snapshots
+       ================================================================ */
+    IF OBJECT_ID(N'dbo.LatestInventorySnapshot', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.LatestInventorySnapshot
+        (
+            Id bigint IDENTITY(1,1) NOT NULL PRIMARY KEY,
+            BN nvarchar(255) NULL,
+            ExpiryMonthKey nvarchar(20) NULL,
+            ExpiryDate date NULL,
+            GenericItemNumber nvarchar(255) NULL,
+            TradeName nvarchar(500) NULL,
+            AvailableQuantity decimal(20,4) NOT NULL DEFAULT (0),
+            SourceFileName nvarchar(500) NULL,
+            SnapshotUtc datetime2(0) NOT NULL DEFAULT (SYSUTCDATETIME())
+        );
+    END;
+
+    IF COL_LENGTH(N'dbo.LatestInventorySnapshot', N'SourceFileName') IS NULL
+        ALTER TABLE dbo.LatestInventorySnapshot ADD SourceFileName nvarchar(500) NULL;
+    IF COL_LENGTH(N'dbo.LatestInventorySnapshot', N'SnapshotUtc') IS NULL
+        ALTER TABLE dbo.LatestInventorySnapshot ADD SnapshotUtc datetime2(0) NOT NULL
+            CONSTRAINT DF_LatestInventorySnapshot_SnapshotUtc_Upgrade DEFAULT (SYSUTCDATETIME()) WITH VALUES;
+
+    IF OBJECT_ID(N'dbo.LatestSFDASnapshot', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.LatestSFDASnapshot
+        (
+            Id bigint IDENTITY(1,1) NOT NULL PRIMARY KEY,
+            GTIN nvarchar(255) NULL,
+            DrugName nvarchar(500) NULL,
+            BN nvarchar(255) NULL,
+            ExpiryMonthKey nvarchar(20) NULL,
+            ExpiryDate date NULL,
+            Quantity decimal(20,4) NOT NULL DEFAULT (0),
+            Active decimal(20,4) NOT NULL DEFAULT (0),
+            QuantitySentPending decimal(20,4) NOT NULL DEFAULT (0),
+            QuantityReceivePending decimal(20,4) NOT NULL DEFAULT (0),
+            SourceFileName nvarchar(500) NULL,
+            SnapshotUtc datetime2(0) NOT NULL DEFAULT (SYSUTCDATETIME())
+        );
+    END;
+
+    IF COL_LENGTH(N'dbo.LatestSFDASnapshot', N'SourceFileName') IS NULL
+        ALTER TABLE dbo.LatestSFDASnapshot ADD SourceFileName nvarchar(500) NULL;
+    IF COL_LENGTH(N'dbo.LatestSFDASnapshot', N'SnapshotUtc') IS NULL
+        ALTER TABLE dbo.LatestSFDASnapshot ADD SnapshotUtc datetime2(0) NOT NULL
+            CONSTRAINT DF_LatestSFDASnapshot_SnapshotUtc_Upgrade DEFAULT (SYSUTCDATETIME()) WITH VALUES;
+
+    /* ================================================================
+       ReconciliationRuns and ReconciliationRunFiles
+       Daily Upload & Run audit trail and downloadable-file registry.
+       ================================================================ */
+    IF OBJECT_ID(N'dbo.ReconciliationRuns', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.ReconciliationRuns
+        (
+            RunID bigint IDENTITY(1,1) NOT NULL PRIMARY KEY,
+            RunNumber nvarchar(100) NOT NULL,
+            ProcessType nvarchar(30) NOT NULL,
+            Status nvarchar(50) NOT NULL,
+            StartedAt datetime2(3) NOT NULL DEFAULT (SYSUTCDATETIME()),
+            CompletedAt datetime2(3) NULL,
+            SubmittedBy nvarchar(250) NULL,
+            ASNFiles int NOT NULL DEFAULT (0),
+            InventoryFiles int NOT NULL DEFAULT (0),
+            DispatchFiles int NOT NULL DEFAULT (0),
+            SFDAFiles int NOT NULL DEFAULT (0),
+            TotalInputRows bigint NOT NULL DEFAULT (0),
+            MasterRecords bigint NOT NULL DEFAULT (0),
+            AcceptRecords bigint NOT NULL DEFAULT (0),
+            DispatchRecords bigint NOT NULL DEFAULT (0),
+            ExceptionRecords bigint NOT NULL DEFAULT (0),
+            GeneratedFiles int NOT NULL DEFAULT (0),
+            ApplicationVersion nvarchar(50) NULL,
+            ErrorMessage nvarchar(max) NULL,
+            CONSTRAINT UQ_ReconciliationRuns_RunNumber UNIQUE (RunNumber)
+        );
+    END;
+
+    IF OBJECT_ID(N'dbo.ReconciliationRunFiles', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.ReconciliationRunFiles
+        (
+            RunFileID bigint IDENTITY(1,1) NOT NULL PRIMARY KEY,
+            RunNumber nvarchar(100) NOT NULL,
+            FileCategory nvarchar(30) NOT NULL,
+            FileName nvarchar(500) NOT NULL,
+            FileType nvarchar(30) NULL,
+            ContainerName nvarchar(150) NULL,
+            BlobName nvarchar(1000) NULL,
+            ContentType nvarchar(250) NULL,
+            SizeBytes bigint NOT NULL DEFAULT (0),
+            ETag nvarchar(250) NULL,
+            CreatedAt datetime2(3) NOT NULL DEFAULT (SYSUTCDATETIME())
+        );
+    END;
+
+    IF OBJECT_ID(N'dbo.DailyProcessedTransactions', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.DailyProcessedTransactions
+        (
+            TransactionKey varchar(64) NOT NULL PRIMARY KEY,
+            ProcessType nvarchar(30) NOT NULL,
+            PayloadJson nvarchar(max) NOT NULL,
+            CreatedAt datetime2(3) NOT NULL DEFAULT (SYSUTCDATETIME())
+        );
+    END;
+
     /* ================================================================
        Performance indexes
        ================================================================ */
