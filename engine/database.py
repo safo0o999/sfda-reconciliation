@@ -2144,6 +2144,21 @@ def confirm_accept_transactions_from_sfda(
                 "confirmed_batches": 0,
             }
 
+        # SQL DATE values are returned by pyodbc/pandas as Python date/object
+        # values, while the freshly normalized SFDA file uses datetime64[ns].
+        # Normalize both sides to the exact same merge-key types before
+        # comparing the previous SFDA baseline with the newly uploaded report.
+        previous["BN"] = previous["BN"].fillna("").astype(str).str.strip()
+        current["BN"] = current["BN"].fillna("").astype(str).str.strip()
+        previous["Expiry Date"] = pd.to_datetime(
+            previous["Expiry Date"],
+            errors="coerce",
+        ).dt.normalize()
+        current["Expiry Date"] = pd.to_datetime(
+            current["Expiry Date"],
+            errors="coerce",
+        ).dt.normalize()
+
         comparison = previous.merge(
             current,
             on=["BN", "Expiry Date"],
