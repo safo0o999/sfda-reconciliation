@@ -520,6 +520,72 @@ BEGIN TRY
             CONSTRAINT DF_DailyProcessedTransactions_CreatedAt_Upgrade DEFAULT (SYSUTCDATETIME()) WITH VALUES;
 
     /* ================================================================
+       Daily Accept confirmation state
+       ================================================================ */
+    IF OBJECT_ID(N'dbo.DailyAcceptTransactions', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.DailyAcceptTransactions
+        (
+            TransactionKey varchar(64) NOT NULL
+                CONSTRAINT PK_DailyAcceptTransactions PRIMARY KEY,
+            BN nvarchar(255) NOT NULL,
+            ExpiryDate date NOT NULL,
+            GenericItemNumber nvarchar(255) NULL,
+            ReferenceNumber nvarchar(255) NULL,
+            ReferenceLine nvarchar(255) NULL,
+            SubmittedQuantityEach decimal(18,4) NOT NULL
+                CONSTRAINT DF_DailyAcceptTransactions_SubmittedEach DEFAULT (0),
+            SubmittedQuantityPack decimal(18,4) NOT NULL
+                CONSTRAINT DF_DailyAcceptTransactions_SubmittedPack DEFAULT (0),
+            ConfirmedQuantityEach decimal(18,4) NOT NULL
+                CONSTRAINT DF_DailyAcceptTransactions_ConfirmedEach DEFAULT (0),
+            ConfirmedQuantityPack decimal(18,4) NOT NULL
+                CONSTRAINT DF_DailyAcceptTransactions_ConfirmedPack DEFAULT (0),
+            FirstSubmittedRun nvarchar(80) NULL,
+            LastSubmittedRun nvarchar(80) NULL,
+            CreatedAt datetime2(3) NOT NULL
+                CONSTRAINT DF_DailyAcceptTransactions_CreatedAt DEFAULT (SYSUTCDATETIME()),
+            UpdatedAt datetime2(3) NOT NULL
+                CONSTRAINT DF_DailyAcceptTransactions_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+            LastConfirmedAt datetime2(3) NULL
+        );
+    END;
+
+    IF OBJECT_ID(N'dbo.DailyAcceptSFDABaseline', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.DailyAcceptSFDABaseline
+        (
+            BN nvarchar(255) NOT NULL,
+            ExpiryDate date NOT NULL,
+            GTIN nvarchar(255) NULL,
+            Active decimal(18,4) NOT NULL
+                CONSTRAINT DF_DailyAcceptSFDABaseline_Active DEFAULT (0),
+            QuantityReceivePending decimal(18,4) NOT NULL
+                CONSTRAINT DF_DailyAcceptSFDABaseline_Pending DEFAULT (0),
+            SourceFileName nvarchar(500) NULL,
+            SnapshotUtc datetime2(3) NOT NULL
+                CONSTRAINT DF_DailyAcceptSFDABaseline_SnapshotUtc DEFAULT (SYSUTCDATETIME()),
+            CONSTRAINT PK_DailyAcceptSFDABaseline PRIMARY KEY (BN, ExpiryDate)
+        );
+    END;
+
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM sys.indexes
+        WHERE object_id = OBJECT_ID(N'dbo.DailyAcceptTransactions')
+          AND name = N'IX_DailyAcceptTransactions_BatchPending'
+    )
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_DailyAcceptTransactions_BatchPending
+        ON dbo.DailyAcceptTransactions (BN, ExpiryDate, CreatedAt)
+        INCLUDE
+        (
+            SubmittedQuantityEach, ConfirmedQuantityEach,
+            SubmittedQuantityPack, ConfirmedQuantityPack, LastConfirmedAt
+        );
+    END;
+
+    /* ================================================================
        Performance indexes
        ================================================================ */
     IF NOT EXISTS
