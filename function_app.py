@@ -1351,12 +1351,40 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
         batch_master = optional_batch_master()
 
         processed_transactions = pd.DataFrame()
+        accept_confirmation = {
+            "baseline_available": False,
+            "confirmed_packs": 0.0,
+            "confirmed_each": 0.0,
+            "confirmed_transactions": 0,
+            "confirmed_batches": 0,
+        }
         try:
-            from engine.database import get_daily_processed_transactions
+            if mode == "accept":
+                from engine.database import (
+                    confirm_accept_transactions_from_sfda,
+                    get_accept_confirmed_transactions,
+                )
 
-            processed_transactions = get_daily_processed_transactions(mode.upper())
+                # A generated Accept file is NOT proof of processing.
+                # Only the newly uploaded SFDA report may confirm prior pending
+                # quantities by showing a matching pending decrease and Active
+                # increase. Legacy DailyProcessedTransactions rows are
+                # intentionally ignored for Accept because older failed runs
+                # could have written them before the workflow completed.
+                accept_confirmation = confirm_accept_transactions_from_sfda(
+                    sfda_df,
+                    sfda_name,
+                )
+                processed_transactions = get_accept_confirmed_transactions()
+            else:
+                from engine.database import get_daily_processed_transactions
+                processed_transactions = get_daily_processed_transactions(
+                    mode.upper()
+                )
         except Exception as exc:
             logger.warning("Daily processed transaction read skipped: %s", exc)
+            if mode == "accept":
+                raise
 
         result = ReconciliationEngine(
             mode=mode,
@@ -1398,25 +1426,11 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             )
             outputs["accept_files"] = {}
 
-        historical_update = refresh_historical_data_after_daily_run(
-            mode=mode,
-            asn_df=asn_df,
-            dispatch_df=dispatch_df,
-            sfda_df=sfda_df,
-            asn_file_name=asn_name,
-            dispatch_file_name=dispatch_name,
-            sfda_file_name=sfda_name,
-        )
-
-        processed_rows = result.get("processed_transactions", pd.DataFrame())
+        # Persistent history and confirmation state are deliberately deferred
+        # until after the files have been generated and archived successfully.
+        historical_update: Dict[str, Any] = {}
         saved_transactions = 0
-        if processed_rows is not None and not processed_rows.empty:
-            from engine.database import save_daily_processed_transactions
-
-            saved_transactions = save_daily_processed_transactions(
-                mode.upper(),
-                processed_rows.to_dict(orient="records"),
-            )
+        pending_confirmation_saved = 0
 
         accept_rows = count_positive_rows(accept, "To Be Accept")
         dispatch_rows = count_positive_rows(
@@ -1430,9 +1444,8 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
         total_input_rows = int(len(sfda_df) + len(asn_df) + len(dispatch_df))
 
         summary = {
-            "batch_master_available": historical_update["batch_master_rows"] > 0,
-            "batch_master_rows": historical_update["batch_master_rows"],
-            "historical_update": historical_update,
+            "batch_master_available": not batch_master.empty,
+            "batch_master_rows": int(len(batch_master)),
             "reconciliation_rows": len(report),
             "total_input_rows": total_input_rows,
             "accept_rows": accept_rows,
@@ -1440,7 +1453,8 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             "accept_files": len(outputs.get("accept_files", {})),
             "dispatch_files": len(outputs.get("dispatch_files", {})),
             "generated_files": generated_output_files,
-            "processed_transactions_saved": saved_transactions,
+            "processed_transactions_saved": 0,
+            "accept_confirmation": accept_confirmation if mode == "accept" else {},
         }
 
         archived_files = save_run_archive(
@@ -1450,6 +1464,61 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             outputs=outputs,
             summary=summary,
             submitted_by=submitted_by,
+        )
+
+        # Only after successful file generation + archive do we mutate the
+        # cumulative WMS history or create new pending-confirmation state.
+        historical_update = refresh_historical_data_after_daily_run(
+            mode=mode,
+            asn_df=asn_df,
+            dispatch_df=dispatch_df,
+            sfda_df=sfda_df,
+            asn_file_name=asn_name,
+            dispatch_file_name=dispatch_name,
+            sfda_file_name=sfda_name,
+        )
+
+        if mode == "accept":
+            from engine.database import (
+                replace_accept_sfda_baseline,
+                save_accept_pending_transactions,
+            )
+
+            pending_rows = result.get(
+                "pending_confirmation_transactions",
+                pd.DataFrame(),
+            )
+            if pending_rows is not None and not pending_rows.empty:
+                pending_confirmation_saved = save_accept_pending_transactions(
+                    pending_rows.to_dict(orient="records"),
+                    run_number,
+                )
+
+            # On the first run there is no proof baseline yet. Store the current
+            # SFDA report only after this Accept run has successfully reached
+            # the persistence stage. On later runs this is idempotent because
+            # confirmation already advanced the baseline before reconciliation.
+            replace_accept_sfda_baseline(sfda_df, sfda_name)
+        else:
+            processed_rows = result.get(
+                "processed_transactions",
+                pd.DataFrame(),
+            )
+            if processed_rows is not None and not processed_rows.empty:
+                from engine.database import save_daily_processed_transactions
+                saved_transactions = save_daily_processed_transactions(
+                    mode.upper(),
+                    processed_rows.to_dict(orient="records"),
+                )
+
+        summary.update(
+            {
+                "batch_master_available": historical_update["batch_master_rows"] > 0,
+                "batch_master_rows": historical_update["batch_master_rows"],
+                "historical_update": historical_update,
+                "processed_transactions_saved": saved_transactions,
+                "pending_confirmation_transactions_saved": pending_confirmation_saved,
+            }
         )
 
         from engine.database import complete_reconciliation_run
