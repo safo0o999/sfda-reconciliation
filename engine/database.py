@@ -1490,3 +1490,253 @@ def get_product_intelligence_sources() -> Dict[str, pd.DataFrame]:
         "inventory_snapshot": get_latest_inventory_snapshot_df(),
         "sfda_snapshot": get_latest_sfda_snapshot_df(),
     }
+
+# ================================================================
+# Daily Upload & Run audit/history compatibility
+# ================================================================
+
+def create_reconciliation_run(
+    run_number: str,
+    process_type: str,
+    submitted_by: str,
+    application_version: str,
+    asn_files: int = 0,
+    inventory_files: int = 0,
+    dispatch_files: int = 0,
+    sfda_files: int = 0,
+) -> None:
+    initialize_database()
+    sql = r"""
+        INSERT INTO dbo.ReconciliationRuns
+        (
+            RunNumber, ProcessType, Status, StartedAt, SubmittedBy,
+            ASNFiles, InventoryFiles, DispatchFiles, SFDAFiles,
+            ApplicationVersion
+        )
+        VALUES (?, ?, 'Running', SYSUTCDATETIME(), ?, ?, ?, ?, ?, ?);
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                sql,
+                (
+                    str(run_number), str(process_type).upper(), str(submitted_by),
+                    int(asn_files), int(inventory_files), int(dispatch_files),
+                    int(sfda_files), str(application_version),
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def complete_reconciliation_run(
+    run_number: str,
+    status: str,
+    total_input_rows: int = 0,
+    master_records: int = 0,
+    accept_records: int = 0,
+    dispatch_records: int = 0,
+    exception_records: int = 0,
+    generated_files: int = 0,
+    error_message: str = "",
+) -> None:
+    initialize_database()
+    sql = r"""
+        UPDATE dbo.ReconciliationRuns
+        SET Status = ?,
+            CompletedAt = SYSUTCDATETIME(),
+            TotalInputRows = ?,
+            MasterRecords = ?,
+            AcceptRecords = ?,
+            DispatchRecords = ?,
+            ExceptionRecords = ?,
+            GeneratedFiles = ?,
+            ErrorMessage = ?
+        WHERE RunNumber = ?;
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                sql,
+                (
+                    str(status), int(total_input_rows or 0), int(master_records or 0),
+                    int(accept_records or 0), int(dispatch_records or 0),
+                    int(exception_records or 0), int(generated_files or 0),
+                    str(error_message or "") or None, str(run_number),
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def save_reconciliation_run_file(
+    run_number: str,
+    file_category: str,
+    file_name: str,
+    file_type: str,
+    container_name: str,
+    blob_name: str,
+    content_type: str,
+    size_bytes: int,
+    etag: str = "",
+) -> None:
+    initialize_database()
+    sql = r"""
+        INSERT INTO dbo.ReconciliationRunFiles
+        (
+            RunNumber, FileCategory, FileName, FileType, ContainerName,
+            BlobName, ContentType, SizeBytes, ETag
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                sql,
+                (
+                    str(run_number), str(file_category), str(file_name), str(file_type),
+                    str(container_name), str(blob_name), str(content_type),
+                    int(size_bytes or 0), str(etag or ""),
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def list_reconciliation_runs(limit: int = 500) -> List[Dict[str, Any]]:
+    initialize_database()
+    safe_limit = max(1, min(int(limit), 5000))
+    sql = f"""
+        SELECT TOP ({safe_limit})
+            RunID, RunNumber, ProcessType, Status, StartedAt, CompletedAt,
+            SubmittedBy, ASNFiles, InventoryFiles, DispatchFiles, SFDAFiles,
+            TotalInputRows, MasterRecords, AcceptRecords, DispatchRecords,
+            ExceptionRecords, GeneratedFiles, ApplicationVersion, ErrorMessage
+        FROM dbo.ReconciliationRuns
+        ORDER BY StartedAt DESC, RunID DESC;
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        rows = cursor.execute(sql).fetchall()
+        names = [column[0] for column in cursor.description]
+    return [dict(zip(names, row)) for row in rows]
+
+
+def get_reconciliation_run(run_number: str) -> Optional[Dict[str, Any]]:
+    initialize_database()
+    sql = r"""
+        SELECT TOP (1)
+            RunID, RunNumber, ProcessType, Status, StartedAt, CompletedAt,
+            SubmittedBy, ASNFiles, InventoryFiles, DispatchFiles, SFDAFiles,
+            TotalInputRows, MasterRecords, AcceptRecords, DispatchRecords,
+            ExceptionRecords, GeneratedFiles, ApplicationVersion, ErrorMessage
+        FROM dbo.ReconciliationRuns
+        WHERE RunNumber = ?
+        ORDER BY RunID DESC;
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        row = cursor.execute(sql, (str(run_number),)).fetchone()
+        if row is None:
+            return None
+        names = [column[0] for column in cursor.description]
+    return dict(zip(names, row))
+
+
+def list_reconciliation_run_files(run_number: str) -> List[Dict[str, Any]]:
+    initialize_database()
+    sql = r"""
+        SELECT RunFileID, RunNumber, FileCategory, FileName, FileType,
+               ContainerName, BlobName, ContentType, SizeBytes, ETag, CreatedAt
+        FROM dbo.ReconciliationRunFiles
+        WHERE RunNumber = ?
+        ORDER BY CreatedAt, RunFileID;
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        rows = cursor.execute(sql, (str(run_number),)).fetchall()
+        names = [column[0] for column in cursor.description]
+    return [dict(zip(names, row)) for row in rows]
+
+
+def _daily_transaction_key(process_type: str, row: Dict[str, Any]) -> str:
+    import hashlib
+    preferred = [
+        "Transaction Key", "Event Key", "Inbound Shipment", "ASN Line",
+        "Sales Order Number", "Order Line", "BN", "Expiry Month Key",
+        "Generic Item Number", "Received Date", "Dispatch Date",
+        "Received Quantity", "Dispatched Quantity",
+    ]
+    parts = [str(process_type).upper()]
+    for name in preferred:
+        value = _value(row, name, "")
+        parts.append(str(value or "").strip().upper())
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def save_daily_processed_transactions(
+    process_type: str,
+    rows: List[Dict[str, Any]],
+) -> int:
+    initialize_database()
+    prepared = []
+    seen = set()
+    for row in rows or []:
+        key = _daily_transaction_key(process_type, row)
+        if key in seen:
+            continue
+        seen.add(key)
+        prepared.append((key, str(process_type).upper(), json.dumps(row, ensure_ascii=False, default=str)))
+
+    sql = r"""
+        INSERT INTO dbo.DailyProcessedTransactions
+            (TransactionKey, ProcessType, PayloadJson)
+        SELECT ?, ?, ?
+        WHERE NOT EXISTS
+        (
+            SELECT 1 FROM dbo.DailyProcessedTransactions WITH (UPDLOCK, HOLDLOCK)
+            WHERE TransactionKey = ?
+        );
+    """
+    inserted = 0
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            for key, ptype, payload in prepared:
+                cursor.execute(sql, (key, ptype, payload, key))
+                inserted += max(0, int(cursor.rowcount or 0))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return inserted
+
+
+def get_daily_processed_transactions(process_type: str) -> pd.DataFrame:
+    initialize_database()
+    sql = r"""
+        SELECT PayloadJson
+        FROM dbo.DailyProcessedTransactions
+        WHERE ProcessType = ?
+        ORDER BY CreatedAt;
+    """
+    with Database().connect() as connection:
+        rows = connection.cursor().execute(sql, (str(process_type).upper(),)).fetchall()
+    records: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            value = json.loads(row[0]) if row[0] else {}
+            if isinstance(value, dict):
+                records.append(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return pd.DataFrame(records)
