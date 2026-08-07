@@ -1195,6 +1195,80 @@ def full_reconciliation_run(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
+
+def refresh_historical_data_after_daily_run(
+    mode: str,
+    asn_df: pd.DataFrame,
+    dispatch_df: pd.DataFrame,
+    sfda_df: pd.DataFrame,
+    asn_file_name: str = "",
+    dispatch_file_name: str = "",
+    sfda_file_name: str = "",
+) -> Dict[str, Any]:
+    """Append successful daily movements and rebuild cumulative history.
+
+    ReceiptEvents and DispatchEvents remain the permanent source of truth.
+    EventKey de-duplication prevents the same daily file from increasing the
+    historical quantities twice. Batch Master and both history tables are
+    rebuilt from the cumulative events after each successful daily run.
+    """
+    from engine.database import (
+        append_events,
+        get_event_summaries,
+        get_history_summaries,
+        replace_batch_master,
+        replace_customer_history,
+        replace_latest_sfda_snapshot,
+        replace_supplier_history,
+    )
+    from engine.full_reconciliation import FullReconciliationEngine
+
+    history_engine = FullReconciliationEngine(
+        asn_df if mode == "accept" else pd.DataFrame(),
+        dispatch_df if mode == "dispatch" else pd.DataFrame(),
+        sfda_df,
+    )
+    prepared = history_engine.prepare_incremental()
+    inserted = append_events(
+        prepared["receipt_records"],
+        prepared["dispatch_records"],
+    )
+
+    receipt_summary, dispatch_summary = get_event_summaries()
+    master = history_engine.build_master_from_summaries(
+        receipt_summary,
+        dispatch_summary,
+        prepared["sfda_summary"],
+    )
+    replace_batch_master(master)
+
+    supplier_summary, customer_summary = get_history_summaries()
+    supplier_history = history_engine.build_supplier_history(
+        supplier_summary,
+        master,
+    )
+    customer_history = history_engine.build_customer_history(
+        customer_summary,
+        master,
+    )
+    replace_supplier_history(supplier_history)
+    replace_customer_history(customer_history)
+
+    sfda_snapshot_rows = replace_latest_sfda_snapshot(
+        sfda_df,
+        sfda_file_name,
+    )
+
+    return {
+        "receipt_events_added": int(inserted.get("receipt_events", 0)),
+        "dispatch_events_added": int(inserted.get("dispatch_events", 0)),
+        "batch_master_rows": int(len(master)),
+        "supplier_history_rows": int(len(supplier_history)),
+        "customer_history_rows": int(len(customer_history)),
+        "sfda_snapshot_rows": int(sfda_snapshot_rows),
+        "source_file": asn_file_name if mode == "accept" else dispatch_file_name,
+    }
+
 def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
     run_number = build_run_number(mode)
     submitted_by = get_submitted_by(req)
@@ -1223,6 +1297,8 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
 
         asn_file_count = 0
         dispatch_file_count = 0
+        asn_name = ""
+        dispatch_name = ""
 
         if mode == "accept":
             asn_file = req.files.get("asn")
@@ -1322,6 +1398,16 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             )
             outputs["accept_files"] = {}
 
+        historical_update = refresh_historical_data_after_daily_run(
+            mode=mode,
+            asn_df=asn_df,
+            dispatch_df=dispatch_df,
+            sfda_df=sfda_df,
+            asn_file_name=asn_name,
+            dispatch_file_name=dispatch_name,
+            sfda_file_name=sfda_name,
+        )
+
         processed_rows = result.get("processed_transactions", pd.DataFrame())
         saved_transactions = 0
         if processed_rows is not None and not processed_rows.empty:
@@ -1344,8 +1430,9 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
         total_input_rows = int(len(sfda_df) + len(asn_df) + len(dispatch_df))
 
         summary = {
-            "batch_master_available": not batch_master.empty,
-            "batch_master_rows": len(batch_master),
+            "batch_master_available": historical_update["batch_master_rows"] > 0,
+            "batch_master_rows": historical_update["batch_master_rows"],
+            "historical_update": historical_update,
             "reconciliation_rows": len(report),
             "total_input_rows": total_input_rows,
             "accept_rows": accept_rows,
@@ -1371,7 +1458,7 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             run_number=run_number,
             status="Completed",
             total_input_rows=total_input_rows,
-            master_records=len(batch_master),
+            master_records=historical_update["batch_master_rows"],
             accept_records=accept_rows,
             dispatch_records=dispatch_rows,
             exception_records=0,
