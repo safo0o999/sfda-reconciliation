@@ -1683,54 +1683,173 @@ def _daily_transaction_key(process_type: str, row: Dict[str, Any]) -> str:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
+def _daily_processed_transaction_columns(
+    connection: pyodbc.Connection,
+) -> Set[str]:
+    """Return the physical columns available on the daily de-duplication table.
+
+    Older deployments used ``TransactionType`` while Version 5 uses
+    ``ProcessType``.  Production databases can therefore contain either name
+    or both names after an in-place schema upgrade.
+    """
+    rows = connection.cursor().execute(
+        r"""
+        SELECT c.name
+        FROM sys.columns AS c
+        WHERE c.object_id = OBJECT_ID(N'dbo.DailyProcessedTransactions');
+        """
+    ).fetchall()
+    return {str(row[0]) for row in rows}
+
+
 def save_daily_processed_transactions(
     process_type: str,
     rows: List[Dict[str, Any]],
 ) -> int:
+    """Persist daily transaction identities without breaking legacy schemas.
+
+    The same process value is written to both ``ProcessType`` and the legacy
+    ``TransactionType`` column whenever both exist.  This is required because
+    some existing Azure SQL databases still enforce ``TransactionType`` as
+    NOT NULL.
+    """
     initialize_database()
     prepared = []
     seen = set()
+    normalized_process_type = str(process_type).upper()
+
     for row in rows or []:
-        key = _daily_transaction_key(process_type, row)
+        key = _daily_transaction_key(normalized_process_type, row)
         if key in seen:
             continue
         seen.add(key)
-        prepared.append((key, str(process_type).upper(), json.dumps(row, ensure_ascii=False, default=str)))
+        prepared.append(
+            (
+                key,
+                normalized_process_type,
+                json.dumps(row, ensure_ascii=False, default=str),
+            )
+        )
 
-    sql = r"""
-        INSERT INTO dbo.DailyProcessedTransactions
-            (TransactionKey, ProcessType, PayloadJson)
-        SELECT ?, ?, ?
-        WHERE NOT EXISTS
-        (
-            SELECT 1 FROM dbo.DailyProcessedTransactions WITH (UPDLOCK, HOLDLOCK)
-            WHERE TransactionKey = ?
-        );
-    """
+    if not prepared:
+        return 0
+
     inserted = 0
     with Database().connect() as connection:
         cursor = connection.cursor()
+        columns = _daily_processed_transaction_columns(connection)
+
+        has_process_type = "ProcessType" in columns
+        has_transaction_type = "TransactionType" in columns
+
+        if not has_process_type and not has_transaction_type:
+            raise RuntimeError(
+                "DailyProcessedTransactions is missing both ProcessType and "
+                "TransactionType columns."
+            )
+
+        if has_process_type and has_transaction_type:
+            sql = r"""
+                INSERT INTO dbo.DailyProcessedTransactions
+                    (TransactionKey, ProcessType, TransactionType, PayloadJson)
+                SELECT ?, ?, ?, ?
+                WHERE NOT EXISTS
+                (
+                    SELECT 1
+                    FROM dbo.DailyProcessedTransactions WITH (UPDLOCK, HOLDLOCK)
+                    WHERE TransactionKey = ?
+                );
+            """
+        elif has_process_type:
+            sql = r"""
+                INSERT INTO dbo.DailyProcessedTransactions
+                    (TransactionKey, ProcessType, PayloadJson)
+                SELECT ?, ?, ?
+                WHERE NOT EXISTS
+                (
+                    SELECT 1
+                    FROM dbo.DailyProcessedTransactions WITH (UPDLOCK, HOLDLOCK)
+                    WHERE TransactionKey = ?
+                );
+            """
+        else:
+            sql = r"""
+                INSERT INTO dbo.DailyProcessedTransactions
+                    (TransactionKey, TransactionType, PayloadJson)
+                SELECT ?, ?, ?
+                WHERE NOT EXISTS
+                (
+                    SELECT 1
+                    FROM dbo.DailyProcessedTransactions WITH (UPDLOCK, HOLDLOCK)
+                    WHERE TransactionKey = ?
+                );
+            """
+
         try:
             for key, ptype, payload in prepared:
-                cursor.execute(sql, (key, ptype, payload, key))
+                if has_process_type and has_transaction_type:
+                    parameters = (key, ptype, ptype, payload, key)
+                else:
+                    parameters = (key, ptype, payload, key)
+
+                cursor.execute(sql, parameters)
                 inserted += max(0, int(cursor.rowcount or 0))
+
             connection.commit()
         except Exception:
             connection.rollback()
             raise
+
     return inserted
 
 
 def get_daily_processed_transactions(process_type: str) -> pd.DataFrame:
+    """Read processed daily rows from Version 5 or legacy database schemas."""
     initialize_database()
-    sql = r"""
-        SELECT PayloadJson
-        FROM dbo.DailyProcessedTransactions
-        WHERE ProcessType = ?
-        ORDER BY CreatedAt;
-    """
+    normalized_process_type = str(process_type).upper()
+
     with Database().connect() as connection:
-        rows = connection.cursor().execute(sql, (str(process_type).upper(),)).fetchall()
+        columns = _daily_processed_transaction_columns(connection)
+        has_process_type = "ProcessType" in columns
+        has_transaction_type = "TransactionType" in columns
+
+        if has_process_type and has_transaction_type:
+            sql = r"""
+                SELECT PayloadJson
+                FROM dbo.DailyProcessedTransactions
+                WHERE UPPER(
+                    COALESCE(
+                        NULLIF(ProcessType, N''),
+                        NULLIF(TransactionType, N'')
+                    )
+                ) = ?
+                ORDER BY CreatedAt;
+            """
+        elif has_process_type:
+            sql = r"""
+                SELECT PayloadJson
+                FROM dbo.DailyProcessedTransactions
+                WHERE UPPER(ProcessType) = ?
+                ORDER BY CreatedAt;
+            """
+        elif has_transaction_type:
+            sql = r"""
+                SELECT PayloadJson
+                FROM dbo.DailyProcessedTransactions
+                WHERE UPPER(TransactionType) = ?
+                ORDER BY CreatedAt;
+            """
+        else:
+            raise RuntimeError(
+                "DailyProcessedTransactions is missing both ProcessType and "
+                "TransactionType columns."
+            )
+
+        rows = connection.cursor().execute(
+            sql,
+            (normalized_process_type,),
+        ).fetchall()
+
     records: List[Dict[str, Any]] = []
     for row in rows:
         try:
@@ -1739,4 +1858,5 @@ def get_daily_processed_transactions(process_type: str) -> pd.DataFrame:
                 records.append(value)
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
+
     return pd.DataFrame(records)
