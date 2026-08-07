@@ -1586,14 +1586,28 @@ def save_reconciliation_run_file(
     size_bytes: int,
     etag: str = "",
 ) -> None:
+    """Persist one archived run file while preserving the legacy RunID FK.
+
+    Older Version 5 databases require ReconciliationRunFiles.RunID to be NOT NULL.
+    RunNumber remains the public lookup key, so resolve the matching RunID inside the
+    same SQL statement before inserting the file row.
+    """
     initialize_database()
     sql = r"""
         INSERT INTO dbo.ReconciliationRunFiles
         (
-            RunNumber, FileCategory, FileName, FileType, ContainerName,
+            RunID, RunNumber, FileCategory, FileName, FileType, ContainerName,
             BlobName, ContentType, SizeBytes, ETag
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        SELECT
+            r.RunID, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        FROM dbo.ReconciliationRuns AS r
+        WHERE r.RunNumber = ?;
+
+        IF @@ROWCOUNT = 0
+        BEGIN
+            THROW 50002, 'Reconciliation run was not found for archived file.', 1;
+        END;
     """
     with Database().connect() as connection:
         cursor = connection.cursor()
@@ -1603,7 +1617,7 @@ def save_reconciliation_run_file(
                 (
                     str(run_number), str(file_category), str(file_name), str(file_type),
                     str(container_name), str(blob_name), str(content_type),
-                    int(size_bytes or 0), str(etag or ""),
+                    int(size_bytes or 0), str(etag or ""), str(run_number),
                 ),
             )
             connection.commit()
@@ -1655,7 +1669,7 @@ def get_reconciliation_run(run_number: str) -> Optional[Dict[str, Any]]:
 def list_reconciliation_run_files(run_number: str) -> List[Dict[str, Any]]:
     initialize_database()
     sql = r"""
-        SELECT RunFileID, RunNumber, FileCategory, FileName, FileType,
+        SELECT RunFileID, RunID, RunNumber, FileCategory, FileName, FileType,
                ContainerName, BlobName, ContentType, SizeBytes, ETag, CreatedAt
         FROM dbo.ReconciliationRunFiles
         WHERE RunNumber = ?
