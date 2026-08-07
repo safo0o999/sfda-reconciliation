@@ -389,6 +389,7 @@ BEGIN TRY
         CREATE TABLE dbo.ReconciliationRunFiles
         (
             RunFileID bigint IDENTITY(1,1) NOT NULL PRIMARY KEY,
+            RunID bigint NOT NULL,
             RunNumber nvarchar(100) NOT NULL,
             FileCategory nvarchar(30) NOT NULL,
             FileName nvarchar(500) NOT NULL,
@@ -398,13 +399,42 @@ BEGIN TRY
             ContentType nvarchar(250) NULL,
             SizeBytes bigint NOT NULL DEFAULT (0),
             ETag nvarchar(250) NULL,
-            CreatedAt datetime2(3) NOT NULL DEFAULT (SYSUTCDATETIME())
+            CreatedAt datetime2(3) NOT NULL DEFAULT (SYSUTCDATETIME()),
+            CONSTRAINT FK_ReconciliationRunFiles_Run
+                FOREIGN KEY (RunID) REFERENCES dbo.ReconciliationRuns(RunID)
         );
     END;
 
     /* Safely upgrade an existing ReconciliationRunFiles table. */
+    IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'RunID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.ReconciliationRunFiles ADD RunID bigint NULL;
+
+        UPDATE f
+        SET RunID = r.RunID
+        FROM dbo.ReconciliationRunFiles AS f
+        INNER JOIN dbo.ReconciliationRuns AS r
+            ON r.RunNumber = f.RunNumber
+        WHERE f.RunID IS NULL;
+
+        IF NOT EXISTS
+        (
+            SELECT 1 FROM dbo.ReconciliationRunFiles WHERE RunID IS NULL
+        )
+            ALTER TABLE dbo.ReconciliationRunFiles ALTER COLUMN RunID bigint NOT NULL;
+    END;
     IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'RunNumber') IS NULL
         ALTER TABLE dbo.ReconciliationRunFiles ADD RunNumber nvarchar(100) NULL;
+
+    IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'RunID') IS NOT NULL
+    BEGIN
+        UPDATE f
+        SET RunID = r.RunID
+        FROM dbo.ReconciliationRunFiles AS f
+        INNER JOIN dbo.ReconciliationRuns AS r
+            ON r.RunNumber = f.RunNumber
+        WHERE f.RunID IS NULL;
+    END;
     IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'FileCategory') IS NULL
         ALTER TABLE dbo.ReconciliationRunFiles ADD FileCategory nvarchar(30) NULL;
     IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'FileName') IS NULL
@@ -425,6 +455,23 @@ BEGIN TRY
     IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'CreatedAt') IS NULL
         ALTER TABLE dbo.ReconciliationRunFiles ADD CreatedAt datetime2(3) NOT NULL
             CONSTRAINT DF_ReconciliationRunFiles_CreatedAt_Upgrade DEFAULT (SYSUTCDATETIME()) WITH VALUES;
+
+    IF NOT EXISTS
+    (
+        SELECT 1
+        FROM sys.foreign_keys
+        WHERE name = N'FK_ReconciliationRunFiles_Run'
+          AND parent_object_id = OBJECT_ID(N'dbo.ReconciliationRunFiles')
+    )
+    AND NOT EXISTS
+    (
+        SELECT 1 FROM dbo.ReconciliationRunFiles WHERE RunID IS NULL
+    )
+    BEGIN
+        ALTER TABLE dbo.ReconciliationRunFiles
+        ADD CONSTRAINT FK_ReconciliationRunFiles_Run
+            FOREIGN KEY (RunID) REFERENCES dbo.ReconciliationRuns(RunID);
+    END;
 
     IF OBJECT_ID(N'dbo.DailyProcessedTransactions', N'U') IS NULL
     BEGIN
