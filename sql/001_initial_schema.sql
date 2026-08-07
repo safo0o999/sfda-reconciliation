@@ -333,6 +333,57 @@ BEGIN TRY
         );
     END;
 
+    /* Safely upgrade an existing ReconciliationRuns table created by an older version. */
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'RunNumber') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD RunNumber nvarchar(100) NULL;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'ProcessType') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD ProcessType nvarchar(30) NOT NULL
+            CONSTRAINT DF_ReconciliationRuns_ProcessType_Upgrade DEFAULT (N'UNKNOWN') WITH VALUES;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'Status') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD Status nvarchar(50) NOT NULL
+            CONSTRAINT DF_ReconciliationRuns_Status_Upgrade DEFAULT (N'Running') WITH VALUES;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'StartedAt') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD StartedAt datetime2(3) NOT NULL
+            CONSTRAINT DF_ReconciliationRuns_StartedAt_Upgrade DEFAULT (SYSUTCDATETIME()) WITH VALUES;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'CompletedAt') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD CompletedAt datetime2(3) NULL;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'SubmittedBy') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD SubmittedBy nvarchar(250) NULL;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'ASNFiles') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD ASNFiles int NOT NULL
+            CONSTRAINT DF_ReconciliationRuns_ASNFiles_Upgrade DEFAULT (0) WITH VALUES;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'InventoryFiles') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD InventoryFiles int NOT NULL
+            CONSTRAINT DF_ReconciliationRuns_InventoryFiles_Upgrade DEFAULT (0) WITH VALUES;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'DispatchFiles') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD DispatchFiles int NOT NULL
+            CONSTRAINT DF_ReconciliationRuns_DispatchFiles_Upgrade DEFAULT (0) WITH VALUES;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'SFDAFiles') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD SFDAFiles int NOT NULL
+            CONSTRAINT DF_ReconciliationRuns_SFDAFiles_Upgrade DEFAULT (0) WITH VALUES;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'TotalInputRows') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD TotalInputRows bigint NOT NULL
+            CONSTRAINT DF_ReconciliationRuns_TotalInputRows_Upgrade DEFAULT (0) WITH VALUES;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'MasterRecords') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD MasterRecords bigint NOT NULL
+            CONSTRAINT DF_ReconciliationRuns_MasterRecords_Upgrade DEFAULT (0) WITH VALUES;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'AcceptRecords') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD AcceptRecords bigint NOT NULL
+            CONSTRAINT DF_ReconciliationRuns_AcceptRecords_Upgrade DEFAULT (0) WITH VALUES;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'DispatchRecords') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD DispatchRecords bigint NOT NULL
+            CONSTRAINT DF_ReconciliationRuns_DispatchRecords_Upgrade DEFAULT (0) WITH VALUES;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'ExceptionRecords') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD ExceptionRecords bigint NOT NULL
+            CONSTRAINT DF_ReconciliationRuns_ExceptionRecords_Upgrade DEFAULT (0) WITH VALUES;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'GeneratedFiles') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD GeneratedFiles int NOT NULL
+            CONSTRAINT DF_ReconciliationRuns_GeneratedFiles_Upgrade DEFAULT (0) WITH VALUES;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'ApplicationVersion') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD ApplicationVersion nvarchar(50) NULL;
+    IF COL_LENGTH(N'dbo.ReconciliationRuns', N'ErrorMessage') IS NULL
+        ALTER TABLE dbo.ReconciliationRuns ADD ErrorMessage nvarchar(max) NULL;
+
     IF OBJECT_ID(N'dbo.ReconciliationRunFiles', N'U') IS NULL
     BEGIN
         CREATE TABLE dbo.ReconciliationRunFiles
@@ -351,6 +402,30 @@ BEGIN TRY
         );
     END;
 
+    /* Safely upgrade an existing ReconciliationRunFiles table. */
+    IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'RunNumber') IS NULL
+        ALTER TABLE dbo.ReconciliationRunFiles ADD RunNumber nvarchar(100) NULL;
+    IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'FileCategory') IS NULL
+        ALTER TABLE dbo.ReconciliationRunFiles ADD FileCategory nvarchar(30) NULL;
+    IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'FileName') IS NULL
+        ALTER TABLE dbo.ReconciliationRunFiles ADD FileName nvarchar(500) NULL;
+    IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'FileType') IS NULL
+        ALTER TABLE dbo.ReconciliationRunFiles ADD FileType nvarchar(30) NULL;
+    IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'ContainerName') IS NULL
+        ALTER TABLE dbo.ReconciliationRunFiles ADD ContainerName nvarchar(150) NULL;
+    IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'BlobName') IS NULL
+        ALTER TABLE dbo.ReconciliationRunFiles ADD BlobName nvarchar(1000) NULL;
+    IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'ContentType') IS NULL
+        ALTER TABLE dbo.ReconciliationRunFiles ADD ContentType nvarchar(250) NULL;
+    IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'SizeBytes') IS NULL
+        ALTER TABLE dbo.ReconciliationRunFiles ADD SizeBytes bigint NOT NULL
+            CONSTRAINT DF_ReconciliationRunFiles_SizeBytes_Upgrade DEFAULT (0) WITH VALUES;
+    IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'ETag') IS NULL
+        ALTER TABLE dbo.ReconciliationRunFiles ADD ETag nvarchar(250) NULL;
+    IF COL_LENGTH(N'dbo.ReconciliationRunFiles', N'CreatedAt') IS NULL
+        ALTER TABLE dbo.ReconciliationRunFiles ADD CreatedAt datetime2(3) NOT NULL
+            CONSTRAINT DF_ReconciliationRunFiles_CreatedAt_Upgrade DEFAULT (SYSUTCDATETIME()) WITH VALUES;
+
     IF OBJECT_ID(N'dbo.DailyProcessedTransactions', N'U') IS NULL
     BEGIN
         CREATE TABLE dbo.DailyProcessedTransactions
@@ -361,6 +436,16 @@ BEGIN TRY
             CreatedAt datetime2(3) NOT NULL DEFAULT (SYSUTCDATETIME())
         );
     END;
+
+    /* Safely upgrade an existing DailyProcessedTransactions table. */
+    IF COL_LENGTH(N'dbo.DailyProcessedTransactions', N'ProcessType') IS NULL
+        ALTER TABLE dbo.DailyProcessedTransactions ADD ProcessType nvarchar(30) NOT NULL
+            CONSTRAINT DF_DailyProcessedTransactions_ProcessType_Upgrade DEFAULT (N'UNKNOWN') WITH VALUES;
+    IF COL_LENGTH(N'dbo.DailyProcessedTransactions', N'PayloadJson') IS NULL
+        ALTER TABLE dbo.DailyProcessedTransactions ADD PayloadJson nvarchar(max) NULL;
+    IF COL_LENGTH(N'dbo.DailyProcessedTransactions', N'CreatedAt') IS NULL
+        ALTER TABLE dbo.DailyProcessedTransactions ADD CreatedAt datetime2(3) NOT NULL
+            CONSTRAINT DF_DailyProcessedTransactions_CreatedAt_Upgrade DEFAULT (SYSUTCDATETIME()) WITH VALUES;
 
     /* ================================================================
        Performance indexes
