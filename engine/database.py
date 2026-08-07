@@ -1874,3 +1874,392 @@ def get_daily_processed_transactions(process_type: str) -> pd.DataFrame:
             continue
 
     return pd.DataFrame(records)
+
+# -----------------------------------------------------------------------------
+# SFDA-confirmed daily Accept state
+# -----------------------------------------------------------------------------
+
+def _prepare_accept_sfda_state(sfda_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize one SFDA report to the batch grain used for Accept proof."""
+    from engine.normalizer import Normalizer
+
+    frame = sfda_df.copy() if sfda_df is not None else pd.DataFrame()
+    if frame.empty:
+        return pd.DataFrame(
+            columns=[
+                "GTIN", "BN", "Expiry Date",
+                "Active", "Quantity Receive Pending",
+            ]
+        )
+
+    frame = Normalizer.normalize_sfda(frame)
+    required = ["GTIN", "BN", "Expiry Date", "Active", "Quantity Receive Pending"]
+    missing = [column for column in required if column not in frame.columns]
+    if missing:
+        raise ValueError(
+            "SFDA confirmation state is missing required columns: "
+            + ", ".join(missing)
+        )
+
+    frame["BN"] = Normalizer.text(frame["BN"])
+    frame["Expiry Date"] = Normalizer.date(frame["Expiry Date"])
+    frame["GTIN"] = Normalizer.text(frame["GTIN"])
+    frame["Active"] = pd.to_numeric(frame["Active"], errors="coerce").fillna(0)
+    frame["Quantity Receive Pending"] = pd.to_numeric(
+        frame["Quantity Receive Pending"], errors="coerce"
+    ).fillna(0)
+
+    return (
+        frame.groupby(["BN", "Expiry Date"], dropna=False)
+        .agg(
+            GTIN=("GTIN", "first"),
+            Active=("Active", "sum"),
+            **{
+                "Quantity Receive Pending": (
+                    "Quantity Receive Pending", "sum"
+                )
+            },
+        )
+        .reset_index()
+    )
+
+
+def get_accept_confirmed_transactions() -> pd.DataFrame:
+    """Return only SFDA-confirmed Accept quantities for daily de-duplication."""
+    initialize_database()
+    sql = r"""
+        SELECT
+            TransactionKey AS [Transaction Key],
+            ConfirmedQuantityEach AS [Processed Quantity Each],
+            LastConfirmedAt AS [Last Processed At]
+        FROM dbo.DailyAcceptTransactions
+        WHERE ConfirmedQuantityEach > 0;
+    """
+    with Database().connect() as connection:
+        return pd.read_sql(sql, connection)
+
+
+def save_accept_pending_transactions(
+    rows: List[Dict[str, Any]],
+    run_number: str,
+) -> int:
+    """Store quantities represented by a generated Accept file as unconfirmed.
+
+    Re-running the same ASN before SFDA changes does not accumulate duplicate
+    pending quantity. Once some quantity is confirmed, a later submission can
+    extend the submitted target by only the newly generated amount.
+    """
+    initialize_database()
+    prepared: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        key = _text(row, "Transaction Key")
+        if not key:
+            continue
+        each_qty = max(0.0, _number(row, "Processed Quantity Each"))
+        pack_qty = max(0.0, _number(row, "Processed Quantity Pack"))
+        if each_qty <= 0 and pack_qty <= 0:
+            continue
+        current = prepared.setdefault(
+            key,
+            {
+                "Transaction Key": key,
+                "BN": _text(row, "BN"),
+                "Expiry Date": _value(row, "Expiry Date"),
+                "Generic Item Number": _text(row, "Generic Item Number"),
+                "Reference Number": _text(row, "Reference Number"),
+                "Reference Line": _text(row, "Reference Line"),
+                "Each": 0.0,
+                "Pack": 0.0,
+            },
+        )
+        current["Each"] += each_qty
+        current["Pack"] += pack_qty
+
+    if not prepared:
+        return 0
+
+    sql = r"""
+        MERGE dbo.DailyAcceptTransactions WITH (HOLDLOCK) AS target
+        USING
+        (
+            SELECT
+                ? AS TransactionKey,
+                ? AS BN,
+                ? AS ExpiryDate,
+                ? AS GenericItemNumber,
+                ? AS ReferenceNumber,
+                ? AS ReferenceLine,
+                ? AS NewQuantityEach,
+                ? AS NewQuantityPack,
+                ? AS RunNumber
+        ) AS source
+        ON target.TransactionKey = source.TransactionKey
+        WHEN MATCHED THEN
+            UPDATE SET
+                BN = source.BN,
+                ExpiryDate = source.ExpiryDate,
+                GenericItemNumber = source.GenericItemNumber,
+                ReferenceNumber = source.ReferenceNumber,
+                ReferenceLine = source.ReferenceLine,
+                SubmittedQuantityEach = CASE
+                    WHEN target.SubmittedQuantityEach >=
+                         target.ConfirmedQuantityEach + source.NewQuantityEach
+                    THEN target.SubmittedQuantityEach
+                    ELSE target.ConfirmedQuantityEach + source.NewQuantityEach
+                END,
+                SubmittedQuantityPack = CASE
+                    WHEN target.SubmittedQuantityPack >=
+                         target.ConfirmedQuantityPack + source.NewQuantityPack
+                    THEN target.SubmittedQuantityPack
+                    ELSE target.ConfirmedQuantityPack + source.NewQuantityPack
+                END,
+                LastSubmittedRun = source.RunNumber,
+                UpdatedAt = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT
+            (
+                TransactionKey, BN, ExpiryDate, GenericItemNumber,
+                ReferenceNumber, ReferenceLine,
+                SubmittedQuantityEach, SubmittedQuantityPack,
+                ConfirmedQuantityEach, ConfirmedQuantityPack,
+                FirstSubmittedRun, LastSubmittedRun
+            )
+            VALUES
+            (
+                source.TransactionKey, source.BN, source.ExpiryDate,
+                source.GenericItemNumber, source.ReferenceNumber,
+                source.ReferenceLine, source.NewQuantityEach,
+                source.NewQuantityPack, 0, 0, source.RunNumber, source.RunNumber
+            );
+    """
+
+    saved = 0
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            for row in prepared.values():
+                cursor.execute(
+                    sql,
+                    (
+                        row["Transaction Key"], row["BN"], row["Expiry Date"],
+                        row["Generic Item Number"], row["Reference Number"],
+                        row["Reference Line"], row["Each"], row["Pack"],
+                        str(run_number),
+                    ),
+                )
+                saved += 1
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return saved
+
+
+def _replace_accept_sfda_baseline_with_connection(
+    connection: pyodbc.Connection,
+    state: pd.DataFrame,
+    source_file_name: str = "",
+) -> int:
+    cursor = connection.cursor()
+    cursor.execute("DELETE FROM dbo.DailyAcceptSFDABaseline;")
+    rows = [
+        (
+            _text(row, "GTIN"),
+            _text(row, "BN"),
+            _value(row, "Expiry Date"),
+            _number(row, "Active"),
+            _number(row, "Quantity Receive Pending"),
+            str(source_file_name or ""),
+        )
+        for row in state.to_dict(orient="records")
+        if _text(row, "BN") and _value(row, "Expiry Date") is not None
+    ]
+    if rows:
+        cursor.fast_executemany = True
+        cursor.executemany(
+            r"""
+            INSERT INTO dbo.DailyAcceptSFDABaseline
+            (GTIN, BN, ExpiryDate, Active, QuantityReceivePending, SourceFileName)
+            VALUES (?, ?, ?, ?, ?, ?);
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def replace_accept_sfda_baseline(
+    sfda_df: pd.DataFrame,
+    source_file_name: str = "",
+) -> int:
+    """Store the current SFDA report as the next Accept confirmation baseline."""
+    initialize_database()
+    state = _prepare_accept_sfda_state(sfda_df)
+    with Database().connect() as connection:
+        try:
+            count = _replace_accept_sfda_baseline_with_connection(
+                connection, state, source_file_name
+            )
+            connection.commit()
+            return count
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def confirm_accept_transactions_from_sfda(
+    sfda_df: pd.DataFrame,
+    source_file_name: str = "",
+) -> Dict[str, Any]:
+    """Confirm prior Accept submissions only when SFDA proves the movement.
+
+    For each BN + Expiry Date, confirmed packs are the conservative minimum of:
+      * the decrease in Quantity Receive Pending, and
+      * the corresponding increase in Active.
+
+    The evidence is allocated to previously submitted, still-unconfirmed ASN
+    transaction identities. The baseline is advanced in the same SQL
+    transaction so the same SFDA delta can never be applied twice.
+    """
+    initialize_database()
+    current = _prepare_accept_sfda_state(sfda_df)
+
+    with Database().connect() as connection:
+        previous = pd.read_sql(
+            r"""
+            SELECT
+                GTIN, BN, ExpiryDate AS [Expiry Date],
+                Active,
+                QuantityReceivePending AS [Quantity Receive Pending]
+            FROM dbo.DailyAcceptSFDABaseline;
+            """,
+            connection,
+        )
+
+        if previous.empty:
+            return {
+                "baseline_available": False,
+                "confirmed_packs": 0.0,
+                "confirmed_each": 0.0,
+                "confirmed_transactions": 0,
+                "confirmed_batches": 0,
+            }
+
+        comparison = previous.merge(
+            current,
+            on=["BN", "Expiry Date"],
+            how="inner",
+            suffixes=(" Previous", " Current"),
+        )
+        if comparison.empty:
+            evidence_rows = []
+        else:
+            comparison["Pending Decrease"] = (
+                pd.to_numeric(
+                    comparison["Quantity Receive Pending Previous"],
+                    errors="coerce",
+                ).fillna(0)
+                - pd.to_numeric(
+                    comparison["Quantity Receive Pending Current"],
+                    errors="coerce",
+                ).fillna(0)
+            ).clip(lower=0)
+            comparison["Active Increase"] = (
+                pd.to_numeric(
+                    comparison["Active Current"], errors="coerce"
+                ).fillna(0)
+                - pd.to_numeric(
+                    comparison["Active Previous"], errors="coerce"
+                ).fillna(0)
+            ).clip(lower=0)
+            comparison["Confirmed Pack Evidence"] = comparison[
+                ["Pending Decrease", "Active Increase"]
+            ].min(axis=1)
+            evidence_rows = comparison.loc[
+                comparison["Confirmed Pack Evidence"].gt(0)
+            ].to_dict(orient="records")
+
+        cursor = connection.cursor()
+        confirmed_pack_total = 0.0
+        confirmed_each_total = 0.0
+        confirmed_transaction_keys: Set[str] = set()
+        confirmed_batches = 0
+
+        try:
+            for evidence in evidence_rows:
+                bn = _text(evidence, "BN")
+                expiry = _value(evidence, "Expiry Date")
+                remaining_pack = max(
+                    0.0, _number(evidence, "Confirmed Pack Evidence")
+                )
+                if remaining_pack <= 0:
+                    continue
+
+                pending_rows = cursor.execute(
+                    r"""
+                    SELECT
+                        TransactionKey,
+                        SubmittedQuantityEach, ConfirmedQuantityEach,
+                        SubmittedQuantityPack, ConfirmedQuantityPack
+                    FROM dbo.DailyAcceptTransactions WITH (UPDLOCK, HOLDLOCK)
+                    WHERE BN = ?
+                      AND ExpiryDate = ?
+                      AND SubmittedQuantityPack > ConfirmedQuantityPack
+                    ORDER BY CreatedAt, TransactionKey;
+                    """,
+                    (bn, expiry),
+                ).fetchall()
+
+                batch_confirmed = 0.0
+                for pending in pending_rows:
+                    if remaining_pack <= 0.0000001:
+                        break
+                    transaction_key = str(pending[0])
+                    submitted_each = float(pending[1] or 0)
+                    confirmed_each = float(pending[2] or 0)
+                    submitted_pack = float(pending[3] or 0)
+                    confirmed_pack = float(pending[4] or 0)
+                    open_pack = max(0.0, submitted_pack - confirmed_pack)
+                    open_each = max(0.0, submitted_each - confirmed_each)
+                    if open_pack <= 0:
+                        continue
+
+                    allocate_pack = min(remaining_pack, open_pack)
+                    each_per_pack = open_each / open_pack if open_pack > 0 else 0
+                    allocate_each = min(open_each, allocate_pack * each_per_pack)
+
+                    cursor.execute(
+                        r"""
+                        UPDATE dbo.DailyAcceptTransactions
+                        SET ConfirmedQuantityPack = ConfirmedQuantityPack + ?,
+                            ConfirmedQuantityEach = ConfirmedQuantityEach + ?,
+                            LastConfirmedAt = SYSUTCDATETIME(),
+                            UpdatedAt = SYSUTCDATETIME()
+                        WHERE TransactionKey = ?;
+                        """,
+                        (allocate_pack, allocate_each, transaction_key),
+                    )
+                    remaining_pack -= allocate_pack
+                    batch_confirmed += allocate_pack
+                    confirmed_pack_total += allocate_pack
+                    confirmed_each_total += allocate_each
+                    confirmed_transaction_keys.add(transaction_key)
+
+                if batch_confirmed > 0:
+                    confirmed_batches += 1
+
+            # Advance the proof baseline atomically with the confirmations.
+            _replace_accept_sfda_baseline_with_connection(
+                connection, current, source_file_name
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "baseline_available": True,
+        "confirmed_packs": float(confirmed_pack_total),
+        "confirmed_each": float(confirmed_each_total),
+        "confirmed_transactions": len(confirmed_transaction_keys),
+        "confirmed_batches": int(confirmed_batches),
+    }
