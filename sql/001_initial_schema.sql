@@ -437,10 +437,35 @@ BEGIN TRY
         );
     END;
 
-    /* Safely upgrade an existing DailyProcessedTransactions table. */
+    /* Safely upgrade an existing DailyProcessedTransactions table.
+       Older deployments used TransactionType. Keep that column intact and
+       synchronize it with ProcessType so historical de-duplication remains
+       compatible without deleting any prior daily transactions. */
     IF COL_LENGTH(N'dbo.DailyProcessedTransactions', N'ProcessType') IS NULL
-        ALTER TABLE dbo.DailyProcessedTransactions ADD ProcessType nvarchar(30) NOT NULL
-            CONSTRAINT DF_DailyProcessedTransactions_ProcessType_Upgrade DEFAULT (N'UNKNOWN') WITH VALUES;
+        ALTER TABLE dbo.DailyProcessedTransactions ADD ProcessType nvarchar(30) NULL;
+
+    IF COL_LENGTH(N'dbo.DailyProcessedTransactions', N'TransactionType') IS NOT NULL
+    BEGIN
+        UPDATE dbo.DailyProcessedTransactions
+        SET ProcessType = NULLIF(LTRIM(RTRIM(TransactionType)), N'')
+        WHERE (ProcessType IS NULL OR LTRIM(RTRIM(ProcessType)) IN (N'', N'UNKNOWN'))
+          AND NULLIF(LTRIM(RTRIM(TransactionType)), N'') IS NOT NULL;
+    END;
+
+    UPDATE dbo.DailyProcessedTransactions
+    SET ProcessType = N'UNKNOWN'
+    WHERE ProcessType IS NULL OR LTRIM(RTRIM(ProcessType)) = N'';
+
+    IF EXISTS
+    (
+        SELECT 1
+        FROM sys.columns
+        WHERE object_id = OBJECT_ID(N'dbo.DailyProcessedTransactions')
+          AND name = N'ProcessType'
+          AND is_nullable = 1
+    )
+        ALTER TABLE dbo.DailyProcessedTransactions ALTER COLUMN ProcessType nvarchar(30) NOT NULL;
+
     IF COL_LENGTH(N'dbo.DailyProcessedTransactions', N'PayloadJson') IS NULL
         ALTER TABLE dbo.DailyProcessedTransactions ADD PayloadJson nvarchar(max) NULL;
     IF COL_LENGTH(N'dbo.DailyProcessedTransactions', N'CreatedAt') IS NULL
