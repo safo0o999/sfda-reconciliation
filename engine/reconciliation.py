@@ -611,6 +611,19 @@ class ReconciliationEngine:
             report
         )
 
+        # Accept is not considered processed merely because a CSV was generated.
+        # Rows that still require an SFDA Accept are explicitly shown as pending
+        # confirmation. A later SFDA report must prove the movement from
+        # Quantity Receive Pending to Active before the corresponding ASN
+        # transactions are treated as previously processed.
+        report.loc[
+            pd.to_numeric(
+                report["To Be Accept"],
+                errors="coerce",
+            ).fillna(0).gt(0),
+            "Processing Status",
+        ] = "Pending Confirmation"
+
         accept = report.loc[
             report["To Be Accept"] > 0,
             [
@@ -653,14 +666,127 @@ class ReconciliationEngine:
             details_columns,
         )
 
+        # Build the exact transaction quantities represented by the generated
+        # Accept CSV. These rows are stored as *pending confirmation* only.
+        # They are not loaded back as processed until a later SFDA report
+        # proves the corresponding pending -> active movement.
         accept_transactions = self.asn.copy()
+        batch_limits = report[
+            self.MATCH_KEYS
+            + ["PackageSize", "To Be Accept"]
+        ].copy()
+        accept_transactions = accept_transactions.merge(
+            batch_limits,
+            on=self.MATCH_KEYS,
+            how="left",
+            validate="many_to_one",
+        )
         accept_transactions["Current Quantity Pack"] = 0.0
+        accept_transactions["Pending Submit Quantity Each"] = 0.0
+        accept_transactions["Pending Submit Quantity Pack"] = 0.0
+
+        package_size = pd.to_numeric(
+            accept_transactions["PackageSize"],
+            errors="coerce",
+        )
+        effective_each = pd.to_numeric(
+            accept_transactions["Effective Quantity Each"],
+            errors="coerce",
+        ).fillna(0).clip(lower=0)
+        current_each = pd.to_numeric(
+            accept_transactions["Current Quantity Each"],
+            errors="coerce",
+        ).fillna(0).clip(lower=0)
+        valid_transaction_package = package_size.notna() & package_size.gt(0)
+        accept_transactions.loc[
+            valid_transaction_package,
+            "Current Quantity Pack",
+        ] = (
+            current_each.loc[valid_transaction_package]
+            / package_size.loc[valid_transaction_package]
+        )
+
+        # Allocate each batch-level To Be Accept quantity across the ASN lines
+        # in their original order. Fractional internal pack allocation is
+        # allowed so that partial confirmations can still map exactly back to
+        # the original each quantities; the exported SFDA quantity remains the
+        # integer batch-level To Be Accept value.
+        for _, limit_row in batch_limits.iterrows():
+            remaining_pack = float(
+                pd.to_numeric(
+                    pd.Series([limit_row.get("To Be Accept", 0)]),
+                    errors="coerce",
+                ).fillna(0).iloc[0]
+            )
+            if remaining_pack <= 0:
+                continue
+
+            mask = pd.Series(True, index=accept_transactions.index)
+            for key in self.MATCH_KEYS:
+                if key == "Expiry Date":
+                    mask = mask & (
+                        pd.to_datetime(
+                            accept_transactions[key], errors="coerce"
+                        )
+                        == pd.to_datetime(limit_row.get(key), errors="coerce")
+                    )
+                else:
+                    mask = mask & (
+                        accept_transactions[key].astype(str)
+                        == str(limit_row.get(key, ""))
+                    )
+
+            for index in accept_transactions.index[mask]:
+                psize = package_size.loc[index]
+                if pd.isna(psize) or float(psize) <= 0:
+                    continue
+                available_each = float(effective_each.loc[index])
+                if available_each <= 0:
+                    continue
+                available_pack = available_each / float(psize)
+                allocated_pack = min(remaining_pack, available_pack)
+                if allocated_pack <= 0:
+                    continue
+                allocated_each = min(
+                    available_each,
+                    allocated_pack * float(psize),
+                )
+                accept_transactions.at[
+                    index, "Pending Submit Quantity Pack"
+                ] = allocated_pack
+                accept_transactions.at[
+                    index, "Pending Submit Quantity Each"
+                ] = allocated_each
+                remaining_pack -= allocated_pack
+                if remaining_pack <= 0.0000001:
+                    break
+
+        pending_source = accept_transactions.loc[
+            pd.to_numeric(
+                accept_transactions["Pending Submit Quantity Pack"],
+                errors="coerce",
+            ).fillna(0).gt(0)
+        ].copy()
+        if pending_source.empty:
+            pending_transactions = pd.DataFrame()
+        else:
+            pending_source["Current Quantity Each"] = pending_source[
+                "Pending Submit Quantity Each"
+            ]
+            pending_source["Current Quantity Pack"] = pending_source[
+                "Pending Submit Quantity Pack"
+            ]
+            pending_transactions = self._transaction_rows(
+                pending_source,
+                "ACCEPT",
+            )
 
         return {
             "report": details,
             "accept": accept,
             "dispatch": pd.DataFrame(),
             "processed_transactions": self._transaction_rows(accept_transactions, "ACCEPT"),
+            "pending_confirmation_transactions": pending_transactions,
         }
 
     def _run_dispatch(self) -> Dict[str, pd.DataFrame]:
