@@ -1646,6 +1646,13 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             "confirmed_transactions": 0,
             "confirmed_batches": 0,
         }
+        dispatch_confirmation = {
+            "baseline_available": False,
+            "confirmed_packs": 0.0,
+            "confirmed_each": 0.0,
+            "confirmed_transactions": 0,
+            "confirmed_batches": 0,
+        }
         try:
             if mode == "accept":
                 from engine.database import (
@@ -1665,10 +1672,19 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
                 )
                 processed_transactions = get_accept_confirmed_transactions()
             else:
-                from engine.database import get_daily_processed_transactions
-                processed_transactions = get_daily_processed_transactions(
-                    mode.upper()
+                from engine.database import (
+                    confirm_dispatch_transactions_from_sfda,
+                    get_dispatch_confirmed_transactions,
                 )
+
+                # Dispatch is considered processed only when the newly uploaded
+                # SFDA report proves the prior movement.  Legacy
+                # DailyProcessedTransactions rows are intentionally ignored.
+                dispatch_confirmation = confirm_dispatch_transactions_from_sfda(
+                    sfda_df,
+                    sfda_name,
+                )
+                processed_transactions = get_dispatch_confirmed_transactions()
         except Exception as exc:
             logger.warning("Daily processed transaction read skipped: %s", exc)
             if mode == "accept":
@@ -1743,6 +1759,7 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             "generated_files": generated_output_files,
             "processed_transactions_saved": 0,
             "accept_confirmation": accept_confirmation if mode == "accept" else {},
+            "dispatch_confirmation": dispatch_confirmation if mode == "dispatch" else {},
         }
 
         archived_files = save_run_archive(
@@ -1754,19 +1771,20 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             submitted_by=submitted_by,
         )
 
-        # Only after successful file generation + archive do we mutate the
-        # cumulative WMS history or create new pending-confirmation state.
-        historical_update = refresh_historical_data_after_daily_run(
-            mode=mode,
-            asn_df=asn_df,
-            dispatch_df=dispatch_df,
-            sfda_df=sfda_df,
-            asn_file_name=asn_name,
-            dispatch_file_name=dispatch_name,
-            sfda_file_name=sfda_name,
-        )
-
+        # Accept keeps the physical receipt history behaviour already approved.
+        # Dispatch is different: the generated CSV must NOT update Batch Master
+        # or Customer History.  Only SFDA-confirmed dispatch quantities are
+        # synchronized to cumulative history.
         if mode == "accept":
+            historical_update = refresh_historical_data_after_daily_run(
+                mode=mode,
+                asn_df=asn_df,
+                dispatch_df=dispatch_df,
+                sfda_df=sfda_df,
+                asn_file_name=asn_name,
+                dispatch_file_name=dispatch_name,
+                sfda_file_name=sfda_name,
+            )
             from engine.database import (
                 replace_accept_sfda_baseline,
                 save_accept_pending_transactions,
@@ -1788,16 +1806,67 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             # confirmation already advanced the baseline before reconciliation.
             replace_accept_sfda_baseline(sfda_df, sfda_name)
         else:
-            processed_rows = result.get(
-                "processed_transactions",
+            from engine.database import (
+                append_events,
+                get_dispatch_confirmed_history_records,
+                get_event_summaries,
+                get_history_summaries,
+                replace_batch_master,
+                replace_customer_history,
+                replace_dispatch_sfda_baseline,
+                replace_latest_sfda_snapshot,
+                replace_supplier_history,
+                save_dispatch_pending_transactions,
+            )
+            from engine.full_reconciliation import FullReconciliationEngine
+
+            # Synchronize only confirmations already proven by the SFDA delta.
+            confirmed_history_rows = get_dispatch_confirmed_history_records()
+            inserted = append_events([], confirmed_history_rows)
+            history_engine = FullReconciliationEngine(
+                pd.DataFrame(), pd.DataFrame(), sfda_df
+            )
+            prepared_sfda = history_engine.prepare_incremental()["sfda_summary"]
+            receipt_summary, dispatch_summary = get_event_summaries()
+            master = history_engine.build_master_from_summaries(
+                receipt_summary, dispatch_summary, prepared_sfda
+            )
+            replace_batch_master(master)
+            supplier_summary, customer_summary = get_history_summaries()
+            supplier_history = history_engine.build_supplier_history(
+                supplier_summary, master
+            )
+            customer_history = history_engine.build_customer_history(
+                customer_summary, master
+            )
+            replace_supplier_history(supplier_history)
+            replace_customer_history(customer_history)
+            sfda_snapshot_rows = replace_latest_sfda_snapshot(sfda_df, sfda_name)
+
+            historical_update = {
+                "receipt_events_added": 0,
+                "dispatch_events_added": int(inserted.get("dispatch_events", 0)),
+                "batch_master_rows": int(len(master)),
+                "supplier_history_rows": int(len(supplier_history)),
+                "customer_history_rows": int(len(customer_history)),
+                "sfda_snapshot_rows": int(sfda_snapshot_rows),
+                "source_file": sfda_name,
+                "confirmation_only": True,
+            }
+
+            pending_rows = result.get(
+                "pending_confirmation_transactions",
                 pd.DataFrame(),
             )
-            if processed_rows is not None and not processed_rows.empty:
-                from engine.database import save_daily_processed_transactions
-                saved_transactions = save_daily_processed_transactions(
-                    mode.upper(),
-                    processed_rows.to_dict(orient="records"),
+            if pending_rows is not None and not pending_rows.empty:
+                pending_confirmation_saved = save_dispatch_pending_transactions(
+                    pending_rows.to_dict(orient="records"),
+                    run_number,
                 )
+
+            # Store the current SFDA state as the proof baseline for the next
+            # Dispatch run.  This does not alter Batch Master quantities.
+            replace_dispatch_sfda_baseline(sfda_df, sfda_name)
 
         summary.update(
             {
