@@ -411,15 +411,40 @@ def blob_run_to_history_row(
 
 
 
-def _history_datetime_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+def _history_datetime_fields(
+    row: Dict[str, Any],
+    files: List[Dict[str, Any]] | None = None,
+) -> Dict[str, Any]:
     """Add explicit UTC and Asia/Riyadh timestamps for History API responses.
 
-    SQL datetime2 values are stored as UTC but are timezone-naive when pyodbc
-    returns them.  Sending explicit ISO timestamps removes browser ambiguity
-    and guarantees that the History page always shows Saudi Arabia time.
+    For older Full Reconciliation runs where StartedAt / CompletedAt were not
+    persisted, recover the timestamp from the archived Blob files. This uses
+    actual stored file timestamps and does not invent a run date.
     """
     result = dict(row)
     riyadh = ZoneInfo("Asia/Riyadh")
+
+    if not result.get("StartedAt") and files:
+        parsed_dates = []
+        for file in files:
+            candidate = (
+                file.get("CreatedAt")
+                or file.get("last_modified")
+                or file.get("LastModified")
+            )
+            if not candidate:
+                continue
+            try:
+                ts = pd.to_datetime(candidate, utc=True, errors="coerce")
+                if not pd.isna(ts):
+                    parsed_dates.append(ts.to_pydatetime())
+            except Exception:
+                continue
+
+        if parsed_dates:
+            result["StartedAt"] = min(parsed_dates)
+            if not result.get("CompletedAt"):
+                result["CompletedAt"] = max(parsed_dates)
 
     for field in ("StartedAt", "CompletedAt", "CreatedAt"):
         value = result.get(field)
@@ -429,14 +454,22 @@ def _history_datetime_fields(row: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(value, pd.Timestamp):
             value = value.to_pydatetime()
 
-        if isinstance(value, datetime):
-            utc_value = (
-                value.replace(tzinfo=timezone.utc)
-                if value.tzinfo is None
-                else value.astimezone(timezone.utc)
-            )
-            result[f"{field}Utc"] = utc_value.isoformat().replace("+00:00", "Z")
-            result[f"{field}Saudi"] = utc_value.astimezone(riyadh).isoformat()
+        if not isinstance(value, datetime):
+            try:
+                parsed = pd.to_datetime(value, utc=True, errors="coerce")
+                if pd.isna(parsed):
+                    continue
+                value = parsed.to_pydatetime()
+            except Exception:
+                continue
+
+        utc_value = (
+            value.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None
+            else value.astimezone(timezone.utc)
+        )
+        result[f"{field}Utc"] = utc_value.isoformat().replace("+00:00", "Z")
+        result[f"{field}Saudi"] = utc_value.astimezone(riyadh).isoformat()
 
     return result
 
@@ -495,7 +528,18 @@ def history(req: func.HttpRequest) -> func.HttpResponse:
                 )
             )
 
-        rows = [_history_datetime_fields(row) for row in rows]
+        enriched_rows = []
+        for row in rows:
+            run_number = str(row.get("RunNumber", "")).strip()
+            files_for_date = (
+                storage.list_all_run_files(run_number)
+                if run_number
+                else []
+            )
+            enriched_rows.append(
+                _history_datetime_fields(row, files_for_date)
+            )
+        rows = enriched_rows
 
         rows.sort(
             key=lambda row: str(
@@ -595,7 +639,7 @@ def history_run(req: func.HttpRequest) -> func.HttpResponse:
                 ],
             )
 
-        run = _history_datetime_fields(run)
+        run = _history_datetime_fields(run, files)
 
         return json_response(
             {
