@@ -586,6 +586,91 @@ BEGIN TRY
     END;
 
     /* ================================================================
+       Daily Dispatch confirmation state
+       ================================================================ */
+    IF OBJECT_ID(N'dbo.DailyDispatchTransactions', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.DailyDispatchTransactions
+        (
+            TransactionKey varchar(64) NOT NULL
+                CONSTRAINT PK_DailyDispatchTransactions PRIMARY KEY,
+            BN nvarchar(255) NOT NULL,
+            ExpiryDate date NOT NULL,
+            GenericItemNumber nvarchar(255) NULL,
+            ReferenceNumber nvarchar(255) NULL,
+            ReferenceLine nvarchar(255) NULL,
+            ToAddress nvarchar(500) NULL,
+            TransactionDate datetime2 NULL,
+            SubmittedQuantityEach decimal(18,4) NOT NULL
+                CONSTRAINT DF_DailyDispatchTransactions_SubmittedEach DEFAULT (0),
+            SubmittedQuantityPack decimal(18,4) NOT NULL
+                CONSTRAINT DF_DailyDispatchTransactions_SubmittedPack DEFAULT (0),
+            ConfirmedQuantityEach decimal(18,4) NOT NULL
+                CONSTRAINT DF_DailyDispatchTransactions_ConfirmedEach DEFAULT (0),
+            ConfirmedQuantityPack decimal(18,4) NOT NULL
+                CONSTRAINT DF_DailyDispatchTransactions_ConfirmedPack DEFAULT (0),
+            FirstSubmittedRun nvarchar(80) NULL,
+            LastSubmittedRun nvarchar(80) NULL,
+            CreatedAt datetime2(3) NOT NULL
+                CONSTRAINT DF_DailyDispatchTransactions_CreatedAt DEFAULT (SYSUTCDATETIME()),
+            UpdatedAt datetime2(3) NOT NULL
+                CONSTRAINT DF_DailyDispatchTransactions_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+            LastConfirmedAt datetime2(3) NULL
+        );
+    END;
+
+    IF OBJECT_ID(N'dbo.DailyDispatchSFDABaseline', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.DailyDispatchSFDABaseline
+        (
+            BN nvarchar(255) NOT NULL,
+            ExpiryDate date NOT NULL,
+            GTIN nvarchar(255) NULL,
+            Active decimal(18,4) NOT NULL
+                CONSTRAINT DF_DailyDispatchSFDABaseline_Active DEFAULT (0),
+            QuantitySentPending decimal(18,4) NOT NULL
+                CONSTRAINT DF_DailyDispatchSFDABaseline_SentPending DEFAULT (0),
+            SourceFileName nvarchar(500) NULL,
+            SnapshotUtc datetime2(3) NOT NULL
+                CONSTRAINT DF_DailyDispatchSFDABaseline_SnapshotUtc DEFAULT (SYSUTCDATETIME()),
+            CONSTRAINT PK_DailyDispatchSFDABaseline PRIMARY KEY (BN, ExpiryDate)
+        );
+    END;
+
+    IF OBJECT_ID(N'dbo.DailyDispatchConfirmations', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.DailyDispatchConfirmations
+        (
+            ConfirmationKey varchar(64) NOT NULL
+                CONSTRAINT PK_DailyDispatchConfirmations PRIMARY KEY,
+            TransactionKey varchar(64) NOT NULL,
+            ConfirmedQuantityEach decimal(18,4) NOT NULL,
+            ConfirmedQuantityPack decimal(18,4) NOT NULL,
+            ConfirmedAt datetime2(3) NOT NULL
+                CONSTRAINT DF_DailyDispatchConfirmations_ConfirmedAt DEFAULT (SYSUTCDATETIME()),
+            CONSTRAINT FK_DailyDispatchConfirmations_Transaction
+                FOREIGN KEY (TransactionKey)
+                REFERENCES dbo.DailyDispatchTransactions(TransactionKey)
+        );
+    END;
+
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM sys.indexes
+        WHERE object_id = OBJECT_ID(N'dbo.DailyDispatchTransactions')
+          AND name = N'IX_DailyDispatchTransactions_BatchPending'
+    )
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_DailyDispatchTransactions_BatchPending
+        ON dbo.DailyDispatchTransactions (BN, ExpiryDate, CreatedAt)
+        INCLUDE
+        (
+            SubmittedQuantityEach, ConfirmedQuantityEach,
+            SubmittedQuantityPack, ConfirmedQuantityPack, LastConfirmedAt
+        );
+    END;
+
+    /* ================================================================
        Performance indexes
        ================================================================ */
     IF NOT EXISTS
