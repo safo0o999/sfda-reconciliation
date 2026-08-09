@@ -2278,3 +2278,434 @@ def confirm_accept_transactions_from_sfda(
         "confirmed_transactions": len(confirmed_transaction_keys),
         "confirmed_batches": int(confirmed_batches),
     }
+
+# -----------------------------------------------------------------------------
+# SFDA-confirmed daily Dispatch state
+# -----------------------------------------------------------------------------
+
+def _prepare_dispatch_sfda_state(sfda_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize one SFDA report to the batch grain used for Dispatch proof."""
+    from engine.normalizer import Normalizer
+
+    frame = sfda_df.copy() if sfda_df is not None else pd.DataFrame()
+    if frame.empty:
+        return pd.DataFrame(
+            columns=["GTIN", "BN", "Expiry Date", "Active", "Quantity sent pending"]
+        )
+
+    frame = Normalizer.normalize_sfda(frame)
+    required = ["GTIN", "BN", "Expiry Date", "Active", "Quantity sent pending"]
+    missing = [column for column in required if column not in frame.columns]
+    if missing:
+        raise ValueError(
+            "SFDA Dispatch confirmation state is missing required columns: "
+            + ", ".join(missing)
+        )
+
+    frame["BN"] = Normalizer.text(frame["BN"])
+    frame["Expiry Date"] = Normalizer.date(frame["Expiry Date"])
+    frame["GTIN"] = Normalizer.text(frame["GTIN"])
+    frame["Active"] = pd.to_numeric(frame["Active"], errors="coerce").fillna(0)
+    frame["Quantity sent pending"] = pd.to_numeric(
+        frame["Quantity sent pending"], errors="coerce"
+    ).fillna(0)
+
+    return (
+        frame.groupby(["BN", "Expiry Date"], dropna=False)
+        .agg(
+            GTIN=("GTIN", "first"),
+            Active=("Active", "sum"),
+            **{"Quantity sent pending": ("Quantity sent pending", "sum")},
+        )
+        .reset_index()
+    )
+
+
+def get_dispatch_confirmed_transactions() -> pd.DataFrame:
+    """Return only SFDA-confirmed Dispatch quantities for daily de-duplication."""
+    initialize_database()
+    sql = r"""
+        SELECT
+            TransactionKey AS [Transaction Key],
+            ConfirmedQuantityEach AS [Processed Quantity Each],
+            LastConfirmedAt AS [Last Processed At]
+        FROM dbo.DailyDispatchTransactions
+        WHERE ConfirmedQuantityEach > 0;
+    """
+    with Database().connect() as connection:
+        return pd.read_sql(sql, connection)
+
+
+def save_dispatch_pending_transactions(
+    rows: List[Dict[str, Any]],
+    run_number: str,
+) -> int:
+    """Store generated Dispatch quantities as pending, not processed."""
+    initialize_database()
+    prepared: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        key = _text(row, "Transaction Key")
+        if not key:
+            continue
+        each_qty = max(0.0, _number(row, "Processed Quantity Each"))
+        pack_qty = max(0.0, _number(row, "Processed Quantity Pack"))
+        if each_qty <= 0 and pack_qty <= 0:
+            continue
+        current = prepared.setdefault(
+            key,
+            {
+                "Transaction Key": key,
+                "BN": _text(row, "BN"),
+                "Expiry Date": _value(row, "Expiry Date"),
+                "Generic Item Number": _text(row, "Generic Item Number"),
+                "Reference Number": _text(row, "Reference Number"),
+                "Reference Line": _text(row, "Reference Line"),
+                "To Address": _text(row, "To Address"),
+                "Transaction Date": _value(row, "Transaction Date"),
+                "Each": 0.0,
+                "Pack": 0.0,
+            },
+        )
+        current["Each"] += each_qty
+        current["Pack"] += pack_qty
+
+    if not prepared:
+        return 0
+
+    sql = r"""
+        MERGE dbo.DailyDispatchTransactions WITH (HOLDLOCK) AS target
+        USING
+        (
+            SELECT
+                ? AS TransactionKey, ? AS BN, ? AS ExpiryDate,
+                ? AS GenericItemNumber, ? AS ReferenceNumber,
+                ? AS ReferenceLine, ? AS ToAddress, ? AS TransactionDate,
+                ? AS NewQuantityEach, ? AS NewQuantityPack, ? AS RunNumber
+        ) AS source
+        ON target.TransactionKey = source.TransactionKey
+        WHEN MATCHED THEN
+            UPDATE SET
+                BN = source.BN,
+                ExpiryDate = source.ExpiryDate,
+                GenericItemNumber = source.GenericItemNumber,
+                ReferenceNumber = source.ReferenceNumber,
+                ReferenceLine = source.ReferenceLine,
+                ToAddress = source.ToAddress,
+                TransactionDate = source.TransactionDate,
+                SubmittedQuantityEach = CASE
+                    WHEN target.SubmittedQuantityEach >=
+                         target.ConfirmedQuantityEach + source.NewQuantityEach
+                    THEN target.SubmittedQuantityEach
+                    ELSE target.ConfirmedQuantityEach + source.NewQuantityEach
+                END,
+                SubmittedQuantityPack = CASE
+                    WHEN target.SubmittedQuantityPack >=
+                         target.ConfirmedQuantityPack + source.NewQuantityPack
+                    THEN target.SubmittedQuantityPack
+                    ELSE target.ConfirmedQuantityPack + source.NewQuantityPack
+                END,
+                LastSubmittedRun = source.RunNumber,
+                UpdatedAt = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT
+            (
+                TransactionKey, BN, ExpiryDate, GenericItemNumber,
+                ReferenceNumber, ReferenceLine, ToAddress, TransactionDate,
+                SubmittedQuantityEach, SubmittedQuantityPack,
+                ConfirmedQuantityEach, ConfirmedQuantityPack,
+                FirstSubmittedRun, LastSubmittedRun
+            )
+            VALUES
+            (
+                source.TransactionKey, source.BN, source.ExpiryDate,
+                source.GenericItemNumber, source.ReferenceNumber,
+                source.ReferenceLine, source.ToAddress, source.TransactionDate,
+                source.NewQuantityEach, source.NewQuantityPack,
+                0, 0, source.RunNumber, source.RunNumber
+            );
+    """
+
+    saved = 0
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            for row in prepared.values():
+                cursor.execute(
+                    sql,
+                    (
+                        row["Transaction Key"], row["BN"], row["Expiry Date"],
+                        row["Generic Item Number"], row["Reference Number"],
+                        row["Reference Line"], row["To Address"],
+                        row["Transaction Date"], row["Each"], row["Pack"],
+                        str(run_number),
+                    ),
+                )
+                saved += 1
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+    return saved
+
+
+def _replace_dispatch_sfda_baseline_with_connection(
+    connection: pyodbc.Connection,
+    state: pd.DataFrame,
+    source_file_name: str = "",
+) -> int:
+    cursor = connection.cursor()
+    cursor.execute("DELETE FROM dbo.DailyDispatchSFDABaseline;")
+    rows = [
+        (
+            _text(row, "GTIN"), _text(row, "BN"), _value(row, "Expiry Date"),
+            _number(row, "Active"), _number(row, "Quantity sent pending"),
+            str(source_file_name or ""),
+        )
+        for row in state.to_dict(orient="records")
+        if _text(row, "BN") and _value(row, "Expiry Date") is not None
+    ]
+    if rows:
+        cursor.fast_executemany = True
+        cursor.executemany(
+            r"""
+            INSERT INTO dbo.DailyDispatchSFDABaseline
+            (GTIN, BN, ExpiryDate, Active, QuantitySentPending, SourceFileName)
+            VALUES (?, ?, ?, ?, ?, ?);
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def replace_dispatch_sfda_baseline(
+    sfda_df: pd.DataFrame,
+    source_file_name: str = "",
+) -> int:
+    initialize_database()
+    state = _prepare_dispatch_sfda_state(sfda_df)
+    with Database().connect() as connection:
+        try:
+            count = _replace_dispatch_sfda_baseline_with_connection(
+                connection, state, source_file_name
+            )
+            connection.commit()
+            return count
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def confirm_dispatch_transactions_from_sfda(
+    sfda_df: pd.DataFrame,
+    source_file_name: str = "",
+) -> Dict[str, Any]:
+    """Confirm prior Dispatch submissions only when the next SFDA report proves it.
+
+    Conservative evidence per BN + Expiry Date is the minimum of the decrease
+    in Active and the increase in Quantity sent pending.  Evidence is allocated
+    only to previously submitted, still-unconfirmed dispatch transactions.
+    """
+    import hashlib
+
+    initialize_database()
+    current = _prepare_dispatch_sfda_state(sfda_df)
+
+    with Database().connect() as connection:
+        previous = pd.read_sql(
+            r"""
+            SELECT GTIN, BN, ExpiryDate AS [Expiry Date], Active,
+                   QuantitySentPending AS [Quantity sent pending]
+            FROM dbo.DailyDispatchSFDABaseline;
+            """,
+            connection,
+        )
+
+        if previous.empty:
+            return {
+                "baseline_available": False,
+                "confirmed_packs": 0.0,
+                "confirmed_each": 0.0,
+                "confirmed_transactions": 0,
+                "confirmed_batches": 0,
+            }
+
+        previous["BN"] = previous["BN"].fillna("").astype(str).str.strip()
+        current["BN"] = current["BN"].fillna("").astype(str).str.strip()
+        previous["Expiry Date"] = pd.to_datetime(
+            previous["Expiry Date"], errors="coerce"
+        ).dt.normalize()
+        current["Expiry Date"] = pd.to_datetime(
+            current["Expiry Date"], errors="coerce"
+        ).dt.normalize()
+
+        comparison = previous.merge(
+            current,
+            on=["BN", "Expiry Date"],
+            how="inner",
+            suffixes=(" Previous", " Current"),
+        )
+        if comparison.empty:
+            evidence_rows = []
+        else:
+            comparison["Active Decrease"] = (
+                pd.to_numeric(comparison["Active Previous"], errors="coerce").fillna(0)
+                - pd.to_numeric(comparison["Active Current"], errors="coerce").fillna(0)
+            ).clip(lower=0)
+            comparison["Sent Pending Increase"] = (
+                pd.to_numeric(
+                    comparison["Quantity sent pending Current"], errors="coerce"
+                ).fillna(0)
+                - pd.to_numeric(
+                    comparison["Quantity sent pending Previous"], errors="coerce"
+                ).fillna(0)
+            ).clip(lower=0)
+            comparison["Confirmed Pack Evidence"] = comparison[
+                ["Active Decrease", "Sent Pending Increase"]
+            ].min(axis=1)
+            evidence_rows = comparison.loc[
+                comparison["Confirmed Pack Evidence"].gt(0)
+            ].to_dict(orient="records")
+
+        cursor = connection.cursor()
+        confirmed_pack_total = 0.0
+        confirmed_each_total = 0.0
+        confirmed_transaction_keys: Set[str] = set()
+        confirmed_batches = 0
+
+        try:
+            for evidence in evidence_rows:
+                bn = _text(evidence, "BN")
+                expiry = _value(evidence, "Expiry Date")
+                remaining_pack = max(0.0, _number(evidence, "Confirmed Pack Evidence"))
+                if remaining_pack <= 0:
+                    continue
+
+                pending_rows = cursor.execute(
+                    r"""
+                    SELECT TransactionKey,
+                           SubmittedQuantityEach, ConfirmedQuantityEach,
+                           SubmittedQuantityPack, ConfirmedQuantityPack
+                    FROM dbo.DailyDispatchTransactions WITH (UPDLOCK, HOLDLOCK)
+                    WHERE BN = ? AND ExpiryDate = ?
+                      AND SubmittedQuantityPack > ConfirmedQuantityPack
+                    ORDER BY CreatedAt, TransactionKey;
+                    """,
+                    (bn, expiry),
+                ).fetchall()
+
+                batch_confirmed = 0.0
+                for pending in pending_rows:
+                    if remaining_pack <= 0.0000001:
+                        break
+                    transaction_key = str(pending[0])
+                    submitted_each = float(pending[1] or 0)
+                    confirmed_each = float(pending[2] or 0)
+                    submitted_pack = float(pending[3] or 0)
+                    confirmed_pack = float(pending[4] or 0)
+                    open_pack = max(0.0, submitted_pack - confirmed_pack)
+                    open_each = max(0.0, submitted_each - confirmed_each)
+                    if open_pack <= 0:
+                        continue
+
+                    allocate_pack = min(remaining_pack, open_pack)
+                    each_per_pack = open_each / open_pack if open_pack > 0 else 0
+                    allocate_each = min(open_each, allocate_pack * each_per_pack)
+                    new_cumulative_pack = confirmed_pack + allocate_pack
+                    confirmation_key = hashlib.sha256(
+                        f"{transaction_key}|{new_cumulative_pack:.6f}".encode("utf-8")
+                    ).hexdigest()
+
+                    cursor.execute(
+                        r"""
+                        UPDATE dbo.DailyDispatchTransactions
+                        SET ConfirmedQuantityPack = ConfirmedQuantityPack + ?,
+                            ConfirmedQuantityEach = ConfirmedQuantityEach + ?,
+                            LastConfirmedAt = SYSUTCDATETIME(),
+                            UpdatedAt = SYSUTCDATETIME()
+                        WHERE TransactionKey = ?;
+                        """,
+                        (allocate_pack, allocate_each, transaction_key),
+                    )
+                    cursor.execute(
+                        r"""
+                        INSERT INTO dbo.DailyDispatchConfirmations
+                            (ConfirmationKey, TransactionKey,
+                             ConfirmedQuantityEach, ConfirmedQuantityPack)
+                        SELECT ?, ?, ?, ?
+                        WHERE NOT EXISTS
+                        (
+                            SELECT 1 FROM dbo.DailyDispatchConfirmations
+                            WHERE ConfirmationKey = ?
+                        );
+                        """,
+                        (
+                            confirmation_key, transaction_key,
+                            allocate_each, allocate_pack, confirmation_key,
+                        ),
+                    )
+
+                    remaining_pack -= allocate_pack
+                    batch_confirmed += allocate_pack
+                    confirmed_pack_total += allocate_pack
+                    confirmed_each_total += allocate_each
+                    confirmed_transaction_keys.add(transaction_key)
+
+                if batch_confirmed > 0:
+                    confirmed_batches += 1
+
+            _replace_dispatch_sfda_baseline_with_connection(
+                connection, current, source_file_name
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "baseline_available": True,
+        "confirmed_packs": float(confirmed_pack_total),
+        "confirmed_each": float(confirmed_each_total),
+        "confirmed_transactions": len(confirmed_transaction_keys),
+        "confirmed_batches": int(confirmed_batches),
+    }
+
+
+def get_dispatch_confirmed_history_records() -> List[Dict[str, Any]]:
+    """Return idempotent DispatchEvents created only from SFDA confirmations."""
+    initialize_database()
+    sql = r"""
+        SELECT
+            c.ConfirmationKey,
+            t.BN, t.ExpiryDate, t.GenericItemNumber,
+            t.ReferenceNumber, t.ReferenceLine, t.ToAddress,
+            t.TransactionDate, c.ConfirmedQuantityEach
+        FROM dbo.DailyDispatchConfirmations AS c
+        INNER JOIN dbo.DailyDispatchTransactions AS t
+            ON t.TransactionKey = c.TransactionKey
+        WHERE c.ConfirmedQuantityEach > 0
+        ORDER BY c.ConfirmedAt, c.ConfirmationKey;
+    """
+    with Database().connect() as connection:
+        rows = connection.cursor().execute(sql).fetchall()
+
+    records: List[Dict[str, Any]] = []
+    for row in rows:
+        expiry = pd.to_datetime(row[2], errors="coerce")
+        expiry_month_key = "" if pd.isna(expiry) else expiry.strftime("%Y-%m")
+        records.append(
+            {
+                "Event Key": "DISPATCH-CONFIRMED-" + str(row[0]),
+                "BN": str(row[1] or "").strip(),
+                "Expiry Month Key": expiry_month_key,
+                "Expiry Date": None if pd.isna(expiry) else expiry,
+                "Generic Item Number": str(row[3] or "").strip(),
+                "Trade Item Number": "",
+                "Trade Name": "",
+                "Dispatched Quantity": float(row[8] or 0),
+                "To Address": str(row[6] or "").strip(),
+                "Sales Order Number": str(row[4] or "").strip(),
+                "Order Line": str(row[5] or "").strip(),
+                "Dispatch Date": row[7],
+            }
+        )
+    return records
