@@ -334,12 +334,24 @@ def _bulk_insert_rows(
     insert_sql: str,
     rows: Sequence[Tuple[Any, ...]],
 ) -> int:
-    """Insert rows in bounded fast_executemany batches."""
+    """Insert rows in bounded batches without ODBC string-buffer truncation.
+
+    ``pyodbc.fast_executemany`` can infer the string buffer size from early
+    values in a batch.  If a later value is longer (for example 166 characters
+    after a 128-character inferred buffer), ODBC Driver 18 raises HY000
+    ``String data, right truncation`` even when the SQL column itself is wide
+    enough.
+
+    Version 5 processes operational text fields whose lengths vary widely
+    (customer address, trade description, supplier name, source file name,
+    etc.), so correctness is preferred over the small bulk-insert speed gain.
+    Regular ``executemany`` lets the driver bind the values safely.
+    """
 
     if not rows:
         return 0
 
-    cursor.fast_executemany = True
+    cursor.fast_executemany = False
     inserted = 0
 
     for row_batch in _chunks(
