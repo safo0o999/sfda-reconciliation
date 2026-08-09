@@ -2465,7 +2465,17 @@ def _replace_dispatch_sfda_baseline_with_connection(
         if _text(row, "BN") and _value(row, "Expiry Date") is not None
     ]
     if rows:
-        cursor.fast_executemany = True
+        # Do NOT use fast_executemany for this SFDA snapshot.
+        #
+        # ODBC Driver 18 can infer an undersized string buffer from the first
+        # rows in a fast_executemany batch. A later BN / GTIN / file-name value
+        # that is longer than that inferred buffer can then fail with:
+        #
+        #   String data, right truncation: length ... buffer ...
+        #
+        # The SQL columns already allow the required lengths, so regular
+        # executemany is used here for reliable Dispatch confirmation.
+        cursor.fast_executemany = False
         cursor.executemany(
             r"""
             INSERT INTO dbo.DailyDispatchSFDABaseline
