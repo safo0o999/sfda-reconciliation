@@ -2465,16 +2465,14 @@ def _replace_dispatch_sfda_baseline_with_connection(
         if _text(row, "BN") and _value(row, "Expiry Date") is not None
     ]
     if rows:
-        # Do NOT use fast_executemany for this SFDA snapshot.
+        # Dispatch SFDA baseline is deliberately inserted without
+        # fast_executemany. ODBC Driver 18 can infer a string buffer that is
+        # smaller than a later value in the batch (for example 128 vs 166
+        # characters), causing HY000 "String data, right truncation" even
+        # though the SQL columns themselves are large enough.
         #
-        # ODBC Driver 18 can infer an undersized string buffer from the first
-        # rows in a fast_executemany batch. A later BN / GTIN / file-name value
-        # that is longer than that inferred buffer can then fail with:
-        #
-        #   String data, right truncation: length ... buffer ...
-        #
-        # The SQL columns already allow the required lengths, so regular
-        # executemany is used here for reliable Dispatch confirmation.
+        # Regular executemany lets the driver bind each value safely and keeps
+        # the confirmation + baseline replacement inside the same transaction.
         cursor.fast_executemany = False
         cursor.executemany(
             r"""
