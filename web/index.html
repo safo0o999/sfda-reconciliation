@@ -1528,10 +1528,14 @@ Drug Traceability Reconciliation Platform</textarea></label>
     $("resultAccept").textContent=formatNumber(m.acceptRows);
     $("resultDispatch").textContent=formatNumber(m.dispatchRows);
     $("resultVariance").textContent=formatNumber(m.varianceRows);
-    $("varianceLatest").textContent=formatNumber(m.varianceRows);
+    const varianceLatest=$("varianceLatest");
+    if(varianceLatest) varianceLatest.textContent=formatNumber(m.varianceRows);
     $("resultFiles").textContent=formatNumber(m.acceptFileCount+m.dispatchFileCount+m.reportFileCount);
     $("resultsInfo").className="status-banner success show";
-    $("resultsInfo").innerHTML=`<span>✓</span><div><strong>Reconciliation completed successfully.</strong><br>Run ${escapeHtml(result.run_number||"—")} · Version ${escapeHtml(result.version||"—")} · ${formatNumber(m.inputRows)} reconciliation rows processed.</div>`;
+    const confirmation=result?.summary?.dispatch_confirmation||result?.summary?.accept_confirmation||{};
+    const confirmedPacks=Number(confirmation.confirmed_packs||0);
+    const confirmationText=confirmedPacks>0?` · SFDA confirmed ${formatNumber(confirmedPacks)} packs from the prior submission`:"";
+    $("resultsInfo").innerHTML=`<span>✓</span><div><strong>Reconciliation completed successfully.</strong><br>Run ${escapeHtml(result.run_number||"—")} · Version ${escapeHtml(result.version||"—")} · ${formatNumber(m.inputRows)} reconciliation rows processed${confirmationText}.</div>`;
     renderCsvFiles("acceptFilesList",outputs.accept_files||{},"Accept");
     renderCsvFiles("dispatchFilesList",outputs.dispatch_files||{},"Dispatch");
     renderReportsFiles(outputs);
