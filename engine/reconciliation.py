@@ -996,11 +996,44 @@ class ReconciliationEngine:
             ],
         ].copy()
 
+        # A generated Dispatch CSV is only a submission candidate.  It must
+        # not be treated as processed until a later SFDA report proves the
+        # regulatory movement.  Persist only the quantities that were actually
+        # allocated to the generated CSV files as pending confirmation.
+        pending_source = details.loc[
+            pd.to_numeric(
+                details["Allocated To Be Dispatch"],
+                errors="coerce",
+            ).fillna(0).gt(0)
+        ].copy()
+
+        if pending_source.empty:
+            pending_transactions = pd.DataFrame()
+        else:
+            allocated_pack = pd.to_numeric(
+                pending_source["Allocated To Be Dispatch"],
+                errors="coerce",
+            ).fillna(0).clip(lower=0)
+            package_size = pd.to_numeric(
+                pending_source["PackageSize"],
+                errors="coerce",
+            ).fillna(0).clip(lower=0)
+            pending_source["Current Quantity Pack"] = allocated_pack
+            pending_source["Current Quantity Each"] = allocated_pack * package_size
+            pending_transactions = self._transaction_rows(
+                pending_source,
+                "DISPATCH",
+            )
+
         return {
             "report": report,
             "accept": pd.DataFrame(),
             "dispatch": dispatch_upload,
-            "processed_transactions": self._transaction_rows(details, "DISPATCH"),
+            # Legacy processed rows are intentionally not used for Dispatch
+            # de-duplication anymore.  SFDA-confirmed rows are the source of
+            # truth, exactly as with Accept.
+            "processed_transactions": pd.DataFrame(),
+            "pending_confirmation_transactions": pending_transactions,
         }
 
     def run(self) -> Dict[str, pd.DataFrame]:
