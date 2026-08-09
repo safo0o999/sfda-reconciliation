@@ -2692,6 +2692,7 @@ def confirm_dispatch_transactions_from_sfda(
 
 def get_dispatch_confirmed_history_records() -> List[Dict[str, Any]]:
     """Return idempotent DispatchEvents created only from SFDA confirmations."""
+    import hashlib
     initialize_database()
     sql = r"""
         SELECT
@@ -2714,7 +2715,14 @@ def get_dispatch_confirmed_history_records() -> List[Dict[str, Any]]:
         expiry_month_key = "" if pd.isna(expiry) else expiry.strftime("%Y-%m")
         records.append(
             {
-                "Event Key": "DISPATCH-CONFIRMED-" + str(row[0]),
+                # DispatchEvents.EventKey is varchar(64).  ConfirmationKey is
+                # already a 64-character SHA-256 hex digest, so prefixing it
+                # with "DISPATCH-CONFIRMED-" makes the value longer than the
+                # physical SQL column.  Re-hash the namespaced value to retain
+                # a deterministic/idempotent 64-character key.
+                "Event Key": hashlib.sha256(
+                    ("DISPATCH-CONFIRMED|" + str(row[0])).encode("utf-8")
+                ).hexdigest(),
                 "BN": str(row[1] or "").strip(),
                 "Expiry Month Key": expiry_month_key,
                 "Expiry Date": None if pd.isna(expiry) else expiry,
