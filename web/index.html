@@ -915,7 +915,7 @@
         <div class="page-head"><div><h1>Reconciliation History</h1><p>Persistent reconciliation runs stored in Azure SQL Database.</p></div><div class="actions"><button class="btn btn-secondary" id="clearHistoryButton">↻ Refresh History</button></div></div>
         <div class="card table-card">
           <div class="table-toolbar"><div class="card-title">Previous Reconciliation Runs</div><div class="filters"><input class="control search" id="historySearch" placeholder="Search run ID or user..."><select class="control" id="historyStatus"><option value="">All statuses</option><option>Pending Upload</option><option>Pending Verification</option><option>Verified</option><option>Investigation Required</option><option>Completed</option><option>Failed</option></select></div></div>
-          <div class="table-scroll history-scroll"><table class="history-table"><thead><tr><th>Run ID</th><th>Date &amp; Time (Saudi)</th><th>User</th><th>Status</th><th>Files</th><th>Input Rows</th><th>Accept</th><th>Dispatch</th><th>Variance</th><th>Version</th><th>Actions</th></tr></thead><tbody id="historyBody"></tbody></table></div>
+          <div class="table-scroll history-scroll"><table class="history-table"><thead><tr><th>Run ID</th><th>Process</th><th>Date &amp; Time (Saudi)</th><th>User</th><th>Status</th><th>Files</th><th>Input Rows</th><th>Accept</th><th>Dispatch</th><th>Variance</th><th>Version</th><th>Actions</th></tr></thead><tbody id="historyBody"></tbody></table></div>
           <div class="table-footer"><span id="historyCount">0 database runs</span><span>Source: Azure SQL · ReconciliationRuns</span></div>
         </div>
       </section>
@@ -1627,18 +1627,34 @@ Drug Traceability Reconciliation Platform</textarea></label>
     });
   }
 
+  function historyProcessLabel(value){
+    const key=String(value||"").trim().toUpperCase();
+    const labels={
+      "ACCEPT":"Daily Accept",
+      "DISPATCH":"Daily Dispatch",
+      "FULL_ACCEPT":"Full Accept Reconciliation",
+      "FULL_DISPATCH":"Full Dispatch Reconciliation",
+      "FULL-ACCEPT":"Full Accept Reconciliation",
+      "FULL-DISPATCH":"Full Dispatch Reconciliation",
+      "HISTORICAL":"Historical Build",
+      "BATCH_MASTER":"Historical Build"
+    };
+    return labels[key]||String(value||"—").replaceAll("_"," ");
+  }
+
   function normalizeHistoryRecord(row){
     return {
       runId: row.RunNumber || `RUN-${row.RunID ?? "—"}`,
       runNumber: row.RunNumber || "—",
       databaseRunId: row.RunID ?? null,
       processType: row.ProcessType || "",
+      processLabel: historyProcessLabel(row.ProcessType),
       asnFiles: Number(row.ASNFiles || 0),
       inventoryFiles: Number(row.InventoryFiles || 0),
       dispatchFiles: Number(row.DispatchFiles || 0),
       sfdaFiles: Number(row.SFDAFiles || 0),
-      timestamp: row.StartedAt || row.RunDate || null,
-      completedAt: row.CompletedAt || null,
+      timestamp: row.StartedAtSaudi || row.StartedAtUtc || row.StartedAt || row.RunDate || null,
+      completedAt: row.CompletedAtSaudi || row.CompletedAtUtc || row.CompletedAt || null,
       user: row.SubmittedBy || "Web User",
       status: row.Status || "Unknown",
       files: Number(row.ASNFiles || 0) + Number(row.InventoryFiles || 0) + Number(row.DispatchFiles || 0) + Number(row.SFDAFiles || 0),
@@ -1712,7 +1728,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
     body.innerHTML="";
  
     if(loadError && !historyCache.length){
-      body.innerHTML=`<tr><td colspan="11"><div class="empty"><strong>Unable to load reconciliation history</strong>${escapeHtml(loadError.message || String(loadError))}</div></td></tr>`;
+      body.innerHTML=`<tr><td colspan="12"><div class="empty"><strong>Unable to load reconciliation history</strong>${escapeHtml(loadError.message || String(loadError))}</div></td></tr>`;
       $('historyCount').textContent="History unavailable";
       return;
     }
@@ -1722,14 +1738,14 @@ Drug Traceability Reconciliation Platform</textarea></label>
       const dateText=formatSaudiDateTime(r.timestamp);
       const statusClass=["Verified","Completed"].includes(r.status)?"success":["Failed","Investigation Required"].includes(r.status)?"failed":r.status==="Pending Verification"?"info":"warning";
       const errorTitle=r.error?` title="${escapeHtml(r.error)}"`:"";
-      tr.innerHTML=`<td><strong style="color:#075fc8"${errorTitle}>${escapeHtml(r.runId)}</strong></td><td>${escapeHtml(dateText)}</td><td>${escapeHtml(r.user)}</td><td><span class="badge ${statusClass}"${errorTitle}>${escapeHtml(r.status)}</span></td><td>${formatNumber(r.files)}</td><td>${formatNumber(r.inputRows)}</td><td>${formatNumber(r.accept)}</td><td>${formatNumber(r.dispatch)}</td><td>${formatNumber(r.variance)}</td><td>${escapeHtml(r.version||"—")}</td><td><button class="btn btn-secondary view-run-btn" type="button">View</button></td>`;
+      tr.innerHTML=`<td><strong style="color:#075fc8"${errorTitle}>${escapeHtml(r.runId)}</strong></td><td>${escapeHtml(r.processLabel)}</td><td>${escapeHtml(dateText)}</td><td>${escapeHtml(r.user)}</td><td><span class="badge ${statusClass}"${errorTitle}>${escapeHtml(r.status)}</span></td><td>${formatNumber(r.files)}</td><td>${formatNumber(r.inputRows)}</td><td>${formatNumber(r.accept)}</td><td>${formatNumber(r.dispatch)}</td><td>${formatNumber(r.variance)}</td><td>${escapeHtml(r.version||"—")}</td><td><button class="btn btn-secondary view-run-btn" type="button">View</button></td>`;
       tr.querySelector(".view-run-btn").addEventListener("click",()=>openRunDetails(r.runNumber));
       body.appendChild(tr);
     });
  
     if(!rows.length){
       const message=historyLoaded?"No matching database runs were found.":"Loading reconciliation history...";
-      body.innerHTML=`<tr><td colspan="11"><div class="empty"><strong>${historyLoaded?"No history found":"Loading history"}</strong>${message}</div></td></tr>`;
+      body.innerHTML=`<tr><td colspan="12"><div class="empty"><strong>${historyLoaded?"No history found":"Loading history"}</strong>${message}</div></td></tr>`;
     }
     $('historyCount').textContent=`${rows.length} stored run${rows.length===1?"":"s"}`;
   }
@@ -1770,13 +1786,15 @@ Drug Traceability Reconciliation Platform</textarea></label>
       const run=payload.run||{};
       const files=Array.isArray(payload.files)?payload.files:[];
       $('runDetailsSubtitle').textContent=`${run.Status||'Unknown'} · ${run.SubmittedBy||'Web User'} · ${run.ApplicationVersion||'—'}`;
-      const start=run.StartedAt||null;
-      const end=run.CompletedAt||null;
-      const duration=(start&&end&&!Number.isNaN(start.getTime())&&!Number.isNaN(end.getTime()))?`${((end-start)/1000).toFixed(1)} sec`:'—';
+      const start=run.StartedAtSaudi||run.StartedAtUtc||run.StartedAt||null;
+      const end=run.CompletedAtSaudi||run.CompletedAtUtc||run.CompletedAt||null;
+      const durationSeconds=calculateRunDuration(start,end);
+      const duration=durationSeconds===null?'—':`${durationSeconds.toFixed(1)} sec`;
       const detailHtml=`<div class="detail-grid">
         <div class="detail-box"><span>Run Number</span><strong>${escapeHtml(run.RunNumber||'—')}</strong></div>
+        <div class="detail-box"><span>Process</span><strong>${escapeHtml(historyProcessLabel(run.ProcessType))}</strong></div>
         <div class="detail-box"><span>Status</span><strong>${escapeHtml(run.Status||'—')}</strong></div>
-        <div class="detail-box"><span>Started</span><strong>${escapeHtml(formatSaudiDateTime(start))}</strong></div>
+        <div class="detail-box"><span>Started (Saudi)</span><strong>${escapeHtml(formatSaudiDateTime(start))}</strong></div>
         <div class="detail-box"><span>Duration</span><strong>${escapeHtml(duration)}</strong></div>
         <div class="detail-box"><span>Input Rows</span><strong>${formatNumber(run.TotalInputRows)}</strong></div>
         <div class="detail-box"><span>Master Records</span><strong>${formatNumber(run.MasterRecords)}</strong></div>
@@ -2516,6 +2534,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       renderSetupFileList("fullAcceptCsvFiles",acceptCsvFiles,"No Accept quantity was required.");
       const summary=result.summary||{};
       showFullResults(`<strong>Full Accept completed.</strong> Accept rows: ${formatNumber(summary.accept_rows||0)} · Supplier variance rows: ${formatNumber(summary.supplier_variance_rows||0)} · Files: ${formatNumber(files.length)}.`);
+      await refreshAzureHistory({silent:true});
       toast("Full Accept Reconciliation completed successfully.","success");
     }catch(error){ finishSetupProgress("accept",false); showSetupError(error.message||String(error)); }
     finally{ button.textContent="▶ Run Full Accept Reconciliation"; updateFullSetupButtons(); }
@@ -2545,6 +2564,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       renderSetupFileList("fullDispatchCsvFiles",dispatchCsvFiles,"No Dispatch quantity was required.");
       const summary=result.summary||{};
       showFullResults(`<strong>Full Dispatch completed.</strong> Dispatch allocation rows: ${formatNumber(summary.dispatch_allocation_rows||0)} · Files: ${formatNumber(files.length)}.`);
+      await refreshAzureHistory({silent:true});
       toast("Full Dispatch Reconciliation completed successfully.","success");
     }catch(error){ finishSetupProgress("dispatch",false); showSetupError(error.message||String(error)); }
     finally{ button.textContent="▶ Run Full Dispatch Reconciliation"; updateFullSetupButtons(); }
