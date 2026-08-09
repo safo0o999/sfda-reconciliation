@@ -497,6 +497,16 @@
     @media(max-width:1200px){.variance-kpi-grid{grid-template-columns:1fr 1fr}.variance-main-grid,.variance-action-grid{grid-template-columns:1fr}.variance-table-scroll{height:420px}.history-scroll{height:560px}}
     @media(max-width:700px){.variance-kpi-grid{grid-template-columns:1fr}.variance-filters{grid-template-columns:1fr}.variance-detail-grid{grid-template-columns:1fr}}
 
+
+    .history-kpi-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:14px;margin:0 0 18px}
+    .history-kpi-card{appearance:none;border:1px solid var(--line);border-radius:14px;background:#fff;padding:16px 17px;text-align:left;cursor:pointer;box-shadow:0 3px 12px rgba(13,42,74,.05);transition:.18s ease}
+    .history-kpi-card:hover{transform:translateY(-1px);border-color:#9fc2ea}
+    .history-kpi-card.active{border-color:#1578d4;box-shadow:0 0 0 2px rgba(21,120,212,.08),0 5px 16px rgba(13,42,74,.08)}
+    .history-kpi-label{display:block;font-size:11px;font-weight:800;color:var(--muted);margin-bottom:7px}
+    .history-kpi-card strong{display:block;font-size:27px;line-height:1;color:#0b2c4a;margin-bottom:8px}
+    .history-kpi-card small{display:block;font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    @media(max-width:1150px){.history-kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media(max-width:650px){.history-kpi-grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -913,6 +923,13 @@
       <!-- HISTORY -->
       <section class="page" id="page-history">
         <div class="page-head"><div><h1>Reconciliation History</h1><p>Persistent reconciliation runs stored in Azure SQL Database.</p></div><div class="actions"><button class="btn btn-secondary" id="clearHistoryButton">↻ Refresh History</button></div></div>
+        <div class="history-kpi-grid" id="historyKpiGrid">
+          <button type="button" class="history-kpi-card active" data-history-filter="all"><span class="history-kpi-label">Total Runs</span><strong id="historyTotalRuns">0</strong><small id="historyTotalLast">No runs yet</small></button>
+          <button type="button" class="history-kpi-card" data-history-filter="ACCEPT"><span class="history-kpi-label">Daily Accept</span><strong id="historyDailyAcceptRuns">0</strong><small id="historyDailyAcceptLast">No runs yet</small></button>
+          <button type="button" class="history-kpi-card" data-history-filter="DISPATCH"><span class="history-kpi-label">Daily Dispatch</span><strong id="historyDailyDispatchRuns">0</strong><small id="historyDailyDispatchLast">No runs yet</small></button>
+          <button type="button" class="history-kpi-card" data-history-filter="FULL_ACCEPT"><span class="history-kpi-label">Full Accept</span><strong id="historyFullAcceptRuns">0</strong><small id="historyFullAcceptLast">No runs yet</small></button>
+          <button type="button" class="history-kpi-card" data-history-filter="FULL_DISPATCH"><span class="history-kpi-label">Full Dispatch</span><strong id="historyFullDispatchRuns">0</strong><small id="historyFullDispatchLast">No runs yet</small></button>
+        </div>
         <div class="card table-card">
           <div class="table-toolbar"><div class="card-title">Previous Reconciliation Runs</div><div class="filters"><input class="control search" id="historySearch" placeholder="Search run ID or user..."><select class="control" id="historyStatus"><option value="">All statuses</option><option>Pending Upload</option><option>Pending Verification</option><option>Verified</option><option>Investigation Required</option><option>Completed</option><option>Failed</option></select></div></div>
           <div class="table-scroll history-scroll"><table class="history-table"><thead><tr><th>Run ID</th><th>Process</th><th>Date &amp; Time (Saudi)</th><th>User</th><th>Status</th><th>Files</th><th>Input Rows</th><th>Accept</th><th>Dispatch</th><th>Variance</th><th>Version</th><th>Actions</th></tr></thead><tbody id="historyBody"></tbody></table></div>
@@ -1172,6 +1189,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   let historyCache = [];
   let historyLoaded = false;
   let historyLoading = false;
+  let activeHistoryFilter = "all";
   let varianceData = {summary:{},items:[],email:{}};
   let varianceSelectedIds = new Set();
   let varianceActiveType = "";
@@ -1720,10 +1738,60 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }
   }
  
+  function historyProcessKey(value){
+    const key=String(value||"").trim().toUpperCase().replaceAll("-","_").replaceAll(" ","_");
+    if(key==="FULLACCEPT") return "FULL_ACCEPT";
+    if(key==="FULLDISPATCH") return "FULL_DISPATCH";
+    return key;
+  }
+
+  function filteredHistoryByProcess(records,filter){
+    if(!filter||filter==="all") return records;
+    return records.filter(record=>historyProcessKey(record.processType)===filter);
+  }
+
+  function latestHistoryLabel(records){
+    if(!records.length) return "No runs yet";
+    const sorted=[...records].sort((a,b)=>{
+      const ad=parseUtcTimestamp(a.timestamp)?.getTime()||0;
+      const bd=parseUtcTimestamp(b.timestamp)?.getTime()||0;
+      return bd-ad;
+    });
+    return `Last: ${formatSaudiDateTime(sorted[0].timestamp)}`;
+  }
+
+  function updateHistoryKpis(records){
+    const groups={
+      all:records,
+      ACCEPT:filteredHistoryByProcess(records,"ACCEPT"),
+      DISPATCH:filteredHistoryByProcess(records,"DISPATCH"),
+      FULL_ACCEPT:filteredHistoryByProcess(records,"FULL_ACCEPT"),
+      FULL_DISPATCH:filteredHistoryByProcess(records,"FULL_DISPATCH")
+    };
+    const map={
+      all:["historyTotalRuns","historyTotalLast"],
+      ACCEPT:["historyDailyAcceptRuns","historyDailyAcceptLast"],
+      DISPATCH:["historyDailyDispatchRuns","historyDailyDispatchLast"],
+      FULL_ACCEPT:["historyFullAcceptRuns","historyFullAcceptLast"],
+      FULL_DISPATCH:["historyFullDispatchRuns","historyFullDispatchLast"]
+    };
+    Object.entries(map).forEach(([key,[countId,lastId]])=>{
+      const rows=groups[key]||[];
+      const countEl=$(countId),lastEl=$(lastId);
+      if(countEl) countEl.textContent=formatNumber(rows.length);
+      if(lastEl) lastEl.textContent=latestHistoryLabel(rows);
+    });
+    document.querySelectorAll("[data-history-filter]").forEach(card=>{
+      card.classList.toggle("active",(card.dataset.historyFilter||"all")===activeHistoryFilter);
+    });
+  }
+
   function renderHistory(loadError=null){
+    updateHistoryKpis(getHistory());
     const q=$('historySearch').value.trim().toLowerCase();
     const status=$('historyStatus').value;
-    const rows=getHistory().filter(r=>(!q||r.runId.toLowerCase().includes(q)||r.user.toLowerCase().includes(q))&&(!status||r.status===status));
+    const processRows=filteredHistoryByProcess(getHistory(),activeHistoryFilter);
+    const rows=processRows.filter(r=>(!q||r.runId.toLowerCase().includes(q)||r.user.toLowerCase().includes(q))&&(!status||r.status===status));
     const body=$('historyBody');
     body.innerHTML="";
  
@@ -1979,6 +2047,12 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }
   });
  
+  document.querySelectorAll("[data-history-filter]").forEach(card=>{
+    card.addEventListener("click",()=>{
+      activeHistoryFilter=card.dataset.historyFilter||"all";
+      renderHistory();
+    });
+  });
   $('historySearch').addEventListener('input',()=>renderHistory());
   $('historyStatus').addEventListener('change',()=>renderHistory());
   $('clearHistoryButton').addEventListener('click',()=>refreshAzureHistory());
