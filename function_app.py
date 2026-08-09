@@ -6,6 +6,7 @@ import mimetypes
 import uuid
 import os
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import quote
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -409,6 +410,37 @@ def blob_run_to_history_row(
     }
 
 
+
+def _history_datetime_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Add explicit UTC and Asia/Riyadh timestamps for History API responses.
+
+    SQL datetime2 values are stored as UTC but are timezone-naive when pyodbc
+    returns them.  Sending explicit ISO timestamps removes browser ambiguity
+    and guarantees that the History page always shows Saudi Arabia time.
+    """
+    result = dict(row)
+    riyadh = ZoneInfo("Asia/Riyadh")
+
+    for field in ("StartedAt", "CompletedAt", "CreatedAt"):
+        value = result.get(field)
+        if value is None:
+            continue
+
+        if isinstance(value, pd.Timestamp):
+            value = value.to_pydatetime()
+
+        if isinstance(value, datetime):
+            utc_value = (
+                value.replace(tzinfo=timezone.utc)
+                if value.tzinfo is None
+                else value.astimezone(timezone.utc)
+            )
+            result[f"{field}Utc"] = utc_value.isoformat().replace("+00:00", "Z")
+            result[f"{field}Saudi"] = utc_value.astimezone(riyadh).isoformat()
+
+    return result
+
+
 def blob_files_for_ui(run_number: str) -> List[Dict[str, Any]]:
     from engine.blob_storage import BlobStorage
 
@@ -463,9 +495,13 @@ def history(req: func.HttpRequest) -> func.HttpResponse:
                 )
             )
 
+        rows = [_history_datetime_fields(row) for row in rows]
+
         rows.sort(
             key=lambda row: str(
-                row.get("StartedAt")
+                row.get("StartedAtUtc")
+                or row.get("StartedAt")
+                or row.get("CompletedAtUtc")
                 or row.get("CompletedAt")
                 or row.get("RunNumber")
                 or ""
@@ -500,17 +536,48 @@ def history_run(req: func.HttpRequest) -> func.HttpResponse:
         )
 
         run = get_reconciliation_run(run_number)
-        files = list_reconciliation_run_files(run_number)
 
-        if not files:
-            files = blob_files_for_ui(run_number)
-        else:
-            for file in files:
-                file["download_url"] = build_download_url(
-                    run_number,
-                    str(file.get("FileCategory", "")),
-                    str(file.get("FileName", "")),
-                )
+        # ReconciliationRunFiles can be incomplete for older / transitional
+        # Daily runs. In particular, some runs have SQL records for generated
+        # output files while the original ASN / Full Dispatch / SFDA inputs are
+        # present only in Blob Storage. The previous implementation used Blob
+        # Storage only when SQL returned zero files, so those input files were
+        # hidden as soon as even one output record existed in SQL.
+        #
+        # History is an audit page, therefore build the file list from BOTH
+        # sources and de-duplicate by category + file name.
+        sql_files = list_reconciliation_run_files(run_number)
+        blob_files = blob_files_for_ui(run_number)
+
+        merged_files: Dict[tuple, Dict[str, Any]] = {}
+
+        for file in blob_files:
+            key = (
+                str(file.get("FileCategory", "")).strip().lower(),
+                str(file.get("FileName", "")).strip().lower(),
+            )
+            merged_files[key] = file
+
+        for file in sql_files:
+            file["download_url"] = build_download_url(
+                run_number,
+                str(file.get("FileCategory", "")),
+                str(file.get("FileName", "")),
+            )
+            key = (
+                str(file.get("FileCategory", "")).strip().lower(),
+                str(file.get("FileName", "")).strip().lower(),
+            )
+            # Prefer the SQL row when both sources describe the same file.
+            merged_files[key] = file
+
+        files = sorted(
+            merged_files.values(),
+            key=lambda file: (
+                str(file.get("FileCategory", "")),
+                str(file.get("FileName", "")),
+            ),
+        )
 
         if not run:
             metadata = load_blob_run_metadata(run_number)
@@ -527,6 +594,8 @@ def history_run(req: func.HttpRequest) -> func.HttpResponse:
                     for file in files
                 ],
             )
+
+        run = _history_datetime_fields(run)
 
         return json_response(
             {
