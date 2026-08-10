@@ -1,9 +1,9 @@
 /*
-    SFDA Reconciliation v5.0
+    SFDA Reconciliation v6.0
     Idempotent Azure SQL schema
 
     This script may be executed repeatedly.
-    It creates missing Version 5 tables, adds missing columns,
+    It creates missing Version 6 tables, adds missing columns,
     defaults and performance indexes without deleting existing data.
 */
 
@@ -1007,10 +1007,10 @@ BEGIN TRY
         ALTER TABLE dbo.ApplicationUsers ADD WarehouseID int NULL;
     IF COL_LENGTH(N'dbo.ApplicationUsers', N'RequestedWarehouseName') IS NULL
         ALTER TABLE dbo.ApplicationUsers ADD RequestedWarehouseName nvarchar(150) NULL;
-    UPDATE dbo.ApplicationUsers SET WarehouseID=1 WHERE WarehouseID IS NULL;
-    ALTER TABLE dbo.ApplicationUsers ALTER COLUMN WarehouseID int NOT NULL;
+    EXEC(N'UPDATE dbo.ApplicationUsers SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+    EXEC(N'ALTER TABLE dbo.ApplicationUsers ALTER COLUMN WarehouseID int NOT NULL;');
     IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name=N'FK_ApplicationUsers_Warehouse')
-        ALTER TABLE dbo.ApplicationUsers ADD CONSTRAINT FK_ApplicationUsers_Warehouse FOREIGN KEY (WarehouseID) REFERENCES dbo.Warehouses(WarehouseID);
+        EXEC(N'ALTER TABLE dbo.ApplicationUsers ADD CONSTRAINT FK_ApplicationUsers_Warehouse FOREIGN KEY (WarehouseID) REFERENCES dbo.Warehouses(WarehouseID);');
 
     IF NOT EXISTS
     (
@@ -1095,153 +1095,159 @@ BEGIN TRY
 
     /* ================================================================
        Version 6 warehouse isolation. All existing rows become Madinah.
+
+       IMPORTANT:
+       WarehouseID migration statements use dynamic SQL intentionally.
+       SQL Server compiles a batch before ALTER TABLE ADD takes effect;
+       without dynamic SQL an existing pre-V6 database raises
+       "Invalid column name 'WarehouseID'" during compilation.
        ================================================================ */
     IF OBJECT_ID(N'dbo.ReceiptEvents', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.ReceiptEvents', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.ReceiptEvents ADD WarehouseID int NULL;
-        UPDATE dbo.ReceiptEvents SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.ReceiptEvents ADD CONSTRAINT DF_ReceiptEvents_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.ReceiptEvents ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.ReceiptEvents SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.ReceiptEvents ADD CONSTRAINT DF_ReceiptEvents_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.ReceiptEvents ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.DispatchEvents', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DispatchEvents', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.DispatchEvents ADD WarehouseID int NULL;
-        UPDATE dbo.DispatchEvents SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.DispatchEvents ADD CONSTRAINT DF_DispatchEvents_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.DispatchEvents ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.DispatchEvents SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.DispatchEvents ADD CONSTRAINT DF_DispatchEvents_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.DispatchEvents ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.BatchMaster', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.BatchMaster', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.BatchMaster ADD WarehouseID int NULL;
-        UPDATE dbo.BatchMaster SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.BatchMaster ADD CONSTRAINT DF_BatchMaster_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.BatchMaster ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.BatchMaster SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.BatchMaster ADD CONSTRAINT DF_BatchMaster_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.BatchMaster ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.SupplierHistory', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.SupplierHistory', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.SupplierHistory ADD WarehouseID int NULL;
-        UPDATE dbo.SupplierHistory SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.SupplierHistory ADD CONSTRAINT DF_SupplierHistory_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.SupplierHistory ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.SupplierHistory SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.SupplierHistory ADD CONSTRAINT DF_SupplierHistory_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.SupplierHistory ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.CustomerHistory', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.CustomerHistory', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.CustomerHistory ADD WarehouseID int NULL;
-        UPDATE dbo.CustomerHistory SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.CustomerHistory ADD CONSTRAINT DF_CustomerHistory_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.CustomerHistory ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.CustomerHistory SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.CustomerHistory ADD CONSTRAINT DF_CustomerHistory_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.CustomerHistory ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.RunHistory', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.RunHistory', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.RunHistory ADD WarehouseID int NULL;
-        UPDATE dbo.RunHistory SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.RunHistory ADD CONSTRAINT DF_RunHistory_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.RunHistory ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.RunHistory SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.RunHistory ADD CONSTRAINT DF_RunHistory_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.RunHistory ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.LatestInventorySnapshot', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.LatestInventorySnapshot', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.LatestInventorySnapshot ADD WarehouseID int NULL;
-        UPDATE dbo.LatestInventorySnapshot SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.LatestInventorySnapshot ADD CONSTRAINT DF_LatestInventorySnapshot_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.LatestInventorySnapshot ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.LatestInventorySnapshot SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.LatestInventorySnapshot ADD CONSTRAINT DF_LatestInventorySnapshot_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.LatestInventorySnapshot ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.LatestSFDASnapshot', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.LatestSFDASnapshot', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.LatestSFDASnapshot ADD WarehouseID int NULL;
-        UPDATE dbo.LatestSFDASnapshot SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.LatestSFDASnapshot ADD CONSTRAINT DF_LatestSFDASnapshot_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.LatestSFDASnapshot ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.LatestSFDASnapshot SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.LatestSFDASnapshot ADD CONSTRAINT DF_LatestSFDASnapshot_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.LatestSFDASnapshot ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.ReconciliationRuns', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.ReconciliationRuns', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.ReconciliationRuns ADD WarehouseID int NULL;
-        UPDATE dbo.ReconciliationRuns SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.ReconciliationRuns ADD CONSTRAINT DF_ReconciliationRuns_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.ReconciliationRuns ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.ReconciliationRuns SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.ReconciliationRuns ADD CONSTRAINT DF_ReconciliationRuns_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.ReconciliationRuns ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.ReconciliationRunFiles', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.ReconciliationRunFiles', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.ReconciliationRunFiles ADD WarehouseID int NULL;
-        UPDATE dbo.ReconciliationRunFiles SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.ReconciliationRunFiles ADD CONSTRAINT DF_ReconciliationRunFiles_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.ReconciliationRunFiles ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.ReconciliationRunFiles SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.ReconciliationRunFiles ADD CONSTRAINT DF_ReconciliationRunFiles_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.ReconciliationRunFiles ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.DailyProcessedTransactions', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DailyProcessedTransactions', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.DailyProcessedTransactions ADD WarehouseID int NULL;
-        UPDATE dbo.DailyProcessedTransactions SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.DailyProcessedTransactions ADD CONSTRAINT DF_DailyProcessedTransactions_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.DailyProcessedTransactions ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.DailyProcessedTransactions SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.DailyProcessedTransactions ADD CONSTRAINT DF_DailyProcessedTransactions_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.DailyProcessedTransactions ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.DailyAcceptTransactions', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DailyAcceptTransactions', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.DailyAcceptTransactions ADD WarehouseID int NULL;
-        UPDATE dbo.DailyAcceptTransactions SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.DailyAcceptTransactions ADD CONSTRAINT DF_DailyAcceptTransactions_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.DailyAcceptTransactions ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.DailyAcceptTransactions SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.DailyAcceptTransactions ADD CONSTRAINT DF_DailyAcceptTransactions_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.DailyAcceptTransactions ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.DailyAcceptSFDABaseline', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DailyAcceptSFDABaseline', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.DailyAcceptSFDABaseline ADD WarehouseID int NULL;
-        UPDATE dbo.DailyAcceptSFDABaseline SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.DailyAcceptSFDABaseline ADD CONSTRAINT DF_DailyAcceptSFDABaseline_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.DailyAcceptSFDABaseline ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.DailyAcceptSFDABaseline SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.DailyAcceptSFDABaseline ADD CONSTRAINT DF_DailyAcceptSFDABaseline_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.DailyAcceptSFDABaseline ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.DailyDispatchTransactions', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DailyDispatchTransactions', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.DailyDispatchTransactions ADD WarehouseID int NULL;
-        UPDATE dbo.DailyDispatchTransactions SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.DailyDispatchTransactions ADD CONSTRAINT DF_DailyDispatchTransactions_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.DailyDispatchTransactions ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.DailyDispatchTransactions SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.DailyDispatchTransactions ADD CONSTRAINT DF_DailyDispatchTransactions_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.DailyDispatchTransactions ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.DailyDispatchSFDABaseline', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DailyDispatchSFDABaseline', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.DailyDispatchSFDABaseline ADD WarehouseID int NULL;
-        UPDATE dbo.DailyDispatchSFDABaseline SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.DailyDispatchSFDABaseline ADD CONSTRAINT DF_DailyDispatchSFDABaseline_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.DailyDispatchSFDABaseline ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.DailyDispatchSFDABaseline SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.DailyDispatchSFDABaseline ADD CONSTRAINT DF_DailyDispatchSFDABaseline_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.DailyDispatchSFDABaseline ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.DailyDispatchConfirmations', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DailyDispatchConfirmations', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.DailyDispatchConfirmations ADD WarehouseID int NULL;
-        UPDATE dbo.DailyDispatchConfirmations SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.DailyDispatchConfirmations ADD CONSTRAINT DF_DailyDispatchConfirmations_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.DailyDispatchConfirmations ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.DailyDispatchConfirmations SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.DailyDispatchConfirmations ADD CONSTRAINT DF_DailyDispatchConfirmations_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.DailyDispatchConfirmations ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.FullDispatchTransactions', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.FullDispatchTransactions', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.FullDispatchTransactions ADD WarehouseID int NULL;
-        UPDATE dbo.FullDispatchTransactions SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.FullDispatchTransactions ADD CONSTRAINT DF_FullDispatchTransactions_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.FullDispatchTransactions ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.FullDispatchTransactions SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.FullDispatchTransactions ADD CONSTRAINT DF_FullDispatchTransactions_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.FullDispatchTransactions ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.FullDispatchSFDABaseline', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.FullDispatchSFDABaseline', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.FullDispatchSFDABaseline ADD WarehouseID int NULL;
-        UPDATE dbo.FullDispatchSFDABaseline SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.FullDispatchSFDABaseline ADD CONSTRAINT DF_FullDispatchSFDABaseline_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.FullDispatchSFDABaseline ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.FullDispatchSFDABaseline SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.FullDispatchSFDABaseline ADD CONSTRAINT DF_FullDispatchSFDABaseline_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.FullDispatchSFDABaseline ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.FullDispatchConfirmations', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.FullDispatchConfirmations', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.FullDispatchConfirmations ADD WarehouseID int NULL;
-        UPDATE dbo.FullDispatchConfirmations SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.FullDispatchConfirmations ADD CONSTRAINT DF_FullDispatchConfirmations_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.FullDispatchConfirmations ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.FullDispatchConfirmations SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.FullDispatchConfirmations ADD CONSTRAINT DF_FullDispatchConfirmations_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.FullDispatchConfirmations ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.HistoricalBuildJobs', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.HistoricalBuildJobs', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.HistoricalBuildJobs ADD WarehouseID int NULL;
-        UPDATE dbo.HistoricalBuildJobs SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.HistoricalBuildJobs ADD CONSTRAINT DF_HistoricalBuildJobs_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.HistoricalBuildJobs ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.HistoricalBuildJobs SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.HistoricalBuildJobs ADD CONSTRAINT DF_HistoricalBuildJobs_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.HistoricalBuildJobs ALTER COLUMN WarehouseID int NOT NULL;');
     END;
     IF OBJECT_ID(N'dbo.OutlookDraftRequests', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.OutlookDraftRequests', N'WarehouseID') IS NULL
     BEGIN
         ALTER TABLE dbo.OutlookDraftRequests ADD WarehouseID int NULL;
-        UPDATE dbo.OutlookDraftRequests SET WarehouseID=1 WHERE WarehouseID IS NULL;
-        ALTER TABLE dbo.OutlookDraftRequests ADD CONSTRAINT DF_OutlookDraftRequests_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
-        ALTER TABLE dbo.OutlookDraftRequests ALTER COLUMN WarehouseID int NOT NULL;
+        EXEC(N'UPDATE dbo.OutlookDraftRequests SET WarehouseID=1 WHERE WarehouseID IS NULL;');
+        EXEC(N'ALTER TABLE dbo.OutlookDraftRequests ADD CONSTRAINT DF_OutlookDraftRequests_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N''''WarehouseID''''))) FOR WarehouseID;');
+        EXEC(N'ALTER TABLE dbo.OutlookDraftRequests ALTER COLUMN WarehouseID int NOT NULL;');
     END;
 
     IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name=N'FK_DailyDispatchConfirmations_Transaction')
@@ -1258,7 +1264,7 @@ BEGIN TRY
        )
     BEGIN
         ALTER TABLE dbo.ReceiptEvents DROP CONSTRAINT PK_ReceiptEvents;
-        ALTER TABLE dbo.ReceiptEvents ADD CONSTRAINT PK_ReceiptEvents PRIMARY KEY (WarehouseID, EventKey);
+        EXEC(N'ALTER TABLE dbo.ReceiptEvents ADD CONSTRAINT PK_ReceiptEvents PRIMARY KEY (WarehouseID, EventKey);');
     END;
     IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_DispatchEvents')
        AND NOT EXISTS (
@@ -1269,7 +1275,7 @@ BEGIN TRY
        )
     BEGIN
         ALTER TABLE dbo.DispatchEvents DROP CONSTRAINT PK_DispatchEvents;
-        ALTER TABLE dbo.DispatchEvents ADD CONSTRAINT PK_DispatchEvents PRIMARY KEY (WarehouseID, EventKey);
+        EXEC(N'ALTER TABLE dbo.DispatchEvents ADD CONSTRAINT PK_DispatchEvents PRIMARY KEY (WarehouseID, EventKey);');
     END;
     IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_BatchMaster')
        AND NOT EXISTS (
@@ -1280,7 +1286,7 @@ BEGIN TRY
        )
     BEGIN
         ALTER TABLE dbo.BatchMaster DROP CONSTRAINT PK_BatchMaster;
-        ALTER TABLE dbo.BatchMaster ADD CONSTRAINT PK_BatchMaster PRIMARY KEY (WarehouseID, BN, ExpiryMonthKey, GenericItemNumber);
+        EXEC(N'ALTER TABLE dbo.BatchMaster ADD CONSTRAINT PK_BatchMaster PRIMARY KEY (WarehouseID, BN, ExpiryMonthKey, GenericItemNumber);');
     END;
     IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_DailyAcceptTransactions')
        AND NOT EXISTS (
@@ -1291,7 +1297,7 @@ BEGIN TRY
        )
     BEGIN
         ALTER TABLE dbo.DailyAcceptTransactions DROP CONSTRAINT PK_DailyAcceptTransactions;
-        ALTER TABLE dbo.DailyAcceptTransactions ADD CONSTRAINT PK_DailyAcceptTransactions PRIMARY KEY (WarehouseID, TransactionKey);
+        EXEC(N'ALTER TABLE dbo.DailyAcceptTransactions ADD CONSTRAINT PK_DailyAcceptTransactions PRIMARY KEY (WarehouseID, TransactionKey);');
     END;
     IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_DailyAcceptSFDABaseline')
        AND NOT EXISTS (
@@ -1302,7 +1308,7 @@ BEGIN TRY
        )
     BEGIN
         ALTER TABLE dbo.DailyAcceptSFDABaseline DROP CONSTRAINT PK_DailyAcceptSFDABaseline;
-        ALTER TABLE dbo.DailyAcceptSFDABaseline ADD CONSTRAINT PK_DailyAcceptSFDABaseline PRIMARY KEY (WarehouseID, BN, ExpiryDate);
+        EXEC(N'ALTER TABLE dbo.DailyAcceptSFDABaseline ADD CONSTRAINT PK_DailyAcceptSFDABaseline PRIMARY KEY (WarehouseID, BN, ExpiryDate);');
     END;
     IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_DailyDispatchTransactions')
        AND NOT EXISTS (
@@ -1313,7 +1319,7 @@ BEGIN TRY
        )
     BEGIN
         ALTER TABLE dbo.DailyDispatchTransactions DROP CONSTRAINT PK_DailyDispatchTransactions;
-        ALTER TABLE dbo.DailyDispatchTransactions ADD CONSTRAINT PK_DailyDispatchTransactions PRIMARY KEY (WarehouseID, TransactionKey);
+        EXEC(N'ALTER TABLE dbo.DailyDispatchTransactions ADD CONSTRAINT PK_DailyDispatchTransactions PRIMARY KEY (WarehouseID, TransactionKey);');
     END;
     IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_DailyDispatchSFDABaseline')
        AND NOT EXISTS (
@@ -1324,7 +1330,7 @@ BEGIN TRY
        )
     BEGIN
         ALTER TABLE dbo.DailyDispatchSFDABaseline DROP CONSTRAINT PK_DailyDispatchSFDABaseline;
-        ALTER TABLE dbo.DailyDispatchSFDABaseline ADD CONSTRAINT PK_DailyDispatchSFDABaseline PRIMARY KEY (WarehouseID, BN, ExpiryDate);
+        EXEC(N'ALTER TABLE dbo.DailyDispatchSFDABaseline ADD CONSTRAINT PK_DailyDispatchSFDABaseline PRIMARY KEY (WarehouseID, BN, ExpiryDate);');
     END;
     IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_DailyDispatchConfirmations')
        AND NOT EXISTS (
@@ -1335,7 +1341,7 @@ BEGIN TRY
        )
     BEGIN
         ALTER TABLE dbo.DailyDispatchConfirmations DROP CONSTRAINT PK_DailyDispatchConfirmations;
-        ALTER TABLE dbo.DailyDispatchConfirmations ADD CONSTRAINT PK_DailyDispatchConfirmations PRIMARY KEY (WarehouseID, ConfirmationKey);
+        EXEC(N'ALTER TABLE dbo.DailyDispatchConfirmations ADD CONSTRAINT PK_DailyDispatchConfirmations PRIMARY KEY (WarehouseID, ConfirmationKey);');
     END;
     IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_FullDispatchTransactions')
        AND NOT EXISTS (
@@ -1346,7 +1352,7 @@ BEGIN TRY
        )
     BEGIN
         ALTER TABLE dbo.FullDispatchTransactions DROP CONSTRAINT PK_FullDispatchTransactions;
-        ALTER TABLE dbo.FullDispatchTransactions ADD CONSTRAINT PK_FullDispatchTransactions PRIMARY KEY (WarehouseID, TransactionKey);
+        EXEC(N'ALTER TABLE dbo.FullDispatchTransactions ADD CONSTRAINT PK_FullDispatchTransactions PRIMARY KEY (WarehouseID, TransactionKey);');
     END;
     IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_FullDispatchSFDABaseline')
        AND NOT EXISTS (
@@ -1357,7 +1363,7 @@ BEGIN TRY
        )
     BEGIN
         ALTER TABLE dbo.FullDispatchSFDABaseline DROP CONSTRAINT PK_FullDispatchSFDABaseline;
-        ALTER TABLE dbo.FullDispatchSFDABaseline ADD CONSTRAINT PK_FullDispatchSFDABaseline PRIMARY KEY (WarehouseID, BN, ExpiryDate);
+        EXEC(N'ALTER TABLE dbo.FullDispatchSFDABaseline ADD CONSTRAINT PK_FullDispatchSFDABaseline PRIMARY KEY (WarehouseID, BN, ExpiryDate);');
     END;
     IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_FullDispatchConfirmations')
        AND NOT EXISTS (
@@ -1368,32 +1374,32 @@ BEGIN TRY
        )
     BEGIN
         ALTER TABLE dbo.FullDispatchConfirmations DROP CONSTRAINT PK_FullDispatchConfirmations;
-        ALTER TABLE dbo.FullDispatchConfirmations ADD CONSTRAINT PK_FullDispatchConfirmations PRIMARY KEY (WarehouseID, ConfirmationKey);
+        EXEC(N'ALTER TABLE dbo.FullDispatchConfirmations ADD CONSTRAINT PK_FullDispatchConfirmations PRIMARY KEY (WarehouseID, ConfirmationKey);');
     END;
 
     IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name=N'FK_DailyDispatchConfirmations_Transaction')
-        ALTER TABLE dbo.DailyDispatchConfirmations ADD CONSTRAINT FK_DailyDispatchConfirmations_Transaction
-            FOREIGN KEY (WarehouseID, TransactionKey) REFERENCES dbo.DailyDispatchTransactions(WarehouseID, TransactionKey);
+        EXEC(N'ALTER TABLE dbo.DailyDispatchConfirmations ADD CONSTRAINT FK_DailyDispatchConfirmations_Transaction
+            FOREIGN KEY (WarehouseID, TransactionKey) REFERENCES dbo.DailyDispatchTransactions(WarehouseID, TransactionKey);');
     IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name=N'FK_FullDispatchConfirmations_Transaction')
-        ALTER TABLE dbo.FullDispatchConfirmations ADD CONSTRAINT FK_FullDispatchConfirmations_Transaction
-            FOREIGN KEY (WarehouseID, TransactionKey) REFERENCES dbo.FullDispatchTransactions(WarehouseID, TransactionKey);
+        EXEC(N'ALTER TABLE dbo.FullDispatchConfirmations ADD CONSTRAINT FK_FullDispatchConfirmations_Transaction
+            FOREIGN KEY (WarehouseID, TransactionKey) REFERENCES dbo.FullDispatchTransactions(WarehouseID, TransactionKey);');
 
     IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.ReceiptEvents') AND name=N'IX_ReceiptEvents_WarehouseID')
-        CREATE INDEX IX_ReceiptEvents_WarehouseID ON dbo.ReceiptEvents(WarehouseID);
+        EXEC(N'CREATE INDEX IX_ReceiptEvents_WarehouseID ON dbo.ReceiptEvents(WarehouseID);');
     IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.DispatchEvents') AND name=N'IX_DispatchEvents_WarehouseID')
-        CREATE INDEX IX_DispatchEvents_WarehouseID ON dbo.DispatchEvents(WarehouseID);
+        EXEC(N'CREATE INDEX IX_DispatchEvents_WarehouseID ON dbo.DispatchEvents(WarehouseID);');
     IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.BatchMaster') AND name=N'IX_BatchMaster_WarehouseID')
-        CREATE INDEX IX_BatchMaster_WarehouseID ON dbo.BatchMaster(WarehouseID);
+        EXEC(N'CREATE INDEX IX_BatchMaster_WarehouseID ON dbo.BatchMaster(WarehouseID);');
     IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.SupplierHistory') AND name=N'IX_SupplierHistory_WarehouseID')
-        CREATE INDEX IX_SupplierHistory_WarehouseID ON dbo.SupplierHistory(WarehouseID);
+        EXEC(N'CREATE INDEX IX_SupplierHistory_WarehouseID ON dbo.SupplierHistory(WarehouseID);');
     IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.CustomerHistory') AND name=N'IX_CustomerHistory_WarehouseID')
-        CREATE INDEX IX_CustomerHistory_WarehouseID ON dbo.CustomerHistory(WarehouseID);
+        EXEC(N'CREATE INDEX IX_CustomerHistory_WarehouseID ON dbo.CustomerHistory(WarehouseID);');
     IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.ReconciliationRuns') AND name=N'IX_ReconciliationRuns_WarehouseID')
-        CREATE INDEX IX_ReconciliationRuns_WarehouseID ON dbo.ReconciliationRuns(WarehouseID);
+        EXEC(N'CREATE INDEX IX_ReconciliationRuns_WarehouseID ON dbo.ReconciliationRuns(WarehouseID);');
     IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.LatestInventorySnapshot') AND name=N'IX_LatestInventorySnapshot_WarehouseID')
-        CREATE INDEX IX_LatestInventorySnapshot_WarehouseID ON dbo.LatestInventorySnapshot(WarehouseID);
+        EXEC(N'CREATE INDEX IX_LatestInventorySnapshot_WarehouseID ON dbo.LatestInventorySnapshot(WarehouseID);');
     IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.LatestSFDASnapshot') AND name=N'IX_LatestSFDASnapshot_WarehouseID')
-        CREATE INDEX IX_LatestSFDASnapshot_WarehouseID ON dbo.LatestSFDASnapshot(WarehouseID);
+        EXEC(N'CREATE INDEX IX_LatestSFDASnapshot_WarehouseID ON dbo.LatestSFDASnapshot(WarehouseID);');
 
     IF OBJECT_ID(N'dbo.fn_WarehouseAccessPredicate', N'IF') IS NULL
         EXEC(N'CREATE FUNCTION dbo.fn_WarehouseAccessPredicate(@WarehouseID int)
