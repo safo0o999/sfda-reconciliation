@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import secrets
 import threading
@@ -10,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 from engine.database import (
-    initialize_database,
+    verify_auth_schema,
     approve_user_by_token_hash,
     count_active_admins,
     create_auth_session,
@@ -27,6 +28,7 @@ from engine.database import (
 from engine.email_service import email_settings, send_email
 
 
+logger = logging.getLogger("SFDA-Reconciliation.Auth")
 
 
 _AUTH_SCHEMA_READY = False
@@ -34,14 +36,29 @@ _AUTH_SCHEMA_LOCK = threading.Lock()
 
 
 def ensure_auth_schema() -> None:
+    """
+    Perform a lightweight one-time verification of the V6 auth schema.
+
+    Registration/login must never execute the full database migration.
+    The deployment migration is handled separately in Azure SQL.
+    """
     global _AUTH_SCHEMA_READY
+
     if _AUTH_SCHEMA_READY:
         return
+
     with _AUTH_SCHEMA_LOCK:
         if _AUTH_SCHEMA_READY:
             return
-        initialize_database()
+
+        started_at = datetime.now(timezone.utc)
+        logger.info("Auth schema verification started.")
+
+        verify_auth_schema()
+
         _AUTH_SCHEMA_READY = True
+        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        logger.info("Auth schema verification completed in %.3f seconds.", elapsed)
 
 PBKDF2_ITERATIONS = 310_000
 SESSION_HOURS = 12
@@ -98,11 +115,25 @@ def _token_hash(token: str) -> str:
 
 
 def register_user(email: str, password: str, warehouse_name: str, base_url: str) -> Dict[str, Any]:
+    request_started = datetime.now(timezone.utc)
+    normalized_email = normalize_email(email)
+    logger.info("Registration started for %s.", normalized_email or "<empty>")
+
     ensure_auth_schema()
+    logger.info("Registration schema verification ready for %s.", normalized_email or "<empty>")
+
     email = validate_corporate_email(email)
     password = validate_password(password)
+    logger.info("Registration input validation passed for %s.", email)
 
     existing = find_user_by_email(email)
+    logger.info(
+        "Registration existing-user lookup completed for %s. Exists=%s Status=%s",
+        email,
+        bool(existing),
+        str((existing or {}).get("Status") or ""),
+    )
+
     if existing and str(existing.get("Status", "")).lower() == "active":
         raise ValueError("A user with this email already exists and is active.")
 
@@ -112,19 +143,35 @@ def register_user(email: str, password: str, warehouse_name: str, base_url: str)
     approval_expires = datetime.now(timezone.utc) + timedelta(hours=APPROVAL_HOURS)
 
     first_admin = count_active_admins() == 0
+    logger.info("Registration admin-count check completed for %s. FirstAdmin=%s", email, first_admin)
+
     if first_admin:
         warehouse = get_madinah_warehouse()
         role = "Admin"
         status = "Active"
         requested_warehouse_name = str(warehouse.get("WarehouseName") or "Madinah Warehouse")
+        logger.info(
+            "First administrator %s assigned to WarehouseID=%s (%s).",
+            email,
+            warehouse.get("WarehouseID"),
+            requested_warehouse_name,
+        )
     else:
         requested_warehouse_name = " ".join(str(warehouse_name or "").strip().split())
         if not requested_warehouse_name:
             raise ValueError("Warehouse name is required.")
+
         warehouse = get_or_create_warehouse(requested_warehouse_name)
         role = "User"
         status = "Pending"
+        logger.info(
+            "Pending user %s assigned to WarehouseID=%s (%s).",
+            email,
+            warehouse.get("WarehouseID"),
+            requested_warehouse_name,
+        )
 
+    logger.info("Registration database upsert started for %s.", email)
     user = create_pending_user_record(
         email=email,
         password_salt=salt_b64,
@@ -136,8 +183,20 @@ def register_user(email: str, password: str, warehouse_name: str, base_url: str)
         requested_warehouse_name=requested_warehouse_name,
         status=status,
     )
+    logger.info(
+        "Registration database upsert completed for %s. UserID=%s Status=%s",
+        email,
+        user.get("UserID"),
+        user.get("Status"),
+    )
 
     if first_admin:
+        elapsed = (datetime.now(timezone.utc) - request_started).total_seconds()
+        logger.info(
+            "First administrator registration completed for %s in %.3f seconds.",
+            email,
+            elapsed,
+        )
         return {
             "user": user,
             "first_admin": True,
@@ -148,6 +207,7 @@ def register_user(email: str, password: str, warehouse_name: str, base_url: str)
     admin_email = normalize_email(os.getenv("USER_APPROVAL_ADMIN_EMAIL", ""))
     mail_sent = False
     mail_error = ""
+
     if admin_email:
         approve_url = f"{base_url.rstrip('/')}/api/auth/approve?token={approval_token}"
         body = (
@@ -159,6 +219,12 @@ def register_user(email: str, password: str, warehouse_name: str, base_url: str)
             f"{approve_url}\n\n"
             f"The link expires in {APPROVAL_HOURS} hours."
         )
+
+        logger.info(
+            "Registration approval email attempt started for %s -> %s.",
+            email,
+            admin_email,
+        )
         try:
             send_email(
                 admin_email,
@@ -166,10 +232,26 @@ def register_user(email: str, password: str, warehouse_name: str, base_url: str)
                 body,
             )
             mail_sent = True
+            logger.info("Registration approval email sent for %s.", email)
         except Exception as exc:
             mail_error = str(exc)
+            logger.warning(
+                "Registration approval email failed for %s: %s",
+                email,
+                mail_error,
+            )
     else:
         mail_error = "USER_APPROVAL_ADMIN_EMAIL is not configured."
+        logger.info("Registration approval email skipped for %s: %s", email, mail_error)
+
+    elapsed = (datetime.now(timezone.utc) - request_started).total_seconds()
+    logger.info(
+        "Registration completed for %s in %.3f seconds. Status=%s EmailSent=%s",
+        email,
+        elapsed,
+        user.get("Status"),
+        mail_sent,
+    )
 
     return {
         "user": user,
