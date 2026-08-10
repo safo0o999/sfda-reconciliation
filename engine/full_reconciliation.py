@@ -205,6 +205,12 @@ class FullReconciliationEngine:
         "PackageSize",
         "Historical Dispatch Quantity Each",
         "Historical Dispatch Quantity Pack",
+        "Previously Confirmed Full Dispatch Each",
+        "Previously Confirmed Full Dispatch Pack",
+        "Reserved Full Dispatch Quantity Each",
+        "Reserved Full Dispatch Quantity Pack",
+        "Available Historical Dispatch Quantity Each",
+        "Available Historical Dispatch Quantity Pack",
         "Current Inventory Quantity Each",
         "Current Inventory Quantity Pack",
         "SFDA Quantity",
@@ -1472,8 +1478,14 @@ class FullReconciliationEngine:
         inventory_df: pd.DataFrame,
         sfda_df: pd.DataFrame,
         customer_history_df: pd.DataFrame,
+        confirmed_full_dispatch_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """Allocate the SFDA Active minus current inventory variance by GLN."""
+        """Allocate only unconsumed historical Dispatch evidence by GLN.
+
+        Full Reconciliation must not reuse the same historical WMS dispatch
+        quantity after SFDA has already confirmed that quantity. The confirmed
+        ledger is therefore subtracted customer-by-customer before allocation.
+        """
 
         sfda = self._prepare_stage2_sfda(sfda_df)
         inventory = self._prepare_stage2_inventory(inventory_df)
@@ -1574,6 +1586,155 @@ class FullReconciliationEngine:
             details["Expiry Date"] = sfda_expiry.combine_first(history_expiry)
             details = details.drop(columns=["SFDA Expiry Date"])
 
+        confirmed = (
+            confirmed_full_dispatch_df.copy()
+            if confirmed_full_dispatch_df is not None
+            else pd.DataFrame()
+        )
+        confirmed_each_column = "Previously Confirmed Full Dispatch Each"
+        confirmed_pack_column = "Previously Confirmed Full Dispatch Pack"
+        reserved_each_column = "Reserved Full Dispatch Quantity Each"
+        reserved_pack_column = "Reserved Full Dispatch Quantity Pack"
+
+        if confirmed.empty:
+            details[confirmed_each_column] = 0.0
+            details[confirmed_pack_column] = 0.0
+            details[reserved_each_column] = 0.0
+            details[reserved_pack_column] = 0.0
+        else:
+            rename_confirmed = {
+                "Confirmed Full Dispatch Quantity Each": confirmed_each_column,
+                "Confirmed Full Dispatch Quantity Pack": confirmed_pack_column,
+                "Reserved Full Dispatch Quantity Each": reserved_each_column,
+                "Reserved Full Dispatch Quantity Pack": reserved_pack_column,
+            }
+            confirmed = confirmed.rename(columns=rename_confirmed)
+
+            for column in [
+                "BN",
+                "Generic Item Number",
+                "To Address",
+                "GLN",
+            ]:
+                if column not in confirmed.columns:
+                    confirmed[column] = ""
+                confirmed[column] = confirmed[column].fillna("").astype(str).str.strip()
+
+            confirmed["Expiry Date"] = Normalizer.date(
+                confirmed.get("Expiry Date", pd.Series(dtype=object))
+            )
+            if "Expiry Month Key" not in confirmed.columns:
+                confirmed["Expiry Month Key"] = self._month_key(
+                    confirmed["Expiry Date"]
+                )
+            confirmed["Expiry Month Key"] = (
+                confirmed["Expiry Month Key"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+            )
+            confirmed[confirmed_each_column] = pd.to_numeric(
+                confirmed.get(confirmed_each_column, 0),
+                errors="coerce",
+            ).fillna(0)
+            confirmed[confirmed_pack_column] = pd.to_numeric(
+                confirmed.get(confirmed_pack_column, 0),
+                errors="coerce",
+            ).fillna(0)
+            confirmed[reserved_each_column] = pd.to_numeric(
+                confirmed.get(reserved_each_column, 0),
+                errors="coerce",
+            ).fillna(0)
+            confirmed[reserved_pack_column] = pd.to_numeric(
+                confirmed.get(reserved_pack_column, 0),
+                errors="coerce",
+            ).fillna(0)
+
+            confirmed = (
+                confirmed.groupby(
+                    [
+                        "BN",
+                        "Expiry Month Key",
+                        "Generic Item Number",
+                        "To Address",
+                        "GLN",
+                    ],
+                    dropna=False,
+                )
+                .agg(
+                    **{
+                        confirmed_each_column: (
+                            confirmed_each_column,
+                            "sum",
+                        ),
+                        confirmed_pack_column: (
+                            confirmed_pack_column,
+                            "sum",
+                        ),
+                        reserved_each_column: (
+                            reserved_each_column,
+                            "sum",
+                        ),
+                        reserved_pack_column: (
+                            reserved_pack_column,
+                            "sum",
+                        ),
+                    }
+                )
+                .reset_index()
+            )
+
+            details = details.merge(
+                confirmed,
+                on=[
+                    "BN",
+                    "Expiry Month Key",
+                    "Generic Item Number",
+                    "To Address",
+                    "GLN",
+                ],
+                how="left",
+                validate="many_to_one",
+            )
+            details[confirmed_each_column] = pd.to_numeric(
+                details[confirmed_each_column],
+                errors="coerce",
+            ).fillna(0)
+            details[confirmed_pack_column] = pd.to_numeric(
+                details[confirmed_pack_column],
+                errors="coerce",
+            ).fillna(0)
+            details[reserved_each_column] = pd.to_numeric(
+                details[reserved_each_column],
+                errors="coerce",
+            ).fillna(0)
+            details[reserved_pack_column] = pd.to_numeric(
+                details[reserved_pack_column],
+                errors="coerce",
+            ).fillna(0)
+
+        details["Available Historical Dispatch Quantity Each"] = (
+            pd.to_numeric(
+                details["Historical Dispatch Quantity Each"],
+                errors="coerce",
+            ).fillna(0)
+            - pd.to_numeric(
+                details[reserved_each_column],
+                errors="coerce",
+            ).fillna(0)
+        ).clip(lower=0)
+
+        details["Available Historical Dispatch Quantity Pack"] = (
+            pd.to_numeric(
+                details["Historical Dispatch Quantity Pack"],
+                errors="coerce",
+            ).fillna(0)
+            - pd.to_numeric(
+                details[reserved_pack_column],
+                errors="coerce",
+            ).fillna(0)
+        ).clip(lower=0)
+
         if "GTIN_y" in details.columns:
             details["GTIN"] = details["GTIN_y"].fillna(
                 details.get("GTIN_x", "")
@@ -1618,7 +1779,15 @@ class FullReconciliationEngine:
             for row_index in index_list:
                 if remaining <= 0:
                     break
-                available = int(max(details.loc[row_index, "Historical Dispatch Quantity Pack"], 0))
+                available = int(
+                    max(
+                        details.loc[
+                            row_index,
+                            "Available Historical Dispatch Quantity Pack",
+                        ],
+                        0,
+                    )
+                )
                 allocated = min(available, remaining)
                 details.loc[row_index, "To Be Dispatch"] = allocated
                 remaining -= allocated
@@ -1707,12 +1876,16 @@ class FullReconciliationEngine:
         inventory_df: pd.DataFrame,
         sfda_df: pd.DataFrame,
         customer_history_df: pd.DataFrame,
+        confirmed_full_dispatch_df: pd.DataFrame | None = None,
     ) -> Dict[str, pd.DataFrame]:
         """Run the Full Dispatch stage after Accept is completed in SFDA."""
 
         Validator.validate(Normalizer.normalize_sfda(sfda_df.copy()), "SFDA")
         dispatch_details = self.build_dispatch_reconciliation(
-            inventory_df, sfda_df, customer_history_df
+            inventory_df,
+            sfda_df,
+            customer_history_df,
+            confirmed_full_dispatch_df,
         )
         empty_accept = pd.DataFrame(columns=self.ACCEPT_RECONCILIATION_COLUMNS)
         empty_variance = pd.DataFrame(columns=self.SUPPLIER_VARIANCE_COLUMNS)
