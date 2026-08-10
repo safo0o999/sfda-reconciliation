@@ -1326,6 +1326,179 @@ def get_historical_build_job(job_id: str) -> Dict[str, Any]:
         "updated_at": row[12],
     }
 
+
+def list_historical_build_jobs(limit: int = 500) -> List[Dict[str, Any]]:
+    """Return historical Full Reconciliation build jobs for the unified History page."""
+
+    initialize_database()
+    safe_limit = max(1, min(int(limit), 5000))
+    sql = f"""
+        SELECT TOP ({safe_limit})
+            JobID,
+            Operation,
+            Status,
+            Progress,
+            CurrentStage,
+            InputManifestJson,
+            OutputManifestJson,
+            SummaryJson,
+            ErrorMessage,
+            CreatedAt,
+            StartedAt,
+            CompletedAt,
+            UpdatedAt
+        FROM dbo.HistoricalBuildJobs
+        ORDER BY COALESCE(StartedAt, CreatedAt) DESC, CreatedAt DESC;
+    """
+
+    with Database().connect() as connection:
+        rows = connection.cursor().execute(sql).fetchall()
+
+    def parse_json(value: Any) -> Dict[str, Any]:
+        if not value:
+            return {}
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        result.append(
+            {
+                "job_id": row[0],
+                "operation": row[1] or "",
+                "status": row[2] or "",
+                "progress": int(row[3] or 0),
+                "current_stage": row[4] or "",
+                "input_manifest": parse_json(row[5]),
+                "output_manifest": parse_json(row[6]),
+                "summary": parse_json(row[7]),
+                "error": row[8] or "",
+                "created_at": row[9],
+                "started_at": row[10],
+                "completed_at": row[11],
+                "updated_at": row[12],
+            }
+        )
+    return result
+
+
+def sync_batch_master_sfda_snapshot(
+    sfda_df: pd.DataFrame,
+) -> Dict[str, int]:
+    """Synchronize the current SFDA position into persisted Batch Master.
+
+    Full Accept / Full Dispatch use the latest SFDA Drug Count as the regulatory
+    source of truth. Product Intelligence already reads the latest SFDA
+    snapshot, but Batch Master historically retained the older SFDA values from
+    the historical build. This function updates only the SFDA-controlled fields
+    while preserving WMS receipt/dispatch history.
+
+    Matching follows the existing Full Reconciliation grain of
+    BN + ExpiryMonthKey. The exact ExpiryDate stored in Batch Master is replaced
+    with the date from the latest SFDA report so exported Batch_Master.xlsx uses
+    the current regulatory expiry date.
+    """
+
+    initialize_database()
+    if sfda_df is None or sfda_df.empty:
+        return {"sfda_rows": 0, "updated_rows": 0}
+
+    from engine.full_reconciliation import FullReconciliationEngine
+    from engine.normalizer import Normalizer
+
+    frame = Normalizer.normalize_sfda(sfda_df.copy())
+    frame["Expiry Month Key"] = FullReconciliationEngine._month_key(
+        frame["Expiry Date"]
+    )
+
+    for column in [
+        "Quantity",
+        "Active",
+        "Quantity sent pending",
+        "Quantity Receive Pending",
+    ]:
+        frame[column] = pd.to_numeric(
+            frame[column],
+            errors="coerce",
+        ).fillna(0)
+
+    grouped = (
+        frame.groupby(["BN", "Expiry Month Key"], dropna=False)
+        .agg(
+            **{
+                "Expiry Date": ("Expiry Date", "first"),
+                "GTIN": ("GTIN", "first"),
+                "Drug Name": ("Drug Name", "first"),
+                "Quantity": ("Quantity", "sum"),
+                "Active": ("Active", "sum"),
+                "Quantity sent pending": ("Quantity sent pending", "sum"),
+                "Quantity Receive Pending": (
+                    "Quantity Receive Pending",
+                    "sum",
+                ),
+            }
+        )
+        .reset_index()
+    )
+
+    rows = [
+        (
+            _value(row, "Expiry Date"),
+            _text(row, "GTIN"),
+            _text(row, "Drug Name"),
+            _number(row, "Quantity"),
+            _number(row, "Active"),
+            _number(row, "Quantity sent pending"),
+            _number(row, "Quantity Receive Pending"),
+            _text(row, "BN"),
+            _text(row, "Expiry Month Key"),
+        )
+        for row in grouped.to_dict(orient="records")
+        if _text(row, "BN") and _text(row, "Expiry Month Key")
+    ]
+
+    if not rows:
+        return {"sfda_rows": int(len(grouped)), "updated_rows": 0}
+
+    sql = r"""
+        UPDATE dbo.BatchMaster
+        SET
+            ExpiryDate = ?,
+            GTIN = ?,
+            DrugName = ?,
+            SFDAQuantity = ?,
+            Active = ?,
+            QuantitySentPending = ?,
+            QuantityReceivePending = ?,
+            LastUpdated = SYSUTCDATETIME()
+        WHERE BN = ?
+          AND ExpiryMonthKey = ?;
+    """
+
+    updated = 0
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            # Regular executemany avoids ODBC variable-string buffer inference
+            # issues previously seen on snapshot persistence.
+            cursor.fast_executemany = False
+            for row in rows:
+                cursor.execute(sql, row)
+                updated += max(0, int(cursor.rowcount or 0))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "sfda_rows": int(len(grouped)),
+        "updated_rows": int(updated),
+    }
+
+
 def test_database_connection() -> Dict[str, Optional[Any]]:
     initialize_database()
 
