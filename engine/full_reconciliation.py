@@ -1538,11 +1538,19 @@ class FullReconciliationEngine:
             - target["Current Inventory Quantity Pack"]
         ).clip(lower=0).astype(int)
 
+        # The SFDA Drug Count is the regulatory source of truth for the expiry
+        # date written to Dispatch CSV files. Customer History can contain an
+        # older WMS expiry day for the same BN/month. Keep the existing
+        # BN + Expiry Month matching for allocation, but carry the exact SFDA
+        # date into the result and overwrite the WMS history date below.
+        target["SFDA Expiry Date"] = Normalizer.date(target["Expiry Date"])
+
         details = customer.merge(
             target[
                 [
                     "BN",
                     "Expiry Month Key",
+                    "SFDA Expiry Date",
                     "GTIN",
                     "Drug Name",
                     "Quantity",
@@ -1559,6 +1567,13 @@ class FullReconciliationEngine:
             how="inner",
             validate="many_to_one",
         )
+
+        if "SFDA Expiry Date" in details.columns:
+            sfda_expiry = Normalizer.date(details["SFDA Expiry Date"])
+            history_expiry = Normalizer.date(details["Expiry Date"])
+            details["Expiry Date"] = sfda_expiry.combine_first(history_expiry)
+            details = details.drop(columns=["SFDA Expiry Date"])
+
         if "GTIN_y" in details.columns:
             details["GTIN"] = details["GTIN_y"].fillna(
                 details.get("GTIN_x", "")
