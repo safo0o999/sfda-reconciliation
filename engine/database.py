@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -76,27 +77,86 @@ def _consume_all_results(cursor: pyodbc.Cursor) -> None:
             break
 
 
-def initialize_database() -> None:
-    """Create or safely upgrade all Version 6 database objects."""
+_DATABASE_READY = False
+_DATABASE_READY_LOCK = threading.Lock()
 
+
+def run_database_migrations() -> None:
+    """
+    Execute the full Version 6 schema migration.
+
+    This is an administration/deployment operation only. Normal API requests
+    must never execute the full 001_initial_schema.sql file.
+    """
     started_at = time.perf_counter()
 
     with Database().connect() as connection:
         cursor = connection.cursor()
-
         try:
             cursor.execute(_load_schema_sql())
             _consume_all_results(cursor)
             connection.commit()
-
         except Exception:
             connection.rollback()
             raise
 
     logger.info(
-        "Database schema check completed in %.2f seconds.",
+        "Database migration completed in %.2f seconds.",
         time.perf_counter() - started_at,
     )
+
+
+def initialize_database() -> None:
+    """
+    Lightweight runtime readiness check.
+
+    Existing repository functions still call initialize_database() for
+    compatibility, but this function now performs only a one-time metadata
+    validation per Function worker. It no longer runs the full schema
+    migration during normal reads/writes.
+    """
+    global _DATABASE_READY
+
+    if _DATABASE_READY:
+        return
+
+    with _DATABASE_READY_LOCK:
+        if _DATABASE_READY:
+            return
+
+        started_at = time.perf_counter()
+        required_tables = (
+            "BatchMaster",
+            "ReconciliationRuns",
+            "LatestSFDASnapshot",
+            "LatestInventorySnapshot",
+            "Warehouses",
+            "ApplicationUsers",
+            "AuthSessions",
+        )
+
+        with Database().connect() as connection:
+            cursor = connection.cursor()
+            missing = []
+            for table_name in required_tables:
+                exists = cursor.execute(
+                    "SELECT CASE WHEN OBJECT_ID(?, N'U') IS NULL THEN 0 ELSE 1 END;",
+                    (f"dbo.{table_name}",),
+                ).fetchone()[0]
+                if not int(exists or 0):
+                    missing.append(table_name)
+
+        if missing:
+            raise RuntimeError(
+                "Version 6 database migration is incomplete. Missing table(s): "
+                + ", ".join(missing)
+            )
+
+        _DATABASE_READY = True
+        logger.info(
+            "Database runtime readiness check completed in %.3f seconds.",
+            time.perf_counter() - started_at,
+        )
 
 
 def verify_auth_schema() -> None:
