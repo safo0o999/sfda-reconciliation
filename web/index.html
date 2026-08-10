@@ -425,18 +425,6 @@
     @media(max-width:1250px){.ops-kpis{grid-template-columns:repeat(3,1fr)}.ops-layout{grid-template-columns:1fr}.dashboard-filter-bar{grid-template-columns:repeat(2,1fr)}.dashboard-filter-bar .btn{width:100%}}
     @media(max-width:760px){.ops-kpis{grid-template-columns:1fr}.dashboard-filter-bar{grid-template-columns:1fr}.bottom-ops-grid{grid-template-columns:1fr}.result-head{flex-direction:column}.mini-donut-wrap{grid-template-columns:1fr}.mini-donut{margin:auto}}
  
- 
-    .verification-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,.72fr);gap:16px}
-    .verification-step{padding:18px;border:1px solid var(--line);border-radius:12px;background:#fff}
-    .verification-step-number{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;background:#eaf4ff;color:var(--blue-700);font-weight:900;font-size:11px;margin-bottom:12px}
-    .verification-step h3{margin:0;font-size:14px}.verification-step p{margin:6px 0 0;color:var(--muted);font-size:10px;line-height:1.55}
-    .verification-form{display:grid;gap:14px}.verification-form label{display:block;font-size:10px;font-weight:800;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.35px}
-    .verification-form select,.verification-form input[type=file]{width:100%}
-    .verification-file-box{padding:13px;border:1px dashed #98b8dc;border-radius:10px;background:#f8fbff}
-    .lifecycle-list{display:grid;gap:10px}.lifecycle-row{display:grid;grid-template-columns:28px 1fr auto;gap:10px;align-items:center;padding:11px;border:1px solid var(--line);border-radius:10px}
-    .lifecycle-dot{width:22px;height:22px;border-radius:50%;display:grid;place-items:center;background:#eaf4ff;color:var(--blue-700);font-size:10px;font-weight:900}
-    @media(max-width:1000px){.verification-grid{grid-template-columns:1fr}}
- 
 
     /* Product Intelligence */
     .pi-page-head{align-items:center}.pi-filter-card{background:linear-gradient(135deg,#08233f,#0d3b67);border-radius:16px;padding:18px 20px;margin-bottom:16px;box-shadow:var(--shadow);color:#fff}.pi-filter-title{display:flex;gap:12px;align-items:center;margin-bottom:14px}.pi-filter-title>span{font-size:24px}.pi-filter-title strong{display:block;font-size:14px}.pi-filter-title small{display:block;color:#bad1e8;margin-top:3px}.pi-filter-grid{display:grid;grid-template-columns:2fr 1fr 1fr 1fr auto;gap:10px}.pi-filter-grid .control{background:#fff}.pi-loading{display:none;align-items:center;justify-content:center;gap:12px;min-height:160px;background:#fff;border:1px solid var(--line);border-radius:16px}.pi-loading.show{display:flex}.pi-loading small{display:block;color:var(--muted);margin-top:4px}.pi-spinner{width:30px;height:30px;border:3px solid #dce8f5;border-top-color:var(--blue-600);border-radius:50%;animation:piSpin .8s linear infinite}@keyframes piSpin{to{transform:rotate(360deg)}}
@@ -498,7 +486,7 @@
     @media(max-width:700px){.variance-kpi-grid{grid-template-columns:1fr}.variance-filters{grid-template-columns:1fr}.variance-detail-grid{grid-template-columns:1fr}}
 
 
-    .history-kpi-grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:14px;margin:0 0 18px}
+    .history-kpi-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:14px;margin:0 0 18px}
     .history-kpi-card{appearance:none;border:1px solid var(--line);border-radius:14px;background:#fff;padding:16px 17px;text-align:left;cursor:pointer;box-shadow:0 3px 12px rgba(13,42,74,.05);transition:.18s ease}
     .history-kpi-card:hover{transform:translateY(-1px);border-color:#9fc2ea}
     .history-kpi-card.active{border-color:#1578d4;box-shadow:0 0 0 2px rgba(21,120,212,.08),0 5px 16px rgba(13,42,74,.08)}
@@ -524,7 +512,6 @@
       <button class="nav-button active" data-page="home"><span class="nav-icon">⌂</span>Home</button>
       <button class="nav-button" data-page="upload"><span class="nav-icon">⇧</span>Upload & Run</button>
       <button class="nav-button" data-page="full-reconciliation"><span class="nav-icon">▦</span>Full Reconciliation</button>
-      <button class="nav-button" data-page="verification" id="verificationNavButton" title="Open SFDA Verification"><span class="nav-icon">✓</span>SFDA Verification</button>
       <button class="nav-button" data-page="history"><span class="nav-icon">◷</span>History</button>
       <button class="nav-button" data-page="reports"><span class="nav-icon">▥</span>Reports</button>
       <button class="nav-button" data-page="intelligence"><span class="nav-icon">◆</span>Product Intelligence</button>
@@ -616,7 +603,7 @@
           </div>
  
           <aside class="ops-side">
-            <div class="card"><div class="card-header"><div class="card-title">Quick Actions</div></div><div class="quick-actions"><button class="btn btn-success" data-go="upload">▶ Run Reconciliation</button><button class="btn btn-primary" data-go="upload">⇩ Prepare Accept</button><button class="btn btn-warning" data-go="upload">⇢ Prepare Dispatch</button><button class="btn btn-purple" data-go="history">◷ Upload History</button><button class="btn btn-secondary" data-go="verification">✓ SFDA Verification</button></div></div>
+            <div class="card"><div class="card-header"><div class="card-title">Quick Actions</div></div><div class="quick-actions"><button class="btn btn-success" data-go="upload">▶ Run Reconciliation</button><button class="btn btn-primary" data-go="upload">⇩ Prepare Accept</button><button class="btn btn-warning" data-go="upload">⇢ Prepare Dispatch</button><button class="btn btn-purple" data-go="history">◷ Upload History</button></div></div>
             <div class="card"><div class="card-header"><div class="card-title">Customer / GLN</div></div><div class="mini-donut-wrap"><div style="position:relative"><div class="mini-donut"></div><div class="mini-donut-label"><div><div style="font-size:18px">—</div><div>Total</div></div></div></div><div class="mini-legend"><div class="mini-legend-row"><span><i class="legend-dot" style="background:#239247"></i>With GLN</span><strong>—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#d94747"></i>Dummy GLN</span><strong>—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#c8ced8"></i>Not Mapped</span><strong>—</strong></div></div></div></div>
             <div class="card"><div class="card-header"><div><div class="card-title">Recent Uploads</div><div class="card-subtitle">Latest locally selected report types</div></div></div><div class="recent-upload-list" id="recentUploads"><div class="empty"><strong>No uploads yet</strong>Selected files will appear after a run.</div></div></div>
             <div class="card"><div class="card-header"><div class="card-title">System Status</div></div><div class="card-body"><div class="status-line"><span>Azure Function</span><span class="status-ok" id="homeHealth">Checking...</span></div><div class="status-line"><span>Version</span><strong id="homeVersion">—</strong></div><div class="status-line"><span>Total Local Runs</span><strong id="homeRuns">0</strong></div><div class="status-line"><span>Successful Runs</span><strong id="homeSuccess">0</strong></div><div class="status-line"><span>Generated Files</span><strong id="homeGenerated">—</strong></div></div></div>
@@ -727,8 +714,6 @@
         </div>
       </section>
  
- 
-      <!-- SFDA VERIFICATION -->
  
       <!-- FULL RECONCILIATION -->
       <section class="page" id="page-full-reconciliation">
@@ -891,49 +876,21 @@
         </div>
       </section>
 
-      <section class="page" id="page-verification">
-        <div class="page-head">
-          <div><h1>SFDA Verification</h1><p>Verify the generated upload files against the latest SFDA Drug Count and portal notification results.</p></div>
-        </div>
-        <div class="verification-grid">
-          <div class="card">
-            <div class="card-header"><div><div class="card-title">Verification Upload</div><div class="card-subtitle">Select a reconciliation run and upload the post-portal evidence files.</div></div></div>
-            <div class="card-body">
-              <form id="verificationForm" class="verification-form">
-                <div><label for="verificationRun">Run</label><select class="control" id="verificationRun" required><option value="">Select a reconciliation run...</option></select></div>
-                <div><label for="verificationSfda">Latest SFDA Drug Count Report</label><div class="verification-file-box"><input id="verificationSfda" type="file" accept=".xls,.xlsx" required><div class="file-meta" id="verificationSfdaName">No file selected</div></div></div>
-                <div><label for="notificationFiles">Notification Result Files</label><div class="verification-file-box"><input id="notificationFiles" type="file" accept=".xls,.xlsx,.csv" multiple required><div class="file-meta" id="notificationFilesName">No files selected</div></div></div>
-                <div class="status-banner info show" id="verificationStatus"><span>ⓘ</span><div>Select the run, latest SFDA report, and all Notification Result files, then click Verify Upload.</div></div>
-                <button class="btn btn-success" id="verifyUploadButton" type="submit" disabled>✓ Verify Upload</button>
-              </form>
-            </div>
-          </div>
-          <div class="card">
-            <div class="card-header"><div><div class="card-title">Run Lifecycle</div><div class="card-subtitle">Controlled status flow after reconciliation.</div></div></div>
-            <div class="card-body lifecycle-list">
-              <div class="lifecycle-row"><div class="lifecycle-dot">1</div><div><strong>Pending Upload</strong><div class="file-info">Upload files generated and awaiting SFDA Portal submission.</div></div><span class="badge warning">Current</span></div>
-              <div class="lifecycle-row"><div class="lifecycle-dot">2</div><div><strong>Pending Verification</strong><div class="file-info">Latest SFDA report and notification results received.</div></div><span class="badge info">Next</span></div>
-              <div class="lifecycle-row"><div class="lifecycle-dot">3</div><div><strong>Verified</strong><div class="file-info">Portal result matches the expected reconciliation outcome.</div></div><span class="badge success">Outcome</span></div>
-              <div class="lifecycle-row"><div class="lifecycle-dot">4</div><div><strong>Investigation Required</strong><div class="file-info">Mismatch or unresolved notification requires investigation.</div></div><span class="badge failed">Exception</span></div>
-            </div>
-          </div>
-        </div>
-      </section>
- 
       <!-- HISTORY -->
       <section class="page" id="page-history">
         <div class="page-head"><div><h1>Reconciliation History</h1><p>Persistent reconciliation runs stored in Azure SQL Database.</p></div><div class="actions"><button class="btn btn-secondary" id="clearHistoryButton">↻ Refresh History</button></div></div>
         <div class="history-kpi-grid" id="historyKpiGrid">
           <button type="button" class="history-kpi-card active" data-history-filter="all"><span class="history-kpi-label">Total Runs</span><strong id="historyTotalRuns">0</strong><small id="historyTotalLast">No runs yet</small></button>
+          <button type="button" class="history-kpi-card" data-history-filter="HISTORICAL_BUILD"><span class="history-kpi-label">Historical Build</span><strong id="historyHistoricalRuns">0</strong><small id="historyHistoricalLast">No runs yet</small></button>
           <button type="button" class="history-kpi-card" data-history-filter="ACCEPT"><span class="history-kpi-label">Daily Accept</span><strong id="historyDailyAcceptRuns">0</strong><small id="historyDailyAcceptLast">No runs yet</small></button>
           <button type="button" class="history-kpi-card" data-history-filter="DISPATCH"><span class="history-kpi-label">Daily Dispatch</span><strong id="historyDailyDispatchRuns">0</strong><small id="historyDailyDispatchLast">No runs yet</small></button>
           <button type="button" class="history-kpi-card" data-history-filter="FULL_ACCEPT"><span class="history-kpi-label">Full Accept</span><strong id="historyFullAcceptRuns">0</strong><small id="historyFullAcceptLast">No runs yet</small></button>
           <button type="button" class="history-kpi-card" data-history-filter="FULL_DISPATCH"><span class="history-kpi-label">Full Dispatch</span><strong id="historyFullDispatchRuns">0</strong><small id="historyFullDispatchLast">No runs yet</small></button>
         </div>
         <div class="card table-card">
-          <div class="table-toolbar"><div class="card-title">Previous Reconciliation Runs</div><div class="filters"><input class="control search" id="historySearch" placeholder="Search run ID or user..."><select class="control" id="historyStatus"><option value="">All statuses</option><option>Pending Upload</option><option>Pending Verification</option><option>Verified</option><option>Investigation Required</option><option>Completed</option><option>Failed</option></select></div></div>
+          <div class="table-toolbar"><div class="card-title">Previous Reconciliation Runs</div><div class="filters"><input class="control search" id="historySearch" placeholder="Search run ID or user..."><select class="control" id="historyStatus"><option value="">All statuses</option><option>Pending Upload</option><option>Investigation Required</option><option>Completed</option><option>Failed</option></select></div></div>
           <div class="table-scroll history-scroll"><table class="history-table"><thead><tr><th>Run ID</th><th>Process</th><th>Date &amp; Time (Saudi)</th><th>User</th><th>Status</th><th>Files</th><th>Input Rows</th><th>Accept</th><th>Dispatch</th><th>Variance</th><th>Version</th><th>Actions</th></tr></thead><tbody id="historyBody"></tbody></table></div>
-          <div class="table-footer"><span id="historyCount">0 database runs</span><span>Source: Azure SQL · ReconciliationRuns</span></div>
+          <div class="table-footer"><span id="historyCount">0 database runs</span><span>Source: Azure SQL · ReconciliationRuns + HistoricalBuildJobs</span></div>
         </div>
       </section>
  
@@ -1174,7 +1131,6 @@ Drug Traceability Reconciliation Platform</textarea></label>
 <script>
   const ACCEPT_API_URL = "/api/reconcile?process_type=accept";
   const DISPATCH_API_URL = "/api/reconcile?process_type=dispatch";
-  const VERIFY_URL = "/api/verify";
   const HEALTH_URL = "/api/health";
   const VERSION_URL = "/api/version";
   const ACCEPT_FILE_KEYS = ["acceptAsn","acceptSfda"];
@@ -1183,7 +1139,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   const VARIANCE_API_URL = "/api/variance-management";
   const VARIANCE_REPORT_URL = "/api/variance-management/report";
   const VARIANCE_EMAIL_URL = "/api/variance-management/email";
-  const DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v1";
+  const DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v2";
   let currentResult = null;
   let progressTimer = null;
   let historyCache = [];
@@ -1211,7 +1167,6 @@ Drug Traceability Reconciliation Platform</textarea></label>
     home:"Dashboard",
     upload:"Upload & Run",
     "full-reconciliation":"Full Reconciliation",
-    verification:"SFDA Verification",
     history:"History",
     reports:"Reports",
     intelligence:"Product Intelligence",
@@ -1247,13 +1202,6 @@ Drug Traceability Reconciliation Platform</textarea></label>
     if (requestedPage === "full-reconciliation") {
       Promise.resolve(refreshHistoricalStatus({silent:true})).catch(error=>{
         console.error("Unable to refresh historical status.", error);
-      });
-    }
-
-    if (requestedPage === "verification") {
-      Promise.resolve(refreshVerificationRuns()).catch(error=>{
-        console.error("Unable to refresh verification runs.", error);
-        toast("SFDA Verification opened, but the run list could not be refreshed.","error");
       });
     }
  
@@ -1435,6 +1383,11 @@ Drug Traceability Reconciliation Platform</textarea></label>
       let result; try{ result=await response.json(); }catch{ throw new Error(`The server returned HTTP ${response.status} without valid JSON.`); }
       if(!response.ok||result.status==="Failed") throw new Error(result.error||result.message||`Request failed with HTTP ${response.status}.`);
       currentResult=result; finishProgress(label,true); setStatus("success",`${label} files generated successfully.`);
+      localStorage.setItem(
+        DASHBOARD_PREVIEW_KEY,
+        JSON.stringify(Array.isArray(result.dashboard_preview)?result.dashboard_preview:[])
+      );
+      renderDashboardOverview();
       populateSummary(result); populateResults(result);
       const metrics=getResultMetrics(result);
       $("homeInputRows").textContent=formatNumber(metrics.inputRows);
@@ -1655,6 +1608,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       "FULL-ACCEPT":"Full Accept Reconciliation",
       "FULL-DISPATCH":"Full Dispatch Reconciliation",
       "HISTORICAL":"Historical Build",
+      "HISTORICAL_BUILD":"Historical Build",
       "BATCH_MASTER":"Historical Build"
     };
     return labels[key]||String(value||"—").replaceAll("_"," ");
@@ -1720,7 +1674,6 @@ Drug Traceability Reconciliation Platform</textarea></label>
       historyCache = sourceRows.map(normalizeHistoryRecord);
       historyLoaded = true;
       renderHistory();
-      refreshVerificationRuns();
       updateDashboard();
       renderReports();
       if(!silent) toast(`History refreshed: ${historyCache.length} run${historyCache.length===1?"":"s"}.`,"success");
@@ -1763,6 +1716,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   function updateHistoryKpis(records){
     const groups={
       all:records,
+      HISTORICAL_BUILD:filteredHistoryByProcess(records,"HISTORICAL_BUILD"),
       ACCEPT:filteredHistoryByProcess(records,"ACCEPT"),
       DISPATCH:filteredHistoryByProcess(records,"DISPATCH"),
       FULL_ACCEPT:filteredHistoryByProcess(records,"FULL_ACCEPT"),
@@ -1770,6 +1724,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
     };
     const map={
       all:["historyTotalRuns","historyTotalLast"],
+      HISTORICAL_BUILD:["historyHistoricalRuns","historyHistoricalLast"],
       ACCEPT:["historyDailyAcceptRuns","historyDailyAcceptLast"],
       DISPATCH:["historyDailyDispatchRuns","historyDailyDispatchLast"],
       FULL_ACCEPT:["historyFullAcceptRuns","historyFullAcceptLast"],
@@ -1804,7 +1759,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
     rows.forEach(r=>{
       const tr=document.createElement('tr');
       const dateText=formatSaudiDateTime(r.timestamp);
-      const statusClass=["Verified","Completed"].includes(r.status)?"success":["Failed","Investigation Required"].includes(r.status)?"failed":r.status==="Pending Verification"?"info":"warning";
+      const statusClass=r.status==="Completed"?"success":["Failed","Investigation Required"].includes(r.status)?"failed":"warning";
       const errorTitle=r.error?` title="${escapeHtml(r.error)}"`:"";
       tr.innerHTML=`<td><strong style="color:#075fc8"${errorTitle}>${escapeHtml(r.runId)}</strong></td><td>${escapeHtml(r.processLabel)}</td><td>${escapeHtml(dateText)}</td><td>${escapeHtml(r.user)}</td><td><span class="badge ${statusClass}"${errorTitle}>${escapeHtml(r.status)}</span></td><td>${formatNumber(r.files)}</td><td>${formatNumber(r.inputRows)}</td><td>${formatNumber(r.accept)}</td><td>${formatNumber(r.dispatch)}</td><td>${formatNumber(r.variance)}</td><td>${escapeHtml(r.version||"—")}</td><td><button class="btn btn-secondary view-run-btn" type="button">View</button></td>`;
       tr.querySelector(".view-run-btn").addEventListener("click",()=>openRunDetails(r.runNumber));
@@ -1887,166 +1842,6 @@ Drug Traceability Reconciliation Platform</textarea></label>
   $('runDetailsModal').addEventListener('click',event=>{if(event.target===$('runDetailsModal')) closeRunDetails();});
   document.addEventListener('keydown',event=>{if(event.key==='Escape') closeRunDetails();});
  
-  function updateVerificationFileState(){
-    const sfdaFile=$("verificationSfda").files[0];
-    const notifications=Array.from($("notificationFiles").files||[]);
-    $("verificationSfdaName").textContent=sfdaFile?`✓ ${sfdaFile.name}`:"No file selected";
-    $("notificationFilesName").textContent=notifications.length?`✓ ${notifications.length} notification result file${notifications.length===1?"":"s"} selected`:"No files selected";
-    const ready=Boolean($("verificationRun").value&&sfdaFile&&notifications.length);
-    $("verifyUploadButton").disabled=!ready;
-  }
- 
-  function refreshVerificationRuns(){
-    const selector=$("verificationRun");
-    if(!selector) return;
- 
-    const selected=selector.value;
-    const eligibleStatuses=[
-      "Pending Upload",
-      "Pending Verification",
-      "Completed"
-    ];
- 
-    const eligible=getHistory()
-      .filter(run=>eligibleStatuses.includes(run.status))
-      .sort((a,b)=>{
-        const aTime=new Date(a.startedAt||a.runDate||0).getTime()||0;
-        const bTime=new Date(b.startedAt||b.runDate||0).getTime()||0;
-        return bTime-aTime;
-      });
- 
-    selector.innerHTML=
-      '<option value="">Select a reconciliation run...</option>'+
-      eligible.map(run=>
-        `<option value="${escapeHtml(run.runNumber)}">${escapeHtml(run.runNumber)} · ${escapeHtml(run.status)}</option>`
-      ).join("");
- 
-    if(eligible.some(run=>run.runNumber===selected)){
-      selector.value=selected;
-    }else if(eligible.length===1){
-      selector.value=eligible[0].runNumber;
-    }
- 
-    const box=$("verificationStatus");
- 
-    if(!eligible.length){
-      box.className="status-banner error show";
-      box.innerHTML='<span>!</span><div>No eligible reconciliation run was found. Complete a reconciliation run, refresh History, then return to SFDA Verification.</div>';
-    }else if(!selector.value){
-      box.className="status-banner info show";
-      box.innerHTML=`<span>ⓘ</span><div>${eligible.length} eligible run${eligible.length===1?"":"s"} found. Select the correct run to enable Verify Upload.</div>`;
-    }
- 
-    updateVerificationFileState();
-  }
- 
-  $("verificationRun").addEventListener("change",updateVerificationFileState);
-  $("verificationSfda").addEventListener("change",updateVerificationFileState);
-  $("notificationFiles").addEventListener("change",updateVerificationFileState);
- 
-  $("verificationForm").addEventListener("submit",async event=>{
-    event.preventDefault();
-    updateVerificationFileState();
- 
-    const runNumber=$("verificationRun").value;
-    const sfdaFile=$("verificationSfda").files[0];
-    const notifications=Array.from($("notificationFiles").files||[]);
-    const button=$("verifyUploadButton");
-    const box=$("verificationStatus");
- 
-    if(!runNumber||!sfdaFile||!notifications.length){
-      box.className="status-banner error show";
-      box.innerHTML='<span>!</span><div>Select a run, the latest SFDA report, and at least one Notification Result file.</div>';
-      toast("Verification files are incomplete.","error");
-      updateVerificationFileState();
-      return;
-    }
- 
-    const formData=new FormData();
-    formData.append("run_number",runNumber);
-    formData.append("latest_sfda",sfdaFile,sfdaFile.name);
- 
-    notifications.forEach(file=>{
-      formData.append("notification_files",file,file.name);
-    });
- 
-    button.disabled=true;
-    button.textContent="◷ Verifying Upload...";
-    box.className="status-banner info show";
-    box.innerHTML=`<span>◷</span><div>Uploading ${notifications.length} Notification Result file${notifications.length===1?"":"s"} and running SFDA verification. Keep this page open until processing is complete.</div>`;
- 
-    try{
-      const response=await fetch(VERIFY_URL,{
-        method:"POST",
-        body:formData,
-        cache:"no-store"
-      });
- 
-      let payload;
-      try{
-        payload=await response.json();
-      }catch{
-        throw new Error(`Verification endpoint returned HTTP ${response.status} without valid JSON.`);
-      }
- 
-      if(!response.ok||payload.status==="Failed"){
-        const failedStep=payload.failed_step?` (${payload.failed_step})`:"";
-        throw new Error(
-          (payload.error||payload.message||`Verification failed with HTTP ${response.status}.`)
-          + failedStep
-        );
-      }
- 
-      const summary=payload.summary||{};
-      const overallStatus=payload.status||"Verification Completed";
-      const isVerified=overallStatus==="Verified";
-      const statusClass=isVerified?"success":"error";
-      const statusIcon=isVerified?"✓":"!";
-      const expected=Number(summary.expected_rows||0).toLocaleString();
-      const notificationsCount=Number(summary.notification_rows||0).toLocaleString();
-      const verified=Number(summary.verified_rows||0).toLocaleString();
-      const rejected=Number(summary.rejected_rows||0).toLocaleString();
-      const unclassified=Number(summary.unclassified_rows||0).toLocaleString();
-      const mismatches=Number(summary.mismatch_rows||0).toLocaleString();
-      const missing=Number(summary.missing_expected_rows||0).toLocaleString();
- 
-      box.className=`status-banner ${statusClass} show`;
-      box.innerHTML=`
-        <span>${statusIcon}</span>
-        <div>
-          <strong>${escapeHtml(overallStatus)}</strong><br>
-          Expected: ${expected} · Notification rows: ${notificationsCount} ·
-          Verified: ${verified} · Rejected: ${rejected} ·
-          Unclassified: ${unclassified} · Mismatches: ${mismatches} ·
-          Missing results: ${missing}
-        </div>`;
- 
-      toast(
-        isVerified
-          ? "SFDA upload verified successfully."
-          : "Verification completed and requires investigation.",
-        isVerified?"success":"error"
-      );
- 
-      await refreshAzureHistory({silent:true});
-      refreshVerificationRuns();
- 
-      if(isVerified){
-        $("verificationSfda").value="";
-        $("notificationFiles").value="";
-        updateVerificationFileState();
-      }
-    }catch(error){
-      console.error("SFDA Verification failed.",error);
-      box.className="status-banner error show";
-      box.innerHTML=`<span>!</span><div><strong>Verification failed.</strong><br>${escapeHtml(error.message||String(error))}</div>`;
-      toast(error.message||String(error),"error");
-    }finally{
-      button.textContent="✓ Verify Upload";
-      updateVerificationFileState();
-    }
-  });
- 
   document.querySelectorAll("[data-history-filter]").forEach(card=>{
     card.addEventListener("click",()=>{
       activeHistoryFilter=card.dataset.historyFilter||"all";
@@ -2102,9 +1897,9 @@ Drug Traceability Reconciliation Platform</textarea></label>
  
   function updateDashboard(){
     renderDashboardOverview();
-    const history=getHistory(),latest=history.find(x=>["Pending Upload","Pending Verification","Verified","Completed"].includes(x.status));
+    const history=getHistory(),latest=history.find(x=>["Pending Upload","Completed"].includes(x.status));
     $("homeRuns").textContent=formatNumber(history.length);
-    $("homeSuccess").textContent=formatNumber(history.filter(x=>["Verified","Completed"].includes(x.status)).length);
+    $("homeSuccess").textContent=formatNumber(history.filter(x=>x.status==="Completed").length);
     $("homeInputRows").textContent=latest?formatNumber(latest.inputRows):"—";
     $("homeAccept").textContent=latest?formatNumber(latest.accept):"—";
     $("homeDispatch").textContent=latest?formatNumber(latest.dispatch):"—";
@@ -2127,7 +1922,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   }
  
   function renderReports(){
-    const history=getHistory(),completed=history.filter(x=>["Verified","Completed"].includes(x.status)),latest=completed[0]||history.find(x=>x.status==="Pending Upload")||{};
+    const history=getHistory(),completed=history.filter(x=>x.status==="Completed"),latest=completed[0]||history.find(x=>x.status==="Pending Upload")||{};
     $("reportRuns").textContent=formatNumber(history.length);
     $("reportSuccessRate").textContent=`${history.length?(completed.length/history.length*100).toFixed(1):0}%`;
     $("reportProcessed").textContent=formatNumber(completed.reduce((s,x)=>s+Number(x.masterRows||0),0));
@@ -2599,15 +2394,26 @@ Drug Traceability Reconciliation Platform</textarea></label>
       const response=await fetch("/api/full-reconciliation/accept",{method:"POST",body:formData,cache:"no-store"});
       const result=await parseApiResponse(response);
       finishSetupProgress("accept",true);
+      const batchMasterFiles=collectOutputFiles({batch_master:result.outputs?.batch_master});
       const excelFiles=collectOutputFiles({accept_details:result.outputs?.accept_details,supplier_variance:result.outputs?.supplier_variance});
       const acceptCsvFiles=collectOutputFiles(result.outputs?.accept_files||{});
-      const files=[...excelFiles,...acceptCsvFiles];
+      const files=[...batchMasterFiles,...excelFiles,...acceptCsvFiles];
       fullSetupFiles.push(...files);
+      if(batchMasterFiles.length){
+        renderSetupFileList("fullBatchMasterFiles",batchMasterFiles,"No Batch Master file was returned.");
+        renderSetupFileList("fullMasterPreview",batchMasterFiles,"No Batch Master file was returned.");
+      }
       fullAcceptReportFiles=excelFiles;
       renderSetupFileList("fullReportFiles",[...fullAcceptReportFiles,...fullDispatchReportFiles],"No reconciliation reports were returned.");
       renderSetupFileList("fullAcceptCsvFiles",acceptCsvFiles,"No Accept quantity was required.");
       const summary=result.summary||{};
       showFullResults(`<strong>Full Accept completed.</strong> Accept rows: ${formatNumber(summary.accept_rows||0)} · Supplier variance rows: ${formatNumber(summary.supplier_variance_rows||0)} · Files: ${formatNumber(files.length)}.`);
+      localStorage.setItem(
+        DASHBOARD_PREVIEW_KEY,
+        JSON.stringify(Array.isArray(result.dashboard_preview)?result.dashboard_preview:[])
+      );
+      renderDashboardOverview();
+      await refreshHistoricalStatus({silent:true});
       await refreshAzureHistory({silent:true});
       toast("Full Accept Reconciliation completed successfully.","success");
     }catch(error){ finishSetupProgress("accept",false); showSetupError(error.message||String(error)); }
@@ -2629,15 +2435,26 @@ Drug Traceability Reconciliation Platform</textarea></label>
       const response=await fetch("/api/full-reconciliation/dispatch",{method:"POST",body:formData,cache:"no-store"});
       const result=await parseApiResponse(response);
       finishSetupProgress("dispatch",true);
+      const batchMasterFiles=collectOutputFiles({batch_master:result.outputs?.batch_master});
       const excelFiles=collectOutputFiles({dispatch_details:result.outputs?.dispatch_details,summary:result.outputs?.summary});
       const dispatchCsvFiles=collectOutputFiles(result.outputs?.dispatch_files||{});
-      const files=[...excelFiles,...dispatchCsvFiles];
+      const files=[...batchMasterFiles,...excelFiles,...dispatchCsvFiles];
       fullSetupFiles.push(...files);
+      if(batchMasterFiles.length){
+        renderSetupFileList("fullBatchMasterFiles",batchMasterFiles,"No Batch Master file was returned.");
+        renderSetupFileList("fullMasterPreview",batchMasterFiles,"No Batch Master file was returned.");
+      }
       fullDispatchReportFiles=excelFiles;
       renderSetupFileList("fullReportFiles",[...fullAcceptReportFiles,...fullDispatchReportFiles],"No reconciliation reports were returned.");
       renderSetupFileList("fullDispatchCsvFiles",dispatchCsvFiles,"No Dispatch quantity was required.");
       const summary=result.summary||{};
       showFullResults(`<strong>Full Dispatch completed.</strong> Dispatch allocation rows: ${formatNumber(summary.dispatch_allocation_rows||0)} · Files: ${formatNumber(files.length)}.`);
+      localStorage.setItem(
+        DASHBOARD_PREVIEW_KEY,
+        JSON.stringify(Array.isArray(result.dashboard_preview)?result.dashboard_preview:[])
+      );
+      renderDashboardOverview();
+      await refreshHistoricalStatus({silent:true});
       await refreshAzureHistory({silent:true});
       toast("Full Dispatch Reconciliation completed successfully.","success");
     }catch(error){ finishSetupProgress("dispatch",false); showSetupError(error.message||String(error)); }
