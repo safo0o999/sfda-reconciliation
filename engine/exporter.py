@@ -89,6 +89,12 @@ class Exporter:
         "PackageSize",
         "Historical Dispatch Quantity Each",
         "Historical Dispatch Quantity Pack",
+        "Previously Confirmed Full Dispatch Each",
+        "Previously Confirmed Full Dispatch Pack",
+        "Reserved Full Dispatch Quantity Each",
+        "Reserved Full Dispatch Quantity Pack",
+        "Available Historical Dispatch Quantity Each",
+        "Available Historical Dispatch Quantity Pack",
         "Current Inventory Quantity Each",
         "Current Inventory Quantity Pack",
         "SFDA Quantity",
@@ -664,8 +670,8 @@ class Exporter:
             elif is_full_dispatch_reconciliation:
                 group_definitions = [
                     (1, 9, "Customer and Batch", "5B9BD5"),
-                    (10, 17, "Quantity Comparison", "4472C4"),
-                    (18, 19, "Decision", "70AD47"),
+                    (10, 23, "Quantity Comparison", "4472C4"),
+                    (24, 25, "Decision", "70AD47"),
                 ]
             elif is_supplier_variance:
                 group_definitions = [
