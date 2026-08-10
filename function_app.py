@@ -838,10 +838,17 @@ def history(req: func.HttpRequest) -> func.HttpResponse:
 
         storage = BlobStorage()
         storage.initialize_containers()
+
+        # Avoid an N+1 Blob Storage pattern. Cache file listings inside this
+        # request and only query Blob files for legacy rows that actually lack
+        # a persisted SQL timestamp.
+        blob_files_cache: Dict[str, List[Dict[str, Any]]] = {}
+
         for run_number in storage.list_run_numbers(limit):
             if run_number in known:
                 continue
             files = storage.list_all_run_files(run_number)
+            blob_files_cache[run_number] = files
             rows.append(
                 blob_run_to_history_row(
                     run_number,
@@ -853,11 +860,15 @@ def history(req: func.HttpRequest) -> func.HttpResponse:
         enriched_rows = []
         for row in rows:
             run_number = str(row.get("RunNumber", "")).strip()
-            files_for_date = (
-                storage.list_all_run_files(run_number)
-                if run_number
-                else []
-            )
+            files_for_date: List[Dict[str, Any]] = []
+
+            if run_number and not row.get("StartedAt"):
+                files_for_date = (
+                    blob_files_cache.get(run_number)
+                    or storage.list_all_run_files(run_number)
+                )
+                blob_files_cache[run_number] = files_for_date
+
             enriched_rows.append(
                 _history_datetime_fields(row, files_for_date)
             )
