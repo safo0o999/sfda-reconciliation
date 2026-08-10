@@ -530,6 +530,7 @@ BEGIN TRY
                 CONSTRAINT PK_DailyAcceptTransactions PRIMARY KEY,
             BN nvarchar(255) NOT NULL,
             ExpiryDate date NOT NULL,
+            ExpiryMonthKey nvarchar(7) NOT NULL,
             GenericItemNumber nvarchar(255) NULL,
             ReferenceNumber nvarchar(255) NULL,
             ReferenceLine nvarchar(255) NULL,
@@ -665,6 +666,105 @@ BEGIN TRY
         ON dbo.DailyDispatchTransactions (BN, ExpiryDate, CreatedAt)
         INCLUDE
         (
+            SubmittedQuantityEach, ConfirmedQuantityEach,
+            SubmittedQuantityPack, ConfirmedQuantityPack, LastConfirmedAt
+        );
+    END;
+
+
+    /* ================================================================
+       Full Dispatch confirmation state
+       ================================================================ */
+    IF OBJECT_ID(N'dbo.FullDispatchTransactions', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.FullDispatchTransactions
+        (
+            TransactionKey varchar(64) NOT NULL
+                CONSTRAINT PK_FullDispatchTransactions PRIMARY KEY,
+            BN nvarchar(255) NOT NULL,
+            ExpiryDate date NOT NULL,
+            ExpiryMonthKey nvarchar(7) NOT NULL,
+            GenericItemNumber nvarchar(255) NULL,
+            ToAddress nvarchar(500) NULL,
+            GLN nvarchar(255) NULL,
+            SubmittedQuantityEach decimal(18,4) NOT NULL
+                CONSTRAINT DF_FullDispatchTransactions_SubmittedEach DEFAULT (0),
+            SubmittedQuantityPack decimal(18,4) NOT NULL
+                CONSTRAINT DF_FullDispatchTransactions_SubmittedPack DEFAULT (0),
+            ConfirmedQuantityEach decimal(18,4) NOT NULL
+                CONSTRAINT DF_FullDispatchTransactions_ConfirmedEach DEFAULT (0),
+            ConfirmedQuantityPack decimal(18,4) NOT NULL
+                CONSTRAINT DF_FullDispatchTransactions_ConfirmedPack DEFAULT (0),
+            FirstSubmittedRun nvarchar(80) NULL,
+            LastSubmittedRun nvarchar(80) NULL,
+            CreatedAt datetime2(3) NOT NULL
+                CONSTRAINT DF_FullDispatchTransactions_CreatedAt DEFAULT (SYSUTCDATETIME()),
+            UpdatedAt datetime2(3) NOT NULL
+                CONSTRAINT DF_FullDispatchTransactions_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+            LastConfirmedAt datetime2(3) NULL
+        );
+    END;
+
+    IF COL_LENGTH(N'dbo.FullDispatchTransactions', N'ExpiryMonthKey') IS NULL
+    BEGIN
+        ALTER TABLE dbo.FullDispatchTransactions
+            ADD ExpiryMonthKey nvarchar(7) NULL;
+
+        UPDATE dbo.FullDispatchTransactions
+        SET ExpiryMonthKey = CONVERT(char(7), ExpiryDate, 126)
+        WHERE ExpiryMonthKey IS NULL;
+
+        ALTER TABLE dbo.FullDispatchTransactions
+            ALTER COLUMN ExpiryMonthKey nvarchar(7) NOT NULL;
+    END;
+
+    IF OBJECT_ID(N'dbo.FullDispatchSFDABaseline', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.FullDispatchSFDABaseline
+        (
+            BN nvarchar(255) NOT NULL,
+            ExpiryDate date NOT NULL,
+            GTIN nvarchar(255) NULL,
+            Active decimal(18,4) NOT NULL
+                CONSTRAINT DF_FullDispatchSFDABaseline_Active DEFAULT (0),
+            QuantitySentPending decimal(18,4) NOT NULL
+                CONSTRAINT DF_FullDispatchSFDABaseline_SentPending DEFAULT (0),
+            SourceFileName nvarchar(500) NULL,
+            SnapshotUtc datetime2(3) NOT NULL
+                CONSTRAINT DF_FullDispatchSFDABaseline_SnapshotUtc DEFAULT (SYSUTCDATETIME()),
+            CONSTRAINT PK_FullDispatchSFDABaseline PRIMARY KEY (BN, ExpiryDate)
+        );
+    END;
+
+    IF OBJECT_ID(N'dbo.FullDispatchConfirmations', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.FullDispatchConfirmations
+        (
+            ConfirmationKey varchar(64) NOT NULL
+                CONSTRAINT PK_FullDispatchConfirmations PRIMARY KEY,
+            TransactionKey varchar(64) NOT NULL,
+            ConfirmedQuantityEach decimal(18,4) NOT NULL,
+            ConfirmedQuantityPack decimal(18,4) NOT NULL,
+            ConfirmedAt datetime2(3) NOT NULL
+                CONSTRAINT DF_FullDispatchConfirmations_ConfirmedAt DEFAULT (SYSUTCDATETIME()),
+            CONSTRAINT FK_FullDispatchConfirmations_Transaction
+                FOREIGN KEY (TransactionKey)
+                REFERENCES dbo.FullDispatchTransactions(TransactionKey)
+        );
+    END;
+
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM sys.indexes
+        WHERE object_id = OBJECT_ID(N'dbo.FullDispatchTransactions')
+          AND name = N'IX_FullDispatchTransactions_BatchPending'
+    )
+    BEGIN
+        CREATE NONCLUSTERED INDEX IX_FullDispatchTransactions_BatchPending
+        ON dbo.FullDispatchTransactions (BN, ExpiryMonthKey, CreatedAt)
+        INCLUDE
+        (
+            ToAddress, GLN,
             SubmittedQuantityEach, ConfirmedQuantityEach,
             SubmittedQuantityPack, ConfirmedQuantityPack, LastConfirmedAt
         );
