@@ -16,7 +16,7 @@ _BULK_INSERT_BATCH_SIZE = 10000
 
 
 class Database:
-    """Azure SQL connection provider for SFDA Reconciliation v5."""
+    """Azure SQL connection provider for SFDA Reconciliation Version 6."""
 
     def __init__(self):
         connection_string = os.getenv("SQL_CONNECTION_STRING", "").strip()
@@ -27,14 +27,17 @@ class Database:
         self.connection_string = connection_string
 
     def connect(self):
-        return pyodbc.connect(
-            self.connection_string,
-            autocommit=False,
+        from engine.warehouse_context import current_warehouse_id
+        connection = pyodbc.connect(self.connection_string, autocommit=False)
+        connection.cursor().execute(
+            "EXEC sys.sp_set_session_context @key=N'WarehouseID', @value=?;",
+            int(current_warehouse_id()),
         )
+        return connection
 
 
 def _load_schema_sql() -> str:
-    """Load the idempotent Version 5 SQL schema from the project SQL folder."""
+    """Load the idempotent Version 6 SQL schema from the project SQL folder."""
 
     schema_path = (
         Path(__file__).resolve().parent.parent
@@ -74,7 +77,7 @@ def _consume_all_results(cursor: pyodbc.Cursor) -> None:
 
 
 def initialize_database() -> None:
-    """Create or safely upgrade all Version 5 database objects."""
+    """Create or safely upgrade all Version 6 database objects."""
 
     started_at = time.perf_counter()
 
@@ -3424,3 +3427,405 @@ def get_full_dispatch_transaction_count() -> int:
             "SELECT COUNT_BIG(*) FROM dbo.FullDispatchTransactions;"
         ).fetchone()
     return int(row[0] or 0)
+
+
+# ================================================================
+# Application authentication
+# ================================================================
+
+def _auth_row(cursor: pyodbc.Cursor, row: Any) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    names = [column[0] for column in cursor.description]
+    return dict(zip(names, row))
+
+
+def normalize_warehouse_name(value: str) -> str:
+    text = " ".join(str(value or "").strip().split())
+    if not text:
+        raise ValueError("Warehouse name is required.")
+    if len(text) > 150:
+        raise ValueError("Warehouse name is too long.")
+    return text
+
+
+def get_or_create_warehouse(name: str) -> Dict[str, Any]:
+    initialize_database()
+    warehouse_name = normalize_warehouse_name(name)
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        row = cursor.execute(
+            "SELECT TOP (1) WarehouseID, WarehouseCode, WarehouseName, Status, CreatedAt "
+            "FROM dbo.Warehouses WHERE LOWER(WarehouseName)=LOWER(?);",
+            warehouse_name,
+        ).fetchone()
+        if not row:
+            cursor.execute(
+                "INSERT INTO dbo.Warehouses (WarehouseName, Status) VALUES (?, N'Active');",
+                warehouse_name,
+            )
+            connection.commit()
+            row = cursor.execute(
+                "SELECT TOP (1) WarehouseID, WarehouseCode, WarehouseName, Status, CreatedAt "
+                "FROM dbo.Warehouses WHERE LOWER(WarehouseName)=LOWER(?);",
+                warehouse_name,
+            ).fetchone()
+        names = [column[0] for column in cursor.description]
+        return dict(zip(names, row))
+
+
+def get_madinah_warehouse() -> Dict[str, Any]:
+    initialize_database()
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        row = cursor.execute(
+            "SELECT TOP (1) WarehouseID, WarehouseCode, WarehouseName, Status, CreatedAt "
+            "FROM dbo.Warehouses WHERE WarehouseCode=N'MADINAH' ORDER BY WarehouseID;"
+        ).fetchone()
+        if not row:
+            raise RuntimeError("Madinah Warehouse bootstrap record is missing.")
+        names = [column[0] for column in cursor.description]
+        return dict(zip(names, row))
+
+
+def list_warehouses() -> List[Dict[str, Any]]:
+    initialize_database()
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        rows = cursor.execute(
+            "SELECT WarehouseID, WarehouseCode, WarehouseName, Status, CreatedAt "
+            "FROM dbo.Warehouses ORDER BY WarehouseName;"
+        ).fetchall()
+        names = [column[0] for column in cursor.description]
+        return [dict(zip(names, row)) for row in rows]
+
+
+def find_user_by_email(email: str) -> Optional[Dict[str, Any]]:
+    sql = """
+        SELECT TOP (1)
+            u.UserID, u.Email, u.PasswordSalt, u.PasswordHash, u.Role, u.Status,
+            u.ApprovalTokenHash, u.ApprovalExpiresAt, u.ApprovedAt,
+            u.CreatedAt, u.UpdatedAt, u.LastLoginAt,
+            u.WarehouseID, w.WarehouseName, w.WarehouseCode,
+            u.RequestedWarehouseName
+        FROM dbo.ApplicationUsers u
+        LEFT JOIN dbo.Warehouses w ON w.WarehouseID=u.WarehouseID
+        WHERE LOWER(u.Email) = LOWER(?);
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        row = cursor.execute(sql, (str(email),)).fetchone()
+        return _auth_row(cursor, row)
+
+
+def count_active_admins() -> int:
+    with Database().connect() as connection:
+        return int(connection.cursor().execute(
+            "SELECT COUNT(*) FROM dbo.ApplicationUsers WHERE Status=N'Active' AND Role=N'Admin';"
+        ).fetchone()[0] or 0)
+
+
+def create_pending_user_record(
+    email: str,
+    password_salt: str,
+    password_hash: str,
+    role: str,
+    approval_token_hash: str,
+    approval_expires_at: Any,
+    warehouse_id: int,
+    requested_warehouse_name: str,
+    status: str = "Pending",
+) -> Dict[str, Any]:
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        existing = cursor.execute(
+            "SELECT TOP (1) UserID FROM dbo.ApplicationUsers WHERE LOWER(Email)=LOWER(?);",
+            (email,),
+        ).fetchone()
+        approved_now = status == "Active"
+        if existing:
+            user_id = int(existing[0])
+            cursor.execute(
+                """
+                UPDATE dbo.ApplicationUsers
+                SET PasswordSalt=?, PasswordHash=?, Role=?, Status=?,
+                    ApprovalTokenHash=?, ApprovalExpiresAt=?,
+                    ApprovedAt=CASE WHEN ?=N'Active' THEN SYSUTCDATETIME() ELSE NULL END,
+                    WarehouseID=?, RequestedWarehouseName=?, UpdatedAt=SYSUTCDATETIME()
+                WHERE UserID=?;
+                """,
+                (
+                    password_salt, password_hash, role, status,
+                    None if approved_now else approval_token_hash,
+                    None if approved_now else approval_expires_at,
+                    status, int(warehouse_id), requested_warehouse_name, user_id,
+                ),
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO dbo.ApplicationUsers
+                (Email, PasswordSalt, PasswordHash, Role, Status,
+                 ApprovalTokenHash, ApprovalExpiresAt, ApprovedAt,
+                 WarehouseID, RequestedWarehouseName)
+                VALUES (?, ?, ?, ?, ?, ?, ?,
+                        CASE WHEN ?=N'Active' THEN SYSUTCDATETIME() ELSE NULL END,
+                        ?, ?);
+                """,
+                (
+                    email, password_salt, password_hash, role, status,
+                    None if approved_now else approval_token_hash,
+                    None if approved_now else approval_expires_at,
+                    status, int(warehouse_id), requested_warehouse_name,
+                ),
+            )
+        row = cursor.execute(
+            """
+            SELECT TOP (1) u.UserID, u.Email, u.Role, u.Status, u.ApprovalExpiresAt,
+                   u.ApprovedAt, u.CreatedAt, u.UpdatedAt, u.LastLoginAt,
+                   u.WarehouseID, w.WarehouseName, w.WarehouseCode,
+                   u.RequestedWarehouseName
+            FROM dbo.ApplicationUsers u
+            LEFT JOIN dbo.Warehouses w ON w.WarehouseID=u.WarehouseID
+            WHERE LOWER(u.Email)=LOWER(?);
+            """,
+            (email,),
+        ).fetchone()
+        result = _auth_row(cursor, row) or {}
+        connection.commit()
+        return result
+
+
+def approve_user_by_token_hash(token_hash: str) -> Optional[Dict[str, Any]]:
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        row = cursor.execute(
+            "SELECT TOP (1) UserID FROM dbo.ApplicationUsers "
+            "WHERE ApprovalTokenHash=? AND Status=N'Pending' "
+            "AND ApprovalExpiresAt>=SYSUTCDATETIME();",
+            (token_hash,),
+        ).fetchone()
+        if not row:
+            return None
+        user_id = int(row[0])
+        cursor.execute(
+            """
+            UPDATE dbo.ApplicationUsers
+            SET Status=N'Active', ApprovedAt=SYSUTCDATETIME(),
+                ApprovalTokenHash=NULL, ApprovalExpiresAt=NULL,
+                UpdatedAt=SYSUTCDATETIME()
+            WHERE UserID=?;
+            """,
+            (user_id,),
+        )
+        result_row = cursor.execute(
+            """
+            SELECT u.UserID,u.Email,u.Role,u.Status,u.ApprovedAt,u.CreatedAt,u.UpdatedAt,u.LastLoginAt,
+                   u.WarehouseID,w.WarehouseName,w.WarehouseCode,u.RequestedWarehouseName
+            FROM dbo.ApplicationUsers u
+            LEFT JOIN dbo.Warehouses w ON w.WarehouseID=u.WarehouseID
+            WHERE u.UserID=?;
+            """,
+            (user_id,),
+        ).fetchone()
+        result = _auth_row(cursor, result_row)
+        connection.commit()
+        return result
+
+
+def create_auth_session(user_id: int, token_hash: str, expires_at: Any) -> None:
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute("DELETE FROM dbo.AuthSessions WHERE ExpiresAt<SYSUTCDATETIME();")
+        cursor.execute(
+            "INSERT INTO dbo.AuthSessions (UserID,TokenHash,ExpiresAt) VALUES (?,?,?);",
+            (int(user_id), token_hash, expires_at),
+        )
+        cursor.execute(
+            "UPDATE dbo.ApplicationUsers SET LastLoginAt=SYSUTCDATETIME(),UpdatedAt=SYSUTCDATETIME() WHERE UserID=?;",
+            (int(user_id),),
+        )
+        connection.commit()
+
+
+def get_auth_session_user(token_hash: str) -> Optional[Dict[str, Any]]:
+    sql = """
+        SELECT TOP (1) u.UserID,u.Email,u.Role,u.Status,u.ApprovedAt,u.CreatedAt,u.UpdatedAt,u.LastLoginAt,
+               u.WarehouseID,w.WarehouseName,w.WarehouseCode,s.ExpiresAt
+        FROM dbo.AuthSessions s
+        INNER JOIN dbo.ApplicationUsers u ON u.UserID=s.UserID
+        LEFT JOIN dbo.Warehouses w ON w.WarehouseID=u.WarehouseID
+        WHERE s.TokenHash=? AND s.ExpiresAt>=SYSUTCDATETIME() AND u.Status=N'Active';
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        row = cursor.execute(sql, (token_hash,)).fetchone()
+        return _auth_row(cursor, row)
+
+
+def delete_auth_session(token_hash: str) -> None:
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute("DELETE FROM dbo.AuthSessions WHERE TokenHash=?;", (token_hash,))
+        connection.commit()
+
+
+def list_auth_users() -> List[Dict[str, Any]]:
+    sql = """
+        SELECT u.UserID,u.Email,u.Role,u.Status,u.ApprovedAt,u.CreatedAt,u.UpdatedAt,u.LastLoginAt,
+               u.WarehouseID,w.WarehouseName,w.WarehouseCode,u.RequestedWarehouseName
+        FROM dbo.ApplicationUsers u
+        LEFT JOIN dbo.Warehouses w ON w.WarehouseID=u.WarehouseID
+        ORDER BY CASE u.Status WHEN N'Pending' THEN 0 WHEN N'Active' THEN 1 ELSE 2 END,u.CreatedAt DESC;
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        rows = cursor.execute(sql).fetchall()
+        names = [column[0] for column in cursor.description]
+        return [dict(zip(names, row)) for row in rows]
+
+
+def set_user_status(user_id: int, status: str) -> Dict[str, Any]:
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE dbo.ApplicationUsers
+            SET Status=?,
+                ApprovedAt=CASE WHEN ?=N'Active' AND ApprovedAt IS NULL THEN SYSUTCDATETIME() ELSE ApprovedAt END,
+                UpdatedAt=SYSUTCDATETIME()
+            WHERE UserID=?;
+            """,
+            (status, status, int(user_id)),
+        )
+        if status != "Active":
+            cursor.execute("DELETE FROM dbo.AuthSessions WHERE UserID=?;", (int(user_id),))
+        row = cursor.execute(
+            """
+            SELECT u.UserID,u.Email,u.Role,u.Status,u.ApprovedAt,u.CreatedAt,u.UpdatedAt,u.LastLoginAt,
+                   u.WarehouseID,w.WarehouseName,w.WarehouseCode,u.RequestedWarehouseName
+            FROM dbo.ApplicationUsers u
+            LEFT JOIN dbo.Warehouses w ON w.WarehouseID=u.WarehouseID
+            WHERE u.UserID=?;
+            """,
+            (int(user_id),),
+        ).fetchone()
+        if not row:
+            connection.rollback()
+            raise ValueError("User was not found.")
+        result = _auth_row(cursor, row)
+        connection.commit()
+        return result
+
+
+def create_outlook_draft_request(
+    *,
+    request_id: str,
+    state_hash: str,
+    requested_by_email: str,
+    selected_ids_json: str,
+    recipient_email: str,
+    subject: str,
+    message_body: str,
+    expires_at: Any,
+) -> None:
+    initialize_database()
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            "DELETE FROM dbo.OutlookDraftRequests "
+            "WHERE ExpiresAt < SYSUTCDATETIME() AND Status=N'Pending';"
+        )
+        cursor.execute(
+            """
+            INSERT INTO dbo.OutlookDraftRequests
+            (
+                RequestID, StateHash, RequestedByEmail, SelectedIDsJson,
+                RecipientEmail, Subject, MessageBody, Status, ExpiresAt
+            )
+            VALUES
+            (
+                CAST(? AS uniqueidentifier), ?, ?, ?, ?, ?, ?,
+                N'Pending', ?
+            );
+            """,
+            (
+                request_id,
+                state_hash,
+                requested_by_email,
+                selected_ids_json,
+                recipient_email,
+                subject,
+                message_body,
+                expires_at,
+            ),
+        )
+        connection.commit()
+
+
+def get_outlook_draft_request_by_state_hash(
+    state_hash: str,
+) -> Optional[Dict[str, Any]]:
+    initialize_database()
+    sql = """
+        SELECT TOP (1)
+            RequestID, StateHash, RequestedByEmail, SelectedIDsJson,
+            RecipientEmail, Subject, MessageBody, Status,
+            GraphMessageID, GraphWebLink, ErrorMessage,
+            CreatedAt, ExpiresAt, CompletedAt
+        FROM dbo.OutlookDraftRequests
+        WHERE StateHash=?
+          AND Status=N'Pending'
+          AND ExpiresAt >= SYSUTCDATETIME();
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        row = cursor.execute(sql, (state_hash,)).fetchone()
+        if not row:
+            return None
+        names = [column[0] for column in cursor.description]
+        return dict(zip(names, row))
+
+
+def complete_outlook_draft_request(
+    request_id: str,
+    *,
+    graph_message_id: str,
+    graph_web_link: str,
+) -> None:
+    initialize_database()
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE dbo.OutlookDraftRequests
+            SET Status=N'Completed',
+                GraphMessageID=?,
+                GraphWebLink=?,
+                ErrorMessage=NULL,
+                CompletedAt=SYSUTCDATETIME()
+            WHERE RequestID=CAST(? AS uniqueidentifier);
+            """,
+            (graph_message_id, graph_web_link, request_id),
+        )
+        connection.commit()
+
+
+def fail_outlook_draft_request(
+    request_id: str,
+    error_message: str,
+) -> None:
+    initialize_database()
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE dbo.OutlookDraftRequests
+            SET Status=N'Failed',
+                ErrorMessage=?,
+                CompletedAt=SYSUTCDATETIME()
+            WHERE RequestID=CAST(? AS uniqueidentifier);
+            """,
+            (str(error_message or "")[:4000], request_id),
+        )
+        connection.commit()
