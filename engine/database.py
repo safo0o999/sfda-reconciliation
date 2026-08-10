@@ -977,6 +977,7 @@ def get_dispatch_events_df() -> pd.DataFrame:
             BN,
             ExpiryMonthKey AS [Expiry Month Key],
             ExpiryDate AS [Expiry Date],
+            ExpiryMonthKey AS [Expiry Month Key],
             GenericItemNumber AS [Generic Item Number],
             TradeItemNumber AS [Trade Item Number],
             TradeName AS [Trade Name],
@@ -2174,6 +2175,7 @@ def save_accept_pending_transactions(
             UPDATE SET
                 BN = source.BN,
                 ExpiryDate = source.ExpiryDate,
+                ExpiryMonthKey = source.ExpiryMonthKey,
                 GenericItemNumber = source.GenericItemNumber,
                 ReferenceNumber = source.ReferenceNumber,
                 ReferenceLine = source.ReferenceLine,
@@ -2563,6 +2565,7 @@ def save_dispatch_pending_transactions(
             UPDATE SET
                 BN = source.BN,
                 ExpiryDate = source.ExpiryDate,
+                ExpiryMonthKey = source.ExpiryMonthKey,
                 GenericItemNumber = source.GenericItemNumber,
                 ReferenceNumber = source.ReferenceNumber,
                 ReferenceLine = source.ReferenceLine,
@@ -2901,3 +2904,523 @@ def get_dispatch_confirmed_history_records() -> List[Dict[str, Any]]:
             }
         )
     return records
+
+
+# -----------------------------------------------------------------------------
+# SFDA-confirmed Full Dispatch consumption state
+# -----------------------------------------------------------------------------
+
+def _full_dispatch_transaction_key(
+    bn: str,
+    expiry_date: Any,
+    generic_item_number: str,
+    to_address: str,
+    gln: str,
+) -> str:
+    """Return one stable Full Dispatch customer-history consumption key."""
+    import hashlib
+
+    expiry = pd.to_datetime(expiry_date, errors="coerce")
+    expiry_text = "" if pd.isna(expiry) else expiry.strftime("%Y-%m")
+    raw = "|".join(
+        [
+            "FULL-DISPATCH",
+            str(bn or "").strip().upper(),
+            expiry_text,
+            str(generic_item_number or "").strip(),
+            str(to_address or "").strip().upper(),
+            str(gln or "").strip(),
+        ]
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def get_full_dispatch_confirmed_allocations() -> pd.DataFrame:
+    """Return Full Dispatch quantities already reserved from historical evidence.
+
+    Submitted quantities are treated as reserved immediately after a successful
+    Full Dispatch run. This prevents regenerating the same historical WMS
+    movement on a retry before SFDA confirmation. Confirmed quantities are also
+    returned for audit/status purposes.
+    """
+    initialize_database()
+    sql = r"""
+        SELECT
+            BN,
+            ExpiryDate AS [Expiry Date],
+            GenericItemNumber AS [Generic Item Number],
+            ToAddress AS [To Address],
+            GLN,
+            SubmittedQuantityEach AS [Reserved Full Dispatch Quantity Each],
+            SubmittedQuantityPack AS [Reserved Full Dispatch Quantity Pack],
+            ConfirmedQuantityEach AS [Confirmed Full Dispatch Quantity Each],
+            ConfirmedQuantityPack AS [Confirmed Full Dispatch Quantity Pack],
+            LastConfirmedAt AS [Last Full Dispatch Confirmed At]
+        FROM dbo.FullDispatchTransactions
+        WHERE SubmittedQuantityPack > 0
+           OR SubmittedQuantityEach > 0;
+    """
+    with Database().connect() as connection:
+        return pd.read_sql(sql, connection)
+
+
+def save_full_dispatch_pending_transactions(
+    rows: List[Dict[str, Any]],
+    run_number: str,
+) -> int:
+    """Persist generated Full Dispatch allocations as awaiting SFDA proof.
+
+    Re-running before SFDA confirmation may regenerate the same allocation.
+    The MERGE keeps one deterministic customer/batch transaction and never
+    double-counts the same submitted quantity.
+    """
+    initialize_database()
+    prepared: Dict[str, Dict[str, Any]] = {}
+
+    for row in rows or []:
+        bn = _text(row, "BN").upper()
+        expiry = _value(row, "Expiry Date")
+        generic = _text(row, "Generic Item Number")
+        to_address = _text(row, "To Address")
+        gln = _text(row, "GLN")
+        pack_qty = max(
+            0.0,
+            _number_with_fallback(
+                row,
+                "Allocated To Be Dispatch",
+                "To Be Dispatch",
+            ),
+        )
+        package_size = max(0.0, _number(row, "PackageSize"))
+        each_qty = pack_qty * package_size
+
+        if not bn or expiry is None or pack_qty <= 0:
+            continue
+
+        expiry_timestamp = pd.to_datetime(expiry, errors="coerce")
+        expiry_month_key = (
+            ""
+            if pd.isna(expiry_timestamp)
+            else expiry_timestamp.strftime("%Y-%m")
+        )
+        if not expiry_month_key:
+            continue
+
+        transaction_key = _full_dispatch_transaction_key(
+            bn,
+            expiry,
+            generic,
+            to_address,
+            gln,
+        )
+
+        current = prepared.setdefault(
+            transaction_key,
+            {
+                "TransactionKey": transaction_key,
+                "BN": bn,
+                "ExpiryDate": expiry,
+                "ExpiryMonthKey": expiry_month_key,
+                "GenericItemNumber": generic,
+                "ToAddress": to_address,
+                "GLN": gln,
+                "Each": 0.0,
+                "Pack": 0.0,
+            },
+        )
+        current["Each"] += each_qty
+        current["Pack"] += pack_qty
+
+    if not prepared:
+        return 0
+
+    sql = r"""
+        MERGE dbo.FullDispatchTransactions WITH (HOLDLOCK) AS target
+        USING
+        (
+            SELECT
+                ? AS TransactionKey, ? AS BN, ? AS ExpiryDate,
+                ? AS ExpiryMonthKey, ? AS GenericItemNumber,
+                ? AS ToAddress, ? AS GLN,
+                ? AS NewQuantityEach, ? AS NewQuantityPack, ? AS RunNumber
+        ) AS source
+        ON target.TransactionKey = source.TransactionKey
+        WHEN MATCHED THEN
+            UPDATE SET
+                BN = source.BN,
+                ExpiryDate = source.ExpiryDate,
+                GenericItemNumber = source.GenericItemNumber,
+                ToAddress = source.ToAddress,
+                GLN = source.GLN,
+                SubmittedQuantityEach = CASE
+                    WHEN target.SubmittedQuantityEach >=
+                         target.ConfirmedQuantityEach + source.NewQuantityEach
+                    THEN target.SubmittedQuantityEach
+                    ELSE target.ConfirmedQuantityEach + source.NewQuantityEach
+                END,
+                SubmittedQuantityPack = CASE
+                    WHEN target.SubmittedQuantityPack >=
+                         target.ConfirmedQuantityPack + source.NewQuantityPack
+                    THEN target.SubmittedQuantityPack
+                    ELSE target.ConfirmedQuantityPack + source.NewQuantityPack
+                END,
+                LastSubmittedRun = source.RunNumber,
+                UpdatedAt = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT
+            (
+                TransactionKey, BN, ExpiryDate, ExpiryMonthKey,
+                GenericItemNumber, ToAddress, GLN,
+                SubmittedQuantityEach, SubmittedQuantityPack,
+                ConfirmedQuantityEach, ConfirmedQuantityPack,
+                FirstSubmittedRun, LastSubmittedRun
+            )
+            VALUES
+            (
+                source.TransactionKey, source.BN, source.ExpiryDate,
+                source.ExpiryMonthKey, source.GenericItemNumber,
+                source.ToAddress, source.GLN,
+                source.NewQuantityEach, source.NewQuantityPack,
+                0, 0, source.RunNumber, source.RunNumber
+            );
+    """
+
+    saved = 0
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            for row in prepared.values():
+                cursor.execute(
+                    sql,
+                    (
+                        row["TransactionKey"],
+                        row["BN"],
+                        row["ExpiryDate"],
+                        row["ExpiryMonthKey"],
+                        row["GenericItemNumber"],
+                        row["ToAddress"],
+                        row["GLN"],
+                        row["Each"],
+                        row["Pack"],
+                        str(run_number),
+                    ),
+                )
+                saved += 1
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return saved
+
+
+def _replace_full_dispatch_sfda_baseline_with_connection(
+    connection: pyodbc.Connection,
+    state: pd.DataFrame,
+    source_file_name: str = "",
+) -> int:
+    cursor = connection.cursor()
+    cursor.execute("DELETE FROM dbo.FullDispatchSFDABaseline;")
+
+    rows = [
+        (
+            _text(row, "GTIN"),
+            _text(row, "BN"),
+            _value(row, "Expiry Date"),
+            _number(row, "Active"),
+            _number(row, "Quantity sent pending"),
+            str(source_file_name or ""),
+        )
+        for row in state.to_dict(orient="records")
+        if _text(row, "BN") and _value(row, "Expiry Date") is not None
+    ]
+
+    if rows:
+        # Keep this proof snapshot on regular executemany. ODBC Driver 18 may
+        # otherwise infer a short string buffer and fail on a later longer BN
+        # or source file name.
+        cursor.fast_executemany = False
+        cursor.executemany(
+            r"""
+            INSERT INTO dbo.FullDispatchSFDABaseline
+            (GTIN, BN, ExpiryDate, Active, QuantitySentPending, SourceFileName)
+            VALUES (?, ?, ?, ?, ?, ?);
+            """,
+            rows,
+        )
+
+    return len(rows)
+
+
+def replace_full_dispatch_sfda_baseline(
+    sfda_df: pd.DataFrame,
+    source_file_name: str = "",
+) -> int:
+    initialize_database()
+    state = _prepare_dispatch_sfda_state(sfda_df)
+
+    with Database().connect() as connection:
+        try:
+            count = _replace_full_dispatch_sfda_baseline_with_connection(
+                connection,
+                state,
+                source_file_name,
+            )
+            connection.commit()
+            return count
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def confirm_full_dispatch_transactions_from_sfda(
+    sfda_df: pd.DataFrame,
+    source_file_name: str = "",
+) -> Dict[str, Any]:
+    """Confirm prior Full Dispatch allocations from the next SFDA report.
+
+    The proof is conservative: for each exact SFDA BN + Expiry Date, confirmed
+    packs equal the smaller of Active decrease and Quantity Sent Pending
+    increase. That evidence is allocated FIFO only to previously generated,
+    still-unconfirmed Full Dispatch allocations.
+
+    This ledger does NOT append new WMS DispatchEvents or increase Batch Master
+    historical dispatch totals. It only marks historical customer dispatch
+    evidence as already consumed by Full Reconciliation so it cannot be
+    proposed again.
+    """
+    import hashlib
+
+    initialize_database()
+    current = _prepare_dispatch_sfda_state(sfda_df)
+
+    with Database().connect() as connection:
+        previous = pd.read_sql(
+            r"""
+            SELECT
+                GTIN,
+                BN,
+                ExpiryDate AS [Expiry Date],
+                Active,
+                QuantitySentPending AS [Quantity sent pending]
+            FROM dbo.FullDispatchSFDABaseline;
+            """,
+            connection,
+        )
+
+        if previous.empty:
+            return {
+                "baseline_available": False,
+                "confirmed_packs": 0.0,
+                "confirmed_each": 0.0,
+                "confirmed_transactions": 0,
+                "confirmed_batches": 0,
+            }
+
+        previous["BN"] = previous["BN"].fillna("").astype(str).str.strip()
+        current["BN"] = current["BN"].fillna("").astype(str).str.strip()
+        previous["Expiry Date"] = pd.to_datetime(
+            previous["Expiry Date"],
+            errors="coerce",
+        ).dt.normalize()
+        current["Expiry Date"] = pd.to_datetime(
+            current["Expiry Date"],
+            errors="coerce",
+        ).dt.normalize()
+
+        comparison = previous.merge(
+            current,
+            on=["BN", "Expiry Date"],
+            how="inner",
+            suffixes=(" Previous", " Current"),
+        )
+
+        if comparison.empty:
+            evidence_rows: List[Dict[str, Any]] = []
+        else:
+            comparison["Active Decrease"] = (
+                pd.to_numeric(
+                    comparison["Active Previous"],
+                    errors="coerce",
+                ).fillna(0)
+                - pd.to_numeric(
+                    comparison["Active Current"],
+                    errors="coerce",
+                ).fillna(0)
+            ).clip(lower=0)
+
+            comparison["Sent Pending Increase"] = (
+                pd.to_numeric(
+                    comparison["Quantity sent pending Current"],
+                    errors="coerce",
+                ).fillna(0)
+                - pd.to_numeric(
+                    comparison["Quantity sent pending Previous"],
+                    errors="coerce",
+                ).fillna(0)
+            ).clip(lower=0)
+
+            comparison["Confirmed Pack Evidence"] = comparison[
+                ["Active Decrease", "Sent Pending Increase"]
+            ].min(axis=1)
+
+            evidence_rows = comparison.loc[
+                comparison["Confirmed Pack Evidence"].gt(0)
+            ].to_dict(orient="records")
+
+        cursor = connection.cursor()
+        confirmed_pack_total = 0.0
+        confirmed_each_total = 0.0
+        confirmed_transaction_keys: Set[str] = set()
+        confirmed_batches = 0
+
+        try:
+            for evidence in evidence_rows:
+                bn = _text(evidence, "BN")
+                expiry = _value(evidence, "Expiry Date")
+                remaining_pack = max(
+                    0.0,
+                    _number(evidence, "Confirmed Pack Evidence"),
+                )
+                if remaining_pack <= 0:
+                    continue
+
+                pending_rows = cursor.execute(
+                    r"""
+                    SELECT
+                        TransactionKey,
+                        SubmittedQuantityEach,
+                        ConfirmedQuantityEach,
+                        SubmittedQuantityPack,
+                        ConfirmedQuantityPack
+                    FROM dbo.FullDispatchTransactions
+                         WITH (UPDLOCK, HOLDLOCK)
+                    WHERE BN = ?
+                      AND ExpiryMonthKey = ?
+                      AND SubmittedQuantityPack > ConfirmedQuantityPack
+                    ORDER BY CreatedAt, TransactionKey;
+                    """,
+                    (
+                        bn,
+                        pd.to_datetime(expiry, errors="coerce").strftime("%Y-%m"),
+                    ),
+                ).fetchall()
+
+                batch_confirmed = 0.0
+
+                for pending in pending_rows:
+                    if remaining_pack <= 0.0000001:
+                        break
+
+                    transaction_key = str(pending[0])
+                    submitted_each = float(pending[1] or 0)
+                    confirmed_each = float(pending[2] or 0)
+                    submitted_pack = float(pending[3] or 0)
+                    confirmed_pack = float(pending[4] or 0)
+
+                    open_pack = max(0.0, submitted_pack - confirmed_pack)
+                    open_each = max(0.0, submitted_each - confirmed_each)
+                    if open_pack <= 0:
+                        continue
+
+                    allocate_pack = min(remaining_pack, open_pack)
+                    each_per_pack = (
+                        open_each / open_pack
+                        if open_pack > 0
+                        else 0
+                    )
+                    allocate_each = min(
+                        open_each,
+                        allocate_pack * each_per_pack,
+                    )
+
+                    new_cumulative_pack = confirmed_pack + allocate_pack
+                    confirmation_key = hashlib.sha256(
+                        (
+                            f"FULL-DISPATCH|{transaction_key}|"
+                            f"{new_cumulative_pack:.6f}"
+                        ).encode("utf-8")
+                    ).hexdigest()
+
+                    cursor.execute(
+                        r"""
+                        UPDATE dbo.FullDispatchTransactions
+                        SET
+                            ConfirmedQuantityPack =
+                                ConfirmedQuantityPack + ?,
+                            ConfirmedQuantityEach =
+                                ConfirmedQuantityEach + ?,
+                            LastConfirmedAt = SYSUTCDATETIME(),
+                            UpdatedAt = SYSUTCDATETIME()
+                        WHERE TransactionKey = ?;
+                        """,
+                        (
+                            allocate_pack,
+                            allocate_each,
+                            transaction_key,
+                        ),
+                    )
+
+                    cursor.execute(
+                        r"""
+                        INSERT INTO dbo.FullDispatchConfirmations
+                        (
+                            ConfirmationKey,
+                            TransactionKey,
+                            ConfirmedQuantityEach,
+                            ConfirmedQuantityPack
+                        )
+                        SELECT ?, ?, ?, ?
+                        WHERE NOT EXISTS
+                        (
+                            SELECT 1
+                            FROM dbo.FullDispatchConfirmations
+                            WHERE ConfirmationKey = ?
+                        );
+                        """,
+                        (
+                            confirmation_key,
+                            transaction_key,
+                            allocate_each,
+                            allocate_pack,
+                            confirmation_key,
+                        ),
+                    )
+
+                    remaining_pack -= allocate_pack
+                    batch_confirmed += allocate_pack
+                    confirmed_pack_total += allocate_pack
+                    confirmed_each_total += allocate_each
+                    confirmed_transaction_keys.add(transaction_key)
+
+                if batch_confirmed > 0:
+                    confirmed_batches += 1
+
+            _replace_full_dispatch_sfda_baseline_with_connection(
+                connection,
+                current,
+                source_file_name,
+            )
+            connection.commit()
+
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "baseline_available": True,
+        "confirmed_packs": float(confirmed_pack_total),
+        "confirmed_each": float(confirmed_each_total),
+        "confirmed_transactions": len(confirmed_transaction_keys),
+        "confirmed_batches": int(confirmed_batches),
+    }
+
+
+def get_full_dispatch_transaction_count() -> int:
+    """Return the number of persisted Full Dispatch reservation rows."""
+    initialize_database()
+    with Database().connect() as connection:
+        row = connection.cursor().execute(
+            "SELECT COUNT_BIG(*) FROM dbo.FullDispatchTransactions;"
+        ).fetchone()
+    return int(row[0] or 0)
