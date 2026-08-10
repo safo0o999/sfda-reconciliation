@@ -99,6 +99,94 @@ def initialize_database() -> None:
     )
 
 
+def verify_auth_schema() -> None:
+    """
+    Verify that the Version 6 authentication / warehouse foundation exists.
+
+    This is intentionally a lightweight metadata check. It MUST NOT execute
+    the full 001_initial_schema.sql migration during a normal web request.
+    Database migrations are deployment/administration work, not part of
+    sign-in or registration.
+    """
+
+    required_tables = (
+        "Warehouses",
+        "ApplicationUsers",
+        "AuthSessions",
+    )
+
+    required_columns = {
+        "Warehouses": ("WarehouseID", "WarehouseName", "Status"),
+        "ApplicationUsers": (
+            "UserID",
+            "Email",
+            "PasswordSalt",
+            "PasswordHash",
+            "Role",
+            "Status",
+            "WarehouseID",
+            "RequestedWarehouseName",
+        ),
+        "AuthSessions": ("SessionID", "UserID", "TokenHash", "ExpiresAt"),
+    }
+
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+
+        missing_tables = []
+        for table_name in required_tables:
+            exists = cursor.execute(
+                "SELECT CASE WHEN OBJECT_ID(?, N'U') IS NULL THEN 0 ELSE 1 END;",
+                (f"dbo.{table_name}",),
+            ).fetchone()[0]
+            if not int(exists or 0):
+                missing_tables.append(table_name)
+
+        if missing_tables:
+            raise RuntimeError(
+                "Version 6 authentication database migration is incomplete. "
+                "Missing table(s): " + ", ".join(missing_tables)
+            )
+
+        missing_columns = []
+        for table_name, columns in required_columns.items():
+            for column_name in columns:
+                exists = cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM sys.columns
+                    WHERE object_id = OBJECT_ID(?)
+                      AND name = ?;
+                    """,
+                    (f"dbo.{table_name}", column_name),
+                ).fetchone()[0]
+                if not int(exists or 0):
+                    missing_columns.append(f"{table_name}.{column_name}")
+
+        if missing_columns:
+            raise RuntimeError(
+                "Version 6 authentication database migration is incomplete. "
+                "Missing column(s): " + ", ".join(missing_columns)
+            )
+
+        madinah = cursor.execute(
+            """
+            SELECT TOP (1) WarehouseID
+            FROM dbo.Warehouses
+            WHERE WarehouseCode=N'MADINAH'
+               OR WarehouseID=1
+            ORDER BY CASE WHEN WarehouseCode=N'MADINAH' THEN 0 ELSE 1 END,
+                     WarehouseID;
+            """
+        ).fetchone()
+
+        if not madinah:
+            raise RuntimeError(
+                "Version 6 authentication database migration is incomplete. "
+                "Madinah Warehouse bootstrap record is missing."
+            )
+
+
 def _value(
     row: Dict[str, Any],
     name: str,
@@ -3450,7 +3538,6 @@ def normalize_warehouse_name(value: str) -> str:
 
 
 def get_or_create_warehouse(name: str) -> Dict[str, Any]:
-    initialize_database()
     warehouse_name = normalize_warehouse_name(name)
     with Database().connect() as connection:
         cursor = connection.cursor()
@@ -3475,7 +3562,6 @@ def get_or_create_warehouse(name: str) -> Dict[str, Any]:
 
 
 def get_madinah_warehouse() -> Dict[str, Any]:
-    initialize_database()
     with Database().connect() as connection:
         cursor = connection.cursor()
         row = cursor.execute(
@@ -3489,7 +3575,6 @@ def get_madinah_warehouse() -> Dict[str, Any]:
 
 
 def list_warehouses() -> List[Dict[str, Any]]:
-    initialize_database()
     with Database().connect() as connection:
         cursor = connection.cursor()
         rows = cursor.execute(
