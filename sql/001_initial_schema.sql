@@ -940,6 +940,537 @@ BEGIN TRY
             ON dbo.HistoricalBuildJobs (Status, CreatedAt DESC);
     END;
 
+
+    /* ================================================================
+       Version 6 Multi-Warehouse foundation
+       Existing pre-V6 operational data is assigned to Madinah Warehouse.
+       ================================================================ */
+    IF OBJECT_ID(N'dbo.Warehouses', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.Warehouses
+        (
+            WarehouseID int IDENTITY(1,1) NOT NULL,
+            WarehouseCode nvarchar(80) NULL,
+            WarehouseName nvarchar(150) NOT NULL,
+            Status nvarchar(30) NOT NULL CONSTRAINT DF_Warehouses_Status DEFAULT (N'Active'),
+            CreatedAt datetime2(0) NOT NULL CONSTRAINT DF_Warehouses_CreatedAt DEFAULT (SYSUTCDATETIME()),
+            CONSTRAINT PK_Warehouses PRIMARY KEY (WarehouseID),
+            CONSTRAINT UQ_Warehouses_WarehouseName UNIQUE (WarehouseName)
+        );
+    END;
+
+    IF NOT EXISTS (SELECT 1 FROM dbo.Warehouses WHERE WarehouseID=1)
+    BEGIN
+        SET IDENTITY_INSERT dbo.Warehouses ON;
+        INSERT INTO dbo.Warehouses (WarehouseID, WarehouseCode, WarehouseName, Status)
+        VALUES (1, N'MADINAH', N'Madinah Warehouse', N'Active');
+        SET IDENTITY_INSERT dbo.Warehouses OFF;
+    END
+    ELSE
+    BEGIN
+        UPDATE dbo.Warehouses
+        SET WarehouseCode=N'MADINAH', WarehouseName=N'Madinah Warehouse', Status=N'Active'
+        WHERE WarehouseID=1;
+    END;
+
+    /* ================================================================
+       ApplicationUsers / AuthSessions
+       Local application authentication with admin approval.
+       Passwords are stored only as PBKDF2 hashes + random salts.
+       ================================================================ */
+    IF OBJECT_ID(N'dbo.ApplicationUsers', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.ApplicationUsers
+        (
+            UserID                int IDENTITY(1,1) NOT NULL,
+            Email                 nvarchar(320) NOT NULL,
+            PasswordSalt          varchar(128) NOT NULL,
+            PasswordHash          varchar(256) NOT NULL,
+            Role                  nvarchar(30) NOT NULL
+                CONSTRAINT DF_ApplicationUsers_Role DEFAULT (N'User'),
+            Status                nvarchar(30) NOT NULL
+                CONSTRAINT DF_ApplicationUsers_Status DEFAULT (N'Pending'),
+            ApprovalTokenHash     varchar(64) NULL,
+            ApprovalExpiresAt     datetime2(0) NULL,
+            ApprovedAt            datetime2(0) NULL,
+            CreatedAt             datetime2(0) NOT NULL
+                CONSTRAINT DF_ApplicationUsers_CreatedAt DEFAULT (SYSUTCDATETIME()),
+            UpdatedAt             datetime2(0) NOT NULL
+                CONSTRAINT DF_ApplicationUsers_UpdatedAt DEFAULT (SYSUTCDATETIME()),
+            LastLoginAt           datetime2(0) NULL,
+            CONSTRAINT PK_ApplicationUsers PRIMARY KEY (UserID),
+            CONSTRAINT UQ_ApplicationUsers_Email UNIQUE (Email)
+        );
+    END;
+
+    IF COL_LENGTH(N'dbo.ApplicationUsers', N'WarehouseID') IS NULL
+        ALTER TABLE dbo.ApplicationUsers ADD WarehouseID int NULL;
+    IF COL_LENGTH(N'dbo.ApplicationUsers', N'RequestedWarehouseName') IS NULL
+        ALTER TABLE dbo.ApplicationUsers ADD RequestedWarehouseName nvarchar(150) NULL;
+    UPDATE dbo.ApplicationUsers SET WarehouseID=1 WHERE WarehouseID IS NULL;
+    ALTER TABLE dbo.ApplicationUsers ALTER COLUMN WarehouseID int NOT NULL;
+    IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name=N'FK_ApplicationUsers_Warehouse')
+        ALTER TABLE dbo.ApplicationUsers ADD CONSTRAINT FK_ApplicationUsers_Warehouse FOREIGN KEY (WarehouseID) REFERENCES dbo.Warehouses(WarehouseID);
+
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM sys.indexes
+        WHERE object_id = OBJECT_ID(N'dbo.ApplicationUsers')
+          AND name = N'IX_ApplicationUsers_StatusRole'
+    )
+    BEGIN
+        CREATE INDEX IX_ApplicationUsers_StatusRole
+            ON dbo.ApplicationUsers (Status, Role, CreatedAt DESC);
+    END;
+
+    IF OBJECT_ID(N'dbo.AuthSessions', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.AuthSessions
+        (
+            SessionID             bigint IDENTITY(1,1) NOT NULL,
+            UserID                int NOT NULL,
+            TokenHash             varchar(64) NOT NULL,
+            ExpiresAt             datetime2(0) NOT NULL,
+            CreatedAt             datetime2(0) NOT NULL
+                CONSTRAINT DF_AuthSessions_CreatedAt DEFAULT (SYSUTCDATETIME()),
+            CONSTRAINT PK_AuthSessions PRIMARY KEY (SessionID),
+            CONSTRAINT UQ_AuthSessions_TokenHash UNIQUE (TokenHash),
+            CONSTRAINT FK_AuthSessions_User
+                FOREIGN KEY (UserID) REFERENCES dbo.ApplicationUsers(UserID)
+        );
+    END;
+
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM sys.indexes
+        WHERE object_id = OBJECT_ID(N'dbo.AuthSessions')
+          AND name = N'IX_AuthSessions_UserExpiry'
+    )
+    BEGIN
+        CREATE INDEX IX_AuthSessions_UserExpiry
+            ON dbo.AuthSessions (UserID, ExpiresAt DESC);
+    END;
+
+
+    /* ================================================================
+       OutlookDraftRequests
+       Short-lived Microsoft Graph OAuth state + requested SFDA draft.
+       No access/refresh tokens are persisted.
+       ================================================================ */
+    IF OBJECT_ID(N'dbo.OutlookDraftRequests', N'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.OutlookDraftRequests
+        (
+            RequestID             uniqueidentifier NOT NULL,
+            StateHash             varchar(64) NOT NULL,
+            RequestedByEmail      nvarchar(320) NOT NULL,
+            SelectedIDsJson       nvarchar(max) NOT NULL,
+            RecipientEmail        nvarchar(320) NOT NULL,
+            Subject               nvarchar(500) NOT NULL,
+            MessageBody           nvarchar(max) NULL,
+            Status                nvarchar(30) NOT NULL
+                CONSTRAINT DF_OutlookDraftRequests_Status DEFAULT (N'Pending'),
+            GraphMessageID        nvarchar(500) NULL,
+            GraphWebLink          nvarchar(max) NULL,
+            ErrorMessage          nvarchar(max) NULL,
+            CreatedAt             datetime2(0) NOT NULL
+                CONSTRAINT DF_OutlookDraftRequests_CreatedAt DEFAULT (SYSUTCDATETIME()),
+            ExpiresAt             datetime2(0) NOT NULL,
+            CompletedAt           datetime2(0) NULL,
+            CONSTRAINT PK_OutlookDraftRequests PRIMARY KEY (RequestID),
+            CONSTRAINT UQ_OutlookDraftRequests_StateHash UNIQUE (StateHash)
+        );
+    END;
+
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM sys.indexes
+        WHERE object_id = OBJECT_ID(N'dbo.OutlookDraftRequests')
+          AND name = N'IX_OutlookDraftRequests_StatusExpiry'
+    )
+    BEGIN
+        CREATE INDEX IX_OutlookDraftRequests_StatusExpiry
+            ON dbo.OutlookDraftRequests (Status, ExpiresAt, CreatedAt DESC);
+    END;
+
+    /* ================================================================
+       Version 6 warehouse isolation. All existing rows become Madinah.
+       ================================================================ */
+    IF OBJECT_ID(N'dbo.ReceiptEvents', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.ReceiptEvents', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.ReceiptEvents ADD WarehouseID int NULL;
+        UPDATE dbo.ReceiptEvents SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.ReceiptEvents ADD CONSTRAINT DF_ReceiptEvents_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.ReceiptEvents ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.DispatchEvents', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DispatchEvents', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.DispatchEvents ADD WarehouseID int NULL;
+        UPDATE dbo.DispatchEvents SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.DispatchEvents ADD CONSTRAINT DF_DispatchEvents_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.DispatchEvents ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.BatchMaster', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.BatchMaster', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.BatchMaster ADD WarehouseID int NULL;
+        UPDATE dbo.BatchMaster SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.BatchMaster ADD CONSTRAINT DF_BatchMaster_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.BatchMaster ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.SupplierHistory', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.SupplierHistory', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.SupplierHistory ADD WarehouseID int NULL;
+        UPDATE dbo.SupplierHistory SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.SupplierHistory ADD CONSTRAINT DF_SupplierHistory_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.SupplierHistory ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.CustomerHistory', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.CustomerHistory', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.CustomerHistory ADD WarehouseID int NULL;
+        UPDATE dbo.CustomerHistory SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.CustomerHistory ADD CONSTRAINT DF_CustomerHistory_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.CustomerHistory ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.RunHistory', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.RunHistory', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.RunHistory ADD WarehouseID int NULL;
+        UPDATE dbo.RunHistory SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.RunHistory ADD CONSTRAINT DF_RunHistory_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.RunHistory ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.LatestInventorySnapshot', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.LatestInventorySnapshot', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.LatestInventorySnapshot ADD WarehouseID int NULL;
+        UPDATE dbo.LatestInventorySnapshot SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.LatestInventorySnapshot ADD CONSTRAINT DF_LatestInventorySnapshot_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.LatestInventorySnapshot ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.LatestSFDASnapshot', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.LatestSFDASnapshot', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.LatestSFDASnapshot ADD WarehouseID int NULL;
+        UPDATE dbo.LatestSFDASnapshot SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.LatestSFDASnapshot ADD CONSTRAINT DF_LatestSFDASnapshot_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.LatestSFDASnapshot ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.ReconciliationRuns', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.ReconciliationRuns', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.ReconciliationRuns ADD WarehouseID int NULL;
+        UPDATE dbo.ReconciliationRuns SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.ReconciliationRuns ADD CONSTRAINT DF_ReconciliationRuns_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.ReconciliationRuns ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.ReconciliationRunFiles', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.ReconciliationRunFiles', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.ReconciliationRunFiles ADD WarehouseID int NULL;
+        UPDATE dbo.ReconciliationRunFiles SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.ReconciliationRunFiles ADD CONSTRAINT DF_ReconciliationRunFiles_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.ReconciliationRunFiles ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.DailyProcessedTransactions', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DailyProcessedTransactions', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.DailyProcessedTransactions ADD WarehouseID int NULL;
+        UPDATE dbo.DailyProcessedTransactions SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.DailyProcessedTransactions ADD CONSTRAINT DF_DailyProcessedTransactions_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.DailyProcessedTransactions ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.DailyAcceptTransactions', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DailyAcceptTransactions', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.DailyAcceptTransactions ADD WarehouseID int NULL;
+        UPDATE dbo.DailyAcceptTransactions SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.DailyAcceptTransactions ADD CONSTRAINT DF_DailyAcceptTransactions_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.DailyAcceptTransactions ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.DailyAcceptSFDABaseline', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DailyAcceptSFDABaseline', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.DailyAcceptSFDABaseline ADD WarehouseID int NULL;
+        UPDATE dbo.DailyAcceptSFDABaseline SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.DailyAcceptSFDABaseline ADD CONSTRAINT DF_DailyAcceptSFDABaseline_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.DailyAcceptSFDABaseline ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.DailyDispatchTransactions', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DailyDispatchTransactions', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.DailyDispatchTransactions ADD WarehouseID int NULL;
+        UPDATE dbo.DailyDispatchTransactions SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.DailyDispatchTransactions ADD CONSTRAINT DF_DailyDispatchTransactions_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.DailyDispatchTransactions ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.DailyDispatchSFDABaseline', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DailyDispatchSFDABaseline', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.DailyDispatchSFDABaseline ADD WarehouseID int NULL;
+        UPDATE dbo.DailyDispatchSFDABaseline SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.DailyDispatchSFDABaseline ADD CONSTRAINT DF_DailyDispatchSFDABaseline_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.DailyDispatchSFDABaseline ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.DailyDispatchConfirmations', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.DailyDispatchConfirmations', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.DailyDispatchConfirmations ADD WarehouseID int NULL;
+        UPDATE dbo.DailyDispatchConfirmations SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.DailyDispatchConfirmations ADD CONSTRAINT DF_DailyDispatchConfirmations_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.DailyDispatchConfirmations ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.FullDispatchTransactions', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.FullDispatchTransactions', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.FullDispatchTransactions ADD WarehouseID int NULL;
+        UPDATE dbo.FullDispatchTransactions SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.FullDispatchTransactions ADD CONSTRAINT DF_FullDispatchTransactions_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.FullDispatchTransactions ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.FullDispatchSFDABaseline', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.FullDispatchSFDABaseline', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.FullDispatchSFDABaseline ADD WarehouseID int NULL;
+        UPDATE dbo.FullDispatchSFDABaseline SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.FullDispatchSFDABaseline ADD CONSTRAINT DF_FullDispatchSFDABaseline_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.FullDispatchSFDABaseline ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.FullDispatchConfirmations', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.FullDispatchConfirmations', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.FullDispatchConfirmations ADD WarehouseID int NULL;
+        UPDATE dbo.FullDispatchConfirmations SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.FullDispatchConfirmations ADD CONSTRAINT DF_FullDispatchConfirmations_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.FullDispatchConfirmations ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.HistoricalBuildJobs', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.HistoricalBuildJobs', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.HistoricalBuildJobs ADD WarehouseID int NULL;
+        UPDATE dbo.HistoricalBuildJobs SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.HistoricalBuildJobs ADD CONSTRAINT DF_HistoricalBuildJobs_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.HistoricalBuildJobs ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+    IF OBJECT_ID(N'dbo.OutlookDraftRequests', N'U') IS NOT NULL AND COL_LENGTH(N'dbo.OutlookDraftRequests', N'WarehouseID') IS NULL
+    BEGIN
+        ALTER TABLE dbo.OutlookDraftRequests ADD WarehouseID int NULL;
+        UPDATE dbo.OutlookDraftRequests SET WarehouseID=1 WHERE WarehouseID IS NULL;
+        ALTER TABLE dbo.OutlookDraftRequests ADD CONSTRAINT DF_OutlookDraftRequests_WarehouseID DEFAULT (CONVERT(int, SESSION_CONTEXT(N'WarehouseID'))) FOR WarehouseID;
+        ALTER TABLE dbo.OutlookDraftRequests ALTER COLUMN WarehouseID int NOT NULL;
+    END;
+
+    IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name=N'FK_DailyDispatchConfirmations_Transaction')
+        ALTER TABLE dbo.DailyDispatchConfirmations DROP CONSTRAINT FK_DailyDispatchConfirmations_Transaction;
+    IF EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name=N'FK_FullDispatchConfirmations_Transaction')
+        ALTER TABLE dbo.FullDispatchConfirmations DROP CONSTRAINT FK_FullDispatchConfirmations_Transaction;
+
+    IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_ReceiptEvents')
+       AND NOT EXISTS (
+           SELECT 1 FROM sys.index_columns ic
+           JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id
+           JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+           WHERE i.name=N'PK_ReceiptEvents' AND c.name=N'WarehouseID'
+       )
+    BEGIN
+        ALTER TABLE dbo.ReceiptEvents DROP CONSTRAINT PK_ReceiptEvents;
+        ALTER TABLE dbo.ReceiptEvents ADD CONSTRAINT PK_ReceiptEvents PRIMARY KEY (WarehouseID, EventKey);
+    END;
+    IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_DispatchEvents')
+       AND NOT EXISTS (
+           SELECT 1 FROM sys.index_columns ic
+           JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id
+           JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+           WHERE i.name=N'PK_DispatchEvents' AND c.name=N'WarehouseID'
+       )
+    BEGIN
+        ALTER TABLE dbo.DispatchEvents DROP CONSTRAINT PK_DispatchEvents;
+        ALTER TABLE dbo.DispatchEvents ADD CONSTRAINT PK_DispatchEvents PRIMARY KEY (WarehouseID, EventKey);
+    END;
+    IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_BatchMaster')
+       AND NOT EXISTS (
+           SELECT 1 FROM sys.index_columns ic
+           JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id
+           JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+           WHERE i.name=N'PK_BatchMaster' AND c.name=N'WarehouseID'
+       )
+    BEGIN
+        ALTER TABLE dbo.BatchMaster DROP CONSTRAINT PK_BatchMaster;
+        ALTER TABLE dbo.BatchMaster ADD CONSTRAINT PK_BatchMaster PRIMARY KEY (WarehouseID, BN, ExpiryMonthKey, GenericItemNumber);
+    END;
+    IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_DailyAcceptTransactions')
+       AND NOT EXISTS (
+           SELECT 1 FROM sys.index_columns ic
+           JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id
+           JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+           WHERE i.name=N'PK_DailyAcceptTransactions' AND c.name=N'WarehouseID'
+       )
+    BEGIN
+        ALTER TABLE dbo.DailyAcceptTransactions DROP CONSTRAINT PK_DailyAcceptTransactions;
+        ALTER TABLE dbo.DailyAcceptTransactions ADD CONSTRAINT PK_DailyAcceptTransactions PRIMARY KEY (WarehouseID, TransactionKey);
+    END;
+    IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_DailyAcceptSFDABaseline')
+       AND NOT EXISTS (
+           SELECT 1 FROM sys.index_columns ic
+           JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id
+           JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+           WHERE i.name=N'PK_DailyAcceptSFDABaseline' AND c.name=N'WarehouseID'
+       )
+    BEGIN
+        ALTER TABLE dbo.DailyAcceptSFDABaseline DROP CONSTRAINT PK_DailyAcceptSFDABaseline;
+        ALTER TABLE dbo.DailyAcceptSFDABaseline ADD CONSTRAINT PK_DailyAcceptSFDABaseline PRIMARY KEY (WarehouseID, BN, ExpiryDate);
+    END;
+    IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_DailyDispatchTransactions')
+       AND NOT EXISTS (
+           SELECT 1 FROM sys.index_columns ic
+           JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id
+           JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+           WHERE i.name=N'PK_DailyDispatchTransactions' AND c.name=N'WarehouseID'
+       )
+    BEGIN
+        ALTER TABLE dbo.DailyDispatchTransactions DROP CONSTRAINT PK_DailyDispatchTransactions;
+        ALTER TABLE dbo.DailyDispatchTransactions ADD CONSTRAINT PK_DailyDispatchTransactions PRIMARY KEY (WarehouseID, TransactionKey);
+    END;
+    IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_DailyDispatchSFDABaseline')
+       AND NOT EXISTS (
+           SELECT 1 FROM sys.index_columns ic
+           JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id
+           JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+           WHERE i.name=N'PK_DailyDispatchSFDABaseline' AND c.name=N'WarehouseID'
+       )
+    BEGIN
+        ALTER TABLE dbo.DailyDispatchSFDABaseline DROP CONSTRAINT PK_DailyDispatchSFDABaseline;
+        ALTER TABLE dbo.DailyDispatchSFDABaseline ADD CONSTRAINT PK_DailyDispatchSFDABaseline PRIMARY KEY (WarehouseID, BN, ExpiryDate);
+    END;
+    IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_DailyDispatchConfirmations')
+       AND NOT EXISTS (
+           SELECT 1 FROM sys.index_columns ic
+           JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id
+           JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+           WHERE i.name=N'PK_DailyDispatchConfirmations' AND c.name=N'WarehouseID'
+       )
+    BEGIN
+        ALTER TABLE dbo.DailyDispatchConfirmations DROP CONSTRAINT PK_DailyDispatchConfirmations;
+        ALTER TABLE dbo.DailyDispatchConfirmations ADD CONSTRAINT PK_DailyDispatchConfirmations PRIMARY KEY (WarehouseID, ConfirmationKey);
+    END;
+    IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_FullDispatchTransactions')
+       AND NOT EXISTS (
+           SELECT 1 FROM sys.index_columns ic
+           JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id
+           JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+           WHERE i.name=N'PK_FullDispatchTransactions' AND c.name=N'WarehouseID'
+       )
+    BEGIN
+        ALTER TABLE dbo.FullDispatchTransactions DROP CONSTRAINT PK_FullDispatchTransactions;
+        ALTER TABLE dbo.FullDispatchTransactions ADD CONSTRAINT PK_FullDispatchTransactions PRIMARY KEY (WarehouseID, TransactionKey);
+    END;
+    IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_FullDispatchSFDABaseline')
+       AND NOT EXISTS (
+           SELECT 1 FROM sys.index_columns ic
+           JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id
+           JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+           WHERE i.name=N'PK_FullDispatchSFDABaseline' AND c.name=N'WarehouseID'
+       )
+    BEGIN
+        ALTER TABLE dbo.FullDispatchSFDABaseline DROP CONSTRAINT PK_FullDispatchSFDABaseline;
+        ALTER TABLE dbo.FullDispatchSFDABaseline ADD CONSTRAINT PK_FullDispatchSFDABaseline PRIMARY KEY (WarehouseID, BN, ExpiryDate);
+    END;
+    IF EXISTS (SELECT 1 FROM sys.key_constraints WHERE name=N'PK_FullDispatchConfirmations')
+       AND NOT EXISTS (
+           SELECT 1 FROM sys.index_columns ic
+           JOIN sys.indexes i ON i.object_id=ic.object_id AND i.index_id=ic.index_id
+           JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id
+           WHERE i.name=N'PK_FullDispatchConfirmations' AND c.name=N'WarehouseID'
+       )
+    BEGIN
+        ALTER TABLE dbo.FullDispatchConfirmations DROP CONSTRAINT PK_FullDispatchConfirmations;
+        ALTER TABLE dbo.FullDispatchConfirmations ADD CONSTRAINT PK_FullDispatchConfirmations PRIMARY KEY (WarehouseID, ConfirmationKey);
+    END;
+
+    IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name=N'FK_DailyDispatchConfirmations_Transaction')
+        ALTER TABLE dbo.DailyDispatchConfirmations ADD CONSTRAINT FK_DailyDispatchConfirmations_Transaction
+            FOREIGN KEY (WarehouseID, TransactionKey) REFERENCES dbo.DailyDispatchTransactions(WarehouseID, TransactionKey);
+    IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name=N'FK_FullDispatchConfirmations_Transaction')
+        ALTER TABLE dbo.FullDispatchConfirmations ADD CONSTRAINT FK_FullDispatchConfirmations_Transaction
+            FOREIGN KEY (WarehouseID, TransactionKey) REFERENCES dbo.FullDispatchTransactions(WarehouseID, TransactionKey);
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.ReceiptEvents') AND name=N'IX_ReceiptEvents_WarehouseID')
+        CREATE INDEX IX_ReceiptEvents_WarehouseID ON dbo.ReceiptEvents(WarehouseID);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.DispatchEvents') AND name=N'IX_DispatchEvents_WarehouseID')
+        CREATE INDEX IX_DispatchEvents_WarehouseID ON dbo.DispatchEvents(WarehouseID);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.BatchMaster') AND name=N'IX_BatchMaster_WarehouseID')
+        CREATE INDEX IX_BatchMaster_WarehouseID ON dbo.BatchMaster(WarehouseID);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.SupplierHistory') AND name=N'IX_SupplierHistory_WarehouseID')
+        CREATE INDEX IX_SupplierHistory_WarehouseID ON dbo.SupplierHistory(WarehouseID);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.CustomerHistory') AND name=N'IX_CustomerHistory_WarehouseID')
+        CREATE INDEX IX_CustomerHistory_WarehouseID ON dbo.CustomerHistory(WarehouseID);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.ReconciliationRuns') AND name=N'IX_ReconciliationRuns_WarehouseID')
+        CREATE INDEX IX_ReconciliationRuns_WarehouseID ON dbo.ReconciliationRuns(WarehouseID);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.LatestInventorySnapshot') AND name=N'IX_LatestInventorySnapshot_WarehouseID')
+        CREATE INDEX IX_LatestInventorySnapshot_WarehouseID ON dbo.LatestInventorySnapshot(WarehouseID);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.LatestSFDASnapshot') AND name=N'IX_LatestSFDASnapshot_WarehouseID')
+        CREATE INDEX IX_LatestSFDASnapshot_WarehouseID ON dbo.LatestSFDASnapshot(WarehouseID);
+
+    IF OBJECT_ID(N'dbo.fn_WarehouseAccessPredicate', N'IF') IS NULL
+        EXEC(N'CREATE FUNCTION dbo.fn_WarehouseAccessPredicate(@WarehouseID int)
+              RETURNS TABLE WITH SCHEMABINDING AS
+              RETURN SELECT 1 AS fn_accessResult
+              WHERE @WarehouseID = CONVERT(int, SESSION_CONTEXT(N''WarehouseID''));');
+
+    IF NOT EXISTS (SELECT 1 FROM sys.security_policies WHERE name=N'WarehouseSecurityPolicy')
+    BEGIN
+        EXEC(N'    CREATE SECURITY POLICY dbo.WarehouseSecurityPolicy
+
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.ReceiptEvents,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.ReceiptEvents AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.ReceiptEvents AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DispatchEvents,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DispatchEvents AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DispatchEvents AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.BatchMaster,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.BatchMaster AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.BatchMaster AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.SupplierHistory,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.SupplierHistory AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.SupplierHistory AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.CustomerHistory,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.CustomerHistory AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.CustomerHistory AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.RunHistory,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.RunHistory AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.RunHistory AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.LatestInventorySnapshot,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.LatestInventorySnapshot AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.LatestInventorySnapshot AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.LatestSFDASnapshot,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.LatestSFDASnapshot AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.LatestSFDASnapshot AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.ReconciliationRuns,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.ReconciliationRuns AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.ReconciliationRuns AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.ReconciliationRunFiles,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.ReconciliationRunFiles AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.ReconciliationRunFiles AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyProcessedTransactions,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyProcessedTransactions AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyProcessedTransactions AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyAcceptTransactions,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyAcceptTransactions AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyAcceptTransactions AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyAcceptSFDABaseline,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyAcceptSFDABaseline AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyAcceptSFDABaseline AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyDispatchTransactions,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyDispatchTransactions AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyDispatchTransactions AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyDispatchSFDABaseline,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyDispatchSFDABaseline AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyDispatchSFDABaseline AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyDispatchConfirmations,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyDispatchConfirmations AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.DailyDispatchConfirmations AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.FullDispatchTransactions,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.FullDispatchTransactions AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.FullDispatchTransactions AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.FullDispatchSFDABaseline,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.FullDispatchSFDABaseline AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.FullDispatchSFDABaseline AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.FullDispatchConfirmations,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.FullDispatchConfirmations AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.FullDispatchConfirmations AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.HistoricalBuildJobs,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.HistoricalBuildJobs AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.HistoricalBuildJobs AFTER UPDATE,
+        ADD FILTER PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.OutlookDraftRequests,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.OutlookDraftRequests AFTER INSERT,
+        ADD BLOCK PREDICATE dbo.fn_WarehouseAccessPredicate(WarehouseID) ON dbo.OutlookDraftRequests AFTER UPDATE
+        WITH (STATE = ON);');
+    END;
+
     COMMIT TRANSACTION;
 END TRY
 BEGIN CATCH
