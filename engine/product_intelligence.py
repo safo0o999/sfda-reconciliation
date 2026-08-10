@@ -146,6 +146,46 @@ class ProductIntelligenceEngine:
         supplier_count = int(self._text(suppliers, "Supplier Name").replace("", pd.NA).nunique()) if not suppliers.empty else 0
         customer_count = int(self._text(customers, "To Address").replace("", pd.NA).nunique()) if not customers.empty else 0
 
+        customer_with_gln_count = 0
+        customer_dummy_gln_count = 0
+        customer_unmapped_count = 0
+        if not customers.empty:
+            customer_names = self._text(customers, "To Address")
+            customer_gln = self._text(customers, "GLN")
+            customer_map = pd.DataFrame(
+                {
+                    "Customer": customer_names,
+                    "GLN": customer_gln,
+                }
+            ).drop_duplicates()
+
+            mapped_mask = (
+                customer_map["GLN"].ne("")
+                & customer_map["GLN"].str.upper().ne("DUMMY")
+                & customer_map["GLN"].ne(self.DEFAULT_GLN)
+            )
+            dummy_mask = (
+                customer_map["GLN"].str.upper().eq("DUMMY")
+                | customer_map["GLN"].eq(self.DEFAULT_GLN)
+            )
+            unmapped_mask = customer_map["GLN"].eq("")
+
+            customer_with_gln_count = int(
+                customer_map.loc[mapped_mask, "Customer"]
+                .replace("", pd.NA)
+                .nunique()
+            )
+            customer_dummy_gln_count = int(
+                customer_map.loc[dummy_mask, "Customer"]
+                .replace("", pd.NA)
+                .nunique()
+            )
+            customer_unmapped_count = int(
+                customer_map.loc[unmapped_mask, "Customer"]
+                .replace("", pd.NA)
+                .nunique()
+            )
+
         summary = {
             "historical_received_pack": float(intelligence["Historical Received Pack"].sum()),
             "historical_dispatched_pack": float(intelligence["Historical Dispatched Pack"].sum()),
@@ -159,6 +199,9 @@ class ProductIntelligenceEngine:
             "generic_count": int(self._text(intelligence, "Generic Item Number").replace("", pd.NA).nunique()),
             "supplier_count": supplier_count,
             "customer_count": customer_count,
+            "customer_with_gln_count": customer_with_gln_count,
+            "customer_dummy_gln_count": customer_dummy_gln_count,
+            "customer_unmapped_count": customer_unmapped_count,
             "last_received": pd.to_datetime(intelligence["Last Received Date"], errors="coerce").max(),
             "last_dispatch": pd.to_datetime(intelligence["Last Dispatch Date"], errors="coerce").max(),
         }
