@@ -49,6 +49,17 @@ class BlobStorage:
         name = str(file_name or "file").replace("\\", "_").replace("/", "_").strip()
         return name or "file"
 
+    @staticmethod
+    def warehouse_prefix() -> str:
+        from engine.warehouse_context import current_warehouse_id
+        return f"w{int(current_warehouse_id())}"
+
+    @classmethod
+    def scoped_blob_name(cls, blob_name: str) -> str:
+        clean = str(blob_name or "").lstrip("/")
+        prefix = cls.warehouse_prefix() + "/"
+        return clean if clean.startswith(prefix) else prefix + clean
+
     def upload_bytes(
         self,
         container_name: str,
@@ -90,7 +101,7 @@ class BlobStorage:
         safe_name = self.sanitize_file_name(file_name)
         return self.upload_bytes(
             INPUTS_CONTAINER,
-            f"{run_number}/{safe_name}",
+            self.scoped_blob_name(f"{run_number}/{safe_name}"),
             file_bytes,
             content_type,
             {"run_number": run_number, "category": "input"},
@@ -106,7 +117,7 @@ class BlobStorage:
         safe_name = self.sanitize_file_name(file_name)
         return self.upload_bytes(
             OUTPUTS_CONTAINER,
-            f"{run_number}/{safe_name}",
+            self.scoped_blob_name(f"{run_number}/{safe_name}"),
             file_bytes,
             content_type,
             {"run_number": run_number, "category": "output"},
@@ -121,7 +132,7 @@ class BlobStorage:
         safe_name = self.sanitize_file_name(file_name)
         return self.upload_bytes(
             METADATA_CONTAINER,
-            f"{run_number}/{safe_name}",
+            self.scoped_blob_name(f"{run_number}/{safe_name}"),
             file_bytes,
             "application/json; charset=utf-8",
             {"run_number": run_number, "category": "metadata"},
@@ -161,7 +172,7 @@ class BlobStorage:
         container_name: str,
     ) -> List[Dict[str, Any]]:
         container = self.service.get_container_client(container_name)
-        prefix = f"{run_number}/"
+        prefix = self.scoped_blob_name(f"{run_number}/")
         rows: List[Dict[str, Any]] = []
         for blob in container.list_blobs(name_starts_with=prefix):
             settings = getattr(blob, "content_settings", None)
@@ -170,13 +181,22 @@ class BlobStorage:
                 "blob_name": blob.name,
                 "file_name": blob.name[len(prefix):],
                 "size_bytes": int(blob.size or 0),
-                "content_type": (
-                    settings.content_type
-                    if settings and settings.content_type
-                    else "application/octet-stream"
-                ),
+                "content_type": settings.content_type if settings and settings.content_type else "application/octet-stream",
                 "last_modified": blob.last_modified,
             })
+        from engine.warehouse_context import current_warehouse_id
+        if int(current_warehouse_id()) == 1:
+            legacy_prefix = f"{run_number}/"
+            for blob in container.list_blobs(name_starts_with=legacy_prefix):
+                settings = getattr(blob, "content_settings", None)
+                rows.append({
+                    "container": container_name,
+                    "blob_name": blob.name,
+                    "file_name": blob.name[len(legacy_prefix):],
+                    "size_bytes": int(blob.size or 0),
+                    "content_type": settings.content_type if settings and settings.content_type else "application/octet-stream",
+                    "last_modified": blob.last_modified,
+                })
         return rows
 
     def list_all_run_files(self, run_number: str) -> List[Dict[str, Any]]:
@@ -205,13 +225,27 @@ class BlobStorage:
             INPUTS_CONTAINER,
         ):
             container = self.service.get_container_client(container_name)
-            for blob in container.list_blobs():
+            prefix = self.warehouse_prefix() + "/"
+            for blob in container.list_blobs(name_starts_with=prefix):
                 name = str(blob.name or "")
-                if "/" not in name:
+                relative = name[len(prefix):]
+                if "/" not in relative:
                     continue
-                run_number = name.split("/", 1)[0].strip()
+                run_number = relative.split("/", 1)[0].strip()
                 if run_number:
                     run_numbers.add(run_number)
+
+            from engine.warehouse_context import current_warehouse_id
+            if int(current_warehouse_id()) == 1:
+                for blob in container.list_blobs():
+                    name = str(blob.name or "")
+                    if name.startswith("w") and "/" in name:
+                        continue
+                    if "/" not in name:
+                        continue
+                    run_number = name.split("/", 1)[0].strip()
+                    if run_number:
+                        run_numbers.add(run_number)
         return sorted(run_numbers, reverse=True)[: max(1, int(limit))]
 
 
@@ -227,7 +261,7 @@ class BlobStorage:
 
         safe_category = self.sanitize_file_name(category).lower()
         safe_name = self.sanitize_file_name(file_name)
-        blob_name = f"{job_id}/{safe_category}/{safe_name}"
+        blob_name = self.scoped_blob_name(f"{job_id}/{safe_category}/{safe_name}")
 
         result = self.upload_bytes(
             INPUTS_CONTAINER,
@@ -256,7 +290,7 @@ class BlobStorage:
         safe_name = self.sanitize_file_name(file_name)
         result = self.upload_bytes(
             OUTPUTS_CONTAINER,
-            f"{job_id}/{safe_name}",
+            self.scoped_blob_name(f"{job_id}/{safe_name}"),
             file_bytes,
             content_type,
             {
