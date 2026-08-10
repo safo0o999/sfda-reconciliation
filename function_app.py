@@ -5,6 +5,8 @@ import logging
 import mimetypes
 import uuid
 import os
+import time
+import threading
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
@@ -19,8 +21,98 @@ from azure.storage.queue import QueueClient
 
 logger = logging.getLogger("SFDA-Reconciliation")
 APPLICATION_NAME = "SFDA Reconciliation"
-APPLICATION_VERSION = "5.0.0"
+APPLICATION_VERSION = "6.0.0"
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+
+
+_VARIANCE_CACHE: Dict[int, Dict[str, Any]] = {}
+_VARIANCE_CACHE_LOCK = threading.Lock()
+_VARIANCE_CACHE_TTL_SECONDS = int(os.getenv("VARIANCE_CACHE_TTL_SECONDS", "300") or 300)
+
+
+def _cookie_value(req: func.HttpRequest, name: str) -> str:
+    raw = str(req.headers.get("Cookie", "") or "")
+    for part in raw.split(";"):
+        key, sep, value = part.strip().partition("=")
+        if sep and key == name:
+            return value
+    return ""
+
+
+def _auth_required() -> bool:
+    return os.getenv("AUTH_REQUIRED", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _current_user(req: func.HttpRequest) -> Optional[Dict[str, Any]]:
+    if not _auth_required():
+        return {
+            "UserID": 0,
+            "Email": req.headers.get("X-MS-CLIENT-PRINCIPAL-NAME") or "Development User",
+            "Role": "Admin",
+            "Status": "Active",
+            "WarehouseID": 1,
+            "WarehouseName": "Madinah Warehouse",
+            "WarehouseCode": "MADINAH",
+        }
+    try:
+        from engine.auth import session_user
+        user = session_user(_cookie_value(req, "sfda_session"))
+        if user:
+            from engine.warehouse_context import set_current_warehouse
+            set_current_warehouse(
+                int(user.get("WarehouseID") or 1),
+                str(user.get("WarehouseName") or "Madinah Warehouse"),
+            )
+        return user
+    except Exception:
+        logger.exception("Authentication lookup failed")
+        return None
+
+
+def _auth_guard(req: func.HttpRequest, admin: bool = False) -> Optional[func.HttpResponse]:
+    user = _current_user(req)
+    if not user:
+        return error_response("Authentication required.", 401)
+    if admin and str(user.get("Role", "")).lower() != "admin":
+        return error_response("Administrator access is required.", 403)
+    from engine.warehouse_context import set_current_warehouse
+    set_current_warehouse(
+        int(user.get("WarehouseID") or 1),
+        str(user.get("WarehouseName") or "Madinah Warehouse"),
+    )
+    return None
+
+
+def _request_base_url(req: func.HttpRequest) -> str:
+    forwarded_proto = str(req.headers.get("X-Forwarded-Proto", "") or "").split(",")[0].strip()
+    proto = forwarded_proto or "https"
+    host = str(req.headers.get("Host", "") or "").strip()
+    if host:
+        return f"{proto}://{host}"
+    url = str(req.url or "")
+    marker = "/api/"
+    return url.split(marker, 1)[0] if marker in url else url.rsplit("/", 1)[0]
+
+
+def _json_response_with_cookie(
+    data: Dict[str, Any],
+    token: str,
+    max_age: int,
+    status_code: int = 200,
+) -> func.HttpResponse:
+    clean_data = sanitize_json(data)
+    cookie = (
+        f"sfda_session={token}; Path=/; Max-Age={max_age}; "
+        "HttpOnly; Secure; SameSite=Lax"
+    )
+    return func.HttpResponse(
+        body=json.dumps(clean_data, ensure_ascii=False, default=str, allow_nan=False),
+        status_code=status_code,
+        mimetype="application/json",
+        charset="utf-8",
+        headers={"Set-Cookie": cookie, "Cache-Control": "no-store"},
+    )
+
 
 
 def sanitize_json(obj):
@@ -141,6 +233,9 @@ def build_run_number(mode: str) -> str:
 
 
 def get_submitted_by(req: func.HttpRequest) -> str:
+    user = _current_user(req)
+    if user and user.get("Email"):
+        return str(user.get("Email"))
     return (
         req.headers.get("X-MS-CLIENT-PRINCIPAL-NAME")
         or req.headers.get("X-User-Name")
@@ -555,8 +650,169 @@ def blob_files_for_ui(run_number: str) -> List[Dict[str, Any]]:
     return rows
 
 
+
+@app.route(route="auth/status", methods=["GET"])
+def auth_status(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        from engine.auth import auth_settings
+        settings = auth_settings()
+        user = _current_user(req)
+        if user:
+            from engine.warehouse_context import set_current_warehouse
+            set_current_warehouse(int(user.get("WarehouseID") or 1), str(user.get("WarehouseName") or "Madinah Warehouse"))
+        return json_response({
+            "status": "Success",
+            "authenticated": bool(user),
+            "user": user,
+            "settings": settings,
+        })
+    except Exception as exc:
+        return error_response("Unable to read authentication status.", 500, str(exc))
+
+
+@app.route(route="auth/register", methods=["POST"])
+def auth_register(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        from engine.auth import register_user
+        payload = req.get_json() or {}
+        result = register_user(
+            str(payload.get("email") or payload.get("username") or ""),
+            str(payload.get("password") or ""),
+            str(payload.get("warehouse_name") or ""),
+            _request_base_url(req),
+        )
+        first_admin = bool(result.get("first_admin"))
+        return json_response({
+            "status": "Active" if first_admin else "Pending Approval",
+            "message": (
+                "Administrator account created for Madinah Warehouse. You can sign in now."
+                if first_admin
+                else (
+                    "Your access request was created. An approval email has been sent to the administrator."
+                    if result.get("approval_email_sent")
+                    else "Your access request was created and is waiting for administrator approval."
+                )
+            ),
+            "first_admin": first_admin,
+            "approval_email_sent": bool(result.get("approval_email_sent")),
+            "approval_email_error": result.get("approval_email_error") or "",
+        }, 201)
+    except ValueError as exc:
+        return error_response("Unable to create user.", 400, str(exc))
+    except Exception as exc:
+        logger.exception("User registration failed")
+        return error_response("Unable to create user.", 500, str(exc))
+
+
+@app.route(route="auth/approve", methods=["GET"])
+def auth_approve(req: func.HttpRequest) -> func.HttpResponse:
+    token = str(req.params.get("token", "") or "").strip()
+    try:
+        from engine.auth import approve_registration
+        user = approve_registration(token)
+        html = f"""<!doctype html><html><head><meta charset="utf-8"><title>Access Approved</title>
+        <style>body{{font-family:Arial;background:#f3f7fb;color:#0b2c4a;display:grid;place-items:center;height:100vh;margin:0}}
+        .card{{background:white;padding:32px;border-radius:16px;box-shadow:0 10px 30px #0b2c4a18;max-width:560px;text-align:center}}
+        h1{{margin-top:0}}a{{color:#0f6cbd}}</style></head><body><div class="card">
+        <h1>Access Approved</h1><p>{str(user.get("Email") or "")} can now sign in to SFDA Reconciliation.</p>
+        <p><a href="/api/ui">Open the application</a></p></div></body></html>"""
+        return func.HttpResponse(html, status_code=200, mimetype="text/html", charset="utf-8")
+    except Exception as exc:
+        html = f"""<!doctype html><html><body style="font-family:Arial;padding:40px">
+        <h2>Approval failed</h2><p>{str(exc)}</p></body></html>"""
+        return func.HttpResponse(html, status_code=400, mimetype="text/html", charset="utf-8")
+
+
+@app.route(route="auth/login", methods=["POST"])
+def auth_login(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        from engine.auth import login_user
+        payload = req.get_json() or {}
+        user, token, expires_at = login_user(
+            str(payload.get("email") or payload.get("username") or ""),
+            str(payload.get("password") or ""),
+        )
+        from engine.warehouse_context import set_current_warehouse
+        set_current_warehouse(int(user.get("WarehouseID") or 1), str(user.get("WarehouseName") or "Madinah Warehouse"))
+        max_age = max(60, int((expires_at - datetime.now(timezone.utc)).total_seconds()))
+        return _json_response_with_cookie({
+            "status": "Completed",
+            "message": "Signed in successfully.",
+            "user": user,
+            "expires_at": expires_at,
+        }, token, max_age)
+    except ValueError as exc:
+        return error_response("Sign in failed.", 401, str(exc))
+    except Exception as exc:
+        logger.exception("Login failed")
+        return error_response("Sign in failed.", 500, str(exc))
+
+
+@app.route(route="auth/logout", methods=["POST"])
+def auth_logout(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        from engine.auth import logout_token
+        logout_token(_cookie_value(req, "sfda_session"))
+    except Exception:
+        logger.exception("Logout cleanup failed")
+    return _json_response_with_cookie(
+        {"status": "Completed", "message": "Signed out."},
+        "",
+        0,
+    )
+
+
+@app.route(route="auth/me", methods=["GET"])
+def auth_me(req: func.HttpRequest) -> func.HttpResponse:
+    user = _current_user(req)
+    if not user:
+        return error_response("Authentication required.", 401)
+    from engine.warehouse_context import set_current_warehouse
+    set_current_warehouse(int(user.get("WarehouseID") or 1), str(user.get("WarehouseName") or "Madinah Warehouse"))
+    return json_response({"status": "Success", "user": user})
+
+
+@app.route(route="admin/users", methods=["GET"])
+def admin_users_route(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req, admin=True)
+    if denied:
+        return denied
+    try:
+        from engine.auth import admin_users, admin_warehouses, auth_settings
+        return json_response({
+            "status": "Success",
+            "users": admin_users(),
+            "warehouses": admin_warehouses(),
+            "settings": auth_settings(),
+        })
+    except Exception as exc:
+        return error_response("Unable to load users.", 500, str(exc))
+
+
+@app.route(route="admin/users/{user_id}/status", methods=["POST"])
+def admin_user_status_route(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req, admin=True)
+    if denied:
+        return denied
+    try:
+        from engine.auth import admin_set_user_status
+        payload = req.get_json() or {}
+        result = admin_set_user_status(
+            int(req.route_params.get("user_id")),
+            str(payload.get("status") or ""),
+        )
+        return json_response({"status": "Completed", "user": result})
+    except ValueError as exc:
+        return error_response("Unable to update user.", 400, str(exc))
+    except Exception as exc:
+        return error_response("Unable to update user.", 500, str(exc))
+
+
 @app.route(route="history", methods=["GET"])
 def history(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     try:
         from engine.blob_storage import BlobStorage
         from engine.database import (
@@ -635,6 +891,9 @@ def history(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="history/{run_number}", methods=["GET"])
 def history_run(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     run_number = str(req.route_params.get("run_number", "")).strip()
     if not run_number:
         return error_response("Run number is required.", 400)
@@ -733,6 +992,9 @@ def history_run(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="history/{run_number}/download", methods=["GET"])
 def history_download(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     run_number = str(req.route_params.get("run_number", "")).strip()
     category = str(req.params.get("category", "")).strip().lower()
     file_name = str(req.params.get("file_name", "")).strip()
@@ -795,6 +1057,9 @@ def history_download(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="historical/status", methods=["GET"])
 def historical_status(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     try:
         from engine.database import get_historical_status
 
@@ -818,6 +1083,9 @@ def historical_status(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="historical/export-current", methods=["GET"])
 def historical_export_current(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     """Export the current persisted historical tables on demand."""
     try:
         from engine.database import (
@@ -859,6 +1127,9 @@ def historical_export_current(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="batch-master/build", methods=["GET", "POST"])
 def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     """Queue a long-running historical build and return immediately."""
 
     if req.method == "GET":
@@ -1010,6 +1281,9 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
     methods=["GET"],
 )
 def historical_build_status(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     job_id = str(
         req.route_params.get("job_id", "")
     ).strip()
@@ -1178,6 +1452,9 @@ def build_dashboard_preview(
 
 @app.route(route="full-reconciliation/accept", methods=["GET", "POST"])
 def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     if req.method == "GET":
         return json_response({"status": "Ready", "required_files": ["sfda"]})
 
@@ -1434,6 +1711,9 @@ def _bootstrap_full_dispatch_ledger_from_history(limit: int = 250) -> Dict[str, 
 
 @app.route(route="full-reconciliation/dispatch", methods=["GET", "POST"])
 def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     if req.method == "GET":
         return json_response({"status": "Ready", "required_files": ["inventory", "sfda"]})
 
@@ -1643,21 +1923,107 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
         return error_response("Full Dispatch Reconciliation failed.", 500, str(exc))
 
 
-def _variance_management_result() -> Dict[str, Any]:
-    from engine.database import (
-        get_customer_history_df,
-        get_latest_inventory_snapshot_df,
-        get_latest_sfda_snapshot_df,
-        get_supplier_history_df,
-    )
-    from engine.variance_management import VarianceManagementEngine
+def _variance_management_result(force_refresh: bool = False) -> Dict[str, Any]:
+    """Build and cache the full variance dataset.
 
-    return VarianceManagementEngine().build(
-        supplier_history=get_supplier_history_df(),
-        customer_history=get_customer_history_df(),
-        sfda_snapshot=get_latest_sfda_snapshot_df(),
-        inventory_snapshot=get_latest_inventory_snapshot_df(),
-    )
+    The page endpoint returns only one server-side page at a time, while report
+    generation and email reuse the cached full dataset by Variance ID.
+    """
+    from engine.warehouse_context import current_warehouse_id
+    warehouse_id = int(current_warehouse_id())
+    now = time.time()
+    warehouse_cache = _VARIANCE_CACHE.get(warehouse_id, {})
+    cached = warehouse_cache.get("result")
+    loaded_at = float(warehouse_cache.get("loaded_at") or 0.0)
+
+    if (
+        not force_refresh
+        and cached is not None
+        and (now - loaded_at) < _VARIANCE_CACHE_TTL_SECONDS
+    ):
+        return cached
+
+    with _VARIANCE_CACHE_LOCK:
+        now = time.time()
+        warehouse_cache = _VARIANCE_CACHE.get(warehouse_id, {})
+        cached = warehouse_cache.get("result")
+        loaded_at = float(warehouse_cache.get("loaded_at") or 0.0)
+        if (
+            not force_refresh
+            and cached is not None
+            and (now - loaded_at) < _VARIANCE_CACHE_TTL_SECONDS
+        ):
+            return cached
+
+        from engine.database import (
+            get_customer_history_df,
+            get_latest_inventory_snapshot_df,
+            get_latest_sfda_snapshot_df,
+            get_supplier_history_df,
+        )
+        from engine.variance_management import VarianceManagementEngine
+
+        result = VarianceManagementEngine().build(
+            supplier_history=get_supplier_history_df(),
+            customer_history=get_customer_history_df(),
+            sfda_snapshot=get_latest_sfda_snapshot_df(),
+            inventory_snapshot=get_latest_inventory_snapshot_df(),
+        )
+        _VARIANCE_CACHE[warehouse_id] = {"result": result, "loaded_at": now}
+        return result
+
+
+def _variance_page(
+    result: Dict[str, Any],
+    *,
+    page: int,
+    page_size: int,
+    search: str = "",
+    variance_type: str = "",
+    severity: str = "",
+) -> Dict[str, Any]:
+    items = list(result.get("items") or [])
+    search = str(search or "").strip().lower()
+    variance_type = str(variance_type or "").strip()
+    severity = str(severity or "").strip()
+
+    def matches(item: Dict[str, Any]) -> bool:
+        if variance_type and str(item.get("Variance Type") or "") != variance_type:
+            return False
+        if severity and str(item.get("Severity") or "") != severity:
+            return False
+        if search:
+            haystack = " ".join(
+                str(item.get(key) or "")
+                for key in (
+                    "BN", "GTIN", "Supplier Name", "Supplier Code",
+                    "Customer", "GLN", "Description", "Drug Name",
+                    "Generic Item Number",
+                )
+            ).lower()
+            if search not in haystack:
+                return False
+        return True
+
+    filtered = [item for item in items if matches(item)]
+    total = len(filtered)
+    page_size = max(25, min(int(page_size or 100), 200))
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(1, min(int(page or 1), total_pages))
+    start = (page - 1) * page_size
+    page_items = filtered[start:start + page_size]
+
+    return {
+        "items": page_items,
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total_items": total,
+            "total_pages": total_pages,
+            "start_item": (start + 1) if total else 0,
+            "end_item": min(start + page_size, total),
+        },
+    }
 
 
 def _build_variance_report(selected_ids: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -1685,17 +2051,38 @@ def _build_variance_report(selected_ids: Optional[List[str]] = None) -> Dict[str
 
 @app.route(route="variance-management", methods=["GET"])
 def variance_management(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     try:
-        result = _variance_management_result()
-        result["email"] = {
-            "configured": bool(
-                os.getenv("VARIANCE_SMTP_HOST", "").strip()
-                and os.getenv("VARIANCE_EMAIL_FROM", "").strip()
-                and os.getenv("SFDA_VARIANCE_EMAIL", "").strip()
-            ),
-            "default_recipient": os.getenv("SFDA_VARIANCE_EMAIL", "").strip(),
+        force_refresh = str(req.params.get("refresh", "")).lower() in {"1", "true", "yes"}
+        result = _variance_management_result(force_refresh=force_refresh)
+        page_result = _variance_page(
+            result,
+            page=int(req.params.get("page", "1") or 1),
+            page_size=int(req.params.get("page_size", "100") or 100),
+            search=str(req.params.get("search", "") or ""),
+            variance_type=str(req.params.get("type", "") or ""),
+            severity=str(req.params.get("severity", "") or ""),
+        )
+        from engine.outlook_graph import graph_settings
+        graph = graph_settings()
+        response = {
+            "status": "Completed",
+            "summary": result.get("summary") or {},
+            "metadata": {
+                **(result.get("metadata") or {}),
+                "cache_age_seconds": max(0, int(time.time() - float(_VARIANCE_CACHE.get(int(__import__("engine.warehouse_context", fromlist=["current_warehouse_id"]).current_warehouse_id()), {}).get("loaded_at") or time.time()))),
+                "cache_ttl_seconds": _VARIANCE_CACHE_TTL_SECONDS,
+            },
+            **page_result,
+            "email": {
+                "configured": bool(graph.get("configured")),
+                "mode": "outlook_draft",
+                "default_recipient": os.getenv("SFDA_VARIANCE_EMAIL", "").strip(),
+            },
         }
-        return json_response(result)
+        return json_response(response)
     except Exception as exc:
         logger.exception("Variance Management failed")
         return error_response("Variance Management failed.", 500, str(exc))
@@ -1703,6 +2090,9 @@ def variance_management(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="variance-management/report", methods=["POST"])
 def variance_management_report(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     try:
         payload = req.get_json() or {}
         selected_ids = payload.get("selected_ids") or []
@@ -1720,19 +2110,41 @@ def variance_management_report(req: func.HttpRequest) -> func.HttpResponse:
         return error_response("Unable to generate SFDA discrepancy report.", 500, str(exc))
 
 
-@app.route(route="variance-management/email", methods=["POST"])
-def variance_management_email(req: func.HttpRequest) -> func.HttpResponse:
+@app.route(route="variance-management/outlook/start", methods=["POST"])
+def variance_management_outlook_start(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     try:
-        import smtplib
-        from email.message import EmailMessage
-        from email.utils import parseaddr
+        from engine.database import create_outlook_draft_request
+        from engine.email_service import validate_email
+        from engine.outlook_graph import (
+            authorization_url,
+            graph_settings,
+            new_oauth_state,
+            state_hash,
+        )
+
+        if not graph_settings().get("configured"):
+            raise RuntimeError(
+                "Microsoft Graph is not configured in Azure Function App."
+            )
 
         payload = req.get_json() or {}
-        selected_ids = payload.get("selected_ids") or []
-        recipient = str(
-            payload.get("recipient")
-            or os.getenv("SFDA_VARIANCE_EMAIL", "")
-        ).strip()
+        selected_ids = [
+            str(value).strip()
+            for value in (payload.get("selected_ids") or [])
+            if str(value).strip()
+        ]
+        if not selected_ids:
+            raise ValueError("Select at least one variance item.")
+
+        recipient = validate_email(
+            str(
+                payload.get("recipient")
+                or os.getenv("SFDA_VARIANCE_EMAIL", "")
+            ).strip()
+        )
         subject = str(
             payload.get("subject")
             or "SFDA Receiving Discrepancy Report"
@@ -1740,75 +2152,227 @@ def variance_management_email(req: func.HttpRequest) -> func.HttpResponse:
         body = str(
             payload.get("message")
             or (
-                "Dear SFDA Team,\n\n"
+                "Dear SFDA Team,\\n\\n"
                 "Please find attached the latest receiving discrepancy report "
                 "showing missing batch registrations and quantity differences "
-                "between WMS receipts and the latest SFDA report.\n\n"
-                "Regards,\nDrug Traceability Reconciliation Platform"
+                "between WMS receipts and the latest SFDA report.\\n\\n"
+                "Regards,\\nDrug Traceability Reconciliation Platform"
             )
         )
 
-        host = os.getenv("VARIANCE_SMTP_HOST", "").strip()
-        port = int(os.getenv("VARIANCE_SMTP_PORT", "587") or 587)
-        username = os.getenv("VARIANCE_SMTP_USERNAME", "").strip()
-        password = os.getenv("VARIANCE_SMTP_PASSWORD", "")
-        sender = os.getenv("VARIANCE_EMAIL_FROM", "").strip()
-        use_ssl = os.getenv("VARIANCE_SMTP_SSL", "false").strip().lower() in {
-            "1", "true", "yes", "on"
-        }
-        use_tls = os.getenv("VARIANCE_SMTP_STARTTLS", "true").strip().lower() in {
-            "1", "true", "yes", "on"
-        }
+        user = _current_user(req) or {}
+        requested_by = str(user.get("Email") or "").strip().lower()
+        if not requested_by:
+            raise RuntimeError("Unable to identify the signed-in application user.")
 
-        if not host or not sender or not recipient:
-            raise RuntimeError(
-                "Email is not configured. Set VARIANCE_SMTP_HOST, "
-                "VARIANCE_EMAIL_FROM, and SFDA_VARIANCE_EMAIL in Azure Function "
-                "App environment variables."
-            )
-        if not parseaddr(recipient)[1] or "@" not in parseaddr(recipient)[1]:
-            raise ValueError("A valid SFDA recipient email address is required.")
+        state = new_oauth_state()
+        request_id = str(uuid.uuid4())
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=15)
 
-        output = _build_variance_report(selected_ids)
-        file_name, file_value = next(iter(output.items()))
-        file_bytes, content_type, _ = decode_generated_file(file_name, file_value)
-
-        message = EmailMessage()
-        message["From"] = sender
-        message["To"] = recipient
-        message["Subject"] = subject
-        message.set_content(body)
-        maintype, subtype = (content_type.split("/", 1) + ["octet-stream"])[:2]
-        message.add_attachment(
-            file_bytes,
-            maintype=maintype,
-            subtype=subtype,
-            filename=file_name,
+        create_outlook_draft_request(
+            request_id=request_id,
+            state_hash=state_hash(state),
+            requested_by_email=requested_by,
+            selected_ids_json=json.dumps(selected_ids, ensure_ascii=False),
+            recipient_email=recipient,
+            subject=subject,
+            message_body=body,
+            expires_at=expires_at,
         )
-
-        smtp_class = smtplib.SMTP_SSL if use_ssl else smtplib.SMTP
-        with smtp_class(host, port, timeout=30) as server:
-            if not use_ssl and use_tls:
-                server.starttls()
-            if username:
-                server.login(username, password)
-            server.send_message(message)
 
         return json_response({
-            "status": "Completed",
-            "message": "SFDA discrepancy report email sent successfully.",
-            "recipient": recipient,
-            "file_name": file_name,
+            "status": "Ready",
+            "mode": "outlook_draft",
+            "authorization_url": authorization_url(state),
+            "expires_at": expires_at,
         })
     except ValueError as exc:
-        return error_response("Unable to send SFDA discrepancy report.", 400, str(exc))
+        return error_response("Unable to prepare Outlook draft.", 400, str(exc))
     except Exception as exc:
-        logger.exception("Variance email failed")
-        return error_response("Unable to send SFDA discrepancy report.", 500, str(exc))
+        logger.exception("Outlook draft authorization start failed")
+        return error_response("Unable to prepare Outlook draft.", 500, str(exc))
+
+
+def _outlook_callback_error(message: str, status_code: int = 400) -> func.HttpResponse:
+    safe = (
+        str(message or "Unable to create Outlook draft.")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+    return func.HttpResponse(
+        f"""<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Outlook Draft Error</title></head>
+<body style="font-family:Segoe UI,Arial,sans-serif;padding:32px;background:#f5f7fb">
+  <div style="max-width:720px;margin:auto;background:white;border:1px solid #dde4ee;border-radius:14px;padding:24px">
+    <h2 style="margin-top:0;color:#b42318">Unable to prepare Outlook draft</h2>
+    <p>{safe}</p>
+    <p>You can close this tab and return to SFDA Reconciliation.</p>
+  </div>
+</body>
+</html>""",
+        status_code=status_code,
+        mimetype="text/html",
+    )
+
+
+@app.route(route="outlook/callback", methods=["GET"])
+def outlook_callback(req: func.HttpRequest) -> func.HttpResponse:
+    request_record = None
+    try:
+        from engine.database import (
+            complete_outlook_draft_request,
+            fail_outlook_draft_request,
+            get_outlook_draft_request_by_state_hash,
+        )
+        from engine.outlook_graph import (
+            create_draft_with_attachment,
+            exchange_authorization_code,
+            graph_me,
+            state_hash,
+        )
+
+        microsoft_error = str(req.params.get("error", "") or "").strip()
+        microsoft_error_description = str(
+            req.params.get("error_description", "") or ""
+        ).strip()
+        if microsoft_error:
+            raise ValueError(
+                microsoft_error_description
+                or f"Microsoft sign-in failed: {microsoft_error}"
+            )
+
+        code = str(req.params.get("code", "") or "").strip()
+        state = str(req.params.get("state", "") or "").strip()
+        if not code or not state:
+            raise ValueError(
+                "Microsoft authorization response is missing code or state."
+            )
+
+        # Resolve the signed-in application user first. _current_user() also
+        # establishes the warehouse context used by SQL Row-Level Security, so
+        # the OAuth state can only be read from that user's warehouse.
+        app_user = _current_user(req)
+        if not app_user:
+            raise ValueError(
+                "Your SFDA Reconciliation session has expired. "
+                "Sign in again and retry."
+            )
+
+        request_record = get_outlook_draft_request_by_state_hash(
+            state_hash(state)
+        )
+        if not request_record:
+            raise ValueError(
+                "The Outlook draft request is invalid or has expired. "
+                "Return to Variance Management and try again."
+            )
+
+        requested_by = str(
+            request_record.get("RequestedByEmail") or ""
+        ).strip().lower()
+        current_app_email = str(
+            app_user.get("Email") or ""
+        ).strip().lower()
+        if requested_by != current_app_email:
+            raise ValueError(
+                "This Outlook draft request belongs to a different "
+                "SFDA Reconciliation user."
+            )
+
+        token = exchange_authorization_code(code)
+        access_token = str(token.get("access_token") or "")
+        microsoft_user = graph_me(access_token)
+        microsoft_email = str(
+            microsoft_user.get("mail")
+            or microsoft_user.get("userPrincipalName")
+            or ""
+        ).strip().lower()
+
+        if microsoft_email != requested_by:
+            raise ValueError(
+                "The Microsoft account used for Outlook does not match "
+                f"the signed-in SFDA user ({requested_by}). "
+                "Sign in to Microsoft with the same company account."
+            )
+
+        selected_ids = json.loads(
+            str(request_record.get("SelectedIDsJson") or "[]")
+        )
+        output = _build_variance_report(selected_ids)
+        file_name, file_value = next(iter(output.items()))
+        file_bytes, content_type, _ = decode_generated_file(
+            file_name,
+            file_value,
+        )
+
+        draft = create_draft_with_attachment(
+            access_token,
+            recipient=str(request_record.get("RecipientEmail") or ""),
+            subject=str(request_record.get("Subject") or ""),
+            body=str(request_record.get("MessageBody") or ""),
+            attachment_bytes=file_bytes,
+            attachment_name=file_name,
+            attachment_content_type=content_type,
+        )
+
+        complete_outlook_draft_request(
+            str(request_record["RequestID"]),
+            graph_message_id=str(draft["message_id"]),
+            graph_web_link=str(draft["web_link"]),
+        )
+
+        return func.HttpResponse(
+            "",
+            status_code=302,
+            headers={
+                "Location": str(draft["web_link"]),
+                "Cache-Control": "no-store",
+            },
+        )
+    except ValueError as exc:
+        if request_record:
+            try:
+                from engine.database import fail_outlook_draft_request
+                fail_outlook_draft_request(
+                    str(request_record["RequestID"]),
+                    str(exc),
+                )
+            except Exception:
+                pass
+        return _outlook_callback_error(str(exc), 400)
+    except Exception as exc:
+        logger.exception("Outlook draft callback failed")
+        if request_record:
+            try:
+                from engine.database import fail_outlook_draft_request
+                fail_outlook_draft_request(
+                    str(request_record["RequestID"]),
+                    str(exc),
+                )
+            except Exception:
+                pass
+        return _outlook_callback_error(str(exc), 500)
+
+
+@app.route(route="variance-management/email", methods=["POST"])
+def variance_management_email_deprecated(
+    req: func.HttpRequest,
+) -> func.HttpResponse:
+    return error_response(
+        "Direct email sending is disabled.",
+        410,
+        "Use Prepare Outlook Draft from Variance Management instead.",
+    )
 
 
 @app.route(route="product-intelligence", methods=["GET"])
 def product_intelligence(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     """Return the consolidated Product Intelligence knowledge base."""
     try:
         from engine.database import get_product_intelligence_sources
@@ -1827,6 +2391,9 @@ def product_intelligence(req: func.HttpRequest) -> func.HttpResponse:
     methods=["GET", "POST"],
 )
 def full_reconciliation_run(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     """Run the one-time Inventory/SFDA alignment against persisted history."""
 
     if req.method == "GET":
@@ -2456,6 +3023,9 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
 
 @app.route(route="process-accept", methods=["GET", "POST"])
 def process_accept(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     if req.method == "GET":
         return json_response({"status": "Ready", "step": "accept", "version": APPLICATION_VERSION})
     return run_daily(req, "accept")
@@ -2463,6 +3033,9 @@ def process_accept(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="process-dispatch", methods=["GET", "POST"])
 def process_dispatch(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     if req.method == "GET":
         return json_response({"status": "Ready", "step": "dispatch", "version": APPLICATION_VERSION})
     return run_daily(req, "dispatch")
@@ -2470,6 +3043,9 @@ def process_dispatch(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="reconcile", methods=["GET", "POST"])
 def reconcile(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
     """Backward-compatible route used by older UI versions."""
     if req.method == "GET":
         return json_response(
