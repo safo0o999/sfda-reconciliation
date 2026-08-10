@@ -495,9 +495,61 @@
     .history-kpi-card small{display:block;font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     @media(max-width:1150px){.history-kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
     @media(max-width:650px){.history-kpi-grid{grid-template-columns:1fr}}
+
+    .variance-pagination{display:flex;align-items:center;justify-content:flex-end;gap:10px;padding:10px 14px;border-top:1px solid var(--line);background:#fff}
+    .variance-page-info{display:flex;flex-direction:column;align-items:center;min-width:150px;font-size:10px;color:var(--muted)}
+    .variance-page-info strong{color:#22344a;font-size:10px}
+    .variance-page-size{display:flex;align-items:center;gap:6px;font-size:9px;font-weight:800;color:var(--muted)}
+    .variance-page-size .control{width:76px;padding:7px}
+    .report-trend-grid{display:grid;grid-template-columns:repeat(7,minmax(70px,1fr));gap:10px;align-items:end;min-height:180px}
+    .report-trend-day{display:flex;flex-direction:column;gap:6px;align-items:center;justify-content:flex-end;height:160px}
+    .report-trend-bar{width:70%;min-height:4px;background:linear-gradient(180deg,#0f6cbd,#23a4d8);border-radius:8px 8px 3px 3px}
+    .report-trend-day strong{font-size:10px}.report-trend-day span{font-size:9px;color:var(--muted)}
+    .auth-overlay{position:fixed;inset:0;z-index:9999;background:linear-gradient(135deg,#071f37,#0d3f67);display:grid;place-items:center;padding:22px}
+    .auth-overlay.hidden{display:none}
+    .auth-card{width:min(460px,100%);background:#fff;border-radius:20px;padding:28px;box-shadow:0 24px 80px rgba(0,0,0,.28)}
+    .auth-brand{display:flex;align-items:center;gap:12px;margin-bottom:20px}.auth-brand .brand-mark{width:52px;height:52px}
+    .auth-card h1{font-size:24px;margin:0 0 6px}.auth-card p{color:var(--muted);font-size:11px;line-height:1.55;margin:0 0 18px}
+    .auth-form{display:grid;gap:12px}.auth-form label{font-size:10px;font-weight:800;color:#53647a}.auth-form .control{width:100%;margin-top:5px}
+    .auth-switch{margin-top:15px;text-align:center;font-size:10px}.auth-switch button{border:0;background:transparent;color:#075fc8;font-weight:800;cursor:pointer}
+    .auth-message{display:none;margin-top:12px;padding:10px 12px;border-radius:10px;font-size:10px;line-height:1.45}
+    .auth-message.show{display:block}.auth-message.error{background:#feecec;color:#a31f25}.auth-message.success{background:#e8f7ee;color:#107c41}.auth-message.info{background:#e8f2ff;color:#075fc8}
+    .admin-users-table{min-width:760px}.admin-user-actions{display:flex;gap:6px;flex-wrap:wrap}
+    .user-card .user-name,.user-card .user-role{max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 </style>
 </head>
 <body>
+<div class="auth-overlay" id="authOverlay">
+  <div class="auth-card">
+    <div class="auth-brand">
+      <div class="brand-mark">SFDA</div>
+      <div><strong>Drug Traceability</strong><div class="brand-subtitle">Reconciliation Platform</div></div>
+    </div>
+    <div id="loginPanel">
+      <h1>Sign in</h1>
+      <p>Use your approved company account to access the platform.</p>
+      <div class="auth-form">
+        <label>Company Email<input class="control" id="loginEmail" type="email" autocomplete="username" placeholder="name@nupco.com"></label>
+        <label>Password<input class="control" id="loginPassword" type="password" autocomplete="current-password"></label>
+        <button class="btn btn-primary" id="loginButton" type="button">Sign In</button>
+      </div>
+      <div class="auth-switch">Need access? <button type="button" id="showRegisterButton">Create New User</button></div>
+    </div>
+    <div id="registerPanel" hidden>
+      <h1>Create New User</h1>
+      <p>Your user name must be a company email. The request stays pending until the administrator approves it from the confirmation email.</p>
+      <div class="auth-form">
+        <label>Company Email<input class="control" id="registerEmail" type="email" autocomplete="username" placeholder="name@nupco.com"></label>
+        <label>Warehouse Name<input class="control" id="registerWarehouse" type="text" autocomplete="organization" placeholder="e.g. Riyadh Warehouse"></label>
+        <label>Password<input class="control" id="registerPassword" type="password" autocomplete="new-password" placeholder="Minimum 10 characters"></label>
+        <label>Confirm Password<input class="control" id="registerPasswordConfirm" type="password" autocomplete="new-password"></label>
+        <button class="btn btn-primary" id="registerButton" type="button">Create Access Request</button>
+      </div>
+      <div class="auth-switch">Already approved? <button type="button" id="showLoginButton">Back to Sign In</button></div>
+    </div>
+    <div class="auth-message" id="authMessage"></div>
+  </div>
+</div>
 <div class="app">
   <aside class="sidebar" id="sidebar">
     <div class="brand">
@@ -523,13 +575,13 @@
     <div class="sidebar-footer">
       <div class="user-card">
         <div class="user-line">
-          <div class="avatar">SN</div>
+          <div class="avatar" id="sidebarAvatar">U</div>
           <div>
-            <div class="user-name">Safwan Noor</div>
-            <div class="user-role">Administrator · Madinah LC</div>
+            <div class="user-name" id="sidebarUserName">—</div>
+            <div class="user-role" id="sidebarUserRole">—</div>
           </div>
         </div>
-        <div class="health-line"><span class="dot"></span>Azure Function connected</div>
+        <div class="health-line"><span class="dot"></span>Azure Function connected</div><button class="btn btn-secondary" id="logoutButton" type="button" style="width:100%;margin-top:10px">Sign Out</button>
       </div>
     </div>
   </aside>
@@ -888,19 +940,57 @@
  
       <!-- REPORTS -->
       <section class="page" id="page-reports">
-        <div class="page-head"><div><h1>Reports & Analytics</h1><p>Operational analytics based on persistent reconciliation history stored in Azure SQL.</p></div><div class="actions"><button class="btn btn-secondary" id="exportHistoryButton">⇩ Export History JSON</button></div></div>
+        <div class="page-head">
+          <div>
+            <h1>Reports & Analytics</h1>
+            <p>Management reporting across reconciliation runs, current exceptions, and product intelligence.</p>
+          </div>
+          <div class="actions">
+            <button class="btn btn-secondary" id="exportHistoryButton">⇩ Export History JSON</button>
+            <button class="btn btn-primary" id="reportsRefreshButton">↻ Refresh Reports</button>
+          </div>
+        </div>
+
         <div class="grid kpi-grid">
           <div class="card kpi"><div class="kpi-label">Total Runs</div><div class="kpi-value" id="reportRuns">0</div><div class="kpi-icon">◷</div></div>
           <div class="card kpi"><div class="kpi-label">Success Rate</div><div class="kpi-value" id="reportSuccessRate">0%</div><div class="kpi-icon green">✓</div></div>
-          <div class="card kpi"><div class="kpi-label">Master Rows Processed</div><div class="kpi-value" id="reportProcessed">0</div><div class="kpi-icon purple">◆</div></div>
-          <div class="card kpi"><div class="kpi-label">Total Variance Items</div><div class="kpi-value" id="reportVariance">0</div><div class="kpi-icon red">!</div></div>
+          <div class="card kpi"><div class="kpi-label">Failed Runs</div><div class="kpi-value" id="reportFailedRuns">0</div><div class="kpi-icon red">!</div></div>
+          <div class="card kpi"><div class="kpi-label">Open Variances</div><div class="kpi-value" id="reportVariance">0</div><div class="kpi-icon red">!</div></div>
         </div>
+
         <div class="grid two-equal" style="margin-top:16px">
-          <div class="card"><div class="card-header"><div><div class="card-title">Latest Run Composition</div><div class="card-subtitle">Accept, Dispatch, and Variance</div></div></div><div class="card-body" id="compositionContent"></div></div>
-          <div class="card"><div class="card-header"><div><div class="card-title">Future Enterprise Reports</div><div class="card-subtitle">Enabled after persistent database implementation</div></div></div><div class="card-body"><div class="status-line"><span>Receiving by date</span><span class="badge warning">Planned</span></div><div class="status-line"><span>Dispatch by customer</span><span class="badge warning">Planned</span></div><div class="status-line"><span>Variance by supplier</span><span class="badge warning">Planned</span></div><div class="status-line"><span>Missing SFDA registrations</span><span class="badge warning">Planned</span></div></div></div>
+          <div class="card">
+            <div class="card-header"><div><div class="card-title">Run Mix</div><div class="card-subtitle">Completed and failed activity by process</div></div></div>
+            <div class="card-body" id="reportProcessMix"></div>
+          </div>
+          <div class="card">
+            <div class="card-header"><div><div class="card-title">Current Variance Position</div><div class="card-subtitle">Latest live exception counts</div></div><button class="btn btn-secondary" data-go="variance">Open Variance</button></div>
+            <div class="card-body" id="reportVarianceSummary"></div>
+          </div>
+        </div>
+
+        <div class="grid two-equal" style="margin-top:16px">
+          <div class="card table-card">
+            <div class="card-header"><div><div class="card-title">Recent Failed Runs</div><div class="card-subtitle">Latest runs requiring technical review</div></div><button class="btn btn-secondary" data-go="history">View History</button></div>
+            <div class="table-scroll" style="max-height:310px">
+              <table>
+                <thead><tr><th>Run ID</th><th>Process</th><th>Date</th><th>Error</th></tr></thead>
+                <tbody id="reportFailedBody"></tbody>
+              </table>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><div><div class="card-title">Product / Batch Position</div><div class="card-subtitle">Latest Product Intelligence snapshot</div></div><button class="btn btn-secondary" data-go="intelligence">Open Product Intelligence</button></div>
+            <div class="card-body" id="reportProductSummary"></div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-header"><div><div class="card-title">Last 7 Days Activity</div><div class="card-subtitle">Reconciliation run volume by Saudi date</div></div></div>
+          <div class="card-body" id="reportTrend"></div>
         </div>
       </section>
- 
+
       <!-- PRODUCT INTELLIGENCE -->
       <section class="page" id="page-intelligence">
         <div class="page-head pi-page-head">
@@ -1047,11 +1137,26 @@
             </div>
             <div class="table-scroll variance-table-scroll">
               <table class="variance-table">
-                <thead><tr><th><input type="checkbox" id="varianceSelectAll" title="Select all reportable rows"></th><th>Severity</th><th>Variance Type</th><th>Batch / GTIN</th><th>Description</th><th>Difference</th><th>Status</th><th>Supplier / Customer</th></tr></thead>
+                <thead><tr><th><input type="checkbox" id="varianceSelectAll" title="Select current page"></th><th>Severity</th><th>Variance Type</th><th>Batch / GTIN</th><th>Description</th><th>Difference</th><th>Status</th><th>Supplier / Customer</th></tr></thead>
                 <tbody id="varianceBody"><tr><td colspan="8"><div class="empty"><strong>Loading variance data</strong>Please wait.</div></td></tr></tbody>
               </table>
             </div>
             <div class="table-footer"><span id="varianceCount">0 items</span><span id="varianceSource">Source: Azure SQL + latest SFDA snapshot</span></div>
+            <div class="variance-pagination">
+              <button class="btn btn-secondary" id="variancePrevPage" type="button">← Previous</button>
+              <div class="variance-page-info">
+                <strong id="variancePageLabel">Page 1 of 1</strong>
+                <span id="varianceRangeLabel">0 items</span>
+              </div>
+              <label class="variance-page-size">Rows
+                <select class="control" id="variancePageSize">
+                  <option value="50">50</option>
+                  <option value="100" selected>100</option>
+                  <option value="200">200</option>
+                </select>
+              </label>
+              <button class="btn btn-secondary" id="varianceNextPage" type="button">Next →</button>
+            </div>
           </div>
 
           <div class="card variance-detail-card">
@@ -1064,8 +1169,8 @@
           <div class="card variance-report-card">
             <div class="card-header"><div><div class="card-title">Generate Discrepancy Report</div><div class="card-subtitle">Create the official supplier discrepancy report for SFDA.</div></div></div>
             <div class="card-body variance-report-options">
-              <label><input type="checkbox" id="varianceIncludeMissing" checked> Missing Registration</label>
-              <label><input type="checkbox" id="varianceIncludeQuantity" checked> Quantity Mismatch (Received Less / More)</label>
+              <label><input type="checkbox" id="varianceIncludeMissing"> Missing Registration</label>
+              <label><input type="checkbox" id="varianceIncludeQuantity"> Quantity Mismatch (Received Less / More)</label>
               <label><input type="checkbox" id="varianceIncludeGln"> GLN Mapping Issues</label>
               <button class="btn btn-primary" id="varianceGenerateButton">Generate &amp; Download Report</button>
             </div>
@@ -1079,7 +1184,7 @@
             </div>
           </div>
           <div class="card variance-email-card">
-            <div class="card-header"><div><div class="card-title">Send Report to SFDA</div><div class="card-subtitle">Email the generated Excel discrepancy report directly from the system.</div></div></div>
+            <div class="card-header"><div><div class="card-title">Prepare Outlook Draft</div><div class="card-subtitle">Create a Microsoft Outlook draft with the selected discrepancy report attached. Review it and press Send yourself.</div></div></div>
             <div class="card-body variance-email-form">
               <label>Recipient Email<input class="control" id="varianceRecipient" type="email" placeholder="SFDA email address"></label>
               <label>Subject<input class="control" id="varianceEmailSubject" value="SFDA Receiving Discrepancy Report"></label>
@@ -1089,8 +1194,8 @@ Please find attached the latest receiving discrepancy report showing missing bat
 
 Regards,
 Drug Traceability Reconciliation Platform</textarea></label>
-              <button class="btn btn-primary" id="varianceEmailButton">✉ Send Email to SFDA</button>
-              <div class="file-info" id="varianceEmailStatus">Email configuration is checked when the page loads.</div>
+              <button class="btn btn-primary" id="varianceEmailButton">✉ Prepare Outlook Draft</button>
+              <div class="file-info" id="varianceEmailStatus">Microsoft Outlook integration is checked when the page loads.</div>
             </div>
           </div>
         </div>
@@ -1098,13 +1203,47 @@ Drug Traceability Reconciliation Platform</textarea></label>
  
       <!-- ADMIN -->
       <section class="page" id="page-administration">
-        <div class="page-head"><div><h1>Administration</h1><p>Manage reference files, business rules, platform status, and future enterprise configuration.</p></div></div>
+        <div class="page-head">
+          <div><h1>Administration</h1><p>Manage users, reference data, email configuration, and platform status.</p></div>
+          <div class="actions"><button class="btn btn-secondary" id="adminRefreshUsers" type="button">↻ Refresh Users</button></div>
+        </div>
+
         <div class="grid three-col">
           <div class="card intelligence-card"><h3>GLN Mapping</h3><p>Maps WMS To Address values to registered SFDA customer GLNs. Unknown customers are classified as DUMMY.</p><div class="intelligence-metric"><span class="badge success">Internal File Active</span><strong>✓</strong></div></div>
           <div class="card intelligence-card"><h3>Pack Size Mapping</h3><p>Converts warehouse units into SFDA packages using controlled internal Package Size references.</p><div class="intelligence-metric"><span class="badge success">Internal File Active</span><strong>✓</strong></div></div>
           <div class="card intelligence-card"><h3>Business Rules</h3><p>Controls Accept, Dispatch, Variance allocation, maximum rows, quantity limits, and file generation.</p><div class="intelligence-metric"><span class="badge success">Python Rules Active</span><strong>✓</strong></div></div>
         </div>
-        <div class="card" style="margin-top:16px"><div class="card-header"><div><div class="card-title">System Information</div><div class="card-subtitle">Current Azure Function environment</div></div></div><div class="card-body"><div class="grid two-equal"><div><div class="card-subtitle">API Endpoint</div><div style="margin-top:6px;font-size:11px;font-weight:800;word-break:break-all" id="apiEndpoint">/api/process-accept · /api/process-dispatch</div></div><div><div class="card-subtitle">Health Status</div><div style="margin-top:6px;font-size:11px;font-weight:800;color:#107c41" id="adminHealth">Checking...</div></div><div><div class="card-subtitle">Application Version</div><div style="margin-top:6px;font-size:11px;font-weight:800" id="adminVersion">—</div></div><div><div class="card-subtitle">Authentication</div><div style="margin-top:6px;font-size:11px;font-weight:800;color:#d97706">Anonymous prototype</div></div></div></div></div>
+
+        <div class="card table-card" style="margin-top:16px" id="adminUsersCard">
+          <div class="card-header"><div><div class="card-title">User Management</div><div class="card-subtitle">New company users remain Pending until approved.</div></div><span class="badge info" id="adminUserCount">0 users</span></div>
+          <div class="table-scroll" style="max-height:360px">
+            <table class="admin-users-table">
+              <thead><tr><th>Email</th><th>Warehouse</th><th>Role</th><th>Status</th><th>Created</th><th>Last Login</th><th>Actions</th></tr></thead>
+              <tbody id="adminUsersBody"><tr><td colspan="7"><div class="empty"><strong>User list not loaded</strong>Administrator access is required.</div></td></tr></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="grid two-equal" style="margin-top:16px">
+          <div class="card">
+            <div class="card-header"><div><div class="card-title">Access & Email Configuration</div><div class="card-subtitle">Security and approval workflow</div></div></div>
+            <div class="card-body">
+              <div class="status-line"><span>Authentication</span><strong id="adminAuthMode">Required</strong></div>
+              <div class="status-line"><span>Allowed Email Domain</span><strong id="adminAllowedDomain">—</strong></div>
+              <div class="status-line"><span>Approval Admin Email</span><strong id="adminApprovalEmail">—</strong></div>
+              <div class="status-line"><span>Email Service</span><strong id="adminEmailConfigured">—</strong></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><div><div class="card-title">System Information</div><div class="card-subtitle">Current Azure Function environment</div></div></div>
+            <div class="card-body">
+              <div class="status-line"><span>API Endpoint</span><strong id="apiEndpoint" style="word-break:break-all">/api/process-accept · /api/process-dispatch</strong></div>
+              <div class="status-line"><span>Health Status</span><strong id="adminHealth" style="color:#107c41">Checking...</strong></div>
+              <div class="status-line"><span>Application Version</span><strong id="adminVersion">—</strong></div>
+              <div class="status-line"><span>Signed In User</span><strong id="adminSignedInUser">—</strong></div>
+            </div>
+          </div>
+        </div>
       </section>
     </div>
   </main>
@@ -1131,7 +1270,12 @@ Drug Traceability Reconciliation Platform</textarea></label>
   const VARIANCE_API_URL = "/api/variance-management";
   const PRODUCT_INTELLIGENCE_API_URL = "/api/product-intelligence";
   const VARIANCE_REPORT_URL = "/api/variance-management/report";
-  const VARIANCE_EMAIL_URL = "/api/variance-management/email";
+  const VARIANCE_OUTLOOK_START_URL = "/api/variance-management/outlook/start";
+  const AUTH_STATUS_URL = "/api/auth/status";
+  const AUTH_LOGIN_URL = "/api/auth/login";
+  const AUTH_REGISTER_URL = "/api/auth/register";
+  const AUTH_LOGOUT_URL = "/api/auth/logout";
+  const ADMIN_USERS_URL = "/api/admin/users";
   const DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v2";
   let currentResult = null;
   let progressTimer = null;
@@ -1143,12 +1287,134 @@ Drug Traceability Reconciliation Platform</textarea></label>
   let dashboardProductData = {summary:{},customers:[],alerts:[]};
   let dashboardVarianceData = {summary:{},items:[]};
   let varianceSelectedIds = new Set();
+  let varianceSelectedMeta = new Map();
   let varianceActiveType = "";
   let varianceActiveRowId = "";
+  let variancePage = 1;
+  let variancePageSize = 100;
+  let varianceSearchTimer = null;
+  let currentUser = null;
+  let authSettings = {};
+  let applicationStarted = false;
  
   const $ = id => document.getElementById(id);
   const formatNumber = value => Number(value || 0).toLocaleString("en-US");
   const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
+ 
+  function setAuthMessage(message,type="info"){
+    const box=$("authMessage");
+    if(!box) return;
+    box.className=`auth-message show ${type}`;
+    box.textContent=message;
+  }
+
+  function clearAuthMessage(){
+    const box=$("authMessage");
+    if(box){box.className="auth-message";box.textContent="";}
+  }
+
+  function showAuthPanel(panel){
+    $("loginPanel").hidden=panel!=="login";
+    $("registerPanel").hidden=panel!=="register";
+    clearAuthMessage();
+  }
+
+  function applySignedInUser(user){
+    currentUser=user||null;
+    const email=String(user?.Email||"");
+    const role=String(user?.Role||"User");
+    if($("sidebarUserName")) $("sidebarUserName").textContent=email||"—";
+    if($("sidebarUserRole")) $("sidebarUserRole").textContent=`${role} · ${user?.WarehouseName||"Warehouse"}`;
+    if($("sidebarAvatar")) $("sidebarAvatar").textContent=(email.split("@")[0]?.slice(0,2)||"U").toUpperCase();
+    if($("adminSignedInUser")) $("adminSignedInUser").textContent=email||"—";
+    const adminButton=document.querySelector('[data-page="administration"]');
+    if(adminButton) adminButton.style.display=role.toLowerCase()==="admin"?"":"none";
+  }
+
+  async function readAuthStatus(){
+    const response=await fetch(AUTH_STATUS_URL,{cache:"no-store",credentials:"same-origin"});
+    const payload=await response.json().catch(()=>({}));
+    if(!response.ok) throw new Error(payload.details||payload.error||"Unable to check authentication.");
+    authSettings=payload.settings||{};
+    const domain=authSettings.allowed_domain||"nupco.com";
+    ["loginEmail","registerEmail"].forEach(id=>{const el=$(id);if(el)el.placeholder=`name@${domain}`;});
+    return payload;
+  }
+
+  async function login(){
+    clearAuthMessage();
+    const button=$("loginButton");
+    button.disabled=true;button.textContent="Signing In...";
+    try{
+      const response=await fetch(AUTH_LOGIN_URL,{
+        method:"POST",credentials:"same-origin",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({email:$("loginEmail").value.trim(),password:$("loginPassword").value})
+      });
+      const payload=await response.json().catch(()=>({}));
+      if(!response.ok) throw new Error(payload.details||payload.error||"Sign in failed.");
+      applySignedInUser(payload.user);
+      $("authOverlay").classList.add("hidden");
+      await startApplication();
+    }catch(error){setAuthMessage(error.message||String(error),"error");}
+    finally{button.disabled=false;button.textContent="Sign In";}
+  }
+
+  async function registerUser(){
+    clearAuthMessage();
+    const email=$("registerEmail").value.trim();
+    const warehouseName=$("registerWarehouse").value.trim();
+    const password=$("registerPassword").value;
+    const confirm=$("registerPasswordConfirm").value;
+    if(!warehouseName){setAuthMessage("Warehouse name is required.","error");return;}
+    if(password!==confirm){setAuthMessage("Passwords do not match.","error");return;}
+    const button=$("registerButton");
+    button.disabled=true;button.textContent="Creating Request...";
+    try{
+      const response=await fetch(AUTH_REGISTER_URL,{
+        method:"POST",credentials:"same-origin",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({email,password,warehouse_name:warehouseName})
+      });
+      const payload=await response.json().catch(()=>({}));
+      if(!response.ok) throw new Error(payload.details||payload.error||"Unable to create user.");
+      setAuthMessage(payload.message||"Access request created.","success");
+      if(payload.first_admin){
+        $("loginEmail").value=email;
+        setTimeout(()=>showAuthPanel("login"),1800);
+      }else if(payload.approval_email_sent){
+        setTimeout(()=>showAuthPanel("login"),2400);
+      }
+    }catch(error){setAuthMessage(error.message||String(error),"error");}
+    finally{button.disabled=false;button.textContent="Create Access Request";}
+  }
+
+  async function logout(){
+    try{await fetch(AUTH_LOGOUT_URL,{method:"POST",credentials:"same-origin"});}catch{}
+    currentUser=null;
+    historyCache=[];piData=null;piLoaded=false;varianceData={summary:{},items:[],email:{}};
+    $("authOverlay").classList.remove("hidden");
+    showAuthPanel("login");
+  }
+
+  async function initializeAuthentication(){
+    try{
+      const payload=await readAuthStatus();
+      if(payload.authenticated){
+        applySignedInUser(payload.user);
+        $("authOverlay").classList.add("hidden");
+        await startApplication();
+      }else{
+        applySignedInUser(null);
+        $("authOverlay").classList.remove("hidden");
+        showAuthPanel("login");
+      }
+    }catch(error){
+      $("authOverlay").classList.remove("hidden");
+      setAuthMessage(error.message||String(error),"error");
+    }
+  }
+
  
   function toast(message,type="info") {
     const el=document.createElement("div");
@@ -1201,9 +1467,19 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }
  
     if (requestedPage === "history" || requestedPage === "reports") {
-      Promise.resolve(refreshAzureHistory()).catch(error=>{
+      Promise.resolve(refreshAzureHistory({silent:true})).catch(error=>{
         console.error("Unable to refresh reconciliation history.", error);
       });
+    }
+
+    if (requestedPage === "reports") {
+      Promise.resolve(loadVarianceManagement({silent:true,preserveSelection:true})).catch(()=>{});
+      Promise.resolve(loadProductIntelligence()).catch(()=>{});
+      setTimeout(renderReports,0);
+    }
+
+    if (requestedPage === "administration") {
+      Promise.resolve(loadAdminUsers()).catch(error=>toast(error.message||String(error),"error"));
     }
 
     if (requestedPage === "intelligence") {
@@ -2024,15 +2300,86 @@ Drug Traceability Reconciliation Platform</textarea></label>
   }
 
   function renderReports(){
-    const history=getHistory(),completed=history.filter(x=>x.status==="Completed"),latest=completed[0]||history.find(x=>x.status==="Pending Upload")||{};
+    const history=getHistory();
+    const completed=history.filter(x=>x.status==="Completed");
+    const failed=history.filter(x=>x.status==="Failed");
+    const varianceSummary=varianceData?.summary||dashboardVarianceData?.summary||{};
+    const productSummary=piData?.summary||dashboardProductData?.summary||{};
+
     $("reportRuns").textContent=formatNumber(history.length);
     $("reportSuccessRate").textContent=`${history.length?(completed.length/history.length*100).toFixed(1):0}%`;
-    $("reportProcessed").textContent=formatNumber(completed.reduce((s,x)=>s+Number(x.masterRows||0),0));
-    $("reportVariance").textContent=formatNumber(completed.reduce((s,x)=>s+Number(x.variance||0),0));
-    const total=Number(latest.accept||0)+Number(latest.dispatch||0)+Number(latest.variance||0);
-    $("compositionContent").innerHTML=total?`<div class="status-line"><span>Accept Items</span><strong>${formatNumber(latest.accept)}</strong></div><div class="status-line"><span>Dispatch Items</span><strong>${formatNumber(latest.dispatch)}</strong></div><div class="status-line"><span>Variance Items</span><strong>${formatNumber(latest.variance)}</strong></div><div class="status-line"><span>Total Result Items</span><strong>${formatNumber(total)}</strong></div>`:`<div class="empty"><strong>No report data yet</strong>Run a reconciliation first.</div>`;
+    $("reportFailedRuns").textContent=formatNumber(failed.length);
+    $("reportVariance").textContent=formatNumber(varianceSummary.total_items||0);
+
+    const processOrder=[
+      ["ACCEPT","Daily Accept"],
+      ["DISPATCH","Daily Dispatch"],
+      ["FULL_ACCEPT","Full Accept"],
+      ["FULL_DISPATCH","Full Dispatch"],
+      ["HISTORICAL","Historical Build"]
+    ];
+    const processRows=processOrder.map(([key,label])=>{
+      const rows=history.filter(row=>historyProcessKey(row.processType)===key || (key==="HISTORICAL"&&historyProcessKey(row.processType).includes("HISTORICAL")));
+      return `<div class="status-line"><span>${label}</span><strong>${formatNumber(rows.length)}</strong></div>`;
+    }).join("");
+    $("reportProcessMix").innerHTML=processRows||'<div class="empty"><strong>No run history</strong>No reconciliation runs are available.</div>';
+
+    $("reportVarianceSummary").innerHTML=`
+      <div class="status-line"><span>Missing Registration</span><strong>${formatNumber(varianceSummary.missing_registration||0)}</strong></div>
+      <div class="status-line"><span>Quantity Mismatch</span><strong>${formatNumber(varianceSummary.quantity_mismatch||0)}</strong></div>
+      <div class="status-line"><span>Unmapped Customers</span><strong>${formatNumber(varianceSummary.unmapped_customers||0)}</strong></div>
+      <div class="status-line"><span>Reportable to SFDA</span><strong>${formatNumber(varianceSummary.reportable_to_sfda||0)}</strong></div>`;
+
+    const failedBody=$("reportFailedBody");
+    failedBody.innerHTML=failed.slice(0,12).map(row=>`<tr>
+      <td><strong>${escapeHtml(row.runId||"—")}</strong></td>
+      <td>${escapeHtml(row.processLabel||historyProcessLabel(row.processType))}</td>
+      <td>${escapeHtml(formatSaudiDateTime(row.timestamp))}</td>
+      <td title="${escapeHtml(row.error||"")}">${escapeHtml(String(row.error||"—").slice(0,90))}</td>
+    </tr>`).join("")||'<tr><td colspan="4"><div class="empty"><strong>No failed runs</strong>There are no failed runs in the loaded history.</div></td></tr>';
+
+    const piDist=piData?.status_distribution||{};
+    $("reportProductSummary").innerHTML=`
+      <div class="status-line"><span>Total Batches</span><strong>${formatNumber(productSummary.batch_count||0)}</strong></div>
+      <div class="status-line"><span>Accept Required</span><strong>${formatNumber(piDist["Accept Required"]||productSummary.accept_required||0)}</strong></div>
+      <div class="status-line"><span>Dispatch Required</span><strong>${formatNumber(piDist["Dispatch Required"]||productSummary.dispatch_required||0)}</strong></div>
+      <div class="status-line"><span>GLN Missing</span><strong>${formatNumber(productSummary.gln_missing||0)}</strong></div>`;
+
+    const now=new Date();
+    const days=[];
+    for(let offset=6;offset>=0;offset--){
+      const d=new Date(now);d.setHours(0,0,0,0);d.setDate(d.getDate()-offset);
+      const key=d.toLocaleDateString("en-CA",{timeZone:"Asia/Riyadh"});
+      const label=d.toLocaleDateString("en-GB",{day:"2-digit",month:"short"});
+      const count=history.filter(row=>{
+        const parsed=parseUtcTimestamp(row.timestamp);
+        return parsed&&parsed.toLocaleDateString("en-CA",{timeZone:"Asia/Riyadh"})===key;
+      }).length;
+      days.push({label,count});
+    }
+    const max=Math.max(1,...days.map(day=>day.count));
+    $("reportTrend").innerHTML=`<div class="report-trend-grid">${days.map(day=>`
+      <div class="report-trend-day">
+        <strong>${formatNumber(day.count)}</strong>
+        <div class="report-trend-bar" style="height:${Math.max(4,day.count/max*105)}px"></div>
+        <span>${day.label}</span>
+      </div>`).join("")}</div>`;
   }
+
   $("exportHistoryButton").addEventListener("click",()=>downloadText("SFDA_Reconciliation_History.json",JSON.stringify(getHistory(),null,2),"application/json;charset=utf-8"));
+  $("reportsRefreshButton").addEventListener("click",async()=>{
+    const button=$("reportsRefreshButton");button.disabled=true;button.textContent="↻ Refreshing...";
+    try{
+      await Promise.all([
+        refreshAzureHistory({silent:true}),
+        loadVarianceManagement({silent:true,forceRefresh:true,preserveSelection:true}),
+        loadProductIntelligence(true)
+      ]);
+      renderReports();
+      toast("Reports refreshed.","success");
+    }catch(error){toast(error.message||String(error),"error");}
+    finally{button.disabled=false;button.textContent="↻ Refresh Reports";}
+  });
  
   async function checkHealth(){
     try{
@@ -2056,14 +2403,6 @@ Drug Traceability Reconciliation Platform</textarea></label>
   $("healthButton").addEventListener("click",async()=>{ const ok=await checkHealth(); toast(ok?"Azure Function is healthy.":"Azure Function health check failed.",ok?"success":"error"); });
  
   if($("dashboardRefresh")) $("dashboardRefresh").addEventListener("click",()=>refreshDashboard());
-  renderHistory();
-  updateDashboard();
-  renderReports();
-  checkHealth();
-  refreshDashboard({silent:true});
- 
-  const initialPage = window.location.hash.replace(/^#/, "") || "home";
-  navigate(initialPage, {skipHash:true, instant:true});
  
  
   // ============================================================
@@ -2413,7 +2752,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }
 
     const operation=document.querySelector('input[name="step1Operation"]:checked')?.value||"append";
-    if(operation==="rebuild"&&!window.confirm("Rebuild Full History will delete the current Version 5 history and rebuild it from the selected files. Continue?")) return;
+    if(operation==="rebuild"&&!window.confirm("Rebuild Full History will delete the current Version 6 warehouse history and rebuild it from the selected files. Continue?")) return;
 
     const formData=new FormData();
     Array.from(asn?.files||[]).forEach(file=>formData.append("asn_files",file,file.name));
@@ -2577,7 +2916,6 @@ Drug Traceability Reconciliation Platform</textarea></label>
   });
 
   updateFullSetupButtons();
-  refreshHistoricalStatus({silent:true});
 
   // Product Intelligence
   let piData=null;
@@ -2592,35 +2930,24 @@ Drug Traceability Reconciliation Platform</textarea></label>
     return Number(value||0).toLocaleString("en-US",{maximumFractionDigits:2});
   }
 
-  function varianceFilteredItems(){
-    const search=($("varianceSearch")?.value||"").trim().toLowerCase();
-    const severity=$("varianceSeverity")?.value||"";
-    return (varianceData.items||[]).filter(item=>{
-      if(varianceActiveType && item["Variance Type"]!==varianceActiveType) return false;
-      if(severity && item.Severity!==severity) return false;
-      if(search){
-        const hay=[item.BN,item.GTIN,item["Supplier Name"],item["Supplier Code"],item.Customer,item.Description,item["Drug Name"]].join(" ").toLowerCase();
-        if(!hay.includes(search)) return false;
-      }
-      return true;
-    });
+  function varianceCurrentItems(){
+    return Array.isArray(varianceData.items)?varianceData.items:[];
+  }
+
+  function rememberVarianceSelection(item,checked){
+    const id=String(item?.["Variance ID"]||"");
+    if(!id) return;
+    if(checked){
+      varianceSelectedIds.add(id);
+      varianceSelectedMeta.set(id,item);
+    }else{
+      varianceSelectedIds.delete(id);
+      varianceSelectedMeta.delete(id);
+    }
   }
 
   function varianceSelectedItems(){
-    return (varianceData.items||[]).filter(item=>varianceSelectedIds.has(String(item["Variance ID"]||"")));
-  }
-
-  function syncVarianceSelectionFromOptions(){
-    const includeMissing=$("varianceIncludeMissing")?.checked;
-    const includeQuantity=$("varianceIncludeQuantity")?.checked;
-    const includeGln=$("varianceIncludeGln")?.checked;
-    varianceSelectedIds=new Set((varianceData.items||[]).filter(item=>
-      (includeMissing && item["Variance Type"]==="Missing Registration") ||
-      (includeQuantity && item["Variance Type"]==="Quantity Mismatch") ||
-      (includeGln && item["Variance Type"]==="GLN Missing")
-    ).map(item=>String(item["Variance ID"]||"")));
-    renderVarianceTable();
-    updateVariancePreview();
+    return Array.from(varianceSelectedMeta.values());
   }
 
   function updateVariancePreview(){
@@ -2659,7 +2986,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   }
 
   function renderVarianceTable(){
-    const rows=varianceFilteredItems();
+    const rows=varianceCurrentItems();
     const body=$("varianceBody");
     if(!body) return;
     body.innerHTML="";
@@ -2675,44 +3002,87 @@ Drug Traceability Reconciliation Platform</textarea></label>
       const check=tr.querySelector(".variance-row-check");
       check.addEventListener("click",event=>event.stopPropagation());
       check.addEventListener("change",()=>{
-        if(check.checked) varianceSelectedIds.add(id); else varianceSelectedIds.delete(id);
+        rememberVarianceSelection(item,check.checked);
         updateVariancePreview();
+        const allCurrent=rows.length>0&&rows.every(row=>varianceSelectedIds.has(String(row["Variance ID"]||"")));
+        $("varianceSelectAll").checked=allCurrent;
       });
       tr.addEventListener("click",()=>renderVarianceDetails(item));
       body.appendChild(tr);
     });
     if(!rows.length){
-      body.innerHTML='<tr><td colspan="8"><div class="empty"><strong>No matching variances</strong>Change the filters or refresh the latest SFDA data.</div></td></tr>';
+      body.innerHTML='<tr><td colspan="8"><div class="empty"><strong>No matching variances</strong>Change the filters or search another batch.</div></td></tr>';
     }
-    $("varianceCount").textContent=`${rows.length} variance item${rows.length===1?"":"s"}`;
-    const allVisibleIds=rows.map(x=>String(x["Variance ID"]||""));
-    $("varianceSelectAll").checked=allVisibleIds.length>0 && allVisibleIds.every(id=>varianceSelectedIds.has(id));
+
+    const pagination=varianceData.pagination||{};
+    const total=Number(pagination.total_items||0);
+    const page=Number(pagination.page||1);
+    const pages=Number(pagination.total_pages||1);
+    const start=Number(pagination.start_item||0);
+    const finish=Number(pagination.end_item||0);
+    $("varianceCount").textContent=`${formatNumber(total)} matching variance item${total===1?"":"s"}`;
+    $("variancePageLabel").textContent=`Page ${formatNumber(page)} of ${formatNumber(pages)}`;
+    $("varianceRangeLabel").textContent=total?`${formatNumber(start)}–${formatNumber(finish)} of ${formatNumber(total)}`:"0 items";
+    $("variancePrevPage").disabled=page<=1;
+    $("varianceNextPage").disabled=page>=pages;
+    $("varianceSelectAll").checked=rows.length>0&&rows.every(row=>varianceSelectedIds.has(String(row["Variance ID"]||"")));
+  }
+
+  function varianceQueryString({forceRefresh=false}={}){
+    const params=new URLSearchParams({
+      page:String(variancePage),
+      page_size:String(variancePageSize)
+    });
+    const search=($("varianceSearch")?.value||"").trim();
+    const severity=$("varianceSeverity")?.value||"";
+    if(search) params.set("search",search);
+    if(severity) params.set("severity",severity);
+    if(varianceActiveType) params.set("type",varianceActiveType);
+    if(forceRefresh) params.set("refresh","true");
+    return params.toString();
   }
 
   async function loadVarianceManagement(options={}){
-    const {silent=false}=options;
+    const {silent=false,forceRefresh=false,preserveSelection=false}=options;
+    if(!preserveSelection){
+      varianceSelectedIds.clear();
+      varianceSelectedMeta.clear();
+      updateVariancePreview();
+    }
     if(!silent) toast("Loading variance data...","info");
-    const response=await fetch(VARIANCE_API_URL,{cache:"no-store"});
-    const payload=await response.json();
+    const response=await fetch(`${VARIANCE_API_URL}?${varianceQueryString({forceRefresh})}`,{cache:"no-store",credentials:"same-origin"});
+    const payload=await response.json().catch(()=>({}));
+    if(response.status===401){await logout();throw new Error("Your session has expired. Please sign in again.");}
     if(!response.ok||payload.status==="Failed") throw new Error(payload.details||payload.error||"Unable to load variance data.");
+
     varianceData=payload;
+    variancePage=Number(payload.pagination?.page||1);
+    variancePageSize=Number(payload.pagination?.page_size||variancePageSize);
+    if($("variancePageSize")) $("variancePageSize").value=String(variancePageSize);
+
     const summary=payload.summary||{};
     $("varianceReceivingCount").textContent=formatNumber(summary.receiving_variance||0);
     $("varianceMissingCount").textContent=formatNumber(summary.missing_registration||0);
     $("varianceQuantityCount").textContent=formatNumber(summary.quantity_mismatch||0);
     $("varianceGlnCount").textContent=formatNumber(summary.unmapped_customers||0);
     $("varianceRecipient").value=payload.email?.default_recipient||$("varianceRecipient").value||"";
-    $("varianceEmailStatus").textContent=payload.email?.configured?"Email service configured and ready.":"Email sending is not configured yet. Configure the Azure SMTP environment variables to enable direct sending.";
-    syncVarianceSelectionFromOptions();
+    $("varianceEmailStatus").textContent=payload.email?.configured
+      ?"Microsoft Outlook draft integration is configured and ready."
+      :"Microsoft Graph is not configured. Add GRAPH_TENANT_ID, GRAPH_CLIENT_ID, GRAPH_CLIENT_SECRET and GRAPH_REDIRECT_URI in Azure Function App settings.";
+
     renderVarianceDetails(null);
-    if(!silent) toast(`Variance data loaded: ${formatNumber(summary.total_items||0)} item(s).`,"success");
+    renderVarianceTable();
+    updateVariancePreview();
+    renderReports();
+    if(!silent) toast(`Variance page loaded: ${formatNumber(payload.pagination?.total_items||0)} matching item(s).`,"success");
+    return payload;
   }
 
   async function requestVarianceReport(download=true){
     const selected=Array.from(varianceSelectedIds);
     if(!selected.length) throw new Error("Select at least one variance item.");
-    const response=await fetch(VARIANCE_REPORT_URL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({selected_ids:selected})});
-    const payload=await response.json();
+    const response=await fetch(VARIANCE_REPORT_URL,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({selected_ids:selected})});
+    const payload=await response.json().catch(()=>({}));
     if(!response.ok||payload.status==="Failed") throw new Error(payload.details||payload.error||"Unable to generate report.");
     if(download){
       const file=firstFile(payload.output);
@@ -2721,36 +3091,96 @@ Drug Traceability Reconciliation Platform</textarea></label>
     return payload;
   }
 
-  async function sendVarianceEmail(){
+  async function prepareVarianceOutlookDraft(){
     const selected=Array.from(varianceSelectedIds);
     if(!selected.length) throw new Error("Select at least one variance item.");
     const recipient=$("varianceRecipient").value.trim();
     if(!recipient) throw new Error("Enter the SFDA recipient email address.");
-    const response=await fetch(VARIANCE_EMAIL_URL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({selected_ids:selected,recipient,subject:$("varianceEmailSubject").value.trim(),message:$("varianceEmailMessage").value})});
-    const payload=await response.json();
-    if(!response.ok||payload.status==="Failed") throw new Error(payload.details||payload.error||"Unable to send email.");
-    toast(`Report sent to ${payload.recipient}.`,"success");
+
+    const outlookWindow=window.open("about:blank","_blank");
+    if(!outlookWindow){
+      throw new Error("Allow pop-ups for this site to open the Outlook draft.");
+    }
+    outlookWindow.document.write(
+      '<div style="font-family:Segoe UI,Arial,sans-serif;padding:28px">Preparing Microsoft sign-in...</div>'
+    );
+
+    $("varianceEmailStatus").textContent="Preparing Outlook draft...";
+    try{
+      const response=await fetch(VARIANCE_OUTLOOK_START_URL,{
+        method:"POST",
+        credentials:"same-origin",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({
+          selected_ids:selected,
+          recipient,
+          subject:$("varianceEmailSubject").value.trim(),
+          message:$("varianceEmailMessage").value
+        })
+      });
+      const payload=await response.json().catch(()=>({}));
+      if(!response.ok||payload.status==="Failed"||!payload.authorization_url){
+        throw new Error(
+          payload.details||
+          payload.error||
+          "Unable to start Microsoft Outlook draft."
+        );
+      }
+
+      $("varianceEmailStatus").textContent=
+        "Microsoft sign-in opened. Complete sign-in; the prepared draft will then open in Outlook.";
+      outlookWindow.location.href=payload.authorization_url;
+      toast("Complete Microsoft sign-in in the new tab to open the Outlook draft.","success");
+    }catch(error){
+      try{outlookWindow.close();}catch{}
+      $("varianceEmailStatus").textContent=error.message||String(error);
+      throw error;
+    }
   }
 
   document.querySelectorAll(".variance-tab").forEach(button=>button.addEventListener("click",()=>{
     document.querySelectorAll(".variance-tab").forEach(x=>x.classList.toggle("active",x===button));
     varianceActiveType=button.dataset.varianceType||"";
-    renderVarianceTable();
+    variancePage=1;
+    loadVarianceManagement({silent:true,preserveSelection:true}).catch(error=>toast(error.message||String(error),"error"));
   }));
-  $("varianceSearch").addEventListener("input",renderVarianceTable);
-  $("varianceSeverity").addEventListener("change",renderVarianceTable);
-  $("varianceSelectAll").addEventListener("change",()=>{
-    varianceFilteredItems().forEach(item=>{
-      const id=String(item["Variance ID"]||"");
-      if($("varianceSelectAll").checked) varianceSelectedIds.add(id); else varianceSelectedIds.delete(id);
-    });
-    renderVarianceTable();updateVariancePreview();
+
+  $("varianceSearch").addEventListener("input",()=>{
+    clearTimeout(varianceSearchTimer);
+    varianceSearchTimer=setTimeout(()=>{
+      variancePage=1;
+      loadVarianceManagement({silent:true,preserveSelection:true}).catch(error=>toast(error.message||String(error),"error"));
+    },350);
   });
-  ["varianceIncludeMissing","varianceIncludeQuantity","varianceIncludeGln"].forEach(id=>$(id).addEventListener("change",syncVarianceSelectionFromOptions));
-  $("varianceRefreshButton").addEventListener("click",()=>loadVarianceManagement().catch(error=>toast(error.message||String(error),"error")));
+
+  $("varianceSeverity").addEventListener("change",()=>{
+    variancePage=1;
+    loadVarianceManagement({silent:true,preserveSelection:true}).catch(error=>toast(error.message||String(error),"error"));
+  });
+
+  $("varianceSelectAll").addEventListener("change",()=>{
+    varianceCurrentItems().forEach(item=>rememberVarianceSelection(item,$("varianceSelectAll").checked));
+    renderVarianceTable();
+    updateVariancePreview();
+  });
+
+  $("variancePrevPage").addEventListener("click",()=>{
+    if(variancePage>1){variancePage-=1;loadVarianceManagement({silent:true,preserveSelection:true}).catch(error=>toast(error.message||String(error),"error"));}
+  });
+  $("varianceNextPage").addEventListener("click",()=>{
+    const pages=Number(varianceData.pagination?.total_pages||1);
+    if(variancePage<pages){variancePage+=1;loadVarianceManagement({silent:true,preserveSelection:true}).catch(error=>toast(error.message||String(error),"error"));}
+  });
+  $("variancePageSize").addEventListener("change",()=>{
+    variancePageSize=Number($("variancePageSize").value||100);variancePage=1;
+    loadVarianceManagement({silent:true,preserveSelection:true}).catch(error=>toast(error.message||String(error),"error"));
+  });
+
+  ["varianceIncludeMissing","varianceIncludeQuantity","varianceIncludeGln"].forEach(id=>$(id).addEventListener("change",updateVariancePreview));
+  $("varianceRefreshButton").addEventListener("click",()=>{variancePage=1;loadVarianceManagement({forceRefresh:true,preserveSelection:false}).catch(error=>toast(error.message||String(error),"error"));});
   $("varianceExportButton").addEventListener("click",()=>requestVarianceReport(true).catch(error=>toast(error.message||String(error),"error")));
   $("varianceGenerateButton").addEventListener("click",()=>requestVarianceReport(true).catch(error=>toast(error.message||String(error),"error")));
-  $("varianceEmailButton").addEventListener("click",()=>sendVarianceEmail().catch(error=>toast(error.message||String(error),"error")));
+  $("varianceEmailButton").addEventListener("click",()=>prepareVarianceOutlookDraft().catch(error=>toast(error.message||String(error),"error")));
 
   async function loadProductIntelligence(force=false){
     if(piLoaded&&!force){applyProductFilters();return;}
@@ -2855,6 +3285,93 @@ Drug Traceability Reconciliation Platform</textarea></label>
   $("piRefreshButton").addEventListener("click",()=>loadProductIntelligence(true));
   $("piExportButton").addEventListener("click",exportPiBatchView);
 
+
+  async function loadAdminUsers(){
+    if(!currentUser || String(currentUser.Role||"").toLowerCase()!=="admin") return;
+    const response=await fetch(ADMIN_USERS_URL,{cache:"no-store",credentials:"same-origin"});
+    const payload=await response.json().catch(()=>({}));
+    if(response.status===401){await logout();return;}
+    if(!response.ok) throw new Error(payload.details||payload.error||"Unable to load users.");
+
+    const users=Array.isArray(payload.users)?payload.users:[];
+    const settings=payload.settings||authSettings||{};
+    $("adminUserCount").textContent=`${formatNumber(users.length)} user${users.length===1?"":"s"}`;
+    $("adminAllowedDomain").textContent=`@${settings.allowed_domain||"nupco.com"}`;
+    $("adminApprovalEmail").textContent=settings.approval_admin_email||"Not configured";
+    $("adminEmailConfigured").textContent=settings.email_configured?"Configured":"Not configured";
+    $("adminEmailConfigured").style.color=settings.email_configured?"#107c41":"#d97706";
+    $("adminAuthMode").textContent=settings.auth_required===false?"Optional":"Required";
+
+    $("adminUsersBody").innerHTML=users.map(user=>{
+      const id=Number(user.UserID||0);
+      const status=String(user.Status||"Unknown");
+      const active=status==="Active";
+      const disabled=status==="Disabled";
+      const isCurrent=Number(currentUser?.UserID||0)===id;
+      return `<tr>
+        <td><strong>${escapeHtml(user.Email||"—")}</strong>${isCurrent?'<div class="file-info">Current user</div>':""}</td>
+        <td>${escapeHtml(user.WarehouseName||user.RequestedWarehouseName||"—")}</td>
+        <td>${escapeHtml(user.Role||"User")}</td>
+        <td><span class="badge ${active?"success":disabled?"failed":"warning"}">${escapeHtml(status)}</span></td>
+        <td>${escapeHtml(formatSaudiDateTime(user.CreatedAt))}</td>
+        <td>${escapeHtml(formatSaudiDateTime(user.LastLoginAt))}</td>
+        <td><div class="admin-user-actions">
+          ${status==="Pending"?`<button class="btn btn-secondary admin-user-status" data-user-id="${id}" data-status="Active">Approve</button>`:""}
+          ${active&&!isCurrent?`<button class="btn btn-secondary admin-user-status" data-user-id="${id}" data-status="Disabled">Disable</button>`:""}
+          ${disabled?`<button class="btn btn-secondary admin-user-status" data-user-id="${id}" data-status="Active">Enable</button>`:""}
+        </div></td>
+      </tr>`;
+    }).join("")||'<tr><td colspan="7"><div class="empty"><strong>No users</strong>No application users have been created.</div></td></tr>';
+
+    document.querySelectorAll(".admin-user-status").forEach(button=>button.addEventListener("click",async()=>{
+      const id=button.dataset.userId,status=button.dataset.status;
+      button.disabled=true;
+      try{
+        const response=await fetch(`/api/admin/users/${encodeURIComponent(id)}/status`,{
+          method:"POST",credentials:"same-origin",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({status})
+        });
+        const payload=await response.json().catch(()=>({}));
+        if(!response.ok) throw new Error(payload.details||payload.error||"Unable to update user.");
+        toast(`User status changed to ${status}.`,"success");
+        await loadAdminUsers();
+      }catch(error){toast(error.message||String(error),"error");button.disabled=false;}
+    }));
+  }
+
+  async function startApplication(){
+    if(applicationStarted){
+      await refreshDashboard({silent:true});
+      return;
+    }
+    applicationStarted=true;
+    renderHistory();
+    updateDashboard();
+    renderReports();
+    await checkHealth();
+    try{
+      await Promise.all([
+        refreshDashboard({silent:true}),
+        refreshHistoricalStatus({silent:true})
+      ]);
+    }catch(error){
+      console.error("Initial application refresh failed",error);
+    }
+    const initialPage=window.location.hash.replace(/^#/,"")||"home";
+    navigate(initialPage,{skipHash:true,instant:true});
+  }
+
+  $("showRegisterButton")?.addEventListener("click",()=>showAuthPanel("register"));
+  $("showLoginButton")?.addEventListener("click",()=>showAuthPanel("login"));
+  $("loginButton")?.addEventListener("click",()=>login());
+  $("registerButton")?.addEventListener("click",()=>registerUser());
+  $("logoutButton")?.addEventListener("click",()=>logout());
+  $("adminRefreshUsers")?.addEventListener("click",()=>loadAdminUsers().catch(error=>toast(error.message||String(error),"error")));
+  $("loginPassword")?.addEventListener("keydown",event=>{if(event.key==="Enter")login();});
+  $("registerPasswordConfirm")?.addEventListener("keydown",event=>{if(event.key==="Enter")registerUser();});
+
+  initializeAuthentication();
 </script>
 </body>
 </html>
