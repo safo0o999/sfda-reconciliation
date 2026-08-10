@@ -555,24 +555,16 @@
       <section class="page active" id="page-home">
         <div class="page-head">
           <div><h1>Dashboard</h1><p>Operational view of SFDA, receiving, inventory, dispatch, exceptions, and customer mapping.</p></div>
-          <div class="actions"><button class="btn btn-primary" data-go="upload">▶ Run Reconciliation</button></div>
+          <div class="actions"><button class="btn btn-secondary" id="dashboardRefresh">↻ Refresh Dashboard</button></div>
         </div>
- 
-        <div class="card dashboard-filter-bar">
-          <div class="filter-field"><label>Snapshot Date</label><input type="date" id="dashboardDate"></div>
-          <div class="filter-field"><label>Trade Name</label><select><option>All</option></select></div>
-          <div class="filter-field"><label>Supplier</label><select><option>All</option></select></div>
-          <div class="filter-field"><label>Customer</label><select><option>All</option></select></div>
-          <button class="btn btn-primary" id="dashboardRefresh">↻ Refresh</button>
-        </div>
- 
+
         <div class="ops-kpis">
           <div class="card ops-kpi"><div class="label">Total Items (SFDA)</div><div class="value" id="homeInputRows">—</div><div class="mini-icon">▣</div></div>
           <div class="card ops-kpi green"><div class="label">Pending to Accept</div><div class="value" id="homeAccept">—<span class="unit">Packs</span></div><div class="mini-icon">✓</div></div>
           <div class="card ops-kpi amber"><div class="label">Pending to Dispatch</div><div class="value" id="homeDispatch">—<span class="unit">Packs</span></div><div class="mini-icon">⇢</div></div>
           <div class="card ops-kpi red"><div class="label">Exceptions</div><div class="value" id="homeVariance">—<span class="unit">Items</span></div><div class="mini-icon">!</div></div>
-          <div class="card ops-kpi purple"><div class="label">Customers with GLN</div><div class="value">—<span class="unit">Customers</span></div><div class="mini-icon">◎</div></div>
-          <div class="card ops-kpi"><div class="label">Dummy GLN Used</div><div class="value">—<span class="unit">Customers</span></div><div class="mini-icon">?</div></div>
+          <div class="card ops-kpi purple"><div class="label">Customers with GLN</div><div class="value" id="homeCustomersWithGln">—<span class="unit">Customers</span></div><div class="mini-icon">◎</div></div>
+          <div class="card ops-kpi"><div class="label">Dummy GLN Used</div><div class="value" id="homeDummyGln">—<span class="unit">Customers</span></div><div class="mini-icon">?</div></div>
         </div>
  
         <div class="ops-layout">
@@ -596,15 +588,15 @@
                 <div class="table-scroll"><table><thead><tr><th>BN</th><th>Expiry Date</th><th>Issue Type</th><th>Description</th><th>Variance</th><th>Action</th></tr></thead><tbody id="homeExceptionsBody"><tr><td colspan="6"><div class="empty"><strong>No exception details available</strong>Detailed records will be loaded from the database phase.</div></td></tr></tbody></table></div>
               </div>
               <div class="card table-card compact-table">
-                <div class="card-header"><div><div class="card-title">Dispatch by Customer</div><div class="card-subtitle">To Be Dispatch allocation</div></div><button class="btn btn-secondary" data-go="upload">View Current Results</button></div>
-                <div class="table-scroll"><table><thead><tr><th>Customer</th><th>GLN</th><th>Total Packs</th><th>Items</th><th>Status</th></tr></thead><tbody><tr><td colspan="5"><div class="empty"><strong>No customer allocation loaded</strong>Run a reconciliation to generate customer files.</div></td></tr></tbody></table></div>
+                <div class="card-header"><div><div class="card-title">Dispatch by Customer</div><div class="card-subtitle">Historical customer movement from Product Intelligence</div></div><button class="btn btn-secondary" data-go="product-intelligence">View Product Intelligence</button></div>
+                <div class="table-scroll"><table><thead><tr><th>Customer</th><th>GLN</th><th>Dispatched Packs</th><th>Last Dispatch</th><th>Mapping</th></tr></thead><tbody id="homeCustomerDispatchBody"><tr><td colspan="5"><div class="empty"><strong>No customer intelligence loaded</strong>Refresh the dashboard to load Product Intelligence.</div></td></tr></tbody></table></div>
               </div>
             </div>
           </div>
  
           <aside class="ops-side">
             <div class="card"><div class="card-header"><div class="card-title">Quick Actions</div></div><div class="quick-actions"><button class="btn btn-success" data-go="upload">▶ Run Reconciliation</button><button class="btn btn-primary" data-go="upload">⇩ Prepare Accept</button><button class="btn btn-warning" data-go="upload">⇢ Prepare Dispatch</button><button class="btn btn-purple" data-go="history">◷ Upload History</button></div></div>
-            <div class="card"><div class="card-header"><div class="card-title">Customer / GLN</div></div><div class="mini-donut-wrap"><div style="position:relative"><div class="mini-donut"></div><div class="mini-donut-label"><div><div style="font-size:18px">—</div><div>Total</div></div></div></div><div class="mini-legend"><div class="mini-legend-row"><span><i class="legend-dot" style="background:#239247"></i>With GLN</span><strong>—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#d94747"></i>Dummy GLN</span><strong>—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#c8ced8"></i>Not Mapped</span><strong>—</strong></div></div></div></div>
+            <div class="card"><div class="card-header"><div class="card-title">Customer / GLN</div></div><div class="mini-donut-wrap"><div style="position:relative"><div class="mini-donut" id="homeGlnDonut"></div><div class="mini-donut-label"><div><div style="font-size:18px" id="homeGlnTotal">—</div><div>Total</div></div></div></div><div class="mini-legend"><div class="mini-legend-row"><span><i class="legend-dot" style="background:#239247"></i>With GLN</span><strong id="homeGlnMapped">—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#d94747"></i>Dummy GLN</span><strong id="homeGlnDummy">—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#c8ced8"></i>Not Mapped</span><strong id="homeGlnUnmapped">—</strong></div></div></div></div>
             <div class="card"><div class="card-header"><div><div class="card-title">Recent Uploads</div><div class="card-subtitle">Latest locally selected report types</div></div></div><div class="recent-upload-list" id="recentUploads"><div class="empty"><strong>No uploads yet</strong>Selected files will appear after a run.</div></div></div>
             <div class="card"><div class="card-header"><div class="card-title">System Status</div></div><div class="card-body"><div class="status-line"><span>Azure Function</span><span class="status-ok" id="homeHealth">Checking...</span></div><div class="status-line"><span>Version</span><strong id="homeVersion">—</strong></div><div class="status-line"><span>Total Local Runs</span><strong id="homeRuns">0</strong></div><div class="status-line"><span>Successful Runs</span><strong id="homeSuccess">0</strong></div><div class="status-line"><span>Generated Files</span><strong id="homeGenerated">—</strong></div></div></div>
           </aside>
@@ -1137,6 +1129,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   const DISPATCH_FILE_KEYS = ["dispatchReport","dispatchSfda"];
   const HISTORY_URL = "/api/history";
   const VARIANCE_API_URL = "/api/variance-management";
+  const PRODUCT_INTELLIGENCE_API_URL = "/api/product-intelligence";
   const VARIANCE_REPORT_URL = "/api/variance-management/report";
   const VARIANCE_EMAIL_URL = "/api/variance-management/email";
   const DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v2";
@@ -1147,6 +1140,8 @@ Drug Traceability Reconciliation Platform</textarea></label>
   let historyLoading = false;
   let activeHistoryFilter = "all";
   let varianceData = {summary:{},items:[],email:{}};
+  let dashboardProductData = {summary:{},customers:[],alerts:[]};
+  let dashboardVarianceData = {summary:{},items:[]};
   let varianceSelectedIds = new Set();
   let varianceActiveType = "";
   let varianceActiveRowId = "";
@@ -1895,16 +1890,123 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }).join("");
   }
  
+  function dashboardPreviewTotals(){
+    const rows=getDashboardPreview();
+    return {
+      accept:rows.reduce((sum,row)=>sum+Number(row["To Be Accept"]||0),0),
+      dispatch:rows.reduce((sum,row)=>sum+Number(row["To Be Dispatch"]||0),0),
+      variance:rows.reduce((sum,row)=>sum+Math.abs(Number(row.Variance||0)),0)
+    };
+  }
+
+  function renderDashboardLinkedData(){
+    const product=dashboardProductData||{};
+    const summary=product.summary||{};
+    const variance=dashboardVarianceData||{};
+    const varianceSummary=variance.summary||{};
+
+    const withGln=Number(summary.customer_with_gln_count||0);
+    const dummy=Number(summary.customer_dummy_gln_count||0);
+    const unmapped=Number(summary.customer_unmapped_count||0);
+    const totalCustomers=Number(summary.customer_count||withGln+dummy+unmapped);
+
+    if($("homeCustomersWithGln")) $("homeCustomersWithGln").textContent=formatNumber(withGln);
+    if($("homeDummyGln")) $("homeDummyGln").textContent=formatNumber(dummy);
+    if($("homeVariance")) $("homeVariance").textContent=formatNumber(Number(varianceSummary.total_items||0));
+
+    if($("homeGlnTotal")) $("homeGlnTotal").textContent=formatNumber(totalCustomers);
+    if($("homeGlnMapped")) $("homeGlnMapped").textContent=formatNumber(withGln);
+    if($("homeGlnDummy")) $("homeGlnDummy").textContent=formatNumber(dummy);
+    if($("homeGlnUnmapped")) $("homeGlnUnmapped").textContent=formatNumber(unmapped);
+
+    const donut=$("homeGlnDonut");
+    if(donut){
+      const denominator=Math.max(withGln+dummy+unmapped,1);
+      const mappedPct=withGln/denominator*100;
+      const dummyPct=dummy/denominator*100;
+      donut.style.background=`conic-gradient(#239247 0 ${mappedPct}%,#d94747 ${mappedPct}% ${mappedPct+dummyPct}%,#c8ced8 ${mappedPct+dummyPct}% 100%)`;
+    }
+
+    const exceptionBody=$("homeExceptionsBody");
+    if(exceptionBody){
+      const items=(variance.items||[]).slice(0,10);
+      exceptionBody.innerHTML=items.length?items.map(item=>`<tr>
+        <td><strong>${escapeHtml(item.BN||"—")}</strong></td>
+        <td>${escapeHtml(piDate(item["Expiry Date"]))}</td>
+        <td>${escapeHtml(item["Variance Type"]||"—")}</td>
+        <td>${escapeHtml(item.Description||item["Variance Status"]||"—")}</td>
+        <td>${formatNumber(Math.abs(Number(item["Difference Pack"]||0)))}</td>
+        <td>${escapeHtml(item["Required Action"]||"Review")}</td>
+      </tr>`).join(""):`<tr><td colspan="6"><div class="empty"><strong>No open exceptions</strong>Variance Management currently has no exception records.</div></td></tr>`;
+    }
+
+    const customerBody=$("homeCustomerDispatchBody");
+    if(customerBody){
+      const customers=(product.customers||[]).slice(0,10);
+      customerBody.innerHTML=customers.length?customers.map(row=>{
+        const gln=String(row.GLN||"").trim();
+        const mapping=(!gln)?"Not Mapped":(gln==="99999999999999"||gln.toUpperCase()==="DUMMY")?"Dummy":"Registered";
+        const badge=mapping==="Registered"?"success":mapping==="Dummy"?"warning":"failed";
+        return `<tr>
+          <td><strong>${escapeHtml(row["To Address"]||"—")}</strong></td>
+          <td>${escapeHtml(gln||"—")}</td>
+          <td>${formatNumber(Number(row.dispatched_pack||0))}</td>
+          <td>${escapeHtml(piDate(row.last_dispatch))}</td>
+          <td><span class="badge ${badge}">${mapping}</span></td>
+        </tr>`;
+      }).join(""):`<tr><td colspan="5"><div class="empty"><strong>No customer intelligence</strong>Product Intelligence has no customer history rows.</div></td></tr>`;
+    }
+  }
+
+  async function loadDashboardLinkedData(){
+    const [varianceResult,productResult]=await Promise.allSettled([
+      fetch(VARIANCE_API_URL,{cache:"no-store"}).then(async response=>{
+        const payload=await response.json().catch(()=>({}));
+        if(!response.ok) throw new Error(payload.details||payload.error||"Variance Management failed.");
+        return payload;
+      }),
+      fetch(PRODUCT_INTELLIGENCE_API_URL,{cache:"no-store"}).then(async response=>{
+        const payload=await response.json().catch(()=>({}));
+        if(!response.ok) throw new Error(payload.details||payload.error||"Product Intelligence failed.");
+        return payload;
+      })
+    ]);
+
+    if(varianceResult.status==="fulfilled") dashboardVarianceData=varianceResult.value;
+    if(productResult.status==="fulfilled") dashboardProductData=productResult.value;
+    renderDashboardLinkedData();
+  }
+
+  async function refreshDashboard({silent=false}={}){
+    const button=$("dashboardRefresh");
+    if(button){button.disabled=true;button.textContent="↻ Refreshing...";}
+    try{
+      await Promise.all([
+        refreshAzureHistory({silent:true}),
+        loadDashboardLinkedData()
+      ]);
+      updateDashboard();
+      if(!silent) toast("Dashboard refreshed.","success");
+    }catch(error){
+      if(!silent) toast(error.message||String(error),"error");
+    }finally{
+      if(button){button.disabled=false;button.textContent="↻ Refresh Dashboard";}
+    }
+  }
+
   function updateDashboard(){
     renderDashboardOverview();
     const history=getHistory(),latest=history.find(x=>["Pending Upload","Completed"].includes(x.status));
+    const previewTotals=dashboardPreviewTotals();
     $("homeRuns").textContent=formatNumber(history.length);
     $("homeSuccess").textContent=formatNumber(history.filter(x=>x.status==="Completed").length);
     $("homeInputRows").textContent=latest?formatNumber(latest.inputRows):"—";
-    $("homeAccept").textContent=latest?formatNumber(latest.accept):"—";
-    $("homeDispatch").textContent=latest?formatNumber(latest.dispatch):"—";
-    $("homeVariance").textContent=latest?formatNumber(latest.variance):"—";
+    $("homeAccept").textContent=formatNumber(previewTotals.accept);
+    $("homeDispatch").textContent=formatNumber(previewTotals.dispatch);
+    if(!(dashboardVarianceData?.summary)) $("homeVariance").textContent=formatNumber(previewTotals.variance);
     $("homeGenerated").textContent=latest?formatNumber(latest.generated):"—";
+    renderDashboardLinkedData();
+
     const list=$("recentActivity"); list.innerHTML="";
     history.slice(0,6).forEach(r=>{ const div=document.createElement("div"); div.className="activity"; div.innerHTML=`<div class="activity-icon" style="${r.status==="Failed"?"background:#fdecec;color:#d13438":""}">${r.status==="Failed"?"!":"✓"}</div><div><div class="activity-title">${r.status==="Failed"?"Reconciliation failed":"Reconciliation completed successfully"}</div><div class="activity-meta">${escapeHtml(r.runId)} · ${formatNumber(r.inputRows)} input rows</div></div><div class="activity-time">${new Date(r.timestamp).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})}</div>`; list.appendChild(div); });
     if(!history.length) list.innerHTML=`<div class="empty"><strong>No activity yet</strong>Run your first reconciliation to populate the dashboard.</div>`;
@@ -1920,7 +2022,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       }else uploads.innerHTML=`<div class="empty"><strong>No uploads yet</strong>Selected files will appear after a run.</div>`;
     }
   }
- 
+
   function renderReports(){
     const history=getHistory(),completed=history.filter(x=>x.status==="Completed"),latest=completed[0]||history.find(x=>x.status==="Pending Upload")||{};
     $("reportRuns").textContent=formatNumber(history.length);
@@ -1953,13 +2055,12 @@ Drug Traceability Reconciliation Platform</textarea></label>
   }
   $("healthButton").addEventListener("click",async()=>{ const ok=await checkHealth(); toast(ok?"Azure Function is healthy.":"Azure Function health check failed.",ok?"success":"error"); });
  
-  if($("dashboardDate")) $("dashboardDate").value=new Date().toISOString().slice(0,10);
-  if($("dashboardRefresh")) $("dashboardRefresh").addEventListener("click",()=>refreshAzureHistory());
+  if($("dashboardRefresh")) $("dashboardRefresh").addEventListener("click",()=>refreshDashboard());
   renderHistory();
   updateDashboard();
   renderReports();
   checkHealth();
-  refreshAzureHistory({silent:true});
+  refreshDashboard({silent:true});
  
   const initialPage = window.location.hash.replace(/^#/, "") || "home";
   navigate(initialPage, {skipHash:true, instant:true});
