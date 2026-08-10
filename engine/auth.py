@@ -7,6 +7,7 @@ import logging
 import os
 import secrets
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -33,6 +34,12 @@ logger = logging.getLogger("SFDA-Reconciliation.Auth")
 
 _AUTH_SCHEMA_READY = False
 _AUTH_SCHEMA_LOCK = threading.Lock()
+
+# Collapse the burst of identical session lookups created by parallel UI API
+# calls immediately after sign-in. SQL remains the source of truth.
+_SESSION_CACHE_TTL_SECONDS = 15
+_SESSION_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_SESSION_CACHE_LOCK = threading.Lock()
 
 
 def ensure_auth_schema() -> None:
@@ -298,6 +305,9 @@ def login_user(email: str, password: str) -> Tuple[Dict[str, Any], str, datetime
         expires_at=expires_at,
     )
     safe_user = {k: v for k, v in user.items() if k not in {"PasswordHash", "PasswordSalt", "ApprovalTokenHash"}}
+    token_hash = _token_hash(token)
+    with _SESSION_CACHE_LOCK:
+        _SESSION_CACHE[token_hash] = (time.monotonic(), dict(safe_user))
     return safe_user, token, expires_at
 
 
@@ -305,13 +315,31 @@ def session_user(token: str) -> Optional[Dict[str, Any]]:
     ensure_auth_schema()
     if not token:
         return None
-    return get_auth_session_user(_token_hash(token))
+
+    token_hash = _token_hash(token)
+    now = time.monotonic()
+
+    with _SESSION_CACHE_LOCK:
+        cached = _SESSION_CACHE.get(token_hash)
+        if cached and (now - cached[0]) < _SESSION_CACHE_TTL_SECONDS:
+            return dict(cached[1])
+        if cached:
+            _SESSION_CACHE.pop(token_hash, None)
+
+    user = get_auth_session_user(token_hash)
+    if user:
+        with _SESSION_CACHE_LOCK:
+            _SESSION_CACHE[token_hash] = (now, dict(user))
+    return user
 
 
 def logout_token(token: str) -> None:
     ensure_auth_schema()
     if token:
-        delete_auth_session(_token_hash(token))
+        token_hash = _token_hash(token)
+        with _SESSION_CACHE_LOCK:
+            _SESSION_CACHE.pop(token_hash, None)
+        delete_auth_session(token_hash)
 
 
 def admin_users() -> list[dict]:
