@@ -1341,6 +1341,97 @@ def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
         return error_response("Full Accept Reconciliation failed.", 500, str(exc))
 
 
+
+def _bootstrap_full_dispatch_ledger_from_history(limit: int = 250) -> Dict[str, int]:
+    """Reserve allocations from successful legacy Full Dispatch runs once.
+
+    Version 27 introduces a dedicated Full Dispatch consumption ledger. Older
+    successful Full Dispatch runs were archived before that ledger existed.
+    On the first run after upgrade, recover those allocations from their
+    archived Full_Dispatch_Reconciliation.xlsx files and reserve them so the
+    same historical WMS dispatch evidence is not proposed again.
+
+    Repeated legacy runs for the same customer/batch do not multiply the
+    reservation because the ledger MERGE uses one deterministic transaction key
+    and preserves the maximum submitted amount.
+    """
+    from engine.blob_storage import BlobStorage
+    from engine.database import (
+        get_full_dispatch_transaction_count,
+        list_reconciliation_runs,
+        save_full_dispatch_pending_transactions,
+    )
+
+    existing = get_full_dispatch_transaction_count()
+    if existing > 0:
+        return {
+            "bootstrapped_runs": 0,
+            "bootstrapped_transactions": 0,
+        }
+
+    storage = BlobStorage()
+    storage.initialize_containers()
+
+    bootstrapped_runs = 0
+    bootstrapped_transactions = 0
+
+    for run in list_reconciliation_runs(limit):
+        process_type = str(run.get("ProcessType") or "").strip().upper()
+        status = str(run.get("Status") or "").strip().upper()
+        run_number = str(run.get("RunNumber") or "").strip()
+
+        if process_type != "FULL_DISPATCH" or status != "COMPLETED" or not run_number:
+            continue
+
+        files = storage.list_all_run_files(run_number)
+        candidate = next(
+            (
+                file
+                for file in files
+                if str(file.get("category") or "").lower() == "output"
+                and str(file.get("file_name") or "").lower()
+                == "full_dispatch_reconciliation.xlsx"
+            ),
+            None,
+        )
+        if candidate is None:
+            continue
+
+        downloaded = storage.download_blob(
+            str(candidate.get("container") or ""),
+            str(candidate.get("blob_name") or ""),
+        )
+
+        try:
+            detail_frame = pd.read_excel(
+                io.BytesIO(downloaded["data"]),
+                engine="openpyxl",
+                header=1,
+                dtype=object,
+            )
+        except Exception:
+            logger.exception(
+                "Unable to recover legacy Full Dispatch detail file for %s",
+                run_number,
+            )
+            continue
+
+        if detail_frame.empty or "To Be Dispatch" not in detail_frame.columns:
+            continue
+
+        saved = save_full_dispatch_pending_transactions(
+            detail_frame.to_dict(orient="records"),
+            run_number,
+        )
+        bootstrapped_runs += 1
+        bootstrapped_transactions += int(saved)
+
+    return {
+        "bootstrapped_runs": bootstrapped_runs,
+        "bootstrapped_transactions": bootstrapped_transactions,
+    }
+
+
 @app.route(route="full-reconciliation/dispatch", methods=["GET", "POST"])
 def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "GET":
@@ -1363,11 +1454,15 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
         sfda_df = read_excel_bytes(sfda_name, sfda_bytes)
         from engine.database import (
             complete_reconciliation_run,
+            confirm_full_dispatch_transactions_from_sfda,
             create_reconciliation_run,
             get_batch_master_df,
             get_customer_history_df,
+            get_full_dispatch_confirmed_allocations,
+            replace_full_dispatch_sfda_baseline,
             replace_latest_inventory_snapshot,
             replace_latest_sfda_snapshot,
+            save_full_dispatch_pending_transactions,
             sync_batch_master_sfda_snapshot,
         )
         from engine.exporter import Exporter
@@ -1386,19 +1481,53 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
         run_created = True
 
         customer_history = get_customer_history_df()
+        if customer_history.empty:
+            raise ValueError("Customer History is empty. Complete Step 1 first.")
+
+        # First upgrade run only: reserve allocations from successful legacy
+        # Full Dispatch runs that pre-date the dedicated consumption ledger.
+        ledger_bootstrap = _bootstrap_full_dispatch_ledger_from_history()
+
+        # The latest SFDA report confirms prior Full Dispatch reservations only
+        # when it proves the movement. Confirmation is independent from WMS
+        # DispatchEvents; Full Reconciliation must never duplicate historical
+        # dispatch totals already present in Batch Master.
+        full_dispatch_confirmation = (
+            confirm_full_dispatch_transactions_from_sfda(
+                sfda_df,
+                sfda_name,
+            )
+        )
+        reserved_full_dispatch = get_full_dispatch_confirmed_allocations()
+
         replace_latest_inventory_snapshot(inventory_df, inventory_name)
         replace_latest_sfda_snapshot(sfda_df, sfda_name)
         batch_master_sync = sync_batch_master_sfda_snapshot(sfda_df)
         batch_master = get_batch_master_df()
-        if customer_history.empty:
-            raise ValueError("Customer History is empty. Complete Step 1 first.")
 
         result = FullReconciliationEngine(
             pd.DataFrame(), pd.DataFrame(), sfda_df
-        ).run_dispatch_reconciliation(inventory_df, sfda_df, customer_history)
+        ).run_dispatch_reconciliation(
+            inventory_df,
+            sfda_df,
+            customer_history,
+            reserved_full_dispatch,
+        )
         dispatch_details = result["dispatch_details"]
         summary_df = result["summary"]
         dispatch_upload = result["dispatch_upload"]
+
+        full_dispatch_pending_saved = 0
+        if not dispatch_upload.empty:
+            full_dispatch_pending_saved = save_full_dispatch_pending_transactions(
+                dispatch_upload.to_dict(orient="records"),
+                run_number,
+            )
+
+        # Current SFDA state becomes the proof baseline for the next Full
+        # Dispatch run. It does not change historical WMS dispatch totals.
+        replace_full_dispatch_sfda_baseline(sfda_df, sfda_name)
+
         outputs = {
             "batch_master": Exporter.build_formatted_excel_file(
                 df=batch_master,
@@ -1438,6 +1567,9 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
             ),
             "dispatch_allocation_rows": int(len(dispatch_upload)),
             "dispatch_files": len(outputs["dispatch_files"]),
+            "full_dispatch_pending_saved": int(full_dispatch_pending_saved),
+            "full_dispatch_confirmation": full_dispatch_confirmation,
+            "full_dispatch_ledger_bootstrap": ledger_bootstrap,
         }
 
         archived_files = save_run_archive(
