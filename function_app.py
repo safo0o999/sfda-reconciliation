@@ -378,7 +378,23 @@ def blob_run_to_history_row(
     process_type = str(
         data.get("process_type")
         or data.get("step")
-        or ("DISPATCH" if run_number.upper().startswith("DISPATCH") else "ACCEPT")
+        or (
+            "HISTORICAL_BUILD"
+            if run_number.upper().startswith("HISTORICAL")
+            else (
+                "FULL_DISPATCH"
+                if run_number.upper().startswith("FULL-DISPATCH")
+                else (
+                    "FULL_ACCEPT"
+                    if run_number.upper().startswith("FULL-ACCEPT")
+                    else (
+                        "DISPATCH"
+                        if run_number.upper().startswith("DISPATCH")
+                        else "ACCEPT"
+                    )
+                )
+            )
+        )
     ).upper()
 
     return {
@@ -409,6 +425,41 @@ def blob_run_to_history_row(
         "ErrorMessage": data.get("error_message", ""),
     }
 
+
+
+
+def historical_job_to_history_row(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert one HistoricalBuildJobs row to the unified History schema."""
+
+    manifest = job.get("input_manifest") or {}
+    summary = job.get("summary") or {}
+    output_manifest = job.get("output_manifest") or {}
+    output_files = output_manifest.get("files") or []
+
+    return {
+        "RunID": None,
+        "RunNumber": str(job.get("job_id", "")),
+        "ProcessType": "HISTORICAL_BUILD",
+        "Status": job.get("status", ""),
+        "StartedAt": job.get("started_at") or job.get("created_at"),
+        "CompletedAt": job.get("completed_at"),
+        "SubmittedBy": "Web User",
+        "ASNFiles": len(manifest.get("asn_files") or []),
+        "InventoryFiles": 0,
+        "DispatchFiles": len(manifest.get("dispatch_files") or []),
+        "SFDAFiles": len(manifest.get("sfda_files") or []),
+        "TotalInputRows": int(
+            summary.get("prepared_receipt_events", 0)
+            + summary.get("prepared_dispatch_events", 0)
+        ),
+        "MasterRecords": int(summary.get("batch_master_rows", 0)),
+        "AcceptRecords": 0,
+        "DispatchRecords": 0,
+        "ExceptionRecords": 0,
+        "GeneratedFiles": len(output_files),
+        "ApplicationVersion": APPLICATION_VERSION,
+        "ErrorMessage": job.get("error", ""),
+    }
 
 
 def _history_datetime_fields(
@@ -508,11 +559,26 @@ def blob_files_for_ui(run_number: str) -> List[Dict[str, Any]]:
 def history(req: func.HttpRequest) -> func.HttpResponse:
     try:
         from engine.blob_storage import BlobStorage
-        from engine.database import list_reconciliation_runs
+        from engine.database import (
+            list_historical_build_jobs,
+            list_reconciliation_runs,
+        )
 
         limit = int(req.params.get("limit", "500") or 500)
         rows = list_reconciliation_runs(limit)
-        known = {str(row.get("RunNumber", "")) for row in rows}
+
+        # Historical Data Builder jobs live in HistoricalBuildJobs, while Daily
+        # and Full Accept/Dispatch runs live in ReconciliationRuns. History must
+        # merge both sources instead of silently losing Full Reconciliation
+        # activity.
+        for job in list_historical_build_jobs(limit):
+            rows.append(historical_job_to_history_row(job))
+
+        known = {
+            str(row.get("RunNumber", "")).strip()
+            for row in rows
+            if str(row.get("RunNumber", "")).strip()
+        }
 
         storage = BlobStorage()
         storage.initialize_containers()
@@ -624,6 +690,16 @@ def history_run(req: func.HttpRequest) -> func.HttpResponse:
         )
 
         if not run:
+            try:
+                from engine.database import get_historical_build_job
+
+                run = historical_job_to_history_row(
+                    get_historical_build_job(run_number)
+                )
+            except KeyError:
+                run = None
+
+        if not run:
             metadata = load_blob_run_metadata(run_number)
             if not files and not metadata:
                 return error_response("Reconciliation run was not found.", 404)
@@ -679,9 +755,25 @@ def history_download(req: func.HttpRequest) -> func.HttpResponse:
             "output": OUTPUTS_CONTAINER,
             "metadata": METADATA_CONTAINER,
         }[category]
-        safe_name = BlobStorage.sanitize_file_name(file_name)
-        blob_name = f"{run_number}/{safe_name}"
-        downloaded = BlobStorage().download_blob(container_name, blob_name)
+        storage = BlobStorage()
+        safe_name = BlobStorage.sanitize_file_name(
+            str(file_name).split("/")[-1]
+        )
+
+        # Historical Data Builder inputs are stored under
+        # <run>/asn/<file>, <run>/dispatch/<file>, etc. Resolve the real BlobName
+        # from storage instead of assuming every file is directly under <run>/.
+        actual_blob_name = ""
+        for item in storage.list_all_run_files(run_number):
+            if (
+                str(item.get("category", "")).lower() == category.lower()
+                and str(item.get("file_name", "")) == file_name
+            ):
+                actual_blob_name = str(item.get("blob_name", ""))
+                break
+
+        blob_name = actual_blob_name or f"{run_number}/{BlobStorage.sanitize_file_name(file_name)}"
+        downloaded = storage.download_blob(container_name, blob_name)
 
         return func.HttpResponse(
             body=downloaded["data"],
@@ -990,6 +1082,100 @@ def historical_build_worker(
 
 
 
+
+def build_dashboard_preview(
+    report: pd.DataFrame,
+    mode: str,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """Return only currently actionable rows for the Home overview.
+
+    The browser previously kept an old localStorage preview forever, so a later
+    successful Dispatch could still show obsolete pending rows. Every completed
+    run now replaces that preview with rows from the current result only.
+    """
+
+    if report is None or report.empty:
+        return []
+
+    frame = report.copy()
+    if str(mode).lower() in {"dispatch", "full_dispatch"}:
+        action_column = (
+            "Allocated To Be Dispatch"
+            if "Allocated To Be Dispatch" in frame.columns
+            else "To Be Dispatch"
+        )
+    else:
+        action_column = "To Be Accept"
+
+    if action_column in frame.columns:
+        action = pd.to_numeric(
+            frame[action_column],
+            errors="coerce",
+        ).fillna(0)
+        frame = frame.loc[action.gt(0)].copy()
+
+    if frame.empty:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for record in frame.head(max(1, int(limit))).to_dict(orient="records"):
+        to_be_dispatch = record.get(
+            "Allocated To Be Dispatch",
+            record.get("To Be Dispatch", 0),
+        )
+        status = (
+            "Dispatch Pending"
+            if pd.to_numeric(
+                pd.Series([to_be_dispatch]),
+                errors="coerce",
+            ).fillna(0).iloc[0] > 0
+            else (
+                "Accept Pending"
+                if pd.to_numeric(
+                    pd.Series([record.get("To Be Accept", 0)]),
+                    errors="coerce",
+                ).fillna(0).iloc[0] > 0
+                else "OK"
+            )
+        )
+        rows.append(
+            {
+                "BN": record.get("BN"),
+                "Expiry Date": record.get("Expiry Date"),
+                "GTIN": record.get("GTIN"),
+                "Drug Name": record.get("Drug Name"),
+                "Active": record.get(
+                    "Active",
+                    record.get("SFDA Active"),
+                ),
+                "Quantity Sent Pending": record.get(
+                    "Quantity sent pending",
+                    record.get("Quantity Sent Pending"),
+                ),
+                "Quantity Receive Pending": record.get(
+                    "Quantity Receive Pending"
+                ),
+                "Receiving": record.get(
+                    "Received Quantity Pack",
+                    record.get("Historical Received Quantity Pack"),
+                ),
+                "To Be Accept": record.get("To Be Accept", 0),
+                "Inventory": record.get(
+                    "Current Inventory Quantity Pack",
+                    record.get("Inventory"),
+                ),
+                "Variance": record.get(
+                    "Quantity Difference",
+                    record.get("Supplier Variance"),
+                ),
+                "To Be Dispatch": to_be_dispatch,
+                "Status": status,
+            }
+        )
+    return rows
+
+
 @app.route(route="full-reconciliation/accept", methods=["GET", "POST"])
 def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "GET":
@@ -1003,7 +1189,7 @@ def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
         if sfda_file is None:
             return error_response("Latest SFDA file is required for Full Accept Reconciliation.")
 
-        sfda_name, sfda_bytes, _ = read_uploaded_bytes(sfda_file)
+        sfda_name, sfda_bytes, sfda_content_type = read_uploaded_bytes(sfda_file)
         sfda_df = read_excel_bytes(sfda_name, sfda_bytes)
         from engine.database import (
             complete_reconciliation_run,
@@ -1011,6 +1197,7 @@ def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
             get_batch_master_df,
             get_supplier_history_df,
             replace_latest_sfda_snapshot,
+            sync_batch_master_sfda_snapshot,
         )
         from engine.exporter import Exporter
         from engine.full_reconciliation import FullReconciliationEngine
@@ -1033,6 +1220,11 @@ def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
         if batch_master.empty:
             raise ValueError("Historical Batch Master is empty. Complete Step 1 first.")
 
+        # Keep persisted Batch Master aligned with the same latest SFDA snapshot
+        # used by Product Intelligence and Full Accept.
+        batch_master_sync = sync_batch_master_sfda_snapshot(sfda_df)
+        batch_master = get_batch_master_df()
+
         result = FullReconciliationEngine(
             pd.DataFrame(), pd.DataFrame(), sfda_df
         ).run_accept_reconciliation(sfda_df, batch_master, supplier_history)
@@ -1040,6 +1232,18 @@ def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
         supplier_variance = result["supplier_variance"]
         accept_upload = result["accept_upload"]
         outputs = {
+            "batch_master": Exporter.build_formatted_excel_file(
+                df=batch_master,
+                file_name="Batch_Master.xlsx",
+                sheet_name="Batch Master",
+                title="SFDA Historical Batch Master",
+                columns=[
+                    column
+                    for column in Exporter.BATCH_MASTER_COLUMNS
+                    if column in batch_master.columns
+                ],
+                sort_columns=["Generic Item Number", "BN", "Expiry Date"],
+            ),
             "accept_details": Exporter.build_formatted_excel_file(
                 df=accept_details,
                 file_name="Full_Accept_Reconciliation.xlsx",
@@ -1060,10 +1264,32 @@ def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
                 accept_upload, "To Be Accept", "SFDA_Full_Accept"
             ),
         }
-        generated_files = sum(
-            len(group) if isinstance(group, dict) else 0
-            for group in outputs.values()
+        summary = {
+            "sfda_rows": int(len(sfda_df)),
+            "batch_master_rows": int(len(batch_master)),
+            "batch_master_sfda_rows_updated": int(
+                batch_master_sync.get("updated_rows", 0)
+            ),
+            "accept_rows": int(len(accept_upload)),
+            "supplier_variance_rows": int(len(supplier_variance)),
+            "accept_files": len(outputs["accept_files"]),
+        }
+
+        archived_files = save_run_archive(
+            run_number=run_number,
+            mode="FULL_ACCEPT",
+            input_files=[
+                {
+                    "file_name": sfda_name,
+                    "data": sfda_bytes,
+                    "content_type": sfda_content_type,
+                }
+            ],
+            outputs=outputs,
+            summary=summary,
+            submitted_by=submitted_by,
         )
+
         complete_reconciliation_run(
             run_number=run_number,
             status="Completed",
@@ -1072,19 +1298,20 @@ def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
             accept_records=int(len(accept_upload)),
             dispatch_records=0,
             exception_records=int(len(supplier_variance)),
-            generated_files=generated_files,
+            generated_files=archived_files,
         )
+        summary["archived_files"] = archived_files
+
         return json_response({
             "status": "Completed",
             "step": "full-accept",
             "run_number": run_number,
             "outputs": outputs,
-            "summary": {
-                "sfda_rows": int(len(sfda_df)),
-                "accept_rows": int(len(accept_upload)),
-                "supplier_variance_rows": int(len(supplier_variance)),
-                "accept_files": len(outputs["accept_files"]),
-            },
+            "summary": summary,
+            "dashboard_preview": build_dashboard_preview(
+                accept_details,
+                "accept",
+            ),
         })
     except ValueError as exc:
         logger.exception("Full Accept validation failed")
@@ -1130,16 +1357,18 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
         if sfda_file is None:
             return error_response("Updated SFDA file is required for Full Dispatch Reconciliation.")
 
-        inventory_name, inventory_bytes, _ = read_uploaded_bytes(inventory_file)
-        sfda_name, sfda_bytes, _ = read_uploaded_bytes(sfda_file)
+        inventory_name, inventory_bytes, inventory_content_type = read_uploaded_bytes(inventory_file)
+        sfda_name, sfda_bytes, sfda_content_type = read_uploaded_bytes(sfda_file)
         inventory_df = read_excel_bytes(inventory_name, inventory_bytes)
         sfda_df = read_excel_bytes(sfda_name, sfda_bytes)
         from engine.database import (
             complete_reconciliation_run,
             create_reconciliation_run,
+            get_batch_master_df,
             get_customer_history_df,
             replace_latest_inventory_snapshot,
             replace_latest_sfda_snapshot,
+            sync_batch_master_sfda_snapshot,
         )
         from engine.exporter import Exporter
         from engine.full_reconciliation import FullReconciliationEngine
@@ -1159,6 +1388,8 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
         customer_history = get_customer_history_df()
         replace_latest_inventory_snapshot(inventory_df, inventory_name)
         replace_latest_sfda_snapshot(sfda_df, sfda_name)
+        batch_master_sync = sync_batch_master_sfda_snapshot(sfda_df)
+        batch_master = get_batch_master_df()
         if customer_history.empty:
             raise ValueError("Customer History is empty. Complete Step 1 first.")
 
@@ -1169,6 +1400,18 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
         summary_df = result["summary"]
         dispatch_upload = result["dispatch_upload"]
         outputs = {
+            "batch_master": Exporter.build_formatted_excel_file(
+                df=batch_master,
+                file_name="Batch_Master.xlsx",
+                sheet_name="Batch Master",
+                title="SFDA Historical Batch Master",
+                columns=[
+                    column
+                    for column in Exporter.BATCH_MASTER_COLUMNS
+                    if column in batch_master.columns
+                ],
+                sort_columns=["Generic Item Number", "BN", "Expiry Date"],
+            ),
             "dispatch_details": Exporter.build_formatted_excel_file(
                 df=dispatch_details,
                 file_name="Full_Dispatch_Reconciliation.xlsx",
@@ -1186,31 +1429,59 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
             ),
             "dispatch_files": Exporter.build_dispatch_files_by_customer(dispatch_upload),
         }
-        generated_files = sum(
-            len(group) if isinstance(group, dict) else 0
-            for group in outputs.values()
+        summary = {
+            "inventory_rows": int(len(inventory_df)),
+            "sfda_rows": int(len(sfda_df)),
+            "batch_master_rows": int(len(batch_master)),
+            "batch_master_sfda_rows_updated": int(
+                batch_master_sync.get("updated_rows", 0)
+            ),
+            "dispatch_allocation_rows": int(len(dispatch_upload)),
+            "dispatch_files": len(outputs["dispatch_files"]),
+        }
+
+        archived_files = save_run_archive(
+            run_number=run_number,
+            mode="FULL_DISPATCH",
+            input_files=[
+                {
+                    "file_name": inventory_name,
+                    "data": inventory_bytes,
+                    "content_type": inventory_content_type,
+                },
+                {
+                    "file_name": sfda_name,
+                    "data": sfda_bytes,
+                    "content_type": sfda_content_type,
+                },
+            ],
+            outputs=outputs,
+            summary=summary,
+            submitted_by=submitted_by,
         )
+
         complete_reconciliation_run(
             run_number=run_number,
             status="Completed",
             total_input_rows=int(len(inventory_df) + len(sfda_df)),
-            master_records=0,
+            master_records=int(len(batch_master)),
             accept_records=0,
             dispatch_records=int(len(dispatch_upload)),
             exception_records=0,
-            generated_files=generated_files,
+            generated_files=archived_files,
         )
+        summary["archived_files"] = archived_files
+
         return json_response({
             "status": "Completed",
             "step": "full-dispatch",
             "run_number": run_number,
             "outputs": outputs,
-            "summary": {
-                "inventory_rows": int(len(inventory_df)),
-                "sfda_rows": int(len(sfda_df)),
-                "dispatch_allocation_rows": int(len(dispatch_upload)),
-                "dispatch_files": len(outputs["dispatch_files"]),
-            },
+            "summary": summary,
+            "dashboard_preview": build_dashboard_preview(
+                dispatch_details,
+                "dispatch",
+            ),
         })
     except ValueError as exc:
         logger.exception("Full Dispatch validation failed")
@@ -2015,6 +2286,10 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
                 "step": mode,
                 "summary": summary,
                 "outputs": outputs,
+                "dashboard_preview": build_dashboard_preview(
+                    report,
+                    mode,
+                ),
             }
         )
     except ValueError as exc:
