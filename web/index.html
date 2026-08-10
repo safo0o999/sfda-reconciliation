@@ -2253,14 +2253,18 @@ Drug Traceability Reconciliation Platform</textarea></label>
     renderDashboardLinkedData();
   }
 
-  async function refreshDashboard({silent=false}={}){
+  async function refreshDashboard({silent=false,includeLinked=true}={}){
     const button=$("dashboardRefresh");
     if(button){button.disabled=true;button.textContent="↻ Refreshing...";}
     try{
-      await Promise.all([
-        refreshAzureHistory({silent:true}),
-        loadDashboardLinkedData()
-      ]);
+      if(includeLinked){
+        await Promise.all([
+          refreshAzureHistory({silent:true}),
+          loadDashboardLinkedData()
+        ]);
+      }else{
+        await refreshAzureHistory({silent:true});
+      }
       updateDashboard();
       if(!silent) toast("Dashboard refreshed.","success");
     }catch(error){
@@ -3342,24 +3346,32 @@ Drug Traceability Reconciliation Platform</textarea></label>
 
   async function startApplication(){
     if(applicationStarted){
-      await refreshDashboard({silent:true});
+      Promise.resolve(refreshDashboard({silent:true,includeLinked:false}))
+        .catch(error=>console.error("Background dashboard refresh failed",error));
       return;
     }
+
     applicationStarted=true;
     renderHistory();
     updateDashboard();
     renderReports();
-    await checkHealth();
-    try{
-      await Promise.all([
-        refreshDashboard({silent:true}),
-        refreshHistoricalStatus({silent:true})
-      ]);
-    }catch(error){
-      console.error("Initial application refresh failed",error);
-    }
+
+    // Navigate immediately after authentication. Heavy analytical datasets
+    // now load in the background instead of blocking the whole application.
     const initialPage=window.location.hash.replace(/^#/,"")||"home";
     navigate(initialPage,{skipHash:true,instant:true});
+
+    Promise.resolve(checkHealth())
+      .catch(error=>console.error("Health check failed",error));
+
+    Promise.allSettled([
+      refreshDashboard({silent:true,includeLinked:false}),
+      refreshHistoricalStatus({silent:true})
+    ]).then(()=>{
+      return loadDashboardLinkedData();
+    }).catch(error=>{
+      console.error("Initial background refresh failed",error);
+    });
   }
 
   $("showRegisterButton")?.addEventListener("click",()=>showAuthPanel("register"));
