@@ -1643,6 +1643,20 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }
   }
  
+  async function waitForReconciliationJob(statusUrl){
+    if(!statusUrl) throw new Error("Background job status URL was not returned.");
+    while(true){
+      await new Promise(resolve=>setTimeout(resolve,2500));
+      const response=await fetch(statusUrl,{cache:"no-store",credentials:"same-origin"});
+      const payload=await response.json().catch(()=>({}));
+      if(!response.ok||payload.status==="Failed") throw new Error(payload.details||payload.error||`Unable to read background job status (HTTP ${response.status}).`);
+      const job=payload.job||{};
+      const status=String(job.status||"").toLowerCase();
+      if(status==="completed") return job.result||{};
+      if(status==="failed") throw new Error(job.error||"Background reconciliation failed.");
+    }
+  }
+
   async function runStage({formId,items,buttonId,url,label}){
     clearStatus(); $("summaryPanel").classList.remove("show");
     const button=$(buttonId);
@@ -1653,6 +1667,11 @@ Drug Traceability Reconciliation Platform</textarea></label>
       const response=await fetch(url,{method:"POST",body:formData});
       let result; try{ result=await response.json(); }catch{ throw new Error(`The server returned HTTP ${response.status} without valid JSON.`); }
       if(!response.ok||result.status==="Failed") throw new Error(result.error||result.message||`Request failed with HTTP ${response.status}.`);
+      if(String(result.status||"").toLowerCase()==="accepted"){
+        setStatus("info",`${label} files uploaded. Processing continues in the background...`);
+        result=await waitForReconciliationJob(result.status_url);
+      }
+      if(!result||String(result.status||"").toLowerCase()==="failed") throw new Error(result?.details||result?.error||`${label} reconciliation failed.`);
       currentResult=result; finishProgress(label,true); setStatus("success",`${label} files generated successfully.`);
       localStorage.setItem(
         DASHBOARD_PREVIEW_KEY,
@@ -2836,7 +2855,11 @@ Drug Traceability Reconciliation Platform</textarea></label>
     startSetupProgress("accept");
     try{
       const response=await fetch("/api/full-reconciliation/accept",{method:"POST",body:formData,cache:"no-store"});
-      const result=await parseApiResponse(response);
+      let result=await parseApiResponse(response);
+      if(String(result.status||"").toLowerCase()==="accepted"){
+        configureProgress("accept",12,"Full Accept queued; processing in background...");
+        result=await waitForReconciliationJob(result.status_url);
+      }
       finishSetupProgress("accept",true);
       const batchMasterFiles=collectOutputFiles({batch_master:result.outputs?.batch_master});
       const excelFiles=collectOutputFiles({accept_details:result.outputs?.accept_details,supplier_variance:result.outputs?.supplier_variance});
@@ -2877,7 +2900,11 @@ Drug Traceability Reconciliation Platform</textarea></label>
     startSetupProgress("dispatch");
     try{
       const response=await fetch("/api/full-reconciliation/dispatch",{method:"POST",body:formData,cache:"no-store"});
-      const result=await parseApiResponse(response);
+      let result=await parseApiResponse(response);
+      if(String(result.status||"").toLowerCase()==="accepted"){
+        configureProgress("dispatch",12,"Full Dispatch queued; processing in background...");
+        result=await waitForReconciliationJob(result.status_url);
+      }
       finishSetupProgress("dispatch",true);
       const batchMasterFiles=collectOutputFiles({batch_master:result.outputs?.batch_master});
       const excelFiles=collectOutputFiles({dispatch_details:result.outputs?.dispatch_details,summary:result.outputs?.summary});
