@@ -19,7 +19,7 @@
       "batchSize": 1,
       "newBatchThreshold": 0,
       "maxDequeueCount": 3,
-      "messageEncoding": "none"
+      "messageEncoding": "base64"
     }
   },
   "functionTimeout": "00:30:00"
