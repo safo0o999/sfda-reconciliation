@@ -2723,7 +2723,6 @@ def save_dispatch_pending_transactions(
             UPDATE SET
                 BN = source.BN,
                 ExpiryDate = source.ExpiryDate,
-                ExpiryMonthKey = source.ExpiryMonthKey,
                 GenericItemNumber = source.GenericItemNumber,
                 ReferenceNumber = source.ReferenceNumber,
                 ReferenceLine = source.ReferenceLine,
