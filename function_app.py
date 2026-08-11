@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import azure.functions as func
 import pandas as pd
 from azure.core.exceptions import ResourceExistsError
-from azure.storage.queue import QueueClient
+from azure.storage.queue import QueueClient, TextBase64EncodePolicy
 
 
 logger = logging.getLogger("SFDA-Reconciliation")
@@ -1233,6 +1233,7 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
         queue = QueueClient.from_connection_string(
             connection_string,
             "historical-build-jobs",
+            message_encode_policy=TextBase64EncodePolicy(),
         )
 
         try:
