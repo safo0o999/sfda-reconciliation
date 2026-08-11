@@ -1320,9 +1320,14 @@ def create_historical_build_job(
 
     initialize_database()
 
+    from engine.warehouse_context import current_warehouse_id
+
+    warehouse_id = int(current_warehouse_id())
+
     sql = r"""
         INSERT INTO dbo.HistoricalBuildJobs
         (
+            WarehouseID,
             JobID,
             Operation,
             Status,
@@ -1331,7 +1336,7 @@ def create_historical_build_job(
             InputManifestJson,
             UpdatedAt
         )
-        VALUES (?, ?, 'Queued', 0, 'Queued for processing', ?, SYSUTCDATETIME());
+        VALUES (?, ?, ?, 'Queued', 0, 'Queued for processing', ?, SYSUTCDATETIME());
     """
 
     with Database().connect() as connection:
@@ -1340,6 +1345,7 @@ def create_historical_build_job(
             cursor.execute(
                 sql,
                 (
+                    warehouse_id,
                     str(job_id),
                     str(operation),
                     json.dumps(
