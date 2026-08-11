@@ -1275,7 +1275,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   const AUTH_LOGIN_URL = "/api/auth/login";
   const AUTH_REGISTER_URL = "/api/auth/register";
   const AUTH_LOGOUT_URL = "/api/auth/logout";
-  const ADMIN_USERS_URL = "/api/admin/users";
+  const ADMIN_USERS_URL = "/api/user-management/users";
   const DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v2";
   let currentResult = null;
   let progressTimer = null;
@@ -3331,7 +3331,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       const id=button.dataset.userId,status=button.dataset.status;
       button.disabled=true;
       try{
-        const response=await fetch(`/api/admin/users/${encodeURIComponent(id)}/status`,{
+        const response=await fetch(`/api/user-management/users/${encodeURIComponent(id)}/status`,{
           method:"POST",credentials:"same-origin",
           headers:{"Content-Type":"application/json"},
           body:JSON.stringify({status})
