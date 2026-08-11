@@ -249,6 +249,43 @@ class BlobStorage:
         return sorted(run_numbers, reverse=True)[: max(1, int(limit))]
 
 
+    def write_background_job_status(
+        self,
+        job_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Persist warehouse-scoped status/result for an async reconciliation job."""
+        import json
+
+        safe_job_id = self.sanitize_file_name(job_id)
+        data = json.dumps(
+            payload,
+            ensure_ascii=False,
+            default=str,
+            allow_nan=False,
+        ).encode("utf-8")
+        return self.upload_bytes(
+            METADATA_CONTAINER,
+            self.scoped_blob_name(f"background-jobs/{safe_job_id}.json"),
+            data,
+            "application/json; charset=utf-8",
+            {"job_id": safe_job_id, "category": "background-job-status"},
+        )
+
+    def read_background_job_status(self, job_id: str) -> Dict[str, Any]:
+        """Read one warehouse-scoped async reconciliation job status."""
+        import json
+
+        safe_job_id = self.sanitize_file_name(job_id)
+        downloaded = self.download_blob(
+            METADATA_CONTAINER,
+            self.scoped_blob_name(f"background-jobs/{safe_job_id}.json"),
+        )
+        parsed = json.loads(downloaded["data"].decode("utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError("Background job status is invalid.")
+        return parsed
+
     def upload_job_input(
         self,
         job_id: str,
