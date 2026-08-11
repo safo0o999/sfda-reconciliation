@@ -217,7 +217,17 @@ jobs:
                   continue
 
               route = getattr(binding, "route", None) or ""
-              methods = tuple(sorted(getattr(binding, "methods", None) or []))
+              raw_methods = getattr(binding, "methods", None) or []
+              methods = tuple(
+                  sorted(
+                      (
+                          getattr(method, "value", None)
+                          or getattr(method, "name", None)
+                          or str(method)
+                      ).upper()
+                      for method in raw_methods
+                  )
+              )
               discovered[route] = {
                   "name": name,
                   "methods": methods,
