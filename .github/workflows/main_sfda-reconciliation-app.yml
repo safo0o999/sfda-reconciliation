@@ -185,6 +185,104 @@ jobs:
           )
           PY
 
+      - name: Validate registered Azure Function routes
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import pathlib
+          import sys
+
+          workspace = pathlib.Path.cwd().resolve()
+          if str(workspace) not in sys.path:
+              sys.path.insert(0, str(workspace))
+
+          import function_app
+
+          app = function_app.app
+          functions = app.get_functions()
+
+          discovered = {}
+          for fn in functions:
+              name = fn.get_function_name()
+              binding = next(
+                  (
+                      b
+                      for b in fn.get_bindings()
+                      if getattr(b, "type", None) == "httpTrigger"
+                  ),
+                  None,
+              )
+              if binding is None:
+                  continue
+
+              route = getattr(binding, "route", None) or ""
+              methods = tuple(sorted(getattr(binding, "methods", None) or []))
+              discovered[route] = {
+                  "name": name,
+                  "methods": methods,
+              }
+
+          print("Discovered HTTP routes:")
+          for route in sorted(discovered):
+              item = discovered[route]
+              print(
+                  f" - {route or '<root>'} "
+                  f"[{', '.join(item['methods'])}] "
+                  f"-> {item['name']}"
+              )
+
+          required = {
+              "health": {"GET"},
+              "version": {"GET"},
+              "auth/status": {"GET"},
+              "auth/register": {"POST"},
+              "auth/login": {"POST"},
+              "auth/logout": {"POST"},
+              "auth/me": {"GET"},
+              "admin/users": {"GET"},
+              "admin/users/{user_id}/status": {"POST"},
+              "history": {"GET"},
+              "historical/status": {"GET"},
+              "batch-master/build": {"GET", "POST"},
+              "full-reconciliation/accept": {"GET", "POST"},
+              "full-reconciliation/dispatch": {"GET", "POST"},
+              "variance-management": {"GET"},
+              "product-intelligence": {"GET"},
+              "process-accept": {"GET", "POST"},
+              "process-dispatch": {"GET", "POST"},
+              "reconcile": {"GET", "POST"},
+              "ui": {"GET"},
+          }
+
+          problems = []
+
+          for route, expected_methods in required.items():
+              item = discovered.get(route)
+              if item is None:
+                  problems.append(f"MISSING route: {route}")
+                  continue
+
+              actual_methods = set(item["methods"])
+              missing_methods = expected_methods - actual_methods
+              if missing_methods:
+                  problems.append(
+                      f"Route {route} is missing methods: "
+                      + ", ".join(sorted(missing_methods))
+                  )
+
+          if problems:
+              print("\nCRITICAL ROUTE VALIDATION FAILED:")
+              for problem in problems:
+                  print(" -", problem)
+              raise SystemExit(1)
+
+          print(
+              f"\nCritical route validation PASSED. "
+              f"{len(functions)} Azure Functions discovered."
+          )
+          PY
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
