@@ -772,7 +772,7 @@ def auth_me(req: func.HttpRequest) -> func.HttpResponse:
     return json_response({"status": "Success", "user": user})
 
 
-@app.route(route="admin/users", methods=["GET"])
+@app.route(route="user-management/users", methods=["GET"])
 def admin_users_route(req: func.HttpRequest) -> func.HttpResponse:
     denied = _auth_guard(req, admin=True)
     if denied:
@@ -789,7 +789,7 @@ def admin_users_route(req: func.HttpRequest) -> func.HttpResponse:
         return error_response("Unable to load users.", 500, str(exc))
 
 
-@app.route(route="admin/users/{user_id}/status", methods=["POST"])
+@app.route(route="user-management/users/{user_id}/status", methods=["POST"])
 def admin_user_status_route(req: func.HttpRequest) -> func.HttpResponse:
     denied = _auth_guard(req, admin=True)
     if denied:
