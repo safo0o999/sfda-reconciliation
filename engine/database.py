@@ -29,11 +29,30 @@ class Database:
 
     def connect(self):
         from engine.warehouse_context import current_warehouse_id
+
+        warehouse_id = int(current_warehouse_id())
+        if warehouse_id < 1:
+            raise RuntimeError(
+                "A valid WarehouseID is required before opening the SQL connection."
+            )
+
         connection = pyodbc.connect(self.connection_string, autocommit=False)
-        connection.cursor().execute(
+        cursor = connection.cursor()
+        cursor.execute(
             "EXEC sys.sp_set_session_context @key=N'WarehouseID', @value=?;",
-            int(current_warehouse_id()),
+            warehouse_id,
         )
+
+        applied_warehouse_id = cursor.execute(
+            "SELECT TRY_CONVERT(int, SESSION_CONTEXT(N'WarehouseID'));"
+        ).fetchone()[0]
+
+        if int(applied_warehouse_id or 0) != warehouse_id:
+            connection.close()
+            raise RuntimeError(
+                "SQL warehouse session context could not be established safely."
+            )
+
         return connection
 
 
@@ -342,6 +361,24 @@ def _text_with_fallback(
     return _text(row, fallback_name, default)
 
 
+def _warehouse_scoped_key(value: str) -> str:
+    """Namespace deterministic keys for non-Madinah warehouses.
+
+    Warehouse 1 keeps the historical key format unchanged so existing Madinah
+    de-duplication remains stable. New warehouses receive a warehouse prefix,
+    preventing global key collisions in legacy single-warehouse tables.
+    """
+    from engine.warehouse_context import current_warehouse_id
+
+    key = str(value or "").strip()
+    warehouse_id = int(current_warehouse_id())
+
+    if not key or warehouse_id == 1:
+        return key
+
+    return f"W{warehouse_id}:{key}"
+
+
 def _validate_event_identity(
     event_key: str,
     bn: str,
@@ -367,7 +404,7 @@ def _validate_event_identity(
 
 
 def _receipt_parameters(row: Dict[str, Any]) -> Tuple[Any, ...]:
-    event_key = _text(row, "Event Key")
+    event_key = _warehouse_scoped_key(_text(row, "Event Key"))
     bn = _text(row, "BN")
     expiry_month_key = _text(row, "Expiry Month Key")
     generic_item_number = _text(row, "Generic Item Number")
@@ -399,7 +436,7 @@ def _receipt_parameters(row: Dict[str, Any]) -> Tuple[Any, ...]:
 
 
 def _dispatch_parameters(row: Dict[str, Any]) -> Tuple[Any, ...]:
-    event_key = _text(row, "Event Key")
+    event_key = _warehouse_scoped_key(_text(row, "Event Key"))
     bn = _text(row, "BN")
     expiry_month_key = _text(row, "Expiry Month Key")
     generic_item_number = _text(row, "Generic Item Number")
@@ -2028,7 +2065,7 @@ def _daily_transaction_key(process_type: str, row: Dict[str, Any]) -> str:
     for name in preferred:
         value = _value(row, name, "")
         parts.append(str(value or "").strip().upper())
-    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+    return _warehouse_scoped_key(hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest())
 
 
 def _daily_processed_transaction_columns(
@@ -3095,7 +3132,7 @@ def _full_dispatch_transaction_key(
             str(gln or "").strip(),
         ]
     )
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return _warehouse_scoped_key(hashlib.sha256(raw.encode("utf-8")).hexdigest())
 
 
 def get_full_dispatch_confirmed_allocations() -> pd.DataFrame:
