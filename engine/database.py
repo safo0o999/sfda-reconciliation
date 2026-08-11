@@ -2293,6 +2293,11 @@ def save_accept_pending_transactions(
                 "Transaction Key": key,
                 "BN": _text(row, "BN"),
                 "Expiry Date": _value(row, "Expiry Date"),
+                "ExpiryMonthKey": (
+                    ""
+                    if pd.isna(pd.to_datetime(_value(row, "Expiry Date"), errors="coerce"))
+                    else pd.to_datetime(_value(row, "Expiry Date"), errors="coerce").strftime("%Y-%m")
+                ),
                 "Generic Item Number": _text(row, "Generic Item Number"),
                 "Reference Number": _text(row, "Reference Number"),
                 "Reference Line": _text(row, "Reference Line"),
@@ -2314,6 +2319,7 @@ def save_accept_pending_transactions(
                 ? AS TransactionKey,
                 ? AS BN,
                 ? AS ExpiryDate,
+                ? AS ExpiryMonthKey,
                 ? AS GenericItemNumber,
                 ? AS ReferenceNumber,
                 ? AS ReferenceLine,
@@ -2347,8 +2353,8 @@ def save_accept_pending_transactions(
         WHEN NOT MATCHED THEN
             INSERT
             (
-                TransactionKey, BN, ExpiryDate, GenericItemNumber,
-                ReferenceNumber, ReferenceLine,
+                TransactionKey, BN, ExpiryDate, ExpiryMonthKey,
+                GenericItemNumber, ReferenceNumber, ReferenceLine,
                 SubmittedQuantityEach, SubmittedQuantityPack,
                 ConfirmedQuantityEach, ConfirmedQuantityPack,
                 FirstSubmittedRun, LastSubmittedRun
@@ -2356,7 +2362,8 @@ def save_accept_pending_transactions(
             VALUES
             (
                 source.TransactionKey, source.BN, source.ExpiryDate,
-                source.GenericItemNumber, source.ReferenceNumber,
+                source.ExpiryMonthKey, source.GenericItemNumber,
+                source.ReferenceNumber,
                 source.ReferenceLine, source.NewQuantityEach,
                 source.NewQuantityPack, 0, 0, source.RunNumber, source.RunNumber
             );
@@ -2371,9 +2378,9 @@ def save_accept_pending_transactions(
                     sql,
                     (
                         row["Transaction Key"], row["BN"], row["Expiry Date"],
-                        row["Generic Item Number"], row["Reference Number"],
-                        row["Reference Line"], row["Each"], row["Pack"],
-                        str(run_number),
+                        row["ExpiryMonthKey"], row["Generic Item Number"],
+                        row["Reference Number"], row["Reference Line"],
+                        row["Each"], row["Pack"], str(run_number),
                     ),
                 )
                 saved += 1
