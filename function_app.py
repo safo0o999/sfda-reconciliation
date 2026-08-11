@@ -1248,6 +1248,18 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
                     "job_id": job_id,
                     "operation": operation,
                     "input_manifest": manifest,
+                    "warehouse_id": int(
+                        __import__(
+                            "engine.warehouse_context",
+                            fromlist=["current_warehouse_id"],
+                        ).current_warehouse_id()
+                    ),
+                    "warehouse_name": str(
+                        __import__(
+                            "engine.warehouse_context",
+                            fromlist=["current_warehouse_name"],
+                        ).current_warehouse_name()
+                    ),
                 },
                 ensure_ascii=False,
             )
@@ -1351,19 +1363,52 @@ def historical_build_worker(
         payload.get("operation", "append")
     ).strip().lower()
     input_manifest = payload.get("input_manifest") or {}
+    warehouse_id_raw = payload.get("warehouse_id")
+    warehouse_name = str(
+        payload.get("warehouse_name", "")
+    ).strip()
 
     if not job_id:
         raise ValueError(
             "Historical build queue message is missing job_id."
         )
 
-    from engine.historical_jobs import process_historical_build_job
+    if warehouse_id_raw in (None, ""):
+        raise ValueError(
+            "Historical build queue message is missing warehouse_id. "
+            "The job was rejected to prevent cross-warehouse processing."
+        )
 
-    process_historical_build_job(
-        job_id,
-        input_manifest,
-        operation,
-    )
+    try:
+        warehouse_id = int(warehouse_id_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Historical build queue message has an invalid warehouse_id."
+        ) from exc
+
+    if warehouse_id < 1:
+        raise ValueError(
+            "Historical build queue message has an invalid warehouse_id."
+        )
+
+    from engine.historical_jobs import process_historical_build_job
+    from engine.warehouse_context import warehouse_scope
+
+    with warehouse_scope(
+        warehouse_id,
+        warehouse_name or f"Warehouse {warehouse_id}",
+    ):
+        logger.info(
+            "Historical build worker scoped to WarehouseID=%s (%s), job_id=%s",
+            warehouse_id,
+            warehouse_name or f"Warehouse {warehouse_id}",
+            job_id,
+        )
+        process_historical_build_job(
+            job_id,
+            input_manifest,
+            operation,
+        )
 
 
 
