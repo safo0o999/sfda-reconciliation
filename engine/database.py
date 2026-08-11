@@ -362,12 +362,16 @@ def _text_with_fallback(
 
 
 def _warehouse_scoped_key(value: str) -> str:
-    """Namespace deterministic keys for non-Madinah warehouses.
+    """Namespace deterministic keys without exceeding legacy SQL key widths.
 
     Warehouse 1 keeps the historical key format unchanged so existing Madinah
-    de-duplication remains stable. New warehouses receive a warehouse prefix,
-    preventing global key collisions in legacy single-warehouse tables.
+    de-duplication remains stable. For other warehouses, the warehouse identity
+    and original key are re-hashed into a fixed 64-character SHA-256 hex key.
+    This prevents cross-warehouse PK collisions without lengthening varchar(64)
+    / nvarchar(64) key columns.
     """
+    import hashlib
+
     from engine.warehouse_context import current_warehouse_id
 
     key = str(value or "").strip()
@@ -376,7 +380,9 @@ def _warehouse_scoped_key(value: str) -> str:
     if not key or warehouse_id == 1:
         return key
 
-    return f"W{warehouse_id}:{key}"
+    return hashlib.sha256(
+        f"W{warehouse_id}|{key}".encode("utf-8")
+    ).hexdigest()
 
 
 def _validate_event_identity(
