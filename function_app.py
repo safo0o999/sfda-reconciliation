@@ -1507,14 +1507,7 @@ def build_dashboard_preview(
     return rows
 
 
-@app.route(route="full-reconciliation/accept", methods=["GET", "POST"])
-def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
-    denied = _auth_guard(req)
-    if denied:
-        return denied
-    if req.method == "GET":
-        return json_response({"status": "Ready", "required_files": ["sfda"]})
-
+def _run_full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
     run_number = build_run_number("FULL-ACCEPT")
     submitted_by = get_submitted_by(req)
     run_created = False
@@ -1676,6 +1669,17 @@ def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
 
 
 
+@app.route(route="full-reconciliation/accept", methods=["GET", "POST"])
+def full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
+    if req.method == "GET":
+        return json_response({"status": "Ready", "required_files": ["sfda"]})
+    return _safe_queue_reconciliation_job(req, "full_accept", ["sfda"])
+
+
+
 def _bootstrap_full_dispatch_ledger_from_history(limit: int = 250) -> Dict[str, int]:
     """Reserve allocations from successful legacy Full Dispatch runs once.
 
@@ -1766,14 +1770,7 @@ def _bootstrap_full_dispatch_ledger_from_history(limit: int = 250) -> Dict[str, 
     }
 
 
-@app.route(route="full-reconciliation/dispatch", methods=["GET", "POST"])
-def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
-    denied = _auth_guard(req)
-    if denied:
-        return denied
-    if req.method == "GET":
-        return json_response({"status": "Ready", "required_files": ["inventory", "sfda"]})
-
+def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
     run_number = build_run_number("FULL-DISPATCH")
     submitted_by = get_submitted_by(req)
     run_created = False
@@ -1978,6 +1975,16 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
             except Exception:
                 logger.exception("Unable to mark Full Dispatch run as failed")
         return error_response("Full Dispatch Reconciliation failed.", 500, str(exc))
+
+
+@app.route(route="full-reconciliation/dispatch", methods=["GET", "POST"])
+def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
+    if req.method == "GET":
+        return json_response({"status": "Ready", "required_files": ["inventory", "sfda"]})
+    return _safe_queue_reconciliation_job(req, "full_dispatch", ["inventory", "sfda"])
 
 
 def _variance_management_result(force_refresh: bool = False) -> Dict[str, Any]:
@@ -2697,6 +2704,309 @@ def refresh_historical_data_after_daily_run(
         "source_file": asn_file_name if mode == "accept" else dispatch_file_name,
     }
 
+
+class _BackgroundUploadedFile:
+    def __init__(self, file_name: str, data: bytes, content_type: str) -> None:
+        self.filename = str(file_name or "uploaded.xlsx")
+        self.content_type = str(content_type or "application/octet-stream")
+        self._data = data or b""
+
+    def read(self) -> bytes:
+        return self._data
+
+
+class _BackgroundFiles:
+    def __init__(self, values: Dict[str, Any]) -> None:
+        self._values = values
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._values.get(key, default)
+
+    def getlist(self, key: str) -> List[Any]:
+        value = self._values.get(key)
+        if value is None:
+            return []
+        return value if isinstance(value, list) else [value]
+
+
+class _BackgroundRequest:
+    def __init__(self, files: Dict[str, Any], submitted_by: str = "Background Worker") -> None:
+        self.files = _BackgroundFiles(files)
+        self.form: Dict[str, Any] = {}
+        self.params: Dict[str, Any] = {}
+        self.route_params: Dict[str, Any] = {}
+        self.headers: Dict[str, Any] = {"X-User-Name": submitted_by}
+        self.method = "POST"
+        self.url = "background://reconciliation"
+
+
+def _http_response_payload(response: func.HttpResponse) -> Dict[str, Any]:
+    body = response.get_body().decode("utf-8") if response.get_body() else ""
+    if not body:
+        return {
+            "status": "Failed",
+            "error": f"Background processing returned HTTP {response.status_code} without JSON.",
+        }
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Background processing returned invalid JSON.") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Background processing returned an invalid payload.")
+    return parsed
+
+
+def _queue_reconciliation_job(
+    req: func.HttpRequest,
+    job_type: str,
+    required_fields: List[str],
+) -> func.HttpResponse:
+    """Upload request inputs, queue processing, and return 202 immediately."""
+    from engine.blob_storage import BlobStorage
+    from engine.warehouse_context import current_warehouse_id, current_warehouse_name
+
+    submitted_by = get_submitted_by(req)
+    job_id = build_run_number("JOB")
+    storage = BlobStorage()
+    storage.initialize_containers()
+
+    manifest: Dict[str, Any] = {}
+    for field in required_fields:
+        uploaded_file = req.files.get(field)
+        if uploaded_file is None:
+            label = {
+                "sfda": "SFDA file",
+                "asn": "ASN/ASDT file",
+                "dispatch": "Full Dispatch file",
+                "inventory": "Current Inventory file",
+            }.get(field, field)
+            return error_response(f"{label} is required.")
+
+        file_name, file_bytes, content_type = read_uploaded_bytes(uploaded_file)
+        saved = storage.upload_job_input(
+            job_id,
+            field,
+            file_name,
+            file_bytes,
+            content_type,
+        )
+        manifest[field] = {
+            "file_name": saved["file_name"],
+            "blob_name": saved["blob_name"],
+            "content_type": saved["content_type"],
+            "size_bytes": saved["size_bytes"],
+        }
+
+    warehouse_id = int(current_warehouse_id())
+    warehouse_name = str(current_warehouse_name())
+    storage.write_background_job_status(
+        job_id,
+        {
+            "job_id": job_id,
+            "job_type": job_type,
+            "status": "Queued",
+            "progress": 5,
+            "current_stage": "Files uploaded; waiting for background worker",
+            "submitted_by": submitted_by,
+            "warehouse_id": warehouse_id,
+            "warehouse_name": warehouse_name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "result": {},
+            "error": "",
+        },
+    )
+
+    connection_string = os.getenv("AzureWebJobsStorage")
+    if not connection_string:
+        raise RuntimeError("AzureWebJobsStorage is missing.")
+
+    queue = QueueClient.from_connection_string(
+        connection_string,
+        "reconciliation-jobs",
+        message_encode_policy=TextBase64EncodePolicy(),
+    )
+    try:
+        queue.create_queue()
+    except ResourceExistsError:
+        pass
+
+    queue.send_message(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "job_type": job_type,
+                "input_manifest": manifest,
+                "submitted_by": submitted_by,
+                "warehouse_id": warehouse_id,
+                "warehouse_name": warehouse_name,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    return json_response(
+        {
+            "status": "Accepted",
+            "application": APPLICATION_NAME,
+            "version": APPLICATION_VERSION,
+            "job_id": job_id,
+            "job_type": job_type,
+            "status_url": f"/api/reconciliation-job/{job_id}",
+            "message": "Reconciliation was queued and will continue in the background.",
+        },
+        202,
+    )
+
+
+def _safe_queue_reconciliation_job(
+    req: func.HttpRequest,
+    job_type: str,
+    required_fields: List[str],
+) -> func.HttpResponse:
+    try:
+        return _queue_reconciliation_job(req, job_type, required_fields)
+    except ValueError as exc:
+        logger.exception("Background reconciliation submission validation failed")
+        return error_response("Reconciliation submission failed.", 400, str(exc))
+    except Exception as exc:
+        logger.exception("Background reconciliation submission failed")
+        return error_response("Failed to queue reconciliation.", 500, str(exc))
+
+
+@app.route(route="reconciliation-job/{job_id}", methods=["GET"])
+def reconciliation_job_status(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
+    job_id = str(req.route_params.get("job_id", "")).strip()
+    if not job_id:
+        return error_response("job_id is required.", 400)
+    try:
+        from engine.blob_storage import BlobStorage
+        job = BlobStorage().read_background_job_status(job_id)
+        return json_response({"status": "Success", "job": job})
+    except FileNotFoundError:
+        return error_response("Background reconciliation job was not found.", 404)
+    except Exception as exc:
+        logger.exception("Background reconciliation status read failed")
+        return error_response("Failed to read reconciliation job status.", 500, str(exc))
+
+
+@app.queue_trigger(
+    arg_name="message",
+    queue_name="reconciliation-jobs",
+    connection="AzureWebJobsStorage",
+)
+def reconciliation_background_worker(message: func.QueueMessage) -> None:
+    payload = json.loads(message.get_body().decode("utf-8"))
+    job_id = str(payload.get("job_id", "")).strip()
+    job_type = str(payload.get("job_type", "")).strip().lower()
+    input_manifest = payload.get("input_manifest") or {}
+    submitted_by = str(payload.get("submitted_by") or "Background Worker")
+    warehouse_id_raw = payload.get("warehouse_id")
+    warehouse_name = str(payload.get("warehouse_name") or "").strip()
+
+    if not job_id or not job_type:
+        raise ValueError("Background reconciliation message is incomplete.")
+    if warehouse_id_raw in (None, ""):
+        raise ValueError("Background reconciliation message is missing warehouse_id.")
+    warehouse_id = int(warehouse_id_raw)
+    if warehouse_id < 1:
+        raise ValueError("Background reconciliation message has an invalid warehouse_id.")
+
+    from engine.blob_storage import BlobStorage, INPUTS_CONTAINER
+    from engine.warehouse_context import warehouse_scope
+
+    with warehouse_scope(warehouse_id, warehouse_name or f"Warehouse {warehouse_id}"):
+        storage = BlobStorage()
+        storage.initialize_containers()
+        base_status = {
+            "job_id": job_id,
+            "job_type": job_type,
+            "submitted_by": submitted_by,
+            "warehouse_id": warehouse_id,
+            "warehouse_name": warehouse_name or f"Warehouse {warehouse_id}",
+        }
+        storage.write_background_job_status(
+            job_id,
+            {
+                **base_status,
+                "status": "Running",
+                "progress": 15,
+                "current_stage": "Reading uploaded files",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "result": {},
+                "error": "",
+            },
+        )
+        try:
+            files: Dict[str, Any] = {}
+            for field, item in input_manifest.items():
+                downloaded = storage.download_blob(INPUTS_CONTAINER, str(item["blob_name"]))
+                files[field] = _BackgroundUploadedFile(
+                    str(item.get("file_name") or field),
+                    downloaded["data"],
+                    str(item.get("content_type") or downloaded["content_type"]),
+                )
+
+            storage.write_background_job_status(
+                job_id,
+                {
+                    **base_status,
+                    "status": "Running",
+                    "progress": 35,
+                    "current_stage": "Running reconciliation in background",
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "result": {},
+                    "error": "",
+                },
+            )
+            background_req = _BackgroundRequest(files, submitted_by)
+            if job_type == "daily_accept":
+                response = run_daily(background_req, "accept")
+            elif job_type == "daily_dispatch":
+                response = run_daily(background_req, "dispatch")
+            elif job_type == "full_accept":
+                response = _run_full_reconciliation_accept(background_req)
+            elif job_type == "full_dispatch":
+                response = _run_full_reconciliation_dispatch(background_req)
+            else:
+                raise ValueError(f"Unsupported background job type: {job_type}")
+
+            result = _http_response_payload(response)
+            failed = response.status_code >= 400 or str(result.get("status", "")).lower() == "failed"
+            storage.write_background_job_status(
+                job_id,
+                {
+                    **base_status,
+                    "status": "Failed" if failed else "Completed",
+                    "progress": 100,
+                    "current_stage": "Failed" if failed else "Completed",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "result": result if not failed else {},
+                    "error": (
+                        str(result.get("details") or result.get("error") or "Background reconciliation failed.")
+                        if failed else ""
+                    ),
+                },
+            )
+        except Exception as exc:
+            logger.exception("Background reconciliation job failed. job_id=%s", job_id)
+            storage.write_background_job_status(
+                job_id,
+                {
+                    **base_status,
+                    "status": "Failed",
+                    "progress": 100,
+                    "current_stage": "Failed",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "result": {},
+                    "error": str(exc),
+                },
+            )
+            raise
+
+
 def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
     run_number = build_run_number(mode)
     submitted_by = get_submitted_by(req)
@@ -3085,7 +3395,7 @@ def process_accept(req: func.HttpRequest) -> func.HttpResponse:
         return denied
     if req.method == "GET":
         return json_response({"status": "Ready", "step": "accept", "version": APPLICATION_VERSION})
-    return run_daily(req, "accept")
+    return _safe_queue_reconciliation_job(req, "daily_accept", ["sfda", "asn"])
 
 
 @app.route(route="process-dispatch", methods=["GET", "POST"])
@@ -3095,7 +3405,7 @@ def process_dispatch(req: func.HttpRequest) -> func.HttpResponse:
         return denied
     if req.method == "GET":
         return json_response({"status": "Ready", "step": "dispatch", "version": APPLICATION_VERSION})
-    return run_daily(req, "dispatch")
+    return _safe_queue_reconciliation_job(req, "daily_dispatch", ["sfda", "dispatch"])
 
 
 @app.route(route="reconcile", methods=["GET", "POST"])
@@ -3112,12 +3422,14 @@ def reconcile(req: func.HttpRequest) -> func.HttpResponse:
                 "version": APPLICATION_VERSION,
             }
         )
-    mode = str(req.form.get("process_type", req.params.get("process_type", ""))).lower()
+    mode = str(req.params.get("process_type", "")).lower().strip()
     if not mode:
         mode = "accept" if req.files.get("asn") is not None else "dispatch"
     if mode not in {"accept", "dispatch"}:
         return error_response("process_type must be accept or dispatch.")
-    return run_daily(req, mode)
+    if mode == "accept":
+        return _safe_queue_reconciliation_job(req, "daily_accept", ["sfda", "asn"])
+    return _safe_queue_reconciliation_job(req, "daily_dispatch", ["sfda", "dispatch"])
 
 
 @app.route(route="ui", methods=["GET"])
