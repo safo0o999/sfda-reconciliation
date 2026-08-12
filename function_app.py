@@ -670,6 +670,19 @@ def auth_status(req: func.HttpRequest) -> func.HttpResponse:
         return error_response("Unable to read authentication status.", 500, str(exc))
 
 
+@app.route(route="auth/warehouses", methods=["GET"])
+def auth_warehouses(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        from engine.auth import registration_warehouses
+        return json_response({
+            "status": "Success",
+            "warehouses": registration_warehouses(),
+        })
+    except Exception as exc:
+        logger.exception("Unable to load registration warehouses")
+        return error_response("Unable to load warehouse list.", 500, str(exc))
+
+
 @app.route(route="auth/register", methods=["POST"])
 def auth_register(req: func.HttpRequest) -> func.HttpResponse:
     try:
@@ -678,7 +691,7 @@ def auth_register(req: func.HttpRequest) -> func.HttpResponse:
         result = register_user(
             str(payload.get("email") or payload.get("username") or ""),
             str(payload.get("password") or ""),
-            str(payload.get("warehouse_name") or ""),
+            int(payload.get("warehouse_id") or 0),
             _request_base_url(req),
         )
         first_admin = bool(result.get("first_admin"))
@@ -806,6 +819,85 @@ def admin_user_status_route(req: func.HttpRequest) -> func.HttpResponse:
         return error_response("Unable to update user.", 400, str(exc))
     except Exception as exc:
         return error_response("Unable to update user.", 500, str(exc))
+
+
+@app.route(route="warehouse-gln/status", methods=["GET"])
+def warehouse_gln_status_route(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
+
+    try:
+        from engine.reference_data import get_current_warehouse_gln_status
+
+        return json_response({
+            "status": "Success",
+            "application": APPLICATION_NAME,
+            "version": APPLICATION_VERSION,
+            "gln": get_current_warehouse_gln_status(),
+        })
+    except Exception as exc:
+        logger.exception("Warehouse GLN status read failed")
+        return error_response(
+            "Unable to load warehouse GLN mapping status.",
+            500,
+            str(exc),
+        )
+
+
+@app.route(route="warehouse-gln/upload", methods=["POST"])
+def warehouse_gln_upload_route(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req)
+    if denied:
+        return denied
+
+    try:
+        uploaded_file = req.files.get("gln_file")
+        if uploaded_file is None:
+            return error_response(
+                "GLN file is required.",
+                400,
+                "Upload an Excel file containing To Address and GLN columns.",
+            )
+
+        file_name = str(uploaded_file.filename or "warehouse_gln.xlsx").strip()
+        if not file_name.lower().endswith((".xlsx", ".xls")):
+            return error_response(
+                "Unsupported GLN file type.",
+                400,
+                "Use .xlsx or .xls.",
+            )
+
+        frame = read_excel_upload(uploaded_file)
+        user = _current_user(req) or {}
+
+        from engine.reference_data import replace_current_warehouse_gln
+
+        result = replace_current_warehouse_gln(
+            frame,
+            source_file_name=file_name,
+            updated_by=str(user.get("Email") or ""),
+        )
+
+        return json_response({
+            "status": "Completed",
+            "application": APPLICATION_NAME,
+            "version": APPLICATION_VERSION,
+            "gln": result,
+        })
+    except (ValueError, KeyError) as exc:
+        return error_response(
+            "Unable to update warehouse GLN mapping.",
+            400,
+            str(exc),
+        )
+    except Exception as exc:
+        logger.exception("Warehouse GLN upload failed")
+        return error_response(
+            "Unable to update warehouse GLN mapping.",
+            500,
+            str(exc),
+        )
 
 
 @app.route(route="history", methods=["GET"])
