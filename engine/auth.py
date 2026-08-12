@@ -22,8 +22,9 @@ from engine.database import (
     get_auth_session_user,
     list_auth_users,
     set_user_status,
-    get_or_create_warehouse,
     get_madinah_warehouse,
+    get_registration_warehouse_by_id,
+    list_registration_warehouses,
     list_warehouses,
 )
 from engine.email_service import email_settings, send_email
@@ -121,7 +122,7 @@ def _token_hash(token: str) -> str:
     return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
 
 
-def register_user(email: str, password: str, warehouse_name: str, base_url: str) -> Dict[str, Any]:
+def register_user(email: str, password: str, warehouse_id: int, base_url: str) -> Dict[str, Any]:
     request_started = datetime.now(timezone.utc)
     normalized_email = normalize_email(email)
     logger.info("Registration started for %s.", normalized_email or "<empty>")
@@ -164,15 +165,15 @@ def register_user(email: str, password: str, warehouse_name: str, base_url: str)
             requested_warehouse_name,
         )
     else:
-        requested_warehouse_name = " ".join(str(warehouse_name or "").strip().split())
+        warehouse = get_registration_warehouse_by_id(warehouse_id)
+        requested_warehouse_name = str(warehouse.get("WarehouseName") or "").strip()
         if not requested_warehouse_name:
-            raise ValueError("Warehouse name is required.")
+            raise ValueError("The selected warehouse is not valid.")
 
-        warehouse = get_or_create_warehouse(requested_warehouse_name)
         role = "User"
         status = "Pending"
         logger.info(
-            "Pending user %s assigned to WarehouseID=%s (%s).",
+            "Pending user %s assigned to approved WarehouseID=%s (%s).",
             email,
             warehouse.get("WarehouseID"),
             requested_warehouse_name,
@@ -363,6 +364,11 @@ def auth_settings() -> dict:
         "email_configured": bool(mail.get("configured")),
         "auth_required": (os.getenv("AUTH_REQUIRED", "true").strip().lower() not in {"0", "false", "no", "off"}),
     }
+
+
+def registration_warehouses() -> list[dict]:
+    ensure_auth_schema()
+    return list_registration_warehouses()
 
 
 def admin_warehouses() -> list[dict]:
