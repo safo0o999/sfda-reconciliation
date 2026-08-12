@@ -935,7 +935,7 @@ def get_supplier_history_df() -> pd.DataFrame:
 def get_customer_history_df() -> pd.DataFrame:
     initialize_database()
     with Database().connect() as connection:
-        return pd.read_sql(r"""
+        frame = pd.read_sql(r"""
             SELECT
                 ToAddress AS [To Address],
                 GLN,
@@ -956,6 +956,12 @@ def get_customer_history_df() -> pd.DataFrame:
             FROM dbo.CustomerHistory
             ORDER BY ToAddress, GenericItemNumber, BN, ExpiryDate;
         """, connection)
+
+    # GLN is reference data, not historical movement. Overlay the currently
+    # approved warehouse mapping at read time so legacy cross-warehouse GLNs
+    # can never leak into Full Dispatch, Product Intelligence or Variance.
+    from engine.reference_data import apply_current_warehouse_gln
+    return apply_current_warehouse_gln(frame)
 
 
 def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
@@ -3698,6 +3704,61 @@ def list_warehouses() -> List[Dict[str, Any]]:
         ).fetchall()
         names = [column[0] for column in cursor.description]
         return [dict(zip(names, row)) for row in rows]
+
+
+# Warehouses approved for self-service registration. Madinah is retained as the
+# existing legacy warehouse, identified by WarehouseCode=MADINAH.
+_REGISTRATION_WAREHOUSE_NAMES = (
+    "Baha LC",
+    "Dammam LC",
+    "Riyadh SMSA",
+    "Riyadh Agility",
+    "Qassim LC",
+    "Jeddah Maersk",
+    "Jeddah Tamer",
+    "Asir Naqel",
+)
+
+
+def list_registration_warehouses() -> List[Dict[str, Any]]:
+    """Return only warehouses approved for the public registration dropdown.
+
+    Existing ad-hoc/test warehouse rows remain in the database for data integrity,
+    but they cannot be selected by a newly registering user.
+    """
+    placeholders = ",".join("?" for _ in _REGISTRATION_WAREHOUSE_NAMES)
+    sql = f"""
+        SELECT WarehouseID, WarehouseCode, WarehouseName, Status, CreatedAt
+        FROM dbo.Warehouses
+        WHERE LOWER(Status)=N'active'
+          AND (WarehouseCode=N'MADINAH' OR WarehouseName IN ({placeholders}))
+        ORDER BY
+            CASE WHEN WarehouseCode=N'MADINAH' THEN 0 ELSE 1 END,
+            WarehouseName;
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        rows = cursor.execute(sql, tuple(_REGISTRATION_WAREHOUSE_NAMES)).fetchall()
+        names = [column[0] for column in cursor.description]
+        return [dict(zip(names, row)) for row in rows]
+
+
+def get_registration_warehouse_by_id(warehouse_id: int) -> Dict[str, Any]:
+    """Resolve a registration WarehouseID and reject non-approved warehouses."""
+    try:
+        warehouse_id = int(warehouse_id)
+    except Exception as exc:
+        raise ValueError("A valid warehouse must be selected.") from exc
+
+    if warehouse_id <= 0:
+        raise ValueError("A valid warehouse must be selected.")
+
+    allowed = list_registration_warehouses()
+    for warehouse in allowed:
+        if int(warehouse.get("WarehouseID") or 0) == warehouse_id:
+            return warehouse
+
+    raise ValueError("The selected warehouse is not available for registration.")
 
 
 def find_user_by_email(email: str) -> Optional[Dict[str, Any]]:
