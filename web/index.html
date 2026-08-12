@@ -1276,7 +1276,8 @@ Drug Traceability Reconciliation Platform</textarea></label>
   const AUTH_REGISTER_URL = "/api/auth/register";
   const AUTH_LOGOUT_URL = "/api/auth/logout";
   const ADMIN_USERS_URL = "/api/user-management/users";
-  const DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v2";
+  const DASHBOARD_PREVIEW_KEY_PREFIX = "sfda_dashboard_preview_v3_w";
+  const LEGACY_DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v2";
   let currentResult = null;
   let progressTimer = null;
   let historyCache = [];
@@ -1298,6 +1299,23 @@ Drug Traceability Reconciliation Platform</textarea></label>
   let applicationStarted = false;
  
   const $ = id => document.getElementById(id);
+
+  function dashboardPreviewStorageKey(user=currentUser){
+    const warehouseId=Number(user?.WarehouseID||0);
+    return warehouseId>0 ? `${DASHBOARD_PREVIEW_KEY_PREFIX}${warehouseId}` : null;
+  }
+
+  function saveDashboardPreview(rows){
+    const key=dashboardPreviewStorageKey();
+    if(!key) return;
+    localStorage.setItem(key,JSON.stringify(Array.isArray(rows)?rows:[]));
+    // Remove the pre-Multi-Warehouse cache so it can never leak into another warehouse.
+    localStorage.removeItem(LEGACY_DASHBOARD_PREVIEW_KEY);
+  }
+
+  function clearLegacyDashboardPreview(){
+    localStorage.removeItem(LEGACY_DASHBOARD_PREVIEW_KEY);
+  }
   const formatNumber = value => Number(value || 0).toLocaleString("en-US");
   const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
  
@@ -1321,6 +1339,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
 
   function applySignedInUser(user){
     currentUser=user||null;
+    clearLegacyDashboardPreview();
     const email=String(user?.Email||"");
     const role=String(user?.Role||"User");
     if($("sidebarUserName")) $("sidebarUserName").textContent=email||"—";
@@ -1392,6 +1411,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   async function logout(){
     try{await fetch(AUTH_LOGOUT_URL,{method:"POST",credentials:"same-origin"});}catch{}
     currentUser=null;
+    clearLegacyDashboardPreview();
     historyCache=[];piData=null;piLoaded=false;varianceData={summary:{},items:[],email:{}};
     $("authOverlay").classList.remove("hidden");
     showAuthPanel("login");
@@ -1673,10 +1693,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       }
       if(!result||String(result.status||"").toLowerCase()==="failed") throw new Error(result?.details||result?.error||`${label} reconciliation failed.`);
       currentResult=result; finishProgress(label,true); setStatus("success",`${label} files generated successfully.`);
-      localStorage.setItem(
-        DASHBOARD_PREVIEW_KEY,
-        JSON.stringify(Array.isArray(result.dashboard_preview)?result.dashboard_preview:[])
-      );
+      saveDashboardPreview(result.dashboard_preview);
       renderDashboardOverview();
       populateSummary(result); populateResults(result);
       const metrics=getResultMetrics(result);
@@ -2144,7 +2161,9 @@ Drug Traceability Reconciliation Platform</textarea></label>
  
   function getDashboardPreview(){
     try{
-      const rows=JSON.parse(localStorage.getItem(DASHBOARD_PREVIEW_KEY) || "[]");
+      const key=dashboardPreviewStorageKey();
+      if(!key) return [];
+      const rows=JSON.parse(localStorage.getItem(key) || "[]");
       return Array.isArray(rows) ? rows : [];
     }catch{
       return [];
@@ -2875,10 +2894,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       renderSetupFileList("fullAcceptCsvFiles",acceptCsvFiles,"No Accept quantity was required.");
       const summary=result.summary||{};
       showFullResults(`<strong>Full Accept completed.</strong> Accept rows: ${formatNumber(summary.accept_rows||0)} · Supplier variance rows: ${formatNumber(summary.supplier_variance_rows||0)} · Files: ${formatNumber(files.length)}.`);
-      localStorage.setItem(
-        DASHBOARD_PREVIEW_KEY,
-        JSON.stringify(Array.isArray(result.dashboard_preview)?result.dashboard_preview:[])
-      );
+      saveDashboardPreview(result.dashboard_preview);
       renderDashboardOverview();
       await refreshHistoricalStatus({silent:true});
       await refreshAzureHistory({silent:true});
@@ -2920,10 +2936,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       renderSetupFileList("fullDispatchCsvFiles",dispatchCsvFiles,"No Dispatch quantity was required.");
       const summary=result.summary||{};
       showFullResults(`<strong>Full Dispatch completed.</strong> Dispatch allocation rows: ${formatNumber(summary.dispatch_allocation_rows||0)} · Files: ${formatNumber(files.length)}.`);
-      localStorage.setItem(
-        DASHBOARD_PREVIEW_KEY,
-        JSON.stringify(Array.isArray(result.dashboard_preview)?result.dashboard_preview:[])
-      );
+      saveDashboardPreview(result.dashboard_preview);
       renderDashboardOverview();
       await refreshHistoricalStatus({silent:true});
       await refreshAzureHistory({silent:true});
