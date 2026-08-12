@@ -10,6 +10,7 @@ import pandas as pd
 
 from engine.normalizer import Normalizer
 from engine.validator import Validator
+from engine.reference_data import load_current_warehouse_gln
 
 
 logger = logging.getLogger("SFDA-Reconciliation.FullReconciliation")
@@ -242,12 +243,10 @@ class FullReconciliationEngine:
             engine="openpyxl",
             dtype=object,
         )
-        gln_path = Path(__file__).resolve().parent.parent / "config" / "gln.xlsx"
-        self.gln = pd.read_excel(
-            gln_path,
-            engine="openpyxl",
-            dtype=object,
-        )
+        # GLN is warehouse-scoped without changing any historical batch logic.
+        # Madinah (WarehouseID=1) continues to use config/gln.xlsx exactly as
+        # before. Other warehouses use only their own stored mapping.
+        self.gln = load_current_warehouse_gln()
 
     @staticmethod
     def _month_key(series: pd.Series) -> pd.Series:
