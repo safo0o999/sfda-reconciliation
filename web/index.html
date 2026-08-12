@@ -540,7 +540,11 @@
       <p>Your user name must be a company email. The request stays pending until the administrator approves it from the confirmation email.</p>
       <div class="auth-form">
         <label>Company Email<input class="control" id="registerEmail" type="email" autocomplete="username" placeholder="name@nupco.com"></label>
-        <label>Warehouse Name<input class="control" id="registerWarehouse" type="text" autocomplete="organization" placeholder="e.g. Riyadh Warehouse"></label>
+        <label>Warehouse
+          <select class="control" id="registerWarehouse">
+            <option value="">Loading warehouses...</option>
+          </select>
+        </label>
         <label>Password<input class="control" id="registerPassword" type="password" autocomplete="new-password" placeholder="Minimum 10 characters"></label>
         <label>Confirm Password<input class="control" id="registerPasswordConfirm" type="password" autocomplete="new-password"></label>
         <button class="btn btn-primary" id="registerButton" type="button">Create Access Request</button>
@@ -1209,7 +1213,16 @@ Drug Traceability Reconciliation Platform</textarea></label>
         </div>
 
         <div class="grid three-col">
-          <div class="card intelligence-card"><h3>GLN Mapping</h3><p>Maps WMS To Address values to registered SFDA customer GLNs. Unknown customers are classified as DUMMY.</p><div class="intelligence-metric"><span class="badge success">Internal File Active</span><strong>✓</strong></div></div>
+          <div class="card intelligence-card" id="warehouseGlnCard">
+            <h3>Warehouse GLN Mapping</h3>
+            <p id="warehouseGlnDescription">Loading the GLN configuration for the signed-in warehouse...</p>
+            <div class="intelligence-metric"><span class="badge info" id="warehouseGlnMode">Checking</span><strong id="warehouseGlnCount">—</strong></div>
+            <div style="margin-top:14px;display:grid;gap:8px">
+              <input class="control" id="warehouseGlnFile" type="file" accept=".xlsx,.xls">
+              <button class="btn btn-secondary" id="warehouseGlnUpload" type="button">Upload / Replace Warehouse GLN</button>
+              <div class="file-info" id="warehouseGlnSource">Required columns: To Address, GLN</div>
+            </div>
+          </div>
           <div class="card intelligence-card"><h3>Pack Size Mapping</h3><p>Converts warehouse units into SFDA packages using controlled internal Package Size references.</p><div class="intelligence-metric"><span class="badge success">Internal File Active</span><strong>✓</strong></div></div>
           <div class="card intelligence-card"><h3>Business Rules</h3><p>Controls Accept, Dispatch, Variance allocation, maximum rows, quantity limits, and file generation.</p><div class="intelligence-metric"><span class="badge success">Python Rules Active</span><strong>✓</strong></div></div>
         </div>
@@ -1225,7 +1238,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
         </div>
 
         <div class="grid two-equal" style="margin-top:16px">
-          <div class="card">
+          <div class="card" id="adminSecurityCard">
             <div class="card-header"><div><div class="card-title">Access & Email Configuration</div><div class="card-subtitle">Security and approval workflow</div></div></div>
             <div class="card-body">
               <div class="status-line"><span>Authentication</span><strong id="adminAuthMode">Required</strong></div>
@@ -1274,8 +1287,11 @@ Drug Traceability Reconciliation Platform</textarea></label>
   const AUTH_STATUS_URL = "/api/auth/status";
   const AUTH_LOGIN_URL = "/api/auth/login";
   const AUTH_REGISTER_URL = "/api/auth/register";
+  const AUTH_WAREHOUSES_URL = "/api/auth/warehouses";
   const AUTH_LOGOUT_URL = "/api/auth/logout";
   const ADMIN_USERS_URL = "/api/user-management/users";
+  const WAREHOUSE_GLN_STATUS_URL = "/api/warehouse-gln/status";
+  const WAREHOUSE_GLN_UPLOAD_URL = "/api/warehouse-gln/upload";
   const DASHBOARD_PREVIEW_KEY_PREFIX = "sfda_dashboard_preview_v3_w";
   const LEGACY_DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v2";
   let currentResult = null;
@@ -1346,8 +1362,15 @@ Drug Traceability Reconciliation Platform</textarea></label>
     if($("sidebarUserRole")) $("sidebarUserRole").textContent=`${role} · ${user?.WarehouseName||"Warehouse"}`;
     if($("sidebarAvatar")) $("sidebarAvatar").textContent=(email.split("@")[0]?.slice(0,2)||"U").toUpperCase();
     if($("adminSignedInUser")) $("adminSignedInUser").textContent=email||"—";
+    const isAdmin=role.toLowerCase()==="admin";
     const adminButton=document.querySelector('[data-page="administration"]');
-    if(adminButton) adminButton.style.display=role.toLowerCase()==="admin"?"":"none";
+    // Administration also contains warehouse-owned GLN reference data, so it
+    // remains available to every authenticated warehouse user. Admin-only
+    // sections are hidden separately below.
+    if(adminButton) adminButton.style.display="";
+    if($("adminUsersCard")) $("adminUsersCard").style.display=isAdmin?"":"none";
+    if($("adminSecurityCard")) $("adminSecurityCard").style.display=isAdmin?"":"none";
+    if($("adminRefreshUsers")) $("adminRefreshUsers").style.display=isAdmin?"":"none";
   }
 
   async function readAuthStatus(){
@@ -1379,13 +1402,34 @@ Drug Traceability Reconciliation Platform</textarea></label>
     finally{button.disabled=false;button.textContent="Sign In";}
   }
 
+  async function loadRegistrationWarehouses(){
+    const select=$("registerWarehouse");
+    if(!select) return;
+    select.disabled=true;
+    select.innerHTML='<option value="">Loading warehouses...</option>';
+    try{
+      const response=await fetch(AUTH_WAREHOUSES_URL,{credentials:"same-origin"});
+      const payload=await response.json().catch(()=>({}));
+      if(!response.ok) throw new Error(payload.details||payload.error||"Unable to load warehouses.");
+      const warehouses=Array.isArray(payload.warehouses)?payload.warehouses:[];
+      select.innerHTML='<option value="">Select Warehouse</option>'+warehouses.map(w=>{
+        const id=Number(w.WarehouseID||0);
+        const name=escapeHtml(w.WarehouseName||`Warehouse ${id}`);
+        return `<option value="${id}">${name}</option>`;
+      }).join("");
+    }catch(error){
+      select.innerHTML='<option value="">Unable to load warehouses</option>';
+      setAuthMessage(error.message||String(error),"error");
+    }finally{select.disabled=false;}
+  }
+
   async function registerUser(){
     clearAuthMessage();
     const email=$("registerEmail").value.trim();
-    const warehouseName=$("registerWarehouse").value.trim();
+    const warehouseId=Number($("registerWarehouse").value||0);
     const password=$("registerPassword").value;
     const confirm=$("registerPasswordConfirm").value;
-    if(!warehouseName){setAuthMessage("Warehouse name is required.","error");return;}
+    if(!warehouseId){setAuthMessage("Please select your warehouse.","error");return;}
     if(password!==confirm){setAuthMessage("Passwords do not match.","error");return;}
     const button=$("registerButton");
     button.disabled=true;button.textContent="Creating Request...";
@@ -1393,7 +1437,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       const response=await fetch(AUTH_REGISTER_URL,{
         method:"POST",credentials:"same-origin",
         headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({email,password,warehouse_name:warehouseName})
+        body:JSON.stringify({email,password,warehouse_id:warehouseId})
       });
       const payload=await response.json().catch(()=>({}));
       if(!response.ok) throw new Error(payload.details||payload.error||"Unable to create user.");
@@ -1499,7 +1543,10 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }
 
     if (requestedPage === "administration") {
-      Promise.resolve(loadAdminUsers()).catch(error=>toast(error.message||String(error),"error"));
+      Promise.resolve(loadWarehouseGlnStatus()).catch(error=>toast(error.message||String(error),"error"));
+      if(currentUser && String(currentUser.Role||"").toLowerCase()==="admin") {
+        Promise.resolve(loadAdminUsers()).catch(error=>toast(error.message||String(error),"error"));
+      }
     }
 
     if (requestedPage === "intelligence") {
@@ -3330,6 +3377,78 @@ Drug Traceability Reconciliation Platform</textarea></label>
   $("piExportButton").addEventListener("click",exportPiBatchView);
 
 
+  async function loadWarehouseGlnStatus(){
+    if(!currentUser) return;
+    const response=await fetch(WAREHOUSE_GLN_STATUS_URL,{cache:"no-store",credentials:"same-origin"});
+    const payload=await response.json().catch(()=>({}));
+    if(response.status===401){await logout();return;}
+    if(!response.ok) throw new Error(payload.details||payload.error||"Unable to load warehouse GLN status.");
+
+    const gln=payload.gln||{};
+    const mode=String(gln.mode||"");
+    const rows=Number(gln.mapping_rows||0);
+    const fileInput=$("warehouseGlnFile");
+    const uploadButton=$("warehouseGlnUpload");
+
+    $("warehouseGlnCount").textContent=`${formatNumber(rows)} rows`;
+    $("warehouseGlnDescription").textContent=gln.message||"Warehouse GLN status loaded.";
+    $("warehouseGlnSource").textContent=gln.source
+      ? `Source: ${gln.source} · Fallback: ${gln.fallback_gln||"99999999999999"}`
+      : `No warehouse GLN file loaded · Fallback: ${gln.fallback_gln||"99999999999999"}`;
+
+    if(mode==="legacy_madinah"){
+      $("warehouseGlnMode").className="badge success";
+      $("warehouseGlnMode").textContent="Madinah Legacy";
+      fileInput.disabled=true;
+      uploadButton.disabled=true;
+      uploadButton.textContent="Madinah Legacy File Locked";
+    }else if(gln.configured){
+      $("warehouseGlnMode").className="badge success";
+      $("warehouseGlnMode").textContent="Warehouse Mapping Active";
+      fileInput.disabled=false;
+      uploadButton.disabled=false;
+      uploadButton.textContent="Upload / Replace Warehouse GLN";
+    }else{
+      $("warehouseGlnMode").className="badge warning";
+      $("warehouseGlnMode").textContent="Dummy GLN Fallback";
+      fileInput.disabled=false;
+      uploadButton.disabled=false;
+      uploadButton.textContent="Upload Warehouse GLN";
+    }
+  }
+
+  async function uploadWarehouseGln(){
+    const input=$("warehouseGlnFile");
+    const file=input?.files?.[0];
+    if(!file){toast("Choose the warehouse GLN Excel file first.","error");return;}
+
+    const button=$("warehouseGlnUpload");
+    button.disabled=true;
+    const originalText=button.textContent;
+    button.textContent="Uploading...";
+    try{
+      const form=new FormData();
+      form.append("gln_file",file,file.name);
+      const response=await fetch(WAREHOUSE_GLN_UPLOAD_URL,{
+        method:"POST",
+        credentials:"same-origin",
+        body:form
+      });
+      const payload=await response.json().catch(()=>({}));
+      if(response.status===401){await logout();return;}
+      if(!response.ok) throw new Error(payload.details||payload.error||"Unable to upload GLN mapping.");
+      input.value="";
+      toast(`Warehouse GLN mapping updated: ${formatNumber(payload.gln?.mapping_rows||0)} rows.`,"success");
+      await loadWarehouseGlnStatus();
+      Promise.resolve(loadProductIntelligence(true)).catch(()=>{});
+    }catch(error){
+      toast(error.message||String(error),"error");
+    }finally{
+      button.disabled=false;
+      if(button.textContent==="Uploading...") button.textContent=originalText;
+    }
+  }
+
   async function loadAdminUsers(){
     if(!currentUser || String(currentUser.Role||"").toLowerCase()!=="admin") return;
     const response=await fetch(ADMIN_USERS_URL,{cache:"no-store",credentials:"same-origin"});
@@ -3414,12 +3533,13 @@ Drug Traceability Reconciliation Platform</textarea></label>
     });
   }
 
-  $("showRegisterButton")?.addEventListener("click",()=>showAuthPanel("register"));
+  $("showRegisterButton")?.addEventListener("click",async()=>{showAuthPanel("register");await loadRegistrationWarehouses();});
   $("showLoginButton")?.addEventListener("click",()=>showAuthPanel("login"));
   $("loginButton")?.addEventListener("click",()=>login());
   $("registerButton")?.addEventListener("click",()=>registerUser());
   $("logoutButton")?.addEventListener("click",()=>logout());
   $("adminRefreshUsers")?.addEventListener("click",()=>loadAdminUsers().catch(error=>toast(error.message||String(error),"error")));
+  $("warehouseGlnUpload")?.addEventListener("click",()=>uploadWarehouseGln());
   $("loginPassword")?.addEventListener("keydown",event=>{if(event.key==="Enter")login();});
   $("registerPasswordConfirm")?.addEventListener("keydown",event=>{if(event.key==="Enter")registerUser();});
 
