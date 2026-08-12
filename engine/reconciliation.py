@@ -8,6 +8,8 @@ import pandas as pd
 
 from engine.normalizer import Normalizer
 from engine.validator import Validator
+from engine.reference_data import DUMMY_GLN as WAREHOUSE_DUMMY_GLN, load_current_warehouse_gln
+from engine.warehouse_context import current_warehouse_id
 
 
 class ReconciliationEngine:
@@ -29,6 +31,8 @@ class ReconciliationEngine:
     """
 
     MATCH_KEYS = ["BN", "Expiry Date"]
+    # Preserve Madinah legacy fallback exactly as before. Non-Madinah
+    # warehouses use WAREHOUSE_DUMMY_GLN (14 nines) below.
     DUMMY_GLN = "9999999999999"
 
     def __init__(
@@ -73,11 +77,11 @@ class ReconciliationEngine:
             engine="openpyxl",
             dtype=object,
         )
-        self.gln = pd.read_excel(
-            config_dir / "gln.xlsx",
-            engine="openpyxl",
-            dtype=object,
-        )
+        # Warehouse 1 / Madinah intentionally keeps the existing legacy
+        # config/gln.xlsx behavior. Every other warehouse receives only its
+        # own SQL mapping; an empty mapping intentionally falls back to the
+        # controlled dummy GLN during Dispatch.
+        self.gln = load_current_warehouse_gln()
 
     @staticmethod
     def _safe_int(value: Any) -> int:
@@ -939,7 +943,11 @@ class ReconciliationEngine:
         details.loc[
             missing_gln,
             "GLN",
-        ] = self.DUMMY_GLN
+        ] = (
+            self.DUMMY_GLN
+            if int(current_warehouse_id()) == 1
+            else WAREHOUSE_DUMMY_GLN
+        )
 
         details = self._enrich_with_master(
             details
