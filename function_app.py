@@ -499,7 +499,12 @@ def blob_run_to_history_row(
         "Status": data.get("status", "Completed"),
         "StartedAt": created,
         "CompletedAt": created,
-        "SubmittedBy": data.get("submitted_by", "Web User"),
+        "SubmittedBy": str(
+            data.get("submitted_by")
+            or data.get("submittedBy")
+            or data.get("user")
+            or "Web User"
+        ),
         "ASNFiles": sum("asn" in name or "asdt" in name for name in input_names),
         "InventoryFiles": sum("inventory" in name for name in input_names),
         "DispatchFiles": sum("dispatch" in name for name in input_names),
@@ -538,7 +543,12 @@ def historical_job_to_history_row(job: Dict[str, Any]) -> Dict[str, Any]:
         "Status": job.get("status", ""),
         "StartedAt": job.get("started_at") or job.get("created_at"),
         "CompletedAt": job.get("completed_at"),
-        "SubmittedBy": "Web User",
+        "SubmittedBy": str(
+            job.get("submitted_by")
+            or manifest.get("submitted_by")
+            or manifest.get("submittedBy")
+            or "Web User"
+        ),
         "ASNFiles": len(manifest.get("asn_files") or []),
         "InventoryFiles": 0,
         "DispatchFiles": len(manifest.get("dispatch_files") or []),
@@ -1271,6 +1281,7 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
         from engine.database import create_historical_build_job
 
         job_id = build_run_number("historical")
+        submitted_by = get_submitted_by(req)
         storage = BlobStorage()
         storage.initialize_containers()
 
@@ -1278,6 +1289,7 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
             "asn_files": [],
             "dispatch_files": [],
             "sfda_files": [],
+            "submitted_by": submitted_by,
         }
 
         for category, uploaded_files in (
