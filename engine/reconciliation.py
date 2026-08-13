@@ -469,6 +469,27 @@ class ReconciliationEngine:
             self.asn, "ACCEPT", "Received Quantity"
         )
 
+        # Customer returns are the only ASN receipt type excluded from SFDA
+        # Accept. WMS identifies them by Inbound Shipment beginning with TRK3.
+        # All other receipts remain eligible, including NUPCO inter-warehouse
+        # transfers, because those movements must also be reflected in SFDA.
+        inbound_shipment = (
+            self.asn.get(
+                "Inbound Shipment",
+                pd.Series("", index=self.asn.index, dtype=object),
+            )
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+        customer_return_mask = inbound_shipment.str.startswith(
+            "TRK3",
+            na=False,
+        )
+        customer_returns = self.asn.loc[customer_return_mask].copy()
+        eligible_asn = self.asn.loc[~customer_return_mask].copy()
+
         self._copy_first_available_column(
             self.asn,
             "Description",
@@ -498,7 +519,7 @@ class ReconciliationEngine:
         )
 
         receiving = (
-            self.asn.groupby(
+            eligible_asn.groupby(
                 self.MATCH_KEYS,
                 dropna=False,
             )
@@ -670,11 +691,66 @@ class ReconciliationEngine:
             details_columns,
         )
 
+        # Keep TRK3 customer-return lines visible in Accept Details as separate
+        # audit rows, while forcing To Be Accept to zero. They never contribute
+        # to the batch-level receiving quantity and never enter Accept CSVs.
+        if not customer_returns.empty:
+            return_details = customer_returns.merge(
+                self._sfda_summary(),
+                on=self.MATCH_KEYS,
+                how="left",
+                validate="many_to_one",
+            )
+
+            return_details["Received Quantity Each"] = pd.to_numeric(
+                return_details.get("Received Quantity", 0),
+                errors="coerce",
+            ).fillna(0)
+
+            return_package = pd.to_numeric(
+                return_details.get("PackageSize", 0),
+                errors="coerce",
+            )
+            valid_return_package = return_package.notna() & return_package.gt(0)
+            return_details["Received Quantity Pack"] = 0.0
+            return_details.loc[
+                valid_return_package,
+                "Received Quantity Pack",
+            ] = (
+                return_details.loc[
+                    valid_return_package,
+                    "Received Quantity Each",
+                ]
+                / return_package.loc[valid_return_package]
+            )
+
+            return_details["To Be Accept"] = 0
+            return_details["Processing Status"] = (
+                "Customer Return - Excluded from SFDA Accept"
+            )
+            return_details["Package Size Status"] = (
+                valid_return_package.map(
+                    {
+                        True: "Mapped",
+                        False: "Missing",
+                    }
+                )
+            )
+            return_details = self._enrich_with_master(return_details)
+            return_details = self._ensure_output_columns(
+                return_details,
+                details_columns,
+            )
+            details = pd.concat(
+                [details, return_details],
+                ignore_index=True,
+            )
+
         # Build the exact transaction quantities represented by the generated
         # Accept CSV. These rows are stored as *pending confirmation* only.
         # They are not loaded back as processed until a later SFDA report
         # proves the corresponding pending -> active movement.
-        accept_transactions = self.asn.copy()
+        accept_transactions = eligible_asn.copy()
         batch_limits = report[
             self.MATCH_KEYS
             + ["PackageSize", "To Be Accept"]
