@@ -727,32 +727,84 @@ def append_events(
 
 
 def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Return cumulative receipt and dispatch summaries for Batch Master."""
+    """Return cumulative receipt and dispatch summaries for Batch Master.
+
+    ASN customer returns are identified exclusively by InboundShipment
+    starting with TRK3 (case-insensitive). Those receipt events remain stored
+    in dbo.ReceiptEvents as historical evidence, but they are excluded from
+    Batch Master received quantities and from the supplier identity selected
+    for SFDA Accept logic.
+
+    All other ASN receipts remain eligible, including inter-warehouse NUPCO
+    transfers, because those movements must still be reflected in SFDA.
+    """
 
     initialize_database()
     started_at = time.perf_counter()
 
     receipt_sql = r"""
+        WITH EligibleReceipt AS
+        (
+            SELECT *
+            FROM dbo.ReceiptEvents
+            WHERE UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, ''))))
+                  NOT LIKE 'TRK3%'
+        ),
+        ReceiptAggregate AS
+        (
+            SELECT
+                BN,
+                ExpiryMonthKey,
+                GenericItemNumber,
+                MAX(ExpiryDate) AS ReceiptExpiryDate,
+                COUNT_BIG(*) AS ReceiveRuns,
+                SUM(ReceivedQuantity) AS TotalReceiveQty,
+                MIN(ReceivedDate) AS FirstReceivedDate,
+                MAX(ReceivedDate) AS LastReceivedDate
+            FROM EligibleReceipt
+            GROUP BY
+                BN,
+                ExpiryMonthKey,
+                GenericItemNumber
+        )
         SELECT
-            BN,
-            ExpiryMonthKey AS [Expiry Month Key],
-            MAX(ExpiryDate) AS [Receipt Expiry Date],
-            GenericItemNumber AS [Generic Item Number],
-            MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
-            MAX(NULLIF(TradeName, '')) AS [Trade Name],
-            MAX(NULLIF(Description, '')) AS [Description],
-            MAX(NULLIF(SupplierName, '')) AS [Supplier Name],
-            MAX(NULLIF(SupplierCode, '')) AS [Supplier Code],
-            MAX(NULLIF(ItemFamilyGroup, '')) AS [Item Family Group],
-            COUNT_BIG(*) AS [Receive Runs],
-            SUM(ReceivedQuantity) AS [Total Receive Qty],
-            MIN(ReceivedDate) AS [First Received Date],
-            MAX(ReceivedDate) AS [Last Received Date]
-        FROM dbo.ReceiptEvents
-        GROUP BY
-            BN,
-            ExpiryMonthKey,
-            GenericItemNumber;
+            aggregate_rows.BN,
+            aggregate_rows.ExpiryMonthKey AS [Expiry Month Key],
+            aggregate_rows.ReceiptExpiryDate AS [Receipt Expiry Date],
+            aggregate_rows.GenericItemNumber AS [Generic Item Number],
+            source_row.TradeItemNumber AS [Trade Item Number],
+            source_row.TradeName AS [Trade Name],
+            source_row.Description AS [Description],
+            source_row.SupplierName AS [Supplier Name],
+            source_row.SupplierCode AS [Supplier Code],
+            source_row.ItemFamilyGroup AS [Item Family Group],
+            aggregate_rows.ReceiveRuns AS [Receive Runs],
+            aggregate_rows.TotalReceiveQty AS [Total Receive Qty],
+            aggregate_rows.FirstReceivedDate AS [First Received Date],
+            aggregate_rows.LastReceivedDate AS [Last Received Date]
+        FROM ReceiptAggregate aggregate_rows
+        OUTER APPLY
+        (
+            SELECT TOP (1)
+                receipt.TradeItemNumber,
+                receipt.TradeName,
+                receipt.Description,
+                receipt.SupplierName,
+                receipt.SupplierCode,
+                receipt.ItemFamilyGroup
+            FROM EligibleReceipt receipt
+            WHERE receipt.BN = aggregate_rows.BN
+              AND receipt.ExpiryMonthKey = aggregate_rows.ExpiryMonthKey
+              AND receipt.GenericItemNumber = aggregate_rows.GenericItemNumber
+            ORDER BY
+                CASE
+                    WHEN NULLIF(LTRIM(RTRIM(ISNULL(receipt.SupplierName, ''))), '') IS NOT NULL
+                      OR NULLIF(LTRIM(RTRIM(ISNULL(receipt.SupplierCode, ''))), '') IS NOT NULL
+                    THEN 0 ELSE 1
+                END,
+                receipt.ReceivedDate ASC,
+                receipt.EventKey ASC
+        ) source_row;
     """
 
     dispatch_sql = r"""
@@ -788,9 +840,16 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     return receipt, dispatch
 
-
 def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Return supplier and customer history at their operational grains."""
+    """Return supplier and customer history at their operational grains.
+
+    Supplier History represents SFDA-eligible receipt sources. Customer-return
+    ASN lines (InboundShipment starting with TRK3) remain preserved in the raw
+    ReceiptEvents audit trail, but are intentionally excluded here so they
+    cannot inflate Supplier History or Supplier Variance.
+
+    Dispatch / Customer History is unchanged.
+    """
 
     initialize_database()
     supplier_sql = r"""
@@ -809,6 +868,8 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             MIN(ReceivedDate) AS [First Received Date],
             MAX(ReceivedDate) AS [Last Received Date]
         FROM dbo.ReceiptEvents
+        WHERE UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, ''))))
+              NOT LIKE 'TRK3%'
         GROUP BY
             SupplierName,
             SupplierCode,
@@ -839,7 +900,6 @@ GROUP BY
         supplier = pd.read_sql(supplier_sql, connection)
         customer = pd.read_sql(customer_sql, connection)
     return supplier, customer
-
 
 def _replace_history_table(
     table_name: str,
