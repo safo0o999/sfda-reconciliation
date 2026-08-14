@@ -1827,9 +1827,12 @@ def get_historical_build_job(job_id: str) -> Dict[str, Any]:
 
 
 def list_historical_build_jobs(limit: int = 500) -> List[Dict[str, Any]]:
-    """Return historical Full Reconciliation build jobs for the unified History page."""
+    """Return historical Full Reconciliation build jobs for the current warehouse."""
 
     initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+
+    warehouse_id = int(current_warehouse_id())
     safe_limit = max(1, min(int(limit), 5000))
     sql = f"""
         SELECT TOP ({safe_limit})
@@ -1847,11 +1850,12 @@ def list_historical_build_jobs(limit: int = 500) -> List[Dict[str, Any]]:
             CompletedAt,
             UpdatedAt
         FROM dbo.HistoricalBuildJobs
+        WHERE WarehouseID = ?
         ORDER BY COALESCE(StartedAt, CreatedAt) DESC, CreatedAt DESC;
     """
 
     with Database().connect() as connection:
-        rows = connection.cursor().execute(sql).fetchall()
+        rows = connection.cursor().execute(sql, warehouse_id).fetchall()
 
     def parse_json(value: Any) -> Dict[str, Any]:
         if not value:
@@ -2303,6 +2307,9 @@ def save_reconciliation_run_file(
 
 def list_reconciliation_runs(limit: int = 500) -> List[Dict[str, Any]]:
     initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+
+    warehouse_id = int(current_warehouse_id())
     safe_limit = max(1, min(int(limit), 5000))
     sql = f"""
         SELECT TOP ({safe_limit})
@@ -2311,17 +2318,21 @@ def list_reconciliation_runs(limit: int = 500) -> List[Dict[str, Any]]:
             TotalInputRows, MasterRecords, AcceptRecords, DispatchRecords,
             ExceptionRecords, GeneratedFiles, ApplicationVersion, ErrorMessage
         FROM dbo.ReconciliationRuns
+        WHERE WarehouseID = ?
         ORDER BY StartedAt DESC, RunID DESC;
     """
     with Database().connect() as connection:
         cursor = connection.cursor()
-        rows = cursor.execute(sql).fetchall()
+        rows = cursor.execute(sql, warehouse_id).fetchall()
         names = [column[0] for column in cursor.description]
     return [dict(zip(names, row)) for row in rows]
 
 
 def get_reconciliation_run(run_number: str) -> Optional[Dict[str, Any]]:
     initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+
+    warehouse_id = int(current_warehouse_id())
     sql = r"""
         SELECT TOP (1)
             RunID, RunNumber, ProcessType, Status, StartedAt, CompletedAt,
@@ -2329,12 +2340,12 @@ def get_reconciliation_run(run_number: str) -> Optional[Dict[str, Any]]:
             TotalInputRows, MasterRecords, AcceptRecords, DispatchRecords,
             ExceptionRecords, GeneratedFiles, ApplicationVersion, ErrorMessage
         FROM dbo.ReconciliationRuns
-        WHERE RunNumber = ?
+        WHERE WarehouseID = ? AND RunNumber = ?
         ORDER BY RunID DESC;
     """
     with Database().connect() as connection:
         cursor = connection.cursor()
-        row = cursor.execute(sql, (str(run_number),)).fetchone()
+        row = cursor.execute(sql, (warehouse_id, str(run_number))).fetchone()
         if row is None:
             return None
         names = [column[0] for column in cursor.description]
@@ -2343,16 +2354,21 @@ def get_reconciliation_run(run_number: str) -> Optional[Dict[str, Any]]:
 
 def list_reconciliation_run_files(run_number: str) -> List[Dict[str, Any]]:
     initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+
+    warehouse_id = int(current_warehouse_id())
     sql = r"""
-        SELECT RunFileID, RunID, RunNumber, FileCategory, FileName, FileType,
-               ContainerName, BlobName, ContentType, SizeBytes, ETag, CreatedAt
-        FROM dbo.ReconciliationRunFiles
-        WHERE RunNumber = ?
-        ORDER BY CreatedAt, RunFileID;
+        SELECT f.RunFileID, f.RunID, f.RunNumber, f.FileCategory, f.FileName, f.FileType,
+               f.ContainerName, f.BlobName, f.ContentType, f.SizeBytes, f.ETag, f.CreatedAt
+        FROM dbo.ReconciliationRunFiles AS f
+        INNER JOIN dbo.ReconciliationRuns AS r
+            ON r.RunID = f.RunID
+        WHERE r.WarehouseID = ? AND f.RunNumber = ?
+        ORDER BY f.CreatedAt, f.RunFileID;
     """
     with Database().connect() as connection:
         cursor = connection.cursor()
-        rows = cursor.execute(sql, (str(run_number),)).fetchall()
+        rows = cursor.execute(sql, (warehouse_id, str(run_number))).fetchall()
         names = [column[0] for column in cursor.description]
     return [dict(zip(names, row)) for row in rows]
 
