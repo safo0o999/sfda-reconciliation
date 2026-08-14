@@ -399,6 +399,25 @@ def build_download_url(run_number: str, category: str, file_name: str) -> str:
     )
 
 
+@app.timer_trigger(
+    schedule="0 15 */6 * * *",
+    arg_name="timer",
+    run_on_startup=False,
+    use_monitor=True,
+)
+def input_retention_cleanup(timer: func.TimerRequest) -> None:
+    """Keep uploaded input files for 24h; preserve outputs and metadata."""
+    try:
+        from engine.blob_storage import BlobStorage
+        retention_hours = int(os.getenv("INPUT_RETENTION_HOURS", "24") or 24)
+        storage = BlobStorage()
+        storage.initialize_containers()
+        result = storage.cleanup_expired_inputs(retention_hours=retention_hours)
+        logger.info("Input retention cleanup completed: %s", result)
+    except Exception:
+        logger.exception("Input retention cleanup failed")
+
+
 @app.route(route="health", methods=["GET"])
 def health(req: func.HttpRequest) -> func.HttpResponse:
     database_status = "Unavailable"
@@ -910,6 +929,27 @@ def warehouse_gln_upload_route(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
+@app.route(route="dashboard/summary", methods=["GET"])
+def dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
+    """Fast Home payload; never builds Variance or Product Intelligence."""
+    denied = _auth_guard(req)
+    if denied:
+        return denied
+    try:
+        from engine.database import (
+            get_dashboard_customer_summary,
+            get_historical_status,
+        )
+        return json_response({
+            "status": "Success",
+            "historical": get_historical_status(),
+            "customer": get_dashboard_customer_summary(limit=10),
+        })
+    except Exception as exc:
+        logger.exception("Dashboard summary failed")
+        return error_response("Dashboard summary failed.", 500, str(exc))
+
+
 @app.route(route="warehouse-data/reset", methods=["POST"])
 def warehouse_data_reset_route(req: func.HttpRequest) -> func.HttpResponse:
     """Reset only uploaded/operational data for the signed-in warehouse."""
@@ -991,48 +1031,49 @@ def history(req: func.HttpRequest) -> func.HttpResponse:
         for job in list_historical_build_jobs(limit):
             rows.append(historical_job_to_history_row(job))
 
-        known = {
-            str(row.get("RunNumber", "")).strip()
-            for row in rows
-            if str(row.get("RunNumber", "")).strip()
-        }
-
-        storage = BlobStorage()
-        storage.initialize_containers()
-
-        # Avoid an N+1 Blob Storage pattern. Cache file listings inside this
-        # request and only query Blob files for legacy rows that actually lack
-        # a persisted SQL timestamp.
+        # SQL is now the authoritative normal History source. Blob recovery is
+        # deliberately opt-in because scanning three containers on every refresh
+        # becomes progressively slower as the platform grows.
+        recover_blob = str(req.params.get("recover_blob", "")).lower() in {"1", "true", "yes"}
         blob_files_cache: Dict[str, List[Dict[str, Any]]] = {}
+        storage = None
 
-        for run_number in storage.list_run_numbers(limit):
-            if run_number in known:
-                continue
-            files = storage.list_all_run_files(run_number)
-            blob_files_cache[run_number] = files
-            rows.append(
-                blob_run_to_history_row(
-                    run_number,
-                    load_blob_run_metadata(run_number),
-                    files,
+        if recover_blob:
+            known = {
+                str(row.get("RunNumber", "")).strip()
+                for row in rows
+                if str(row.get("RunNumber", "")).strip()
+            }
+            storage = BlobStorage()
+            storage.initialize_containers()
+            for run_number in storage.list_run_numbers(
+                limit, include_fallback_containers=True
+            ):
+                if run_number in known:
+                    continue
+                files = storage.list_all_run_files(run_number)
+                blob_files_cache[run_number] = files
+                rows.append(
+                    blob_run_to_history_row(
+                        run_number,
+                        load_blob_run_metadata(run_number),
+                        files,
+                    )
                 )
-            )
 
         enriched_rows = []
         for row in rows:
             run_number = str(row.get("RunNumber", "")).strip()
             files_for_date: List[Dict[str, Any]] = []
-
-            if run_number and not row.get("StartedAt"):
+            if recover_blob and run_number and not row.get("StartedAt"):
+                if storage is None:
+                    storage = BlobStorage()
                 files_for_date = (
                     blob_files_cache.get(run_number)
                     or storage.list_all_run_files(run_number)
                 )
                 blob_files_cache[run_number] = files_for_date
-
-            enriched_rows.append(
-                _history_datetime_fields(row, files_for_date)
-            )
+            enriched_rows.append(_history_datetime_fields(row, files_for_date))
         rows = enriched_rows
 
         rows.sort(
@@ -1099,14 +1140,27 @@ def history_run(req: func.HttpRequest) -> func.HttpResponse:
             )
             merged_files[key] = file
 
+        input_retention_hours = max(1, int(os.getenv("INPUT_RETENTION_HOURS", "24") or 24))
+        input_cutoff = datetime.now(timezone.utc) - timedelta(hours=input_retention_hours)
+
         for file in sql_files:
-            file["download_url"] = build_download_url(
+            category = str(file.get("FileCategory", "")).strip().lower()
+            created_at = file.get("CreatedAt")
+            expired = False
+            if category == "input" and created_at:
+                try:
+                    parsed = pd.to_datetime(created_at, utc=True, errors="coerce")
+                    expired = bool(not pd.isna(parsed) and parsed.to_pydatetime() < input_cutoff)
+                except Exception:
+                    expired = False
+            file["RetentionExpired"] = expired
+            file["download_url"] = "" if expired else build_download_url(
                 run_number,
-                str(file.get("FileCategory", "")),
+                category,
                 str(file.get("FileName", "")),
             )
             key = (
-                str(file.get("FileCategory", "")).strip().lower(),
+                category,
                 str(file.get("FileName", "")).strip().lower(),
             )
             # Prefer the SQL row when both sources describe the same file.
@@ -1124,8 +1178,54 @@ def history_run(req: func.HttpRequest) -> func.HttpResponse:
             try:
                 from engine.database import get_historical_build_job
 
-                run = historical_job_to_history_row(
-                    get_historical_build_job(run_number)
+                historical_job = get_historical_build_job(run_number)
+                run = historical_job_to_history_row(historical_job)
+
+                # Historical build inputs are recorded in the SQL job manifest.
+                # Keep those file names visible after the 24h Blob retention
+                # window expires; only the original bytes/download disappear.
+                manifest = historical_job.get("input_manifest") or {}
+                job_created = historical_job.get("created_at") or historical_job.get("started_at")
+                manifest_expired = False
+                if job_created:
+                    try:
+                        parsed = pd.to_datetime(job_created, utc=True, errors="coerce")
+                        manifest_expired = bool(not pd.isna(parsed) and parsed.to_pydatetime() < input_cutoff)
+                    except Exception:
+                        manifest_expired = False
+
+                for category_key in ("asn_files", "dispatch_files", "sfda_files"):
+                    for item in manifest.get(category_key) or []:
+                        file_name = str(item.get("file_name") or "").strip()
+                        if not file_name:
+                            continue
+                        key = ("input", file_name.lower())
+                        if key in merged_files:
+                            continue
+                        merged_files[key] = {
+                            "RunFileID": None,
+                            "RunNumber": run_number,
+                            "FileCategory": "input",
+                            "FileName": file_name,
+                            "FileType": file_type_from_name(file_name),
+                            "ContainerName": "runs-inputs",
+                            "BlobName": item.get("blob_name") or "",
+                            "ContentType": item.get("content_type") or "application/octet-stream",
+                            "SizeBytes": int(item.get("size_bytes") or 0),
+                            "ETag": "",
+                            "CreatedAt": job_created,
+                            "RetentionExpired": manifest_expired,
+                            "download_url": "" if manifest_expired else build_download_url(
+                                run_number, "input", file_name
+                            ),
+                        }
+
+                files = sorted(
+                    merged_files.values(),
+                    key=lambda file: (
+                        str(file.get("FileCategory", "")),
+                        str(file.get("FileName", "")),
+                    ),
                 )
             except KeyError:
                 run = None
