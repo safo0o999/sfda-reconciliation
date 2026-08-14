@@ -615,10 +615,10 @@
         </div>
 
         <div class="ops-kpis">
-          <div class="card ops-kpi"><div class="label">Total Items (SFDA)</div><div class="value" id="homeInputRows">—</div><div class="mini-icon">▣</div></div>
-          <div class="card ops-kpi green"><div class="label">Pending to Accept</div><div class="value" id="homeAccept">—<span class="unit">Packs</span></div><div class="mini-icon">✓</div></div>
-          <div class="card ops-kpi amber"><div class="label">Pending to Dispatch</div><div class="value" id="homeDispatch">—<span class="unit">Packs</span></div><div class="mini-icon">⇢</div></div>
-          <div class="card ops-kpi red"><div class="label">Exceptions</div><div class="value" id="homeVariance">—<span class="unit">Items</span></div><div class="mini-icon">!</div></div>
+          <div class="card ops-kpi"><div class="label">Total SFDA Batches</div><div class="value" id="homeSfdaBatches">—<span class="unit">Batches</span></div><div class="mini-icon">▣</div></div>
+          <div class="card ops-kpi red"><div class="label">Missing Supplier Batches</div><div class="value" id="homeMissingSupplierBatches">—<span class="unit">Batches</span></div><div class="mini-icon">!</div></div>
+          <div class="card ops-kpi amber"><div class="label">Pending STO RSD Transfers</div><div class="value" id="homeStoFollowup">—<span class="unit">Batches</span></div><div class="mini-icon">⇄</div></div>
+          <div class="card ops-kpi green"><div class="label">Historical Data Coverage</div><div class="value" id="homeHistoricalCoverage" style="font-size:22px">—</div><div class="mini-icon">◷</div></div>
           <div class="card ops-kpi purple"><div class="label">Customers with GLN</div><div class="value" id="homeCustomersWithGln">—<span class="unit">Customers</span></div><div class="mini-icon">◎</div></div>
           <div class="card ops-kpi"><div class="label">Dummy GLN Used</div><div class="value" id="homeDummyGln">—<span class="unit">Customers</span></div><div class="mini-icon">?</div></div>
         </div>
@@ -1227,6 +1227,14 @@ Drug Traceability Reconciliation Platform</textarea></label>
           <div class="card intelligence-card"><h3>Business Rules</h3><p>Controls Accept, Dispatch, Variance allocation, maximum rows, quantity limits, and file generation.</p><div class="intelligence-metric"><span class="badge success">Python Rules Active</span><strong>✓</strong></div></div>
         </div>
 
+        <div class="card" style="margin-top:16px;border:1px solid #f1b8ba" id="warehouseResetCard">
+          <div class="card-header"><div><div class="card-title" style="color:#b42318">Reset Warehouse Data</div><div class="card-subtitle">Delete only uploaded and operational data for this warehouse and return it to a clean state. Users, warehouse setup, GLN mapping, Pack Size and business rules are preserved.</div></div></div>
+          <div class="card-body" style="display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap">
+            <div class="file-info" id="warehouseResetInfo">This action deletes Batch Master, historical events, snapshots, reconciliation runs and warehouse run files.</div>
+            <button class="btn btn-danger" id="warehouseResetButton" type="button">Reset Warehouse Data</button>
+          </div>
+        </div>
+
         <div class="card table-card" style="margin-top:16px" id="adminUsersCard">
           <div class="card-header"><div><div class="card-title">User Management</div><div class="card-subtitle">New company users remain Pending until approved.</div></div><span class="badge info" id="adminUserCount">0 users</span></div>
           <div class="table-scroll" style="max-height:360px">
@@ -1292,6 +1300,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   const ADMIN_USERS_URL = "/api/user-management/users";
   const WAREHOUSE_GLN_STATUS_URL = "/api/warehouse-gln/status";
   const WAREHOUSE_GLN_UPLOAD_URL = "/api/warehouse-gln/upload";
+  const WAREHOUSE_RESET_URL = "/api/warehouse-data/reset";
   const DASHBOARD_PREVIEW_KEY_PREFIX = "sfda_dashboard_preview_v3_w";
   const LEGACY_DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v2";
   let currentResult = null;
@@ -1744,12 +1753,11 @@ Drug Traceability Reconciliation Platform</textarea></label>
       renderDashboardOverview();
       populateSummary(result); populateResults(result);
       const metrics=getResultMetrics(result);
-      $("homeInputRows").textContent=formatNumber(metrics.inputRows);
-      $("homeAccept").innerHTML=`${formatNumber(metrics.acceptRows)}<span class="unit">Packs</span>`;
-      $("homeDispatch").innerHTML=`${formatNumber(metrics.dispatchRows)}<span class="unit">Packs</span>`;
-      $("homeVariance").innerHTML=`${formatNumber(metrics.varianceRows)}<span class="unit">Items</span>`;
       $("homeGenerated").textContent=formatNumber(metrics.acceptFileCount+metrics.dispatchFileCount+metrics.reportFileCount);
-      await refreshAzureHistory({silent:true});
+      await Promise.all([
+        refreshAzureHistory({silent:true}),
+        refreshHistoricalStatus({silent:true})
+      ]);
       $("inlineResults").classList.add("show"); setTimeout(()=>$("inlineResults").scrollIntoView({behavior:"smooth",block:"start"}),120);
       toast(`${label} files generated successfully.`,"success");
     }catch(error){
@@ -2345,7 +2353,8 @@ Drug Traceability Reconciliation Platform</textarea></label>
       if(includeLinked){
         await Promise.all([
           refreshAzureHistory({silent:true}),
-          loadDashboardLinkedData()
+          loadDashboardLinkedData(),
+          refreshHistoricalStatus({silent:true})
         ]);
       }else{
         await refreshAzureHistory({silent:true});
@@ -2359,16 +2368,28 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }
   }
 
+  function formatHistoricalCoverage(fromValue,toValue){
+    const from=parseUtcTimestamp(fromValue),to=parseUtcTimestamp(toValue);
+    if(!from||!to) return "—";
+    const formatter=new Intl.DateTimeFormat("en-US",{month:"short",year:"numeric",timeZone:"Asia/Riyadh"});
+    return `${formatter.format(from)} → ${formatter.format(to)}`;
+  }
+
+  function renderHistoricalDashboardCards(status){
+    const data=status||{};
+    if($("homeSfdaBatches")) $("homeSfdaBatches").textContent=formatNumber(data.total_sfda_batches||0);
+    if($("homeMissingSupplierBatches")) $("homeMissingSupplierBatches").textContent=formatNumber(data.missing_supplier_batches||0);
+    if($("homeStoFollowup")) $("homeStoFollowup").textContent=formatNumber(data.sto_followup_batches||0);
+    if($("homeHistoricalCoverage")) $("homeHistoricalCoverage").textContent=formatHistoricalCoverage(data.historical_from,data.historical_to);
+  }
+
   function updateDashboard(){
     renderDashboardOverview();
     const history=getHistory(),latest=history.find(x=>["Pending Upload","Completed"].includes(x.status));
     const previewTotals=dashboardPreviewTotals();
     $("homeRuns").textContent=formatNumber(history.length);
     $("homeSuccess").textContent=formatNumber(history.filter(x=>x.status==="Completed").length);
-    $("homeInputRows").textContent=latest?formatNumber(latest.inputRows):"—";
-    $("homeAccept").textContent=formatNumber(previewTotals.accept);
-    $("homeDispatch").textContent=formatNumber(previewTotals.dispatch);
-    if(!(dashboardVarianceData?.summary)) $("homeVariance").textContent=formatNumber(previewTotals.variance);
+    renderHistoricalDashboardCards(historicalStatusData);
     $("homeGenerated").textContent=latest?formatNumber(latest.generated):"—";
     renderDashboardLinkedData();
 
@@ -2503,6 +2524,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   let step1ProgressTimer = null;
   let step2ProgressTimer = null;
   let historicalDataReady = false;
+  let historicalStatusData = {};
 
   function element(id){ return document.getElementById(id); }
 
@@ -2552,7 +2574,9 @@ Drug Traceability Reconciliation Platform</textarea></label>
   }
 
   function applyHistoricalStatus(status){
+    historicalStatusData=status||{};
     historicalDataReady=Boolean(status?.exists);
+    renderHistoricalDashboardCards(historicalStatusData);
     const acceptSfda=element("step2AcceptSfdaFile");
     const dispatchInventory=element("step2DispatchInventoryFile");
     const dispatchSfda=element("step2DispatchSfdaFile");
@@ -3449,6 +3473,61 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }
   }
 
+  async function resetWarehouseData(){
+    const button=$("warehouseResetButton");
+    const warehouseName=String(currentUser?.WarehouseName||"this warehouse");
+    const confirmed=window.confirm(
+      `Reset all uploaded and operational data for ${warehouseName}?\n\n`+
+      `This will delete Batch Master, historical receipt/dispatch events, snapshots, run history and generated run files for this warehouse only.\n\n`+
+      `Users, warehouse setup, GLN mapping, Pack Size and business rules will NOT be deleted.`
+    );
+    if(!confirmed) return;
+
+    const secondConfirm=window.confirm(
+      `Final confirmation: return ${warehouseName} to a clean data state? This cannot be undone.`
+    );
+    if(!secondConfirm) return;
+
+    const originalText=button?.textContent||"Reset Warehouse Data";
+    if(button){button.disabled=true;button.textContent="Resetting...";}
+    try{
+      const response=await fetch(WAREHOUSE_RESET_URL,{
+        method:"POST",
+        credentials:"same-origin",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({confirm:"RESET"})
+      });
+      const payload=await response.json().catch(()=>({}));
+      if(response.status===401){await logout();return;}
+      if(!response.ok) throw new Error(payload.details||payload.error||"Warehouse reset failed.");
+
+      const key=dashboardPreviewStorageKey();
+      if(key) localStorage.removeItem(key);
+      clearLegacyDashboardPreview();
+      currentResult=null;
+      historyCache=[];
+      historyLoaded=false;
+      dashboardVarianceData={summary:{},items:[]};
+      dashboardProductData={summary:{},customers:[],alerts:[]};
+      historicalStatusData={};
+      historicalDataReady=false;
+
+      await Promise.allSettled([
+        refreshAzureHistory({silent:true}),
+        refreshHistoricalStatus({silent:true}),
+        loadDashboardLinkedData()
+      ]);
+      updateDashboard();
+      renderHistory();
+      renderReports();
+      toast(`${warehouseName} data reset completed. The warehouse is ready for a fresh build.`,"success");
+    }catch(error){
+      toast(error.message||String(error),"error");
+    }finally{
+      if(button){button.disabled=false;button.textContent=originalText;}
+    }
+  }
+
   async function loadAdminUsers(){
     if(!currentUser || String(currentUser.Role||"").toLowerCase()!=="admin") return;
     const response=await fetch(ADMIN_USERS_URL,{cache:"no-store",credentials:"same-origin"});
@@ -3540,6 +3619,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   $("logoutButton")?.addEventListener("click",()=>logout());
   $("adminRefreshUsers")?.addEventListener("click",()=>loadAdminUsers().catch(error=>toast(error.message||String(error),"error")));
   $("warehouseGlnUpload")?.addEventListener("click",()=>uploadWarehouseGln());
+  $("warehouseResetButton")?.addEventListener("click",()=>resetWarehouseData());
   $("loginPassword")?.addEventListener("keydown",event=>{if(event.key==="Enter")login();});
   $("registerPasswordConfirm")?.addEventListener("keydown",event=>{if(event.key==="Enter")registerUser();});
 
