@@ -1565,25 +1565,34 @@ def reset_history() -> None:
 
 
 def get_historical_status() -> Dict[str, Any]:
-    """Return warehouse-scoped historical readiness and dashboard coverage."""
+    """Return lightweight warehouse-scoped historical readiness/dashboard coverage.
+
+    The previous query relied only on RLS predicates. Explicit WarehouseID filters
+    let SQL Server use the Version 6 composite indexes directly and make Home
+    refreshes predictable as historical data grows.
+    """
 
     initialize_database()
+    from engine.warehouse_context import current_warehouse_id
 
+    warehouse_id = int(current_warehouse_id())
     sql = r"""
         SELECT
-            (SELECT COUNT_BIG(*) FROM dbo.BatchMaster) AS BatchMasterRows,
-            (SELECT COUNT_BIG(*) FROM dbo.SupplierHistory) AS SupplierHistoryRows,
-            (SELECT COUNT_BIG(*) FROM dbo.CustomerHistory) AS CustomerHistoryRows,
-            (SELECT MAX(LastUpdated) FROM dbo.BatchMaster) AS LastBuildUtc,
-            (SELECT COUNT_BIG(*) FROM dbo.LatestSFDASnapshot) AS TotalSFDABatches,
+            (SELECT COUNT_BIG(*) FROM dbo.BatchMaster WHERE WarehouseID = ?) AS BatchMasterRows,
+            (SELECT COUNT_BIG(*) FROM dbo.SupplierHistory WHERE WarehouseID = ?) AS SupplierHistoryRows,
+            (SELECT COUNT_BIG(*) FROM dbo.CustomerHistory WHERE WarehouseID = ?) AS CustomerHistoryRows,
+            (SELECT MAX(LastUpdated) FROM dbo.BatchMaster WHERE WarehouseID = ?) AS LastBuildUtc,
+            (SELECT COUNT_BIG(*) FROM dbo.LatestSFDASnapshot WHERE WarehouseID = ?) AS TotalSFDABatches,
             (
                 SELECT COUNT_BIG(*)
                 FROM (
                     SELECT s.BN, s.ExpiryMonthKey, s.GenericItemNumber
                     FROM dbo.SupplierHistory s
                     LEFT JOIN dbo.LatestSFDASnapshot f
-                      ON f.BN=s.BN AND f.ExpiryMonthKey=s.ExpiryMonthKey
-                    WHERE f.BN IS NULL
+                      ON f.WarehouseID = s.WarehouseID
+                     AND f.BN = s.BN
+                     AND f.ExpiryMonthKey = s.ExpiryMonthKey
+                    WHERE s.WarehouseID = ? AND f.BN IS NULL
                     GROUP BY s.BN, s.ExpiryMonthKey, s.GenericItemNumber
                 ) missing_supplier
             ) AS MissingSupplierBatches,
@@ -1593,24 +1602,25 @@ def get_historical_status() -> Dict[str, Any]:
                     SELECT r.BN, r.ExpiryMonthKey, r.GenericItemNumber
                     FROM dbo.ReceiptEvents r
                     LEFT JOIN dbo.LatestSFDASnapshot f
-                      ON f.BN=r.BN
-                     AND f.ExpiryMonthKey=r.ExpiryMonthKey
+                      ON f.WarehouseID = r.WarehouseID
+                     AND f.BN = r.BN
+                     AND f.ExpiryMonthKey = r.ExpiryMonthKey
                     WHERE
-                        UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, '')))) LIKE 'TRK800%'
+                        r.WarehouseID = ?
+                        AND UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, '')))) LIKE 'TRK800%'
                         AND EXISTS
                         (
                             SELECT 1
                             FROM dbo.BatchMaster bm_filter
-                            WHERE
-                                (
-                                    bm_filter.BN = r.BN
-                                    AND bm_filter.ExpiryMonthKey = r.ExpiryMonthKey
-                                )
-                                OR
-                                (
-                                    NULLIF(LTRIM(RTRIM(r.GenericItemNumber)), '') IS NOT NULL
-                                    AND bm_filter.GenericItemNumber = r.GenericItemNumber
-                                )
+                            WHERE bm_filter.WarehouseID = r.WarehouseID
+                              AND (
+                                    (bm_filter.BN = r.BN AND bm_filter.ExpiryMonthKey = r.ExpiryMonthKey)
+                                    OR
+                                    (
+                                        NULLIF(LTRIM(RTRIM(r.GenericItemNumber)), '') IS NOT NULL
+                                        AND bm_filter.GenericItemNumber = r.GenericItemNumber
+                                    )
+                                  )
                         )
                     GROUP BY r.BN, r.ExpiryMonthKey, r.GenericItemNumber
                     HAVING COALESCE(MAX(f.QuantityReceivePending), 0) <= 0
@@ -1619,23 +1629,24 @@ def get_historical_status() -> Dict[str, Any]:
             (
                 SELECT MIN(d.TransactionDate)
                 FROM (
-                    SELECT ReceivedDate AS TransactionDate FROM dbo.ReceiptEvents
+                    SELECT ReceivedDate AS TransactionDate FROM dbo.ReceiptEvents WHERE WarehouseID = ?
                     UNION ALL
-                    SELECT DispatchDate AS TransactionDate FROM dbo.DispatchEvents
+                    SELECT DispatchDate AS TransactionDate FROM dbo.DispatchEvents WHERE WarehouseID = ?
                 ) d
             ) AS HistoricalFrom,
             (
                 SELECT MAX(d.TransactionDate)
                 FROM (
-                    SELECT ReceivedDate AS TransactionDate FROM dbo.ReceiptEvents
+                    SELECT ReceivedDate AS TransactionDate FROM dbo.ReceiptEvents WHERE WarehouseID = ?
                     UNION ALL
-                    SELECT DispatchDate AS TransactionDate FROM dbo.DispatchEvents
+                    SELECT DispatchDate AS TransactionDate FROM dbo.DispatchEvents WHERE WarehouseID = ?
                 ) d
             ) AS HistoricalTo;
     """
 
+    params = (warehouse_id,) * 11
     with Database().connect() as connection:
-        row = connection.cursor().execute(sql).fetchone()
+        row = connection.cursor().execute(sql, params).fetchone()
 
     batch_rows = int(row[0] or 0)
     supplier_rows = int(row[1] or 0)
@@ -1654,6 +1665,72 @@ def get_historical_status() -> Dict[str, Any]:
         "historical_to": row[8],
     }
 
+
+def get_dashboard_customer_summary(limit: int = 10) -> Dict[str, Any]:
+    """Return Home customer/GLN metrics without building Product Intelligence.
+
+    SQL first aggregates CustomerHistory to one row per customer, then the small
+    result is overlaid with the current warehouse GLN reference. This preserves
+    the exact GLN business rule while avoiding full Batch Master / snapshot reads.
+    """
+
+    initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+    from engine.reference_data import apply_current_warehouse_gln, DUMMY_GLN
+
+    warehouse_id = int(current_warehouse_id())
+    sql = r"""
+        SELECT
+            ToAddress AS [To Address],
+            SUM(COALESCE(DispatchQuantityPack, 0)) AS dispatched_pack,
+            MAX(LastDispatchDate) AS last_dispatch
+        FROM dbo.CustomerHistory
+        WHERE WarehouseID = ?
+          AND NULLIF(LTRIM(RTRIM(ISNULL(ToAddress, ''))), '') IS NOT NULL
+        GROUP BY ToAddress;
+    """
+    with Database().connect() as connection:
+        customers = pd.read_sql(sql, connection, params=[warehouse_id])
+
+    if customers.empty:
+        return {
+            "summary": {
+                "customer_count": 0,
+                "customer_with_gln_count": 0,
+                "customer_dummy_gln_count": 0,
+                "customer_unmapped_count": 0,
+            },
+            "customers": [],
+        }
+
+    customers = apply_current_warehouse_gln(customers)
+    gln = customers.get("GLN", pd.Series("", index=customers.index)).fillna("").astype(str).str.strip()
+    address = customers["To Address"].fillna("").astype(str).str.strip()
+    dummy_mask = gln.str.upper().eq("DUMMY") | gln.eq(DUMMY_GLN)
+    mapped_mask = gln.ne("") & ~dummy_mask
+    unmapped_mask = gln.eq("")
+
+    customers["dispatched_pack"] = pd.to_numeric(customers["dispatched_pack"], errors="coerce").fillna(0)
+    customers = customers.sort_values(["dispatched_pack", "To Address"], ascending=[False, True])
+
+    top_rows = []
+    for row in customers.head(max(1, min(int(limit), 50))).to_dict(orient="records"):
+        top_rows.append({
+            "To Address": row.get("To Address"),
+            "GLN": row.get("GLN"),
+            "dispatched_pack": row.get("dispatched_pack", 0),
+            "last_dispatch": row.get("last_dispatch"),
+        })
+
+    return {
+        "summary": {
+            "customer_count": int(address.replace("", pd.NA).nunique()),
+            "customer_with_gln_count": int(address.loc[mapped_mask].replace("", pd.NA).nunique()),
+            "customer_dummy_gln_count": int(address.loc[dummy_mask].replace("", pd.NA).nunique()),
+            "customer_unmapped_count": int(address.loc[unmapped_mask].replace("", pd.NA).nunique()),
+        },
+        "customers": top_rows,
+    }
 
 def reset_current_warehouse_data() -> Dict[str, Any]:
     """Delete only uploaded/operational data owned by the current warehouse.
