@@ -889,15 +889,55 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
     return supplier, customer
 
 
-def _get_sto_receipt_history(prefix: str) -> pd.DataFrame:
-    """Return aggregated STO receipt evidence enriched from Batch Master."""
+def _get_sto_receipt_history(
+    prefix: str,
+    *,
+    sfda_relevant_only: bool = False,
+) -> pd.DataFrame:
+    """Return aggregated STO receipt evidence enriched from Batch Master.
+
+    STO Incoming (TRK800) must not expose every physical inter-warehouse receipt.
+    When ``sfda_relevant_only=True`` a receipt is kept only when either:
+
+      1. its exact BN + Expiry Month exists in Batch Master; OR
+      2. its Generic Item Number exists anywhere in Batch Master.
+
+    Batch Master is already the platform's SFDA-relevant historical universe, so
+    this makes it the eligibility filter for STO Incoming while preserving the
+    actual STO batch number from ReceiptEvents.
+
+    If the exact STO batch is not in Batch Master but the Generic Item Number is,
+    the row is retained as a generic-level SFDA-relevant batch. Drug/GTIN/package
+    enrichment is taken from the best available Batch Master row for that generic,
+    preferring an exact BN + Expiry match when one exists.
+    """
 
     initialize_database()
     safe_prefix = str(prefix or "").strip().upper()
     if safe_prefix not in {"TRK800", "TRK49"}:
         raise ValueError("Unsupported STO receipt prefix.")
 
-    sql = r"""
+    relevance_where = ""
+    if sfda_relevant_only:
+        relevance_where = r"""
+        WHERE EXISTS
+        (
+            SELECT 1
+            FROM dbo.BatchMaster bm_filter
+            WHERE
+                (
+                    bm_filter.BN = r.BN
+                    AND bm_filter.ExpiryMonthKey = r.ExpiryMonthKey
+                )
+                OR
+                (
+                    NULLIF(LTRIM(RTRIM(r.GenericItemNumber)), '') IS NOT NULL
+                    AND bm_filter.GenericItemNumber = r.GenericItemNumber
+                )
+        )
+        """
+
+    sql = rf"""
         WITH Receipt AS
         (
             SELECT
@@ -917,7 +957,13 @@ def _get_sto_receipt_history(prefix: str) -> pd.DataFrame:
                 MAX(ReceivedDate) AS LastReceivedDate
             FROM dbo.ReceiptEvents
             WHERE UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE ?
-            GROUP BY InboundShipment, SupplierName, SupplierCode, BN, ExpiryMonthKey, GenericItemNumber
+            GROUP BY
+                InboundShipment,
+                SupplierName,
+                SupplierCode,
+                BN,
+                ExpiryMonthKey,
+                GenericItemNumber
         )
         SELECT
             r.InboundShipment AS [Inbound Shipment],
@@ -934,27 +980,82 @@ def _get_sto_receipt_history(prefix: str) -> pd.DataFrame:
             r.ItemFamilyGroup AS [Item Family Group],
             COALESCE(b.PackageSize, 0) AS PackageSize,
             r.ReceivedQuantityEach AS [Received Quantity Each],
-            CASE WHEN COALESCE(b.PackageSize, 0) > 0
-                 THEN r.ReceivedQuantityEach / b.PackageSize ELSE 0 END AS [Received Quantity Pack],
+            CASE
+                WHEN COALESCE(b.PackageSize, 0) > 0
+                THEN r.ReceivedQuantityEach / b.PackageSize
+                ELSE 0
+            END AS [Received Quantity Pack],
             r.FirstReceivedDate AS [First Received Date],
-            r.LastReceivedDate AS [Last Received Date]
+            r.LastReceivedDate AS [Last Received Date],
+            CASE
+                WHEN b.BN = r.BN
+                 AND b.ExpiryMonthKey = r.ExpiryMonthKey
+                    THEN 'Exact Batch in SFDA-Relevant Master'
+                WHEN b.GenericItemNumber = r.GenericItemNumber
+                    THEN 'Generic Exists - STO Batch Missing from SFDA'
+                ELSE ''
+            END AS [SFDA Match Status]
         FROM Receipt r
-        LEFT JOIN dbo.BatchMaster b
-          ON b.BN=r.BN
-         AND b.ExpiryMonthKey=r.ExpiryMonthKey
-         AND b.GenericItemNumber=r.GenericItemNumber
-        ORDER BY r.LastReceivedDate, r.BN, r.GenericItemNumber;
+        OUTER APPLY
+        (
+            SELECT TOP (1)
+                bm.BN,
+                bm.ExpiryMonthKey,
+                bm.ExpiryDate,
+                bm.GenericItemNumber,
+                bm.GTIN,
+                bm.DrugName,
+                bm.TradeName,
+                bm.PackageSize,
+                bm.GenericExistsInSFDA
+            FROM dbo.BatchMaster bm
+            WHERE
+                (
+                    bm.BN = r.BN
+                    AND bm.ExpiryMonthKey = r.ExpiryMonthKey
+                )
+                OR
+                (
+                    NULLIF(LTRIM(RTRIM(r.GenericItemNumber)), '') IS NOT NULL
+                    AND bm.GenericItemNumber = r.GenericItemNumber
+                )
+            ORDER BY
+                CASE
+                    WHEN bm.BN = r.BN
+                     AND bm.ExpiryMonthKey = r.ExpiryMonthKey
+                    THEN 0 ELSE 1
+                END,
+                bm.LastUpdated DESC,
+                bm.BN
+        ) b
+        {relevance_where}
+        ORDER BY
+            r.LastReceivedDate,
+            r.BN,
+            r.GenericItemNumber;
     """
 
     with Database().connect() as connection:
-        return pd.read_sql(sql, connection, params=(safe_prefix + "%",))
+        return pd.read_sql(
+            sql,
+            connection,
+            params=(safe_prefix + "%",),
+        )
 
 
 def get_sto_incoming_history_df() -> pd.DataFrame:
-    return _get_sto_receipt_history("TRK800")
+    # STO Incoming is an RSD follow-up list, not a complete physical-transfer
+    # archive. Show only SFDA-relevant batches (exact SFDA batch or equivalent
+    # Generic Item Number proven in SFDA through Batch Master).
+    return _get_sto_receipt_history(
+        "TRK800",
+        sfda_relevant_only=True,
+    )
 
 
 def get_sto_return_history_df() -> pd.DataFrame:
+    # STO Return remains a physical cancellation-action list and is intentionally
+    # not restricted by the STO Incoming SFDA-relevance filter.
     frame = _get_sto_receipt_history("TRK49")
     if frame.empty:
         frame["Required Action"] = pd.Series(dtype=object)
@@ -1485,8 +1586,25 @@ def get_historical_status() -> Dict[str, Any]:
                     SELECT r.BN, r.ExpiryMonthKey, r.GenericItemNumber
                     FROM dbo.ReceiptEvents r
                     LEFT JOIN dbo.LatestSFDASnapshot f
-                      ON f.BN=r.BN AND f.ExpiryMonthKey=r.ExpiryMonthKey
-                    WHERE UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, '')))) LIKE 'TRK800%'
+                      ON f.BN=r.BN
+                     AND f.ExpiryMonthKey=r.ExpiryMonthKey
+                    WHERE
+                        UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, '')))) LIKE 'TRK800%'
+                        AND EXISTS
+                        (
+                            SELECT 1
+                            FROM dbo.BatchMaster bm_filter
+                            WHERE
+                                (
+                                    bm_filter.BN = r.BN
+                                    AND bm_filter.ExpiryMonthKey = r.ExpiryMonthKey
+                                )
+                                OR
+                                (
+                                    NULLIF(LTRIM(RTRIM(r.GenericItemNumber)), '') IS NOT NULL
+                                    AND bm_filter.GenericItemNumber = r.GenericItemNumber
+                                )
+                        )
                     GROUP BY r.BN, r.ExpiryMonthKey, r.GenericItemNumber
                     HAVING COALESCE(MAX(f.QuantityReceivePending), 0) <= 0
                 ) sto_followup
