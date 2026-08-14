@@ -910,6 +910,59 @@ def warehouse_gln_upload_route(req: func.HttpRequest) -> func.HttpResponse:
         )
 
 
+@app.route(route="warehouse-data/reset", methods=["POST"])
+def warehouse_data_reset_route(req: func.HttpRequest) -> func.HttpResponse:
+    """Reset only uploaded/operational data for the signed-in warehouse."""
+    denied = _auth_guard(req)
+    if denied:
+        return denied
+
+    try:
+        payload = req.get_json() or {}
+        if str(payload.get("confirm") or "").strip().upper() != "RESET":
+            return error_response(
+                "Reset confirmation is required.",
+                400,
+                "Send {confirm: 'RESET'} after the user confirms the destructive action.",
+            )
+
+        user = _current_user(req) or {}
+        warehouse_id = int(user.get("WarehouseID") or 0)
+        warehouse_name = str(user.get("WarehouseName") or f"Warehouse {warehouse_id}")
+        if warehouse_id < 1:
+            return error_response("A valid warehouse is required.", 400)
+
+        from engine.database import reset_current_warehouse_data
+        from engine.blob_storage import BlobStorage
+
+        database_result = reset_current_warehouse_data()
+        storage = BlobStorage()
+        storage.initialize_containers()
+        blob_result = storage.delete_current_warehouse_data()
+
+        return json_response({
+            "status": "Completed",
+            "message": "Warehouse operational data was reset successfully.",
+            "warehouse_id": warehouse_id,
+            "warehouse_name": warehouse_name,
+            "database": database_result,
+            "blob": blob_result,
+            "preserved": [
+                "Warehouse account and users",
+                "Warehouse GLN mapping",
+                "Pack Size reference",
+                "Business rules and application logic",
+            ],
+        })
+    except Exception as exc:
+        logger.exception("Warehouse data reset failed")
+        return error_response(
+            "Unable to reset warehouse operational data.",
+            500,
+            str(exc),
+        )
+
+
 @app.route(route="history", methods=["GET"])
 def history(req: func.HttpRequest) -> func.HttpResponse:
     denied = _auth_guard(req)
@@ -1205,12 +1258,16 @@ def historical_export_current(req: func.HttpRequest) -> func.HttpResponse:
             get_batch_master_df,
             get_customer_history_df,
             get_supplier_history_df,
+            get_sto_incoming_history_df,
+            get_sto_return_history_df,
         )
         from engine.exporter import Exporter
 
         batch_master = get_batch_master_df()
         supplier_history = get_supplier_history_df()
         customer_history = get_customer_history_df()
+        sto_incoming_history = get_sto_incoming_history_df()
+        sto_return_history = get_sto_return_history_df()
         if batch_master.empty:
             return error_response(
                 "Historical Batch Master is empty. Complete Step 1 first.", 400
@@ -1231,6 +1288,16 @@ def historical_export_current(req: func.HttpRequest) -> func.HttpResponse:
             df=customer_history, file_name="Customer_History.xlsx",
             sheet_name="Customer History", title="Historical Customer Dispatch History",
             sort_columns=["To Address", "Generic Item Number", "BN", "Expiry Date"],
+        ))
+        outputs.update(Exporter.build_formatted_excel_file(
+            df=sto_incoming_history, file_name="STO_Incoming_History.xlsx",
+            sheet_name="STO Incoming", title="Historical STO Incoming Receipt History",
+            sort_columns=["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
+        ))
+        outputs.update(Exporter.build_formatted_excel_file(
+            df=sto_return_history, file_name="STO_Return_Cancel_Dispatch.xlsx",
+            sheet_name="STO Return", title="STO Returns - Cancel Previous RSD Dispatch",
+            sort_columns=["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
         ))
         return json_response({"status": "Completed", "outputs": outputs})
     except Exception as exc:
@@ -1627,6 +1694,8 @@ def _run_full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
             create_reconciliation_run,
             get_batch_master_df,
             get_supplier_history_df,
+            get_sto_incoming_history_df,
+            get_sto_return_history_df,
             replace_latest_sfda_snapshot,
             sync_batch_master_sfda_snapshot,
         )
@@ -1647,6 +1716,8 @@ def _run_full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
 
         batch_master = get_batch_master_df()
         supplier_history = get_supplier_history_df()
+        sto_incoming_history = get_sto_incoming_history_df()
+        sto_return_history = get_sto_return_history_df()
         replace_latest_sfda_snapshot(sfda_df, sfda_name)
         if batch_master.empty:
             raise ValueError("Historical Batch Master is empty. Complete Step 1 first.")
@@ -1658,9 +1729,17 @@ def _run_full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
 
         result = FullReconciliationEngine(
             pd.DataFrame(), pd.DataFrame(), sfda_df
-        ).run_accept_reconciliation(sfda_df, batch_master, supplier_history)
+        ).run_accept_reconciliation(
+            sfda_df,
+            batch_master,
+            supplier_history,
+            sto_incoming_history,
+            sto_return_history,
+        )
         accept_details = result["accept_details"]
         supplier_variance = result["supplier_variance"]
+        sto_incoming = result["sto_incoming"]
+        sto_return_cancel = result["sto_return_cancel_dispatch"]
         accept_upload = result["accept_upload"]
         outputs = {
             "batch_master": Exporter.build_formatted_excel_file(
@@ -1687,9 +1766,25 @@ def _run_full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
                 df=supplier_variance,
                 file_name="Supplier_Variance.xlsx",
                 sheet_name="Supplier Variance",
-                title="Supplier Quantity Variance",
+                title="Supplier Quantity Variance - TRK5060 Only",
                 columns=list(supplier_variance.columns),
                 sort_columns=["Supplier Name", "Generic Item Number", "BN"],
+            ),
+            "sto_incoming": Exporter.build_formatted_excel_file(
+                df=sto_incoming,
+                file_name="STO_Incoming_RSD_Follow_Up.xlsx",
+                sheet_name="STO Incoming",
+                title="STO Incoming - RSD Receive Pending Follow-up",
+                columns=list(sto_incoming.columns),
+                sort_columns=["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
+            ),
+            "sto_return_cancel_dispatch": Exporter.build_formatted_excel_file(
+                df=sto_return_cancel,
+                file_name="STO_Return_Cancel_Dispatch.xlsx",
+                sheet_name="STO Return",
+                title="STO Return - Cancel Previous RSD Dispatch",
+                columns=list(sto_return_cancel.columns),
+                sort_columns=["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
             ),
             "accept_files": Exporter.build_sfda_upload_files(
                 accept_upload, "To Be Accept", "SFDA_Full_Accept"
@@ -1703,6 +1798,12 @@ def _run_full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
             ),
             "accept_rows": int(len(accept_upload)),
             "supplier_variance_rows": int(len(supplier_variance)),
+            "sto_incoming_rows": int(len(sto_incoming)),
+            "sto_incoming_followup_rows": int(
+                pd.to_numeric(sto_incoming.get("STO Pending RSD Qty", 0), errors="coerce")
+                .fillna(0).gt(0).sum()
+            ) if not sto_incoming.empty else 0,
+            "sto_return_rows": int(len(sto_return_cancel)),
             "accept_files": len(outputs["accept_files"]),
         }
 
@@ -3257,6 +3358,8 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
         report = result["report"]
         accept = result["accept"]
         dispatch = result["dispatch"]
+        sto_incoming_followup = result.get("sto_incoming_followup", pd.DataFrame())
+        sto_return_cancel = result.get("sto_return_cancel_dispatch", pd.DataFrame())
 
         outputs: Dict[str, Any] = {}
         if mode == "accept":
@@ -3264,7 +3367,19 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
                 report,
                 "Accept_Details.xlsx",
                 "Accept Details",
-                "SFDA Accept Details",
+                "SFDA Accept Details - Classified by TRK",
+            )
+            outputs["sto_incoming_followup"] = build_excel(
+                sto_incoming_followup,
+                "STO_Incoming_RSD_Follow_Up.xlsx",
+                "STO Incoming",
+                "STO Incoming - RSD Follow-up",
+            )
+            outputs["sto_return_cancel_dispatch"] = build_excel(
+                sto_return_cancel,
+                "STO_Return_Cancel_Dispatch.xlsx",
+                "STO Return",
+                "STO Return - Cancel Previous RSD Dispatch",
             )
             outputs["accept_files"] = Exporter.build_sfda_upload_files(
                 accept,
@@ -3310,6 +3425,8 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             "dispatch_rows": dispatch_rows,
             "accept_files": len(outputs.get("accept_files", {})),
             "dispatch_files": len(outputs.get("dispatch_files", {})),
+            "sto_incoming_followup_rows": int(len(sto_incoming_followup)),
+            "sto_return_rows": int(len(sto_return_cancel)),
             "generated_files": generated_output_files,
             "processed_transactions_saved": 0,
             "accept_confirmation": accept_confirmation if mode == "accept" else {},
