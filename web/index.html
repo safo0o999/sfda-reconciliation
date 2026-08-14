@@ -1756,7 +1756,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       const metrics=getResultMetrics(result);
       $("homeGenerated").textContent=formatNumber(metrics.acceptFileCount+metrics.dispatchFileCount+metrics.reportFileCount);
       await Promise.all([
-        refreshAzureHistory({silent:true}),
+        refreshAzureHistory({silent:true,limit:10}),
         refreshHistoricalStatus({silent:true})
       ]);
       $("inlineResults").classList.add("show"); setTimeout(()=>$("inlineResults").scrollIntoView({behavior:"smooth",block:"start"}),120);
@@ -2018,12 +2018,13 @@ Drug Traceability Reconciliation Platform</textarea></label>
   }
  
   async function refreshAzureHistory(options={}){
-    const {silent=false} = options;
+    const {silent=false,limit=500} = options;
+    const safeLimit=Math.max(1,Math.min(Number(limit)||500,500));
     if(historyLoading) return historyCache;
     historyLoading = true;
     if(!silent) toast("Refreshing reconciliation history...","info");
     try{
-      const response = await fetch(`${HISTORY_URL}?limit=500`, {cache:"no-store"});
+      const response = await fetch(`${HISTORY_URL}?limit=${safeLimit}`, {cache:"no-store"});
       let payload;
       try{
         payload = await response.json();
@@ -2359,7 +2360,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
     try{
       if(includeLinked){
         await Promise.all([
-          refreshAzureHistory({silent:true}),
+          refreshAzureHistory({silent:true,limit:10}),
           loadDashboardLinkedData()
         ]);
       }else{
@@ -3541,7 +3542,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       // Keep reset fast: reload only lightweight warehouse state. Variance and
       // Product Intelligence stay cleared and load only when their pages open.
       const reloadResults=await Promise.allSettled([
-        refreshAzureHistory({silent:true}),
+        refreshAzureHistory({silent:true,limit:10}),
         loadDashboardLinkedData()
       ]);
 
