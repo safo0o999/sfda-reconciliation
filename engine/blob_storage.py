@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from azure.core.exceptions import ResourceNotFoundError
@@ -217,26 +217,39 @@ class BlobStorage:
             ),
         )
 
-    def list_run_numbers(self, limit: int = 500) -> List[str]:
+    def list_run_numbers(
+        self,
+        limit: int = 500,
+        *,
+        include_fallback_containers: bool = False,
+    ) -> List[str]:
+        """List run numbers efficiently.
+
+        Normal History discovery uses only runs-metadata. Older deployments can
+        explicitly request the slower fallback scan across output/input containers.
+        This removes two full Blob listings from every ordinary History refresh.
+        """
         run_numbers = set()
-        for container_name in (
-            METADATA_CONTAINER,
-            OUTPUTS_CONTAINER,
-            INPUTS_CONTAINER,
-        ):
+        containers = [METADATA_CONTAINER]
+        if include_fallback_containers:
+            containers.extend([OUTPUTS_CONTAINER, INPUTS_CONTAINER])
+
+        from engine.warehouse_context import current_warehouse_id
+        warehouse_id = int(current_warehouse_id())
+        prefix = self.warehouse_prefix() + "/"
+
+        for container_name in containers:
             container = self.service.get_container_client(container_name)
-            prefix = self.warehouse_prefix() + "/"
             for blob in container.list_blobs(name_starts_with=prefix):
                 name = str(blob.name or "")
                 relative = name[len(prefix):]
                 if "/" not in relative:
                     continue
                 run_number = relative.split("/", 1)[0].strip()
-                if run_number:
+                if run_number and run_number != "background-jobs":
                     run_numbers.add(run_number)
 
-            from engine.warehouse_context import current_warehouse_id
-            if int(current_warehouse_id()) == 1:
+            if warehouse_id == 1:
                 for blob in container.list_blobs():
                     name = str(blob.name or "")
                     if name.startswith("w") and "/" in name:
@@ -244,9 +257,59 @@ class BlobStorage:
                     if "/" not in name:
                         continue
                     run_number = name.split("/", 1)[0].strip()
-                    if run_number:
+                    if run_number and run_number != "background-jobs":
                         run_numbers.add(run_number)
+
         return sorted(run_numbers, reverse=True)[: max(1, int(limit))]
+
+    @staticmethod
+    def _chunks(values: List[str], size: int = 256):
+        for index in range(0, len(values), size):
+            yield values[index:index + size]
+
+    @staticmethod
+    def _delete_blob_names(container, names: List[str]) -> int:
+        """Delete Blob names in Azure batch requests with a safe fallback."""
+        deleted = 0
+        for chunk in BlobStorage._chunks(names, 256):
+            if not chunk:
+                continue
+            try:
+                container.delete_blobs(*chunk, delete_snapshots="include")
+                deleted += len(chunk)
+            except Exception:
+                # Some storage accounts / SDK combinations can reject one item in
+                # a batch. Fall back only for that batch instead of failing reset.
+                for blob_name in chunk:
+                    try:
+                        container.delete_blob(blob_name, delete_snapshots="include")
+                        deleted += 1
+                    except ResourceNotFoundError:
+                        pass
+        return deleted
+
+    def cleanup_expired_inputs(self, retention_hours: int = 24) -> Dict[str, Any]:
+        """Delete only uploaded input Blob bytes older than the retention window.
+
+        SQL run/file records, runs-metadata, and generated outputs are deliberately
+        preserved so History remains auditable after the original WMS/SFDA upload
+        expires.
+        """
+        safe_hours = max(1, int(retention_hours))
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=safe_hours)
+        container = self.service.get_container_client(INPUTS_CONTAINER)
+        names = [
+            str(blob.name)
+            for blob in container.list_blobs()
+            if blob.last_modified is not None and blob.last_modified < cutoff
+        ]
+        deleted = self._delete_blob_names(container, names)
+        return {
+            "status": "Completed",
+            "retention_hours": safe_hours,
+            "cutoff_utc": cutoff.isoformat(),
+            "deleted_input_blobs": deleted,
+        }
 
 
     def write_background_job_status(
@@ -376,14 +439,7 @@ class BlobStorage:
                         continue
                     if name and name not in names:
                         names.append(name)
-            count = 0
-            for blob_name in names:
-                container.delete_blob(
-                    blob_name,
-                    delete_snapshots="include",
-                )
-                count += 1
-            deleted[container_name] = count
+            deleted[container_name] = self._delete_blob_names(container, names)
 
         return {
             "status": "Completed",
