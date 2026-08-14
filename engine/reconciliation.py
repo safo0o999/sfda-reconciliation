@@ -10,6 +10,13 @@ from engine.normalizer import Normalizer
 from engine.validator import Validator
 from engine.reference_data import DUMMY_GLN as WAREHOUSE_DUMMY_GLN, load_current_warehouse_gln
 from engine.warehouse_context import current_warehouse_id
+from engine.inbound_classification import (
+    ACCEPT_TYPES,
+    STO_INCOMING,
+    STO_RETURN,
+    classify_inbound_shipment,
+    classification_status,
+)
 
 
 class ReconciliationEngine:
@@ -457,209 +464,168 @@ class ReconciliationEngine:
                 "ASN/ASDT file is required for Accept reconciliation."
             )
 
-        self.asn = Normalizer.normalize_asn(
-            self.asn
-        )
-        Validator.validate(
-            self.asn,
-            "ASN",
-        )
-
+        self.asn = Normalizer.normalize_asn(self.asn)
+        Validator.validate(self.asn, "ASN")
         self.asn = self._apply_processing_status(
             self.asn, "ACCEPT", "Received Quantity"
         )
 
-        # Customer returns are the only ASN receipt type excluded from SFDA
-        # Accept. WMS identifies them by Inbound Shipment beginning with TRK3.
-        # All other receipts remain eligible, including NUPCO inter-warehouse
-        # transfers, because those movements must also be reflected in SFDA.
-        inbound_shipment = (
-            self.asn.get(
-                "Inbound Shipment",
-                pd.Series("", index=self.asn.index, dtype=object),
-            )
-            .fillna("")
-            .astype(str)
-            .str.strip()
-            .str.upper()
-        )
-        customer_return_mask = inbound_shipment.str.startswith(
-            "TRK3",
-            na=False,
-        )
-        customer_returns = self.asn.loc[customer_return_mask].copy()
-        eligible_asn = self.asn.loc[~customer_return_mask].copy()
-
+        # Prepare descriptive columns before splitting the ASN so every branch
+        # carries the same audit information.
         self._copy_first_available_column(
             self.asn,
             "Description",
-            [
-                "Description",
-                "Item Description",
-                "Generic Item Description",
-            ],
+            ["Description", "Item Description", "Generic Item Description"],
         )
         self._copy_first_available_column(
             self.asn,
             "Supplier Code",
-            [
-                "Supplier Code",
-                "Vendor Code",
-                "Supplier Number",
-            ],
+            ["Supplier Code", "Vendor Code", "Supplier Number"],
         )
         self._copy_first_available_column(
             self.asn,
             "Item Family Group",
-            [
-                "Item Family Group",
-                "Item Family",
-                "Family Group",
-            ],
+            ["Item Family Group", "Item Family", "Family Group"],
         )
 
+        self.asn["Receipt Type"] = self.asn.get(
+            "Inbound Shipment",
+            pd.Series("", index=self.asn.index, dtype=object),
+        ).map(classify_inbound_shipment)
+
+        eligible_mask = self.asn["Receipt Type"].isin(ACCEPT_TYPES)
+        eligible_asn = self.asn.loc[eligible_mask].copy()
+        excluded_asn = self.asn.loc[~eligible_mask].copy()
+
+        # Supplier (TRK5060) and STO Incoming (TRK800) stay separate all the
+        # way through calculation. This prevents STO from entering supplier
+        # variance/identity and lets us allocate RSD Receive Pending safely.
         receiving = (
             eligible_asn.groupby(
-                self.MATCH_KEYS,
+                self.MATCH_KEYS + ["Receipt Type"],
                 dropna=False,
             )
             .agg(
                 **{
-                    "Generic Item Number": (
-                        "Generic Item Number",
-                        "first",
-                    ),
-                    "Trade Name": (
-                        "Trade Name",
-                        "first",
-                    ),
-                    "Received Quantity Each": (
-                        "Effective Quantity Each",
-                        "sum",
-                    ),
-                    "Description": (
-                        "Description",
-                        self._join_unique,
-                    ),
-                    "Inbound Shipment": (
-                        "Inbound Shipment",
-                        self._join_unique,
-                    ),
-                    "Supplier Name": (
-                        "Supplier Name",
-                        self._join_unique,
-                    ),
-                    "Supplier Code": (
-                        "Supplier Code",
-                        self._join_unique,
-                    ),
-                    "Item Family Group": (
-                        "Item Family Group",
-                        self._join_unique,
-                    ),
-                    "Processing Status": (
-                        "Processing Status",
-                        self._join_unique,
-                    ),
-                    "Previous Run Date": (
-                        "Previous Run Date",
-                        "max",
-                    ),
-                    "Previous Quantity Each": (
-                        "Previous Quantity Each",
-                        "sum",
-                    ),
-                    "Current Quantity Each": (
-                        "Current Quantity Each",
-                        "sum",
-                    ),
-                    "Quantity Difference": (
-                        "Quantity Difference",
-                        "sum",
-                    ),
+                    "Generic Item Number": ("Generic Item Number", "first"),
+                    "Trade Name": ("Trade Name", "first"),
+                    "Received Quantity Each": ("Effective Quantity Each", "sum"),
+                    "Description": ("Description", self._join_unique),
+                    "Inbound Shipment": ("Inbound Shipment", self._join_unique),
+                    "Supplier Name": ("Supplier Name", self._join_unique),
+                    "Supplier Code": ("Supplier Code", self._join_unique),
+                    "Item Family Group": ("Item Family Group", self._join_unique),
+                    "Processing Status": ("Processing Status", self._join_unique),
+                    "Previous Run Date": ("Previous Run Date", "max"),
+                    "Previous Quantity Each": ("Previous Quantity Each", "sum"),
+                    "Current Quantity Each": ("Current Quantity Each", "sum"),
+                    "Quantity Difference": ("Quantity Difference", "sum"),
                 }
             )
             .reset_index()
         )
 
-        # Match WMS to the already-enriched SFDA table only by BN + Expiry Date.
+        sfda_summary = self._sfda_summary()
         report = receiving.merge(
-            self._sfda_summary(),
+            sfda_summary,
             on=self.MATCH_KEYS,
-            how="inner",
-            validate="one_to_one",
+            how="left",
+            validate="many_to_one",
         )
 
-        valid_package = (
-            report["PackageSize"].notna()
-            & report["PackageSize"].gt(0)
-        )
-
-        report["Received Quantity Pack"] = 0.0
-        report.loc[
-            valid_package,
-            "Received Quantity Pack",
-        ] = (
-            pd.to_numeric(
-                report.loc[
-                    valid_package,
-                    "Received Quantity Each",
-                ],
-                errors="coerce",
+        for column in [
+            "Quantity", "Active", "Quantity sent pending", "Quantity Receive Pending",
+            "PackageSize",
+        ]:
+            report[column] = pd.to_numeric(
+                report.get(column, 0), errors="coerce"
             ).fillna(0)
-            / report.loc[
-                valid_package,
-                "PackageSize",
-            ]
-        )
 
-        report["To Be Accept"] = 0
-
-        report.loc[
-            valid_package,
-            "To Be Accept",
-        ] = report.loc[
-            valid_package
-        ].apply(
-            lambda row: min(
-                self._safe_int(
-                    row["Quantity Receive Pending"]
-                ),
-                self._safe_int(
-                    row["Received Quantity Pack"]
-                ),
-            ),
-            axis=1,
-        )
-
-        report = self._enrich_with_master(
-            report
-        )
-
-        # Accept is not considered processed merely because a CSV was generated.
-        # Rows that still require an SFDA Accept are explicitly shown as pending
-        # confirmation. A later SFDA report must prove the movement from
-        # Quantity Receive Pending to Active before the corresponding ASN
-        # transactions are treated as previously processed.
-        report.loc[
+        valid_package = report["PackageSize"].gt(0)
+        report["Received Quantity Pack"] = 0.0
+        report.loc[valid_package, "Received Quantity Pack"] = (
             pd.to_numeric(
-                report["To Be Accept"],
-                errors="coerce",
-            ).fillna(0).gt(0),
-            "Processing Status",
-        ] = "Pending Confirmation"
+                report.loc[valid_package, "Received Quantity Each"], errors="coerce"
+            ).fillna(0)
+            / report.loc[valid_package, "PackageSize"]
+        )
 
-        accept = report.loc[
-            report["To Be Accept"] > 0,
-            [
-                "GTIN",
-                "To Be Accept",
-                "BN",
-                "Expiry Date",
-            ],
-        ].copy()
+        # Allocate each batch's RSD Receive Pending once. Supplier receives
+        # priority, then STO Incoming uses the remaining pending. This prevents
+        # the same RSD pending quantity from being accepted twice when both
+        # receipt sources exist for one BN/expiry.
+        report["To Be Accept"] = 0
+        report["STO Pending RSD Qty"] = 0.0
+        report["Required Action"] = ""
+        report["Receipt Type Priority"] = report["Receipt Type"].map(
+            {"Supplier": 0, STO_INCOMING: 1}
+        ).fillna(9)
+        report = report.sort_values(
+            self.MATCH_KEYS + ["Receipt Type Priority"], kind="stable"
+        ).reset_index(drop=True)
+        valid_package = pd.to_numeric(
+            report["PackageSize"], errors="coerce"
+        ).fillna(0).gt(0)
+
+        for _, group in report.groupby(self.MATCH_KEYS, dropna=False, sort=False):
+            pending = float(
+                pd.to_numeric(
+                    pd.Series([group["Quantity Receive Pending"].iloc[0]]),
+                    errors="coerce",
+                ).fillna(0).iloc[0]
+            )
+            pending = max(0.0, pending)
+            for index in group.index:
+                if not bool(valid_package.loc[index]):
+                    continue
+                requested = float(max(0, report.at[index, "Received Quantity Pack"]))
+                allocated = min(pending, requested)
+                report.at[index, "To Be Accept"] = self._safe_int(allocated)
+                pending = max(0.0, pending - float(report.at[index, "To Be Accept"]))
+
+        sto_mask = report["Receipt Type"].eq(STO_INCOMING)
+        report.loc[sto_mask, "STO Pending RSD Qty"] = (
+            pd.to_numeric(
+                report.loc[sto_mask, "Received Quantity Pack"], errors="coerce"
+            ).fillna(0)
+            - pd.to_numeric(
+                report.loc[sto_mask, "To Be Accept"], errors="coerce"
+            ).fillna(0)
+        ).clip(lower=0)
+        report.loc[sto_mask, "Required Action"] = (
+            "Ask sending warehouse to dispatch the missing quantity through RSD"
+        )
+        report.loc[
+            sto_mask & report["STO Pending RSD Qty"].le(0),
+            "Required Action",
+        ] = "Accept available RSD transfer"
+
+        report = self._enrich_with_master(report)
+        positive_accept = pd.to_numeric(
+            report["To Be Accept"], errors="coerce"
+        ).fillna(0).gt(0)
+        report.loc[positive_accept, "Processing Status"] = "Pending Confirmation"
+        report.loc[
+            sto_mask & ~positive_accept,
+            "Processing Status",
+        ] = "STO Incoming - RSD Transfer Not Available"
+
+        # One SFDA upload row per exact batch, even if Supplier + STO both
+        # contributed to the accepted quantity.
+        accept_source = report.loc[positive_accept].copy()
+        if accept_source.empty:
+            accept = pd.DataFrame(columns=["GTIN", "To Be Accept", "BN", "Expiry Date"])
+        else:
+            accept = (
+                accept_source.groupby(
+                    ["GTIN", "BN", "Expiry Date"], dropna=False
+                )["To Be Accept"]
+                .sum().reset_index()
+            )
+            accept = accept[["GTIN", "To Be Accept", "BN", "Expiry Date"]]
 
         details_columns = [
+            "Receipt Type",
             "GTIN",
             "Drug Name",
             "BN",
@@ -677,6 +643,8 @@ class ReconciliationEngine:
             "Supplier Code",
             "Item Family Group",
             "To Be Accept",
+            "STO Pending RSD Qty",
+            "Required Action",
             "Processing Status",
             "Previous Run Date",
             "Previous Quantity Each",
@@ -685,79 +653,77 @@ class ReconciliationEngine:
             "Package Size Status",
             "Batch Master Status",
         ]
+        details = self._ensure_output_columns(report, details_columns)
 
-        details = self._ensure_output_columns(
-            report,
-            details_columns,
-        )
-
-        # Keep TRK3 customer-return lines visible in Accept Details as separate
-        # audit rows, while forcing To Be Accept to zero. They never contribute
-        # to the batch-level receiving quantity and never enter Accept CSVs.
-        if not customer_returns.empty:
-            return_details = customer_returns.merge(
-                self._sfda_summary(),
+        # Excluded receipt classes stay visible for audit but never participate
+        # in To Be Accept, pending-confirmation transactions, or any RSD output.
+        excluded_details = pd.DataFrame(columns=details_columns)
+        if not excluded_asn.empty:
+            excluded_details = excluded_asn.merge(
+                sfda_summary,
                 on=self.MATCH_KEYS,
                 how="left",
                 validate="many_to_one",
             )
-
-            return_details["Received Quantity Each"] = pd.to_numeric(
-                return_details.get("Received Quantity", 0),
-                errors="coerce",
+            excluded_details["Received Quantity Each"] = pd.to_numeric(
+                excluded_details.get("Received Quantity", 0), errors="coerce"
             ).fillna(0)
+            excluded_details["PackageSize"] = pd.to_numeric(
+                excluded_details.get("PackageSize", 0), errors="coerce"
+            ).fillna(0)
+            excluded_details["Received Quantity Pack"] = 0.0
+            valid_excluded_pack = excluded_details["PackageSize"].gt(0)
+            excluded_details.loc[valid_excluded_pack, "Received Quantity Pack"] = (
+                excluded_details.loc[valid_excluded_pack, "Received Quantity Each"]
+                / excluded_details.loc[valid_excluded_pack, "PackageSize"]
+            )
+            excluded_details["To Be Accept"] = 0
+            excluded_details["STO Pending RSD Qty"] = 0
+            excluded_details["Required Action"] = "No SFDA/RSD calculation"
+            excluded_details.loc[
+                excluded_details["Receipt Type"].eq(STO_RETURN),
+                "Required Action",
+            ] = "Cancel Previous RSD Dispatch"
+            excluded_details["Processing Status"] = excluded_details[
+                "Receipt Type"
+            ].map(classification_status)
+            excluded_details["Package Size Status"] = valid_excluded_pack.map(
+                {True: "Mapped", False: "Missing"}
+            )
+            excluded_details = self._enrich_with_master(excluded_details)
+            excluded_details = self._ensure_output_columns(
+                excluded_details, details_columns
+            )
+            details = pd.concat([details, excluded_details], ignore_index=True)
 
-            return_package = pd.to_numeric(
-                return_details.get("PackageSize", 0),
-                errors="coerce",
-            )
-            valid_return_package = return_package.notna() & return_package.gt(0)
-            return_details["Received Quantity Pack"] = 0.0
-            return_details.loc[
-                valid_return_package,
-                "Received Quantity Pack",
-            ] = (
-                return_details.loc[
-                    valid_return_package,
-                    "Received Quantity Each",
-                ]
-                / return_package.loc[valid_return_package]
-            )
+        sto_incoming_followup = self._ensure_output_columns(
+            report.loc[
+                sto_mask
+                & pd.to_numeric(
+                    report["STO Pending RSD Qty"], errors="coerce"
+                ).fillna(0).gt(0)
+            ].copy(),
+            details_columns,
+        )
 
-            return_details["To Be Accept"] = 0
-            return_details["Processing Status"] = (
-                "Customer Return - Excluded from SFDA Accept"
-            )
-            return_details["Package Size Status"] = (
-                valid_return_package.map(
-                    {
-                        True: "Mapped",
-                        False: "Missing",
-                    }
-                )
-            )
-            return_details = self._enrich_with_master(return_details)
-            return_details = self._ensure_output_columns(
-                return_details,
-                details_columns,
-            )
-            details = pd.concat(
-                [details, return_details],
-                ignore_index=True,
-            )
+        sto_return_cancel = self._ensure_output_columns(
+            excluded_details.loc[
+                excluded_details.get("Receipt Type", "").eq(STO_RETURN)
+            ].copy()
+            if not excluded_details.empty
+            else pd.DataFrame(),
+            details_columns,
+        )
 
-        # Build the exact transaction quantities represented by the generated
-        # Accept CSV. These rows are stored as *pending confirmation* only.
-        # They are not loaded back as processed until a later SFDA report
-        # proves the corresponding pending -> active movement.
+        # Build pending-confirmation transactions only from regulatory-eligible
+        # ASN rows. Excluded TRKs can never be marked as processed by SFDA.
         accept_transactions = eligible_asn.copy()
         batch_limits = report[
-            self.MATCH_KEYS
-            + ["PackageSize", "To Be Accept"]
+            self.MATCH_KEYS + ["Receipt Type", "PackageSize", "To Be Accept"]
         ].copy()
         accept_transactions = accept_transactions.merge(
             batch_limits,
-            on=self.MATCH_KEYS,
+            on=self.MATCH_KEYS + ["Receipt Type"],
             how="left",
             validate="many_to_one",
         )
@@ -766,31 +732,22 @@ class ReconciliationEngine:
         accept_transactions["Pending Submit Quantity Pack"] = 0.0
 
         package_size = pd.to_numeric(
-            accept_transactions["PackageSize"],
-            errors="coerce",
+            accept_transactions["PackageSize"], errors="coerce"
         )
         effective_each = pd.to_numeric(
-            accept_transactions["Effective Quantity Each"],
-            errors="coerce",
+            accept_transactions["Effective Quantity Each"], errors="coerce"
         ).fillna(0).clip(lower=0)
         current_each = pd.to_numeric(
-            accept_transactions["Current Quantity Each"],
-            errors="coerce",
+            accept_transactions["Current Quantity Each"], errors="coerce"
         ).fillna(0).clip(lower=0)
         valid_transaction_package = package_size.notna() & package_size.gt(0)
         accept_transactions.loc[
-            valid_transaction_package,
-            "Current Quantity Pack",
+            valid_transaction_package, "Current Quantity Pack"
         ] = (
             current_each.loc[valid_transaction_package]
             / package_size.loc[valid_transaction_package]
         )
 
-        # Allocate each batch-level To Be Accept quantity across the ASN lines
-        # in their original order. Fractional internal pack allocation is
-        # allowed so that partial confirmations can still map exactly back to
-        # the original each quantities; the exported SFDA quantity remains the
-        # integer batch-level To Be Accept value.
         for _, limit_row in batch_limits.iterrows():
             remaining_pack = float(
                 pd.to_numeric(
@@ -801,13 +758,13 @@ class ReconciliationEngine:
             if remaining_pack <= 0:
                 continue
 
-            mask = pd.Series(True, index=accept_transactions.index)
+            mask = accept_transactions["Receipt Type"].eq(
+                limit_row.get("Receipt Type", "")
+            )
             for key in self.MATCH_KEYS:
                 if key == "Expiry Date":
                     mask = mask & (
-                        pd.to_datetime(
-                            accept_transactions[key], errors="coerce"
-                        )
+                        pd.to_datetime(accept_transactions[key], errors="coerce")
                         == pd.to_datetime(limit_row.get(key), errors="coerce")
                     )
                 else:
@@ -828,15 +785,10 @@ class ReconciliationEngine:
                 if allocated_pack <= 0:
                     continue
                 allocated_each = min(
-                    available_each,
-                    allocated_pack * float(psize),
+                    available_each, allocated_pack * float(psize)
                 )
-                accept_transactions.at[
-                    index, "Pending Submit Quantity Pack"
-                ] = allocated_pack
-                accept_transactions.at[
-                    index, "Pending Submit Quantity Each"
-                ] = allocated_each
+                accept_transactions.at[index, "Pending Submit Quantity Pack"] = allocated_pack
+                accept_transactions.at[index, "Pending Submit Quantity Each"] = allocated_each
                 remaining_pack -= allocated_pack
                 if remaining_pack <= 0.0000001:
                     break
@@ -857,16 +809,19 @@ class ReconciliationEngine:
                 "Pending Submit Quantity Pack"
             ]
             pending_transactions = self._transaction_rows(
-                pending_source,
-                "ACCEPT",
+                pending_source, "ACCEPT"
             )
 
         return {
-            "report": details,
+            "report": details.reset_index(drop=True),
             "accept": accept,
             "dispatch": pd.DataFrame(),
-            "processed_transactions": self._transaction_rows(accept_transactions, "ACCEPT"),
+            "processed_transactions": self._transaction_rows(
+                accept_transactions, "ACCEPT"
+            ),
             "pending_confirmation_transactions": pending_transactions,
+            "sto_incoming_followup": sto_incoming_followup.reset_index(drop=True),
+            "sto_return_cancel_dispatch": sto_return_cancel.reset_index(drop=True),
         }
 
     def _run_dispatch(self) -> Dict[str, pd.DataFrame]:
