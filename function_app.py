@@ -30,6 +30,15 @@ _VARIANCE_CACHE_LOCK = threading.Lock()
 _VARIANCE_CACHE_TTL_SECONDS = int(os.getenv("VARIANCE_CACHE_TTL_SECONDS", "300") or 300)
 
 
+def _refresh_dashboard_summary_safe() -> None:
+    """Refresh cached Home metrics without failing the business transaction."""
+    try:
+        from engine.database import refresh_dashboard_summary_cache
+        refresh_dashboard_summary_cache()
+    except Exception:
+        logger.exception("Dashboard summary cache refresh failed")
+
+
 def _cookie_value(req: func.HttpRequest, name: str) -> str:
     raw = str(req.headers.get("Cookie", "") or "")
     for part in raw.split(";"):
@@ -907,6 +916,7 @@ def warehouse_gln_upload_route(req: func.HttpRequest) -> func.HttpResponse:
             source_file_name=file_name,
             updated_by=str(user.get("Email") or ""),
         )
+        _refresh_dashboard_summary_safe()
 
         return json_response({
             "status": "Completed",
@@ -936,14 +946,13 @@ def dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
     if denied:
         return denied
     try:
-        from engine.database import (
-            get_dashboard_customer_summary,
-            get_historical_status,
-        )
+        from engine.database import get_cached_dashboard_summary
+        cached = get_cached_dashboard_summary()
         return json_response({
             "status": "Success",
-            "historical": get_historical_status(),
-            "customer": get_dashboard_customer_summary(limit=10),
+            "historical": cached.get("historical") or {},
+            "customer": cached.get("customer") or {},
+            "updated_at": cached.get("updated_at"),
         })
     except Exception as exc:
         logger.exception("Dashboard summary failed")
@@ -1687,6 +1696,7 @@ def historical_build_worker(
             input_manifest,
             operation,
         )
+        _refresh_dashboard_summary_safe()
 
 
 
@@ -3301,6 +3311,8 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
                     ),
                 },
             )
+            if not failed:
+                _refresh_dashboard_summary_safe()
         except Exception as exc:
             logger.exception("Background reconciliation job failed. job_id=%s", job_id)
             storage.write_background_job_status(
