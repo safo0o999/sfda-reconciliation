@@ -940,6 +940,12 @@ def warehouse_data_reset_route(req: func.HttpRequest) -> func.HttpResponse:
         storage.initialize_containers()
         blob_result = storage.delete_current_warehouse_data()
 
+        # Variance Management keeps a short-lived per-warehouse server cache.
+        # Reset must invalidate it immediately so the page cannot show stale
+        # discrepancies after the warehouse data has been deleted.
+        with _VARIANCE_CACHE_LOCK:
+            _VARIANCE_CACHE.pop(warehouse_id, None)
+
         return json_response({
             "status": "Completed",
             "message": "Warehouse operational data was reset successfully.",
