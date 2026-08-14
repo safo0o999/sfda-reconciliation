@@ -16,9 +16,12 @@ from engine.database import (
     get_event_summaries,
     get_history_summaries,
     get_supplier_history_df,
+    get_sto_incoming_history_df,
+    get_sto_return_history_df,
     replace_batch_master,
     replace_customer_history,
     replace_supplier_history,
+    replace_latest_sfda_snapshot,
     reset_history,
     update_historical_build_job,
 )
@@ -129,6 +132,8 @@ def process_historical_build_job(
             raise ValueError("SFDA file is missing from the historical job.")
 
         sfda_df = _read_input_group(storage, sfda_items)
+        sfda_source_name = str(sfda_items[0].get("file_name", "") or "")
+        replace_latest_sfda_snapshot(sfda_df, sfda_source_name)
 
         update_historical_build_job(
             job_id,
@@ -178,6 +183,8 @@ def process_historical_build_job(
             master = get_batch_master_df()
             supplier_history = get_supplier_history_df()
             customer_history = get_customer_history_df()
+            sto_incoming_history = get_sto_incoming_history_df()
+            sto_return_history = get_sto_return_history_df()
         else:
             update_historical_build_job(
                 job_id,
@@ -208,6 +215,8 @@ def process_historical_build_job(
             )
             replace_supplier_history(supplier_history)
             replace_customer_history(customer_history)
+            sto_incoming_history = get_sto_incoming_history_df()
+            sto_return_history = get_sto_return_history_df()
 
         update_historical_build_job(
             job_id,
@@ -251,6 +260,20 @@ def process_historical_build_job(
                     "Expiry Date",
                 ],
             ),
+            Exporter.build_formatted_excel_file(
+                df=sto_incoming_history,
+                file_name="STO_Incoming_History.xlsx",
+                sheet_name="STO Incoming",
+                title="Historical STO Incoming Receipt History",
+                sort_columns=["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
+            ),
+            Exporter.build_formatted_excel_file(
+                df=sto_return_history,
+                file_name="STO_Return_Cancel_Dispatch.xlsx",
+                sheet_name="STO Return",
+                title="STO Returns - Cancel Previous RSD Dispatch",
+                sort_columns=["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
+            ),
         ]
 
         output_files: List[Dict[str, Any]] = []
@@ -285,6 +308,8 @@ def process_historical_build_job(
             "batch_master_rows": len(master),
             "supplier_history_rows": len(supplier_history),
             "customer_history_rows": len(customer_history),
+            "sto_incoming_rows": len(sto_incoming_history),
+            "sto_return_rows": len(sto_return_history),
         }
 
         update_historical_build_job(
