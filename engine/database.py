@@ -1732,6 +1732,209 @@ def get_dashboard_customer_summary(limit: int = 10) -> Dict[str, Any]:
         "customers": top_rows,
     }
 
+
+def refresh_dashboard_summary_cache() -> Dict[str, Any]:
+    """Rebuild the small Home Dashboard cache for the current warehouse.
+
+    This intentionally performs the heavier historical/GLN aggregation only when
+    warehouse data changes (Historical/Daily/Full reconciliation or GLN update),
+    not every time a user opens or refreshes Home.
+    """
+    initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+
+    warehouse_id = int(current_warehouse_id())
+    historical = get_historical_status()
+    customer = get_dashboard_customer_summary(limit=10)
+    customer_summary = customer.get("summary") or {}
+    customers_json = json.dumps(
+        customer.get("customers") or [],
+        ensure_ascii=False,
+        default=str,
+    )
+
+    sql = r"""
+        MERGE dbo.WarehouseDashboardSummary AS target
+        USING (SELECT ? AS WarehouseID) AS source
+          ON target.WarehouseID = source.WarehouseID
+        WHEN MATCHED THEN
+            UPDATE SET
+                BatchMasterRows = ?,
+                SupplierHistoryRows = ?,
+                CustomerHistoryRows = ?,
+                LastBuildUtc = ?,
+                TotalSFDABatches = ?,
+                MissingSupplierBatches = ?,
+                STOFollowupBatches = ?,
+                HistoricalFrom = ?,
+                HistoricalTo = ?,
+                CustomerCount = ?,
+                CustomersWithGLN = ?,
+                DummyGLNCustomers = ?,
+                UnmappedGLNCustomers = ?,
+                CustomersJson = ?,
+                UpdatedAt = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT
+            (
+                WarehouseID,
+                BatchMasterRows,
+                SupplierHistoryRows,
+                CustomerHistoryRows,
+                LastBuildUtc,
+                TotalSFDABatches,
+                MissingSupplierBatches,
+                STOFollowupBatches,
+                HistoricalFrom,
+                HistoricalTo,
+                CustomerCount,
+                CustomersWithGLN,
+                DummyGLNCustomers,
+                UnmappedGLNCustomers,
+                CustomersJson,
+                UpdatedAt
+            )
+            VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
+    """
+
+    values = (
+        warehouse_id,
+        int(historical.get("batch_master_rows") or 0),
+        int(historical.get("supplier_history_rows") or 0),
+        int(historical.get("customer_history_rows") or 0),
+        historical.get("last_build_utc"),
+        int(historical.get("total_sfda_batches") or 0),
+        int(historical.get("missing_supplier_batches") or 0),
+        int(historical.get("sto_followup_batches") or 0),
+        historical.get("historical_from"),
+        historical.get("historical_to"),
+        int(customer_summary.get("customer_count") or 0),
+        int(customer_summary.get("customer_with_gln_count") or 0),
+        int(customer_summary.get("customer_dummy_gln_count") or 0),
+        int(customer_summary.get("customer_unmapped_count") or 0),
+        customers_json,
+    )
+    params = values + values
+
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(sql, params)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "historical": historical,
+        "customer": customer,
+    }
+
+
+def get_cached_dashboard_summary() -> Dict[str, Any]:
+    """Return Home Dashboard data from one warehouse-scoped SQL row.
+
+    Existing deployments may have no cached row immediately after the migration;
+    in that one-time case the cache is built synchronously. Subsequent Home
+    refreshes are a single-row read.
+    """
+    initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+
+    warehouse_id = int(current_warehouse_id())
+    sql = r"""
+        SELECT
+            BatchMasterRows,
+            SupplierHistoryRows,
+            CustomerHistoryRows,
+            LastBuildUtc,
+            TotalSFDABatches,
+            MissingSupplierBatches,
+            STOFollowupBatches,
+            HistoricalFrom,
+            HistoricalTo,
+            CustomerCount,
+            CustomersWithGLN,
+            DummyGLNCustomers,
+            UnmappedGLNCustomers,
+            CustomersJson,
+            UpdatedAt
+        FROM dbo.WarehouseDashboardSummary
+        WHERE WarehouseID = ?;
+    """
+
+    try:
+        with Database().connect() as connection:
+            row = connection.cursor().execute(sql, warehouse_id).fetchone()
+    except pyodbc.Error as exc:
+        # Friendly deployment fallback if code is deployed before migration.
+        if "WarehouseDashboardSummary" in str(exc) or "Invalid object name" in str(exc):
+            logger.warning(
+                "WarehouseDashboardSummary is unavailable; computing Home summary directly."
+            )
+            return {
+                "historical": get_historical_status(),
+                "customer": get_dashboard_customer_summary(limit=10),
+                "updated_at": None,
+            }
+        raise
+
+    if row is None:
+        return refresh_dashboard_summary_cache()
+
+    try:
+        customers = json.loads(row[13]) if row[13] else []
+    except (TypeError, ValueError, json.JSONDecodeError):
+        customers = []
+
+    batch_rows = int(row[0] or 0)
+    return {
+        "historical": {
+            "exists": batch_rows > 0,
+            "batch_master_rows": batch_rows,
+            "supplier_history_rows": int(row[1] or 0),
+            "customer_history_rows": int(row[2] or 0),
+            "last_build_utc": row[3],
+            "total_sfda_batches": int(row[4] or 0),
+            "missing_supplier_batches": int(row[5] or 0),
+            "sto_followup_batches": int(row[6] or 0),
+            "historical_from": row[7],
+            "historical_to": row[8],
+        },
+        "customer": {
+            "summary": {
+                "customer_count": int(row[9] or 0),
+                "customer_with_gln_count": int(row[10] or 0),
+                "customer_dummy_gln_count": int(row[11] or 0),
+                "customer_unmapped_count": int(row[12] or 0),
+            },
+            "customers": customers if isinstance(customers, list) else [],
+        },
+        "updated_at": row[14],
+    }
+
+
+def clear_dashboard_summary_cache() -> None:
+    """Delete the cached Home row for the current warehouse only."""
+    initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+    warehouse_id = int(current_warehouse_id())
+
+    try:
+        with Database().connect() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                "DELETE FROM dbo.WarehouseDashboardSummary WHERE WarehouseID = ?;",
+                warehouse_id,
+            )
+            connection.commit()
+    except pyodbc.Error as exc:
+        if "WarehouseDashboardSummary" in str(exc) or "Invalid object name" in str(exc):
+            return
+        raise
+
+
 def reset_current_warehouse_data() -> Dict[str, Any]:
     """Delete only uploaded/operational data owned by the current warehouse.
 
@@ -1767,6 +1970,7 @@ def reset_current_warehouse_data() -> Dict[str, Any]:
         "FullDispatchSFDABaseline",
         "LatestInventorySnapshot",
         "LatestSFDASnapshot",
+        "WarehouseDashboardSummary",
         "CustomerHistory",
         "SupplierHistory",
         "BatchMaster",
