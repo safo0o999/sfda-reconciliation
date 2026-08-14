@@ -1264,6 +1264,213 @@ class FullReconciliationEngine:
             .reset_index()
         )
 
+    def _supplier_only_master_for_accept(
+        self,
+        batch_master_df: pd.DataFrame,
+        supplier_history_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Return Batch Master rows with receipt quantity replaced by TRK5060 only.
+
+        Batch Master remains a physical historical view and can include STO
+        receipt/return movements. Full Accept must not use that combined receipt
+        quantity. Supplier Accept therefore receives an isolated supplier-only
+        quantity from SupplierHistory (which is TRK5060-only at SQL level).
+        """
+
+        master = batch_master_df.copy() if batch_master_df is not None else pd.DataFrame()
+        supplier = self._rename_history_columns(supplier_history_df)
+        if master.empty or supplier.empty:
+            return pd.DataFrame(columns=master.columns if not master.empty else self.MASTER_COLUMNS)
+
+        for column in self.KEYS:
+            master[column] = Normalizer.text(master[column])
+            supplier[column] = Normalizer.text(supplier[column])
+
+        supplier["Received Quantity Each"] = pd.to_numeric(
+            supplier.get("Received Quantity Each", 0), errors="coerce"
+        ).fillna(0)
+
+        supplier_qty = (
+            supplier.groupby(self.KEYS, dropna=False)["Received Quantity Each"]
+            .sum()
+            .reset_index()
+            .rename(columns={"Received Quantity Each": "_Supplier Received Each"})
+        )
+
+        result = master.merge(
+            supplier_qty,
+            on=self.KEYS,
+            how="inner",
+            validate="one_to_one",
+        )
+        result["Received Quantity Each"] = pd.to_numeric(
+            result["_Supplier Received Each"], errors="coerce"
+        ).fillna(0)
+        result = result.drop(columns=["_Supplier Received Each"], errors="ignore")
+        return result
+
+    def build_sto_incoming_reconciliation(
+        self,
+        sfda_df: pd.DataFrame,
+        batch_master_df: pd.DataFrame,
+        sto_incoming_df: pd.DataFrame,
+        supplier_accept_details: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        """Reconcile TRK800 STO receipts against current RSD Receive Pending.
+
+        STO receipt quantities NEVER enter Supplier Variance.  RSD pending that
+        remains after supplier Accept allocation is made available to STO. Any
+        unrepresented STO quantity is surfaced for follow-up with the sending
+        NUPCO warehouse instead of being reported as a supplier variance.
+        """
+
+        sto = sto_incoming_df.copy() if sto_incoming_df is not None else pd.DataFrame()
+        if sto.empty:
+            return pd.DataFrame(columns=[
+                "Source Warehouse", "Source Warehouse Code", "Inbound Shipment",
+                "GTIN", "Drug Name", "BN", "Expiry Date", "Expiry Month Key",
+                "Generic Item Number", "PackageSize", "STO Received Quantity Each",
+                "STO Received Quantity Pack", "Quantity Receive Pending",
+                "Available RSD Receive Pending", "To Be Accept", "STO Pending RSD Qty",
+                "RSD Status", "Required Action",
+            ])
+
+        sfda = self._prepare_stage2_sfda(sfda_df)
+        master = batch_master_df.copy() if batch_master_df is not None else pd.DataFrame()
+
+        for column in ["BN", "Expiry Month Key", "Generic Item Number"]:
+            if column in sto.columns:
+                sto[column] = Normalizer.text(sto[column])
+            if not master.empty and column in master.columns:
+                master[column] = Normalizer.text(master[column])
+
+        # Enrich missing reference data from Batch Master without changing STO grain.
+        reference_columns = self.KEYS + [
+            "GTIN", "Drug Name", "Expiry Date", "PackageSize", "Trade Description"
+        ]
+        if not master.empty:
+            reference = self._ensure_columns(master, reference_columns)[reference_columns]
+            reference = reference.drop_duplicates(subset=self.KEYS, keep="first")
+            sto = sto.merge(
+                reference,
+                on=self.KEYS,
+                how="left",
+                suffixes=("", " Master"),
+                validate="many_to_one",
+            )
+            for column in ["GTIN", "Drug Name", "Expiry Date", "PackageSize", "Trade Description"]:
+                master_col = f"{column} Master"
+                if master_col not in sto.columns:
+                    continue
+                if column == "Expiry Date":
+                    sto[column] = Normalizer.date(sto.get(column, pd.NaT)).combine_first(
+                        Normalizer.date(sto[master_col])
+                    )
+                elif column == "PackageSize":
+                    current = pd.to_numeric(sto.get(column, 0), errors="coerce").fillna(0)
+                    fallback = pd.to_numeric(sto[master_col], errors="coerce").fillna(0)
+                    sto[column] = current.where(current.gt(0), fallback)
+                else:
+                    current = sto.get(column, "").fillna("").astype(str).str.strip()
+                    fallback = sto[master_col].fillna("").astype(str).str.strip()
+                    sto[column] = current.where(current.ne(""), fallback)
+            sto = sto.drop(columns=[c for c in sto.columns if c.endswith(" Master")], errors="ignore")
+
+        sto = sto.merge(
+            sfda,
+            on=["BN", "Expiry Month Key"],
+            how="left",
+            suffixes=("", " SFDA"),
+            validate="many_to_one",
+        )
+
+        # Prefer exact identifiers/current expiry from the uploaded SFDA report.
+        for column in ["GTIN", "Drug Name"]:
+            sfda_col = f"{column} SFDA"
+            if sfda_col in sto.columns:
+                sfda_text = sto[sfda_col].fillna("").astype(str).str.strip()
+                current = sto.get(column, "").fillna("").astype(str).str.strip()
+                sto[column] = sfda_text.where(sfda_text.ne(""), current)
+        if "Expiry Date SFDA" in sto.columns:
+            sto["Expiry Date"] = Normalizer.date(sto["Expiry Date SFDA"]).combine_first(
+                Normalizer.date(sto.get("Expiry Date", pd.NaT))
+            )
+
+        sto["PackageSize"] = pd.to_numeric(sto.get("PackageSize", 0), errors="coerce").fillna(0)
+        sto["STO Received Quantity Each"] = pd.to_numeric(
+            sto.get("Received Quantity Each", 0), errors="coerce"
+        ).fillna(0)
+        sto["STO Received Quantity Pack"] = 0.0
+        valid_pack = sto["PackageSize"].gt(0)
+        sto.loc[valid_pack, "STO Received Quantity Pack"] = (
+            sto.loc[valid_pack, "STO Received Quantity Each"]
+            / sto.loc[valid_pack, "PackageSize"]
+        )
+
+        sto["Quantity Receive Pending"] = pd.to_numeric(
+            sto.get("Quantity Receive Pending", 0), errors="coerce"
+        ).fillna(0).clip(lower=0)
+
+        supplier_allocated = pd.DataFrame(columns=["BN", "Expiry Month Key", "_Supplier Accept"])
+        if supplier_accept_details is not None and not supplier_accept_details.empty:
+            supplier_tmp = supplier_accept_details.copy()
+            supplier_tmp["To Be Accept"] = pd.to_numeric(
+                supplier_tmp.get("To Be Accept", 0), errors="coerce"
+            ).fillna(0)
+            supplier_allocated = (
+                supplier_tmp.groupby(["BN", "Expiry Month Key"], dropna=False)["To Be Accept"]
+                .sum().reset_index().rename(columns={"To Be Accept": "_Supplier Accept"})
+            )
+        sto = sto.merge(
+            supplier_allocated,
+            on=["BN", "Expiry Month Key"],
+            how="left",
+            validate="many_to_one",
+        )
+        sto["_Supplier Accept"] = pd.to_numeric(sto.get("_Supplier Accept", 0), errors="coerce").fillna(0)
+        sto["Available RSD Receive Pending"] = (
+            sto["Quantity Receive Pending"] - sto["_Supplier Accept"]
+        ).clip(lower=0)
+
+        # Allocate remaining pending in stable order when several sending
+        # warehouses/shipments share the same batch.
+        sto["To Be Accept"] = 0
+        sto = sto.reset_index(drop=True)
+        for _, group in sto.groupby(["BN", "Expiry Month Key"], dropna=False, sort=False):
+            remaining = float(group["Available RSD Receive Pending"].iloc[0] if len(group) else 0)
+            for index in group.index:
+                requested = float(max(0, sto.at[index, "STO Received Quantity Pack"]))
+                allocated = min(remaining, requested)
+                sto.at[index, "To Be Accept"] = int(max(0, allocated))
+                remaining -= allocated
+                if remaining < 0:
+                    remaining = 0
+
+        sto["STO Pending RSD Qty"] = (
+            pd.to_numeric(sto["STO Received Quantity Pack"], errors="coerce").fillna(0)
+            - pd.to_numeric(sto["To Be Accept"], errors="coerce").fillna(0)
+        ).clip(lower=0)
+        sto["RSD Status"] = "RSD Transfer Pending - Follow Up"
+        ready = sto["To Be Accept"].gt(0) & sto["STO Pending RSD Qty"].le(0)
+        partial = sto["To Be Accept"].gt(0) & sto["STO Pending RSD Qty"].gt(0)
+        sto.loc[ready, "RSD Status"] = "RSD Transfer Available - Accept"
+        sto.loc[partial, "RSD Status"] = "Partial RSD Transfer Available"
+        sto["Required Action"] = "Ask sending warehouse to dispatch the missing quantity through RSD"
+        sto.loc[ready, "Required Action"] = "Accept available RSD transfer"
+        sto.loc[partial, "Required Action"] = "Accept available quantity and follow up remaining quantity"
+        sto.loc[~valid_pack, "RSD Status"] = "Package Size Missing"
+        sto.loc[~valid_pack, "Required Action"] = "Complete Package Size mapping"
+
+        columns = [
+            "Source Warehouse", "Source Warehouse Code", "Inbound Shipment",
+            "GTIN", "Drug Name", "BN", "Expiry Date", "Expiry Month Key",
+            "Generic Item Number", "PackageSize", "STO Received Quantity Each",
+            "STO Received Quantity Pack", "Quantity Receive Pending",
+            "Available RSD Receive Pending", "To Be Accept", "STO Pending RSD Qty",
+            "RSD Status", "Required Action",
+        ]
+        return self._ensure_columns(sto, columns)[columns].reset_index(drop=True)
+
     def build_accept_reconciliation(
         self,
         sfda_df: pd.DataFrame,
@@ -1847,26 +2054,84 @@ class FullReconciliationEngine:
         sfda_df: pd.DataFrame,
         batch_master_df: pd.DataFrame,
         supplier_history_df: pd.DataFrame,
+        sto_incoming_df: pd.DataFrame | None = None,
+        sto_return_df: pd.DataFrame | None = None,
     ) -> Dict[str, pd.DataFrame]:
-        """Run the Full Accept stage using SFDA and persisted history only."""
+        """Run Full Accept with strict receipt-source separation.
+
+        Supplier Accept/Variance uses TRK5060 only. TRK800 is reconciled in a
+        dedicated STO table and can produce Accept only when current RSD
+        Quantity Receive Pending is available. TRK49 is returned separately as
+        a cancel-dispatch action list and never contributes to Accept/Variance.
+        """
 
         Validator.validate(Normalizer.normalize_sfda(sfda_df.copy()), "SFDA")
-        accept_details = self.build_accept_reconciliation(
-            sfda_df, batch_master_df
+
+        supplier_master = self._supplier_only_master_for_accept(
+            batch_master_df,
+            supplier_history_df,
+        )
+        supplier_accept_details = self.build_accept_reconciliation(
+            sfda_df,
+            supplier_master,
         )
         supplier_variance = self.build_supplier_variance(
-            sfda_df, supplier_history_df
+            sfda_df,
+            supplier_history_df,
         )
-        accept_upload = accept_details.loc[
+
+        sto_incoming = self.build_sto_incoming_reconciliation(
+            sfda_df,
+            batch_master_df,
+            sto_incoming_df if sto_incoming_df is not None else pd.DataFrame(),
+            supplier_accept_details,
+        )
+        sto_return_cancel = (
+            sto_return_df.copy()
+            if sto_return_df is not None
+            else pd.DataFrame()
+        )
+        if not sto_return_cancel.empty:
+            sto_return_cancel["Required Action"] = "Cancel Previous RSD Dispatch"
+
+        supplier_upload = supplier_accept_details.loc[
             pd.to_numeric(
-                accept_details.get("To Be Accept", 0),
-                errors="coerce",
+                supplier_accept_details.get("To Be Accept", 0), errors="coerce"
             ).fillna(0).gt(0)
         ].copy()
 
+        sto_upload = sto_incoming.loc[
+            pd.to_numeric(sto_incoming.get("To Be Accept", 0), errors="coerce")
+            .fillna(0).gt(0)
+        ].copy()
+
+        upload_parts = []
+        for frame in (supplier_upload, sto_upload):
+            if frame is None or frame.empty:
+                continue
+            upload_parts.append(
+                self._ensure_columns(
+                    frame,
+                    ["GTIN", "BN", "Expiry Date", "To Be Accept"],
+                )[["GTIN", "BN", "Expiry Date", "To Be Accept"]]
+            )
+        if upload_parts:
+            accept_upload = pd.concat(upload_parts, ignore_index=True)
+            accept_upload["To Be Accept"] = pd.to_numeric(
+                accept_upload["To Be Accept"], errors="coerce"
+            ).fillna(0)
+            accept_upload = (
+                accept_upload.groupby(["GTIN", "BN", "Expiry Date"], dropna=False)["To Be Accept"]
+                .sum().reset_index()
+            )
+        else:
+            accept_upload = pd.DataFrame(columns=["GTIN", "BN", "Expiry Date", "To Be Accept"])
+
         return {
-            "accept_details": accept_details,
+            "accept_details": supplier_accept_details,
             "supplier_variance": supplier_variance,
+            "sto_incoming": sto_incoming,
+            "sto_return_cancel_dispatch": sto_return_cancel,
             "accept_upload": accept_upload,
         }
 
