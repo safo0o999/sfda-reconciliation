@@ -729,14 +729,15 @@ def append_events(
 def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Return cumulative receipt and dispatch summaries for Batch Master.
 
-    ASN customer returns are identified exclusively by InboundShipment
-    starting with TRK3 (case-insensitive). Those receipt events remain stored
-    in dbo.ReceiptEvents as historical evidence, but they are excluded from
-    Batch Master received quantities and from the supplier identity selected
-    for SFDA Accept logic.
+    Batch Master receipt totals include only the three physical WMS receipt
+    classes relevant to warehouse stock history:
+      * TRK5060 - Supplier
+      * TRK800  - STO incoming
+      * TRK49   - STO return
 
-    All other ASN receipts remain eligible, including inter-warehouse NUPCO
-    transfers, because those movements must still be reflected in SFDA.
+    TRK30 Customer Return, TRK43 Reservation and TRK74 Principal are retained
+    in ReceiptEvents for audit only and never enter Batch Master quantities.
+    Unknown TRK prefixes are also excluded until classified explicitly.
     """
 
     initialize_database()
@@ -747,8 +748,10 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
         (
             SELECT *
             FROM dbo.ReceiptEvents
-            WHERE UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, ''))))
-                  NOT LIKE 'TRK3%'
+            WHERE
+                UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK5060%'
+                OR UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK800%'
+                OR UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK49%'
         ),
         ReceiptAggregate AS
         (
@@ -762,49 +765,48 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
                 MIN(ReceivedDate) AS FirstReceivedDate,
                 MAX(ReceivedDate) AS LastReceivedDate
             FROM EligibleReceipt
-            GROUP BY
-                BN,
-                ExpiryMonthKey,
-                GenericItemNumber
+            GROUP BY BN, ExpiryMonthKey, GenericItemNumber
         )
         SELECT
-            aggregate_rows.BN,
-            aggregate_rows.ExpiryMonthKey AS [Expiry Month Key],
-            aggregate_rows.ReceiptExpiryDate AS [Receipt Expiry Date],
-            aggregate_rows.GenericItemNumber AS [Generic Item Number],
-            source_row.TradeItemNumber AS [Trade Item Number],
-            source_row.TradeName AS [Trade Name],
-            source_row.Description AS [Description],
-            source_row.SupplierName AS [Supplier Name],
-            source_row.SupplierCode AS [Supplier Code],
-            source_row.ItemFamilyGroup AS [Item Family Group],
-            aggregate_rows.ReceiveRuns AS [Receive Runs],
-            aggregate_rows.TotalReceiveQty AS [Total Receive Qty],
-            aggregate_rows.FirstReceivedDate AS [First Received Date],
-            aggregate_rows.LastReceivedDate AS [Last Received Date]
-        FROM ReceiptAggregate aggregate_rows
+            a.BN,
+            a.ExpiryMonthKey AS [Expiry Month Key],
+            a.ReceiptExpiryDate AS [Receipt Expiry Date],
+            a.GenericItemNumber AS [Generic Item Number],
+            s.TradeItemNumber AS [Trade Item Number],
+            s.TradeName AS [Trade Name],
+            s.Description AS [Description],
+            s.SupplierName AS [Supplier Name],
+            s.SupplierCode AS [Supplier Code],
+            s.ItemFamilyGroup AS [Item Family Group],
+            a.ReceiveRuns AS [Receive Runs],
+            a.TotalReceiveQty AS [Total Receive Qty],
+            a.FirstReceivedDate AS [First Received Date],
+            a.LastReceivedDate AS [Last Received Date]
+        FROM ReceiptAggregate a
         OUTER APPLY
         (
             SELECT TOP (1)
-                receipt.TradeItemNumber,
-                receipt.TradeName,
-                receipt.Description,
-                receipt.SupplierName,
-                receipt.SupplierCode,
-                receipt.ItemFamilyGroup
-            FROM EligibleReceipt receipt
-            WHERE receipt.BN = aggregate_rows.BN
-              AND receipt.ExpiryMonthKey = aggregate_rows.ExpiryMonthKey
-              AND receipt.GenericItemNumber = aggregate_rows.GenericItemNumber
+                r.TradeItemNumber,
+                r.TradeName,
+                r.Description,
+                r.SupplierName,
+                r.SupplierCode,
+                r.ItemFamilyGroup
+            FROM EligibleReceipt r
+            WHERE r.BN = a.BN
+              AND r.ExpiryMonthKey = a.ExpiryMonthKey
+              AND r.GenericItemNumber = a.GenericItemNumber
             ORDER BY
                 CASE
-                    WHEN NULLIF(LTRIM(RTRIM(ISNULL(receipt.SupplierName, ''))), '') IS NOT NULL
-                      OR NULLIF(LTRIM(RTRIM(ISNULL(receipt.SupplierCode, ''))), '') IS NOT NULL
-                    THEN 0 ELSE 1
+                    WHEN UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, '')))) LIKE 'TRK5060%'
+                    THEN 0
+                    WHEN UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, '')))) LIKE 'TRK800%'
+                    THEN 1
+                    ELSE 2
                 END,
-                receipt.ReceivedDate ASC,
-                receipt.EventKey ASC
-        ) source_row;
+                r.ReceivedDate ASC,
+                r.EventKey ASC
+        ) s;
     """
 
     dispatch_sql = r"""
@@ -820,10 +822,7 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             MIN(DispatchDate) AS [First Dispatch Date],
             MAX(DispatchDate) AS [Last Dispatch Date]
         FROM dbo.DispatchEvents
-        GROUP BY
-            BN,
-            ExpiryMonthKey,
-            GenericItemNumber;
+        GROUP BY BN, ExpiryMonthKey, GenericItemNumber;
     """
 
     with Database().connect() as connection:
@@ -831,24 +830,20 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
         dispatch = pd.read_sql(dispatch_sql, connection)
 
     logger.info(
-        "Event summaries loaded in %.2f seconds. "
-        "receipt_groups=%s dispatch_groups=%s",
+        "Historical event summaries loaded in %.2f seconds. receipt_groups=%s dispatch_groups=%s",
         time.perf_counter() - started_at,
         len(receipt),
         len(dispatch),
     )
-
     return receipt, dispatch
 
+
 def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Return supplier and customer history at their operational grains.
+    """Return Supplier History and Customer History at their operational grains.
 
-    Supplier History represents SFDA-eligible receipt sources. Customer-return
-    ASN lines (InboundShipment starting with TRK3) remain preserved in the raw
-    ReceiptEvents audit trail, but are intentionally excluded here so they
-    cannot inflate Supplier History or Supplier Variance.
-
-    Dispatch / Customer History is unchanged.
+    Supplier History is intentionally TRK5060-only. This guarantees that
+    Supplier Variance can never be inflated by STO, returns, reservations or
+    principal movements.
     """
 
     initialize_database()
@@ -868,38 +863,105 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             MIN(ReceivedDate) AS [First Received Date],
             MAX(ReceivedDate) AS [Last Received Date]
         FROM dbo.ReceiptEvents
-        WHERE UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, ''))))
-              NOT LIKE 'TRK3%'
-        GROUP BY
-            SupplierName,
-            SupplierCode,
-            BN,
-            ExpiryMonthKey,
-            GenericItemNumber;
+        WHERE UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK5060%'
+        GROUP BY SupplierName, SupplierCode, BN, ExpiryMonthKey, GenericItemNumber;
     """
+
     customer_sql = r"""
-       SELECT
-    ToAddress AS [To Address],
-    BN,
-    ExpiryMonthKey AS [Expiry Month Key],
-    MAX(ExpiryDate) AS [Expiry Date],
-    GenericItemNumber AS [Generic Item Number],
-    MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
-    MAX(NULLIF(TradeName, '')) AS [Trade Name],
-    SUM(DispatchedQuantity) AS [Dispatch Quantity Each],
-    MIN(DispatchDate) AS [First Dispatch Date],
-    MAX(DispatchDate) AS [Last Dispatch Date]
-FROM dbo.DispatchEvents
-GROUP BY
-    ToAddress,
-    BN,
-    ExpiryMonthKey,
-    GenericItemNumber;
+        SELECT
+            ToAddress AS [To Address],
+            BN,
+            ExpiryMonthKey AS [Expiry Month Key],
+            MAX(ExpiryDate) AS [Expiry Date],
+            GenericItemNumber AS [Generic Item Number],
+            MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
+            MAX(NULLIF(TradeName, '')) AS [Trade Name],
+            SUM(DispatchedQuantity) AS [Dispatch Quantity Each],
+            MIN(DispatchDate) AS [First Dispatch Date],
+            MAX(DispatchDate) AS [Last Dispatch Date]
+        FROM dbo.DispatchEvents
+        GROUP BY ToAddress, BN, ExpiryMonthKey, GenericItemNumber;
     """
+
     with Database().connect() as connection:
         supplier = pd.read_sql(supplier_sql, connection)
         customer = pd.read_sql(customer_sql, connection)
     return supplier, customer
+
+
+def _get_sto_receipt_history(prefix: str) -> pd.DataFrame:
+    """Return aggregated STO receipt evidence enriched from Batch Master."""
+
+    initialize_database()
+    safe_prefix = str(prefix or "").strip().upper()
+    if safe_prefix not in {"TRK800", "TRK49"}:
+        raise ValueError("Unsupported STO receipt prefix.")
+
+    sql = r"""
+        WITH Receipt AS
+        (
+            SELECT
+                InboundShipment,
+                SupplierName,
+                SupplierCode,
+                BN,
+                ExpiryMonthKey,
+                MAX(ExpiryDate) AS ExpiryDate,
+                GenericItemNumber,
+                MAX(NULLIF(TradeItemNumber, '')) AS TradeItemNumber,
+                MAX(NULLIF(TradeName, '')) AS TradeName,
+                MAX(NULLIF(Description, '')) AS Description,
+                MAX(NULLIF(ItemFamilyGroup, '')) AS ItemFamilyGroup,
+                SUM(ReceivedQuantity) AS ReceivedQuantityEach,
+                MIN(ReceivedDate) AS FirstReceivedDate,
+                MAX(ReceivedDate) AS LastReceivedDate
+            FROM dbo.ReceiptEvents
+            WHERE UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE ?
+            GROUP BY InboundShipment, SupplierName, SupplierCode, BN, ExpiryMonthKey, GenericItemNumber
+        )
+        SELECT
+            r.InboundShipment AS [Inbound Shipment],
+            r.SupplierName AS [Source Warehouse],
+            r.SupplierCode AS [Source Warehouse Code],
+            r.BN,
+            r.ExpiryMonthKey AS [Expiry Month Key],
+            COALESCE(b.ExpiryDate, r.ExpiryDate) AS [Expiry Date],
+            r.GenericItemNumber AS [Generic Item Number],
+            COALESCE(NULLIF(b.GTIN, ''), '') AS GTIN,
+            COALESCE(NULLIF(b.DrugName, ''), '') AS [Drug Name],
+            COALESCE(NULLIF(b.TradeName, ''), r.TradeName, '') AS [Trade Description],
+            r.Description,
+            r.ItemFamilyGroup AS [Item Family Group],
+            COALESCE(b.PackageSize, 0) AS PackageSize,
+            r.ReceivedQuantityEach AS [Received Quantity Each],
+            CASE WHEN COALESCE(b.PackageSize, 0) > 0
+                 THEN r.ReceivedQuantityEach / b.PackageSize ELSE 0 END AS [Received Quantity Pack],
+            r.FirstReceivedDate AS [First Received Date],
+            r.LastReceivedDate AS [Last Received Date]
+        FROM Receipt r
+        LEFT JOIN dbo.BatchMaster b
+          ON b.BN=r.BN
+         AND b.ExpiryMonthKey=r.ExpiryMonthKey
+         AND b.GenericItemNumber=r.GenericItemNumber
+        ORDER BY r.LastReceivedDate, r.BN, r.GenericItemNumber;
+    """
+
+    with Database().connect() as connection:
+        return pd.read_sql(sql, connection, params=(safe_prefix + "%",))
+
+
+def get_sto_incoming_history_df() -> pd.DataFrame:
+    return _get_sto_receipt_history("TRK800")
+
+
+def get_sto_return_history_df() -> pd.DataFrame:
+    frame = _get_sto_receipt_history("TRK49")
+    if frame.empty:
+        frame["Required Action"] = pd.Series(dtype=object)
+        return frame
+    frame["Required Action"] = "Cancel Previous RSD Dispatch"
+    return frame
+
 
 def _replace_history_table(
     table_name: str,
@@ -1365,13 +1427,18 @@ def get_reconciliation_history(limit: int = 100) -> List[Dict[str, Any]]:
 
 
 def reset_history() -> None:
-    """Delete all cumulative history and Batch Master rows for rebuild mode."""
+    """Delete cumulative historical tables for the current warehouse only.
+
+    Database connections always carry WarehouseID session context and Version 6
+    RLS isolates these tables. This function is used only by Historical Build
+    operation=rebuild and does not touch users, warehouse configuration, GLN or
+    reference data.
+    """
 
     initialize_database()
 
     with Database().connect() as connection:
         cursor = connection.cursor()
-
         try:
             cursor.execute(
                 """
@@ -1384,14 +1451,13 @@ def reset_history() -> None:
                 """
             )
             connection.commit()
-
         except Exception:
             connection.rollback()
             raise
 
 
 def get_historical_status() -> Dict[str, Any]:
-    """Return the readiness and latest build state of historical data."""
+    """Return warehouse-scoped historical readiness and dashboard coverage."""
 
     initialize_database()
 
@@ -1400,7 +1466,47 @@ def get_historical_status() -> Dict[str, Any]:
             (SELECT COUNT_BIG(*) FROM dbo.BatchMaster) AS BatchMasterRows,
             (SELECT COUNT_BIG(*) FROM dbo.SupplierHistory) AS SupplierHistoryRows,
             (SELECT COUNT_BIG(*) FROM dbo.CustomerHistory) AS CustomerHistoryRows,
-            (SELECT MAX(LastUpdated) FROM dbo.BatchMaster) AS LastBuildUtc;
+            (SELECT MAX(LastUpdated) FROM dbo.BatchMaster) AS LastBuildUtc,
+            (SELECT COUNT_BIG(*) FROM dbo.LatestSFDASnapshot) AS TotalSFDABatches,
+            (
+                SELECT COUNT_BIG(*)
+                FROM (
+                    SELECT s.BN, s.ExpiryMonthKey, s.GenericItemNumber
+                    FROM dbo.SupplierHistory s
+                    LEFT JOIN dbo.LatestSFDASnapshot f
+                      ON f.BN=s.BN AND f.ExpiryMonthKey=s.ExpiryMonthKey
+                    WHERE f.BN IS NULL
+                    GROUP BY s.BN, s.ExpiryMonthKey, s.GenericItemNumber
+                ) missing_supplier
+            ) AS MissingSupplierBatches,
+            (
+                SELECT COUNT_BIG(*)
+                FROM (
+                    SELECT r.BN, r.ExpiryMonthKey, r.GenericItemNumber
+                    FROM dbo.ReceiptEvents r
+                    LEFT JOIN dbo.LatestSFDASnapshot f
+                      ON f.BN=r.BN AND f.ExpiryMonthKey=r.ExpiryMonthKey
+                    WHERE UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, '')))) LIKE 'TRK800%'
+                    GROUP BY r.BN, r.ExpiryMonthKey, r.GenericItemNumber
+                    HAVING COALESCE(MAX(f.QuantityReceivePending), 0) <= 0
+                ) sto_followup
+            ) AS STOFollowupBatches,
+            (
+                SELECT MIN(d.TransactionDate)
+                FROM (
+                    SELECT ReceivedDate AS TransactionDate FROM dbo.ReceiptEvents
+                    UNION ALL
+                    SELECT DispatchDate AS TransactionDate FROM dbo.DispatchEvents
+                ) d
+            ) AS HistoricalFrom,
+            (
+                SELECT MAX(d.TransactionDate)
+                FROM (
+                    SELECT ReceivedDate AS TransactionDate FROM dbo.ReceiptEvents
+                    UNION ALL
+                    SELECT DispatchDate AS TransactionDate FROM dbo.DispatchEvents
+                ) d
+            ) AS HistoricalTo;
     """
 
     with Database().connect() as connection:
@@ -1416,8 +1522,134 @@ def get_historical_status() -> Dict[str, Any]:
         "supplier_history_rows": supplier_rows,
         "customer_history_rows": customer_rows,
         "last_build_utc": row[3],
+        "total_sfda_batches": int(row[4] or 0),
+        "missing_supplier_batches": int(row[5] or 0),
+        "sto_followup_batches": int(row[6] or 0),
+        "historical_from": row[7],
+        "historical_to": row[8],
     }
 
+
+def reset_current_warehouse_data() -> Dict[str, Any]:
+    """Delete only uploaded/operational data owned by the current warehouse.
+
+    Preserved deliberately:
+      * Warehouses
+      * ApplicationUsers / AuthSessions
+      * WarehouseGLNMapping
+      * config/pack_size.xlsx and all application/business-rule code
+
+    Every DELETE is explicitly constrained by WarehouseID. Tables that are not
+    present in an older deployment are skipped. This keeps the operation safe
+    across Version 6 transitional databases without touching another warehouse.
+    """
+
+    initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+
+    warehouse_id = int(current_warehouse_id())
+    if warehouse_id < 1:
+        raise RuntimeError("A valid WarehouseID is required for reset.")
+
+    # Child tables first, then parents. Keep this list limited to active Version
+    # 6 operational tables. Legacy backup tables are intentionally untouched.
+    delete_order = [
+        "DailyDispatchConfirmations",
+        "FullDispatchConfirmations",
+        "DailyProcessedTransactions",
+        "DailyAcceptTransactions",
+        "DailyDispatchTransactions",
+        "FullDispatchTransactions",
+        "DailyAcceptSFDABaseline",
+        "DailyDispatchSFDABaseline",
+        "FullDispatchSFDABaseline",
+        "LatestInventorySnapshot",
+        "LatestSFDASnapshot",
+        "CustomerHistory",
+        "SupplierHistory",
+        "BatchMaster",
+        "DispatchEvents",
+        "ReceiptEvents",
+        "HistoricalBuildJobs",
+        "OutlookDraftRequests",
+        "ReconciliationRuns",
+        "RunHistory",
+    ]
+
+    deleted: Dict[str, int] = {}
+
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            # Legacy audit children may not have WarehouseID, but they point to
+            # ReconciliationRuns.RunID. Delete only children whose parent run
+            # belongs to the current warehouse before deleting parent runs.
+            for child_table in (
+                "ReconciliationRunFiles",
+                "BatchEvents",
+                "ReconciliationActions",
+                "SFDAVerifications",
+                "VerificationRuns",
+            ):
+                object_name = f"dbo.{child_table}"
+                exists = cursor.execute(
+                    "SELECT CASE WHEN OBJECT_ID(?, N'U') IS NULL THEN 0 ELSE 1 END;",
+                    (object_name,),
+                ).fetchone()[0]
+                if not int(exists or 0):
+                    continue
+                has_run_id = cursor.execute(
+                    "SELECT CASE WHEN COL_LENGTH(?, N'RunID') IS NULL THEN 0 ELSE 1 END;",
+                    (object_name,),
+                ).fetchone()[0]
+                if not int(has_run_id or 0):
+                    continue
+                cursor.execute(
+                    f"DELETE child FROM dbo.[{child_table}] child "
+                    "WHERE child.RunID IN ("
+                    "SELECT parent.RunID FROM dbo.ReconciliationRuns parent "
+                    "WHERE parent.WarehouseID = ?);",
+                    warehouse_id,
+                )
+                deleted[child_table] = max(0, int(cursor.rowcount or 0))
+
+            for table_name in delete_order:
+                object_name = f"dbo.{table_name}"
+                exists = cursor.execute(
+                    "SELECT CASE WHEN OBJECT_ID(?, N'U') IS NULL THEN 0 ELSE 1 END;",
+                    (object_name,),
+                ).fetchone()[0]
+                if not int(exists or 0):
+                    continue
+
+                has_warehouse = cursor.execute(
+                    "SELECT CASE WHEN COL_LENGTH(?, N'WarehouseID') IS NULL THEN 0 ELSE 1 END;",
+                    (object_name,),
+                ).fetchone()[0]
+                if not int(has_warehouse or 0):
+                    logger.warning(
+                        "Warehouse reset skipped %s because WarehouseID is missing.",
+                        table_name,
+                    )
+                    continue
+
+                cursor.execute(
+                    f"DELETE FROM dbo.[{table_name}] WHERE WarehouseID = ?;",
+                    warehouse_id,
+                )
+                deleted[table_name] = max(0, int(cursor.rowcount or 0))
+
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "status": "Completed",
+        "warehouse_id": warehouse_id,
+        "deleted_rows": deleted,
+        "deleted_rows_total": int(sum(deleted.values())),
+    }
 
 
 def create_historical_build_job(
