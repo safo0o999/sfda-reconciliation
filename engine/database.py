@@ -1054,9 +1054,16 @@ def get_sto_incoming_history_df() -> pd.DataFrame:
 
 
 def get_sto_return_history_df() -> pd.DataFrame:
-    # STO Return remains a physical cancellation-action list and is intentionally
-    # not restricted by the STO Incoming SFDA-relevance filter.
-    frame = _get_sto_receipt_history("TRK49")
+    """Return only SFDA-relevant STO Return (TRK49) cancellation actions.
+
+    Keep a TRK49 return only when either the exact BN + Expiry Month exists in
+    Batch Master, or the Generic Item Number exists anywhere in Batch Master.
+    Unrelated physical returns must never appear in the RSD cancel-dispatch list.
+    """
+    frame = _get_sto_receipt_history(
+        "TRK49",
+        sfda_relevant_only=True,
+    )
     if frame.empty:
         frame["Required Action"] = pd.Series(dtype=object)
         return frame
