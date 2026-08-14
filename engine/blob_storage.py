@@ -339,6 +339,60 @@ class BlobStorage:
         result["file_name"] = safe_name
         return result
 
+    def delete_current_warehouse_data(self) -> Dict[str, Any]:
+        """Delete only Blob data stored under the current warehouse prefix.
+
+        Reference/configuration files are not stored in these run containers, so
+        GLN mappings, Pack Size and business rules are never touched here.
+        Warehouse 1 additionally owns legacy unscoped run archives created
+        before Multi-Warehouse, so an explicitly confirmed Warehouse 1 reset
+        removes those legacy run blobs while preserving every other wN/ prefix.
+        """
+        from engine.warehouse_context import current_warehouse_id
+
+        warehouse_id = int(current_warehouse_id())
+        if warehouse_id < 1:
+            raise RuntimeError("A valid WarehouseID is required for Blob reset.")
+
+        prefix = f"w{warehouse_id}/"
+        deleted = {}
+        for container_name in (
+            INPUTS_CONTAINER,
+            OUTPUTS_CONTAINER,
+            METADATA_CONTAINER,
+        ):
+            container = self.service.get_container_client(container_name)
+            names = [
+                str(blob.name)
+                for blob in container.list_blobs(name_starts_with=prefix)
+            ]
+            # Warehouse 1 owns the legacy unscoped run archives that existed
+            # before Multi-Warehouse. An explicitly confirmed Warehouse 1 reset
+            # must remove those too; never touch another wN/ prefix.
+            if warehouse_id == 1:
+                for blob in container.list_blobs():
+                    name = str(blob.name or "")
+                    if name.startswith("w") and "/" in name and name.split("/", 1)[0][1:].isdigit():
+                        continue
+                    if name and name not in names:
+                        names.append(name)
+            count = 0
+            for blob_name in names:
+                container.delete_blob(
+                    blob_name,
+                    delete_snapshots="include",
+                )
+                count += 1
+            deleted[container_name] = count
+
+        return {
+            "status": "Completed",
+            "warehouse_id": warehouse_id,
+            "deleted_blobs": deleted,
+            "deleted_blobs_total": int(sum(deleted.values())),
+            "legacy_unscoped_madinah_blobs_deleted": warehouse_id == 1,
+        }
+
     def health(self) -> Dict[str, Any]:
         self.initialize_containers()
         account_name = self.service.account_name
