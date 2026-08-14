@@ -3504,23 +3504,57 @@ Drug Traceability Reconciliation Platform</textarea></label>
       const key=dashboardPreviewStorageKey();
       if(key) localStorage.removeItem(key);
       clearLegacyDashboardPreview();
+
+      // Clear every browser-side dataset that can survive navigation after a
+      // destructive warehouse reset.
       currentResult=null;
       historyCache=[];
       historyLoaded=false;
+      historyLoading=false;
+
+      varianceData={summary:{},items:[],email:{}};
       dashboardVarianceData={summary:{},items:[]};
+      varianceSelectedIds.clear();
+      varianceSelectedMeta.clear();
+      varianceActiveRowId="";
+      variancePage=1;
+
+      piData=null;
+      piLoaded=false;
       dashboardProductData={summary:{},customers:[],alerts:[]};
+
       historicalStatusData={};
       historicalDataReady=false;
 
-      await Promise.allSettled([
+      // Show the clean state immediately, then force reload all affected pages
+      // directly from the backend.
+      renderHistory();
+      renderReports();
+      updateDashboard();
+
+      const reloadResults=await Promise.allSettled([
         refreshAzureHistory({silent:true}),
         refreshHistoricalStatus({silent:true}),
+        loadVarianceManagement({
+          silent:true,
+          forceRefresh:true,
+          preserveSelection:false
+        }),
+        loadProductIntelligence(true),
         loadDashboardLinkedData()
       ]);
+
+      const failedReloads=reloadResults.filter(item=>item.status==="rejected");
       updateDashboard();
       renderHistory();
       renderReports();
-      toast(`${warehouseName} data reset completed. The warehouse is ready for a fresh build.`,"success");
+
+      if(failedReloads.length){
+        console.warn("Warehouse reset completed, but one or more page refreshes failed.",failedReloads);
+        toast(`${warehouseName} data was reset. Refresh the page once to reload all views.`,"warning");
+      }else{
+        toast(`${warehouseName} data reset completed. The warehouse is ready for a fresh build.`,"success");
+      }
     }catch(error){
       toast(error.message||String(error),"error");
     }finally{
