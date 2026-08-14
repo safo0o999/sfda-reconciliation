@@ -1290,6 +1290,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   const HISTORY_URL = "/api/history";
   const VARIANCE_API_URL = "/api/variance-management";
   const PRODUCT_INTELLIGENCE_API_URL = "/api/product-intelligence";
+  const DASHBOARD_SUMMARY_API_URL = "/api/dashboard/summary";
   const VARIANCE_REPORT_URL = "/api/variance-management/report";
   const VARIANCE_OUTLOOK_START_URL = "/api/variance-management/outlook/start";
   const AUTH_STATUS_URL = "/api/auth/status";
@@ -2153,7 +2154,9 @@ Drug Traceability Reconciliation Platform</textarea></label>
       <div class="history-file-row">
         <div><div class="file-name">${escapeHtml(file.FileName||'File')}</div><div class="history-file-meta">${escapeHtml(file.FileType||file.FileCategory||'')} · ${formatBytes(file.SizeBytes)} · ${escapeHtml(file.ContentType||'')}</div></div>
         <span class="badge info">${escapeHtml(file.FileCategory||'file')}</span>
-        <a class="btn btn-primary" href="${escapeHtml(file.download_url)}">Download</a>
+        ${file.RetentionExpired||!file.download_url
+          ?`<span class="badge warning">Input expired · metadata kept</span>`
+          :`<a class="btn btn-primary" href="${escapeHtml(file.download_url)}">Download</a>`}
       </div>`).join('')}</div>`;
   }
  
@@ -2299,14 +2302,18 @@ Drug Traceability Reconciliation Platform</textarea></label>
     const exceptionBody=$("homeExceptionsBody");
     if(exceptionBody){
       const items=(variance.items||[]).slice(0,10);
-      exceptionBody.innerHTML=items.length?items.map(item=>`<tr>
-        <td><strong>${escapeHtml(item.BN||"—")}</strong></td>
-        <td>${escapeHtml(piDate(item["Expiry Date"]))}</td>
-        <td>${escapeHtml(item["Variance Type"]||"—")}</td>
-        <td>${escapeHtml(item.Description||item["Variance Status"]||"—")}</td>
-        <td>${formatNumber(Math.abs(Number(item["Difference Pack"]||0)))}</td>
-        <td>${escapeHtml(item["Required Action"]||"Review")}</td>
-      </tr>`).join(""):`<tr><td colspan="6"><div class="empty"><strong>No open exceptions</strong>Variance Management currently has no exception records.</div></td></tr>`;
+      if(items.length){
+        exceptionBody.innerHTML=items.map(item=>`<tr>
+          <td><strong>${escapeHtml(item.BN||"—")}</strong></td>
+          <td>${escapeHtml(piDate(item["Expiry Date"]))}</td>
+          <td>${escapeHtml(item["Variance Type"]||"—")}</td>
+          <td>${escapeHtml(item.Description||item["Variance Status"]||"—")}</td>
+          <td>${formatNumber(Math.abs(Number(item["Difference Pack"]||0)))}</td>
+          <td>${escapeHtml(item["Required Action"]||"Review")}</td>
+        </tr>`).join("");
+      }else{
+        exceptionBody.innerHTML=`<tr><td colspan="6"><div class="empty"><strong>Details load on demand</strong>Open Variance Management to load the current exception list.</div></td></tr>`;
+      }
     }
 
     const customerBody=$("homeCustomerDispatchBody");
@@ -2323,27 +2330,27 @@ Drug Traceability Reconciliation Platform</textarea></label>
           <td>${escapeHtml(piDate(row.last_dispatch))}</td>
           <td><span class="badge ${badge}">${mapping}</span></td>
         </tr>`;
-      }).join(""):`<tr><td colspan="5"><div class="empty"><strong>No customer intelligence</strong>Product Intelligence has no customer history rows.</div></td></tr>`;
+      }).join(""):`<tr><td colspan="5"><div class="empty"><strong>No customer history</strong>No customer dispatch history is available for this warehouse.</div></td></tr>`;
     }
   }
 
   async function loadDashboardLinkedData(){
-    const [varianceResult,productResult]=await Promise.allSettled([
-      fetch(VARIANCE_API_URL,{cache:"no-store"}).then(async response=>{
-        const payload=await response.json().catch(()=>({}));
-        if(!response.ok) throw new Error(payload.details||payload.error||"Variance Management failed.");
-        return payload;
-      }),
-      fetch(PRODUCT_INTELLIGENCE_API_URL,{cache:"no-store"}).then(async response=>{
-        const payload=await response.json().catch(()=>({}));
-        if(!response.ok) throw new Error(payload.details||payload.error||"Product Intelligence failed.");
-        return payload;
-      })
-    ]);
+    const response=await fetch(DASHBOARD_SUMMARY_API_URL,{cache:"no-store",credentials:"same-origin"});
+    const payload=await response.json().catch(()=>({}));
+    if(response.status===401){await logout();throw new Error("Your session has expired. Please sign in again.");}
+    if(!response.ok||payload.status==="Failed") throw new Error(payload.details||payload.error||"Dashboard summary failed.");
 
-    if(varianceResult.status==="fulfilled") dashboardVarianceData=varianceResult.value;
-    if(productResult.status==="fulfilled") dashboardProductData=productResult.value;
+    historicalStatusData=payload.historical||{};
+    historicalDataReady=Boolean(historicalStatusData.exists);
+    const customer=payload.customer||{};
+    dashboardProductData={
+      summary: customer.summary||{},
+      customers: customer.customers||[],
+      alerts: []
+    };
+    renderHistoricalDashboardCards(historicalStatusData);
     renderDashboardLinkedData();
+    return payload;
   }
 
   async function refreshDashboard({silent=false,includeLinked=true}={}){
@@ -2353,8 +2360,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       if(includeLinked){
         await Promise.all([
           refreshAzureHistory({silent:true}),
-          loadDashboardLinkedData(),
-          refreshHistoricalStatus({silent:true})
+          loadDashboardLinkedData()
         ]);
       }else{
         await refreshAzureHistory({silent:true});
@@ -3532,15 +3538,10 @@ Drug Traceability Reconciliation Platform</textarea></label>
       renderReports();
       updateDashboard();
 
+      // Keep reset fast: reload only lightweight warehouse state. Variance and
+      // Product Intelligence stay cleared and load only when their pages open.
       const reloadResults=await Promise.allSettled([
         refreshAzureHistory({silent:true}),
-        refreshHistoricalStatus({silent:true}),
-        loadVarianceManagement({
-          silent:true,
-          forceRefresh:true,
-          preserveSelection:false
-        }),
-        loadProductIntelligence(true),
         loadDashboardLinkedData()
       ]);
 
@@ -3636,14 +3637,8 @@ Drug Traceability Reconciliation Platform</textarea></label>
     Promise.resolve(checkHealth())
       .catch(error=>console.error("Health check failed",error));
 
-    Promise.allSettled([
-      refreshDashboard({silent:true,includeLinked:false}),
-      refreshHistoricalStatus({silent:true})
-    ]).then(()=>{
-      return loadDashboardLinkedData();
-    }).catch(error=>{
-      console.error("Initial background refresh failed",error);
-    });
+    Promise.resolve(refreshDashboard({silent:true,includeLinked:true}))
+      .catch(error=>console.error("Initial background refresh failed",error));
   }
 
   $("showRegisterButton")?.addEventListener("click",async()=>{showAuthPanel("register");await loadRegistrationWarehouses();});
