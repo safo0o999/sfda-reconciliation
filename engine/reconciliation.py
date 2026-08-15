@@ -34,7 +34,8 @@ class ReconciliationEngine:
     After that, SFDA is matched to ASN / Full Dispatch by:
         BN + Expiry Date
 
-    Batch Master is optional enrichment and never blocks daily processing.
+    Batch Master defines the SFDA-relevant universe for Daily Accept. If it is
+    unavailable, Daily Accept falls back to exact batches in the current SFDA file.
     """
 
     MATCH_KEYS = ["BN", "Expiry Date"]
@@ -280,6 +281,11 @@ class ReconciliationEngine:
                     self.batch_master["Expiry Date"]
                 )
 
+            if "Generic Item Number" in self.batch_master.columns:
+                self.batch_master["Generic Item Number"] = Normalizer.text(
+                    self.batch_master["Generic Item Number"]
+                )
+
     def _validate_common(self) -> None:
         Validator.validate(
             self.sfda,
@@ -458,6 +464,83 @@ class ReconciliationEngine:
 
         return report
 
+    def _filter_accept_sfda_relevant(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Keep only Daily Accept ASN rows connected to the SFDA universe.
+
+        Eligibility follows the same rule used by the historical/STO reports:
+          1. exact BN + Expiry Date exists in Batch Master; OR
+          2. Generic Item Number exists anywhere in Batch Master.
+
+        The second rule intentionally keeps a newly received batch when the
+        generic drug is SFDA-relevant but that exact batch is still missing from
+        the SFDA report. Rows unrelated to SFDA are removed before Accept, STO
+        follow-up, excluded-receipt audit output, and transaction persistence.
+
+        If Batch Master is unavailable, fall back conservatively to exact
+        BN + Expiry Date rows present in the uploaded SFDA report so Daily Accept
+        never expands to every ASN row.
+        """
+        if frame.empty:
+            return frame.copy()
+
+        result = frame.copy()
+        bn = Normalizer.text(result.get(
+            "BN", pd.Series("", index=result.index, dtype=object)
+        ))
+        expiry = Normalizer.date(result.get(
+            "Expiry Date", pd.Series(pd.NaT, index=result.index)
+        ))
+        generic = Normalizer.text(result.get(
+            "Generic Item Number", pd.Series("", index=result.index, dtype=object)
+        ))
+
+        def date_key(series: pd.Series) -> pd.Series:
+            parsed = pd.to_datetime(series, errors="coerce")
+            return parsed.dt.strftime("%Y-%m-%d").fillna("")
+
+        row_exact = bn.astype(str) + "|" + date_key(expiry)
+
+        if not self.batch_master.empty:
+            master = self.batch_master.copy()
+            master_bn = Normalizer.text(master.get(
+                "BN", pd.Series("", index=master.index, dtype=object)
+            ))
+            master_expiry = Normalizer.date(master.get(
+                "Expiry Date", pd.Series(pd.NaT, index=master.index)
+            ))
+            master_generic = Normalizer.text(master.get(
+                "Generic Item Number", pd.Series("", index=master.index, dtype=object)
+            ))
+
+            exact_keys = set(
+                (master_bn.astype(str) + "|" + date_key(master_expiry)).tolist()
+            )
+            generic_keys = {
+                value for value in master_generic.astype(str).tolist() if value.strip()
+            }
+
+            exact_match = row_exact.isin(exact_keys)
+            generic_match = generic.astype(str).isin(generic_keys) & generic.astype(str).str.strip().ne("")
+            keep = exact_match | generic_match
+
+            result["SFDA Relevance Status"] = "Not SFDA Relevant"
+            result.loc[generic_match, "SFDA Relevance Status"] = "Generic Exists in SFDA-Relevant Master"
+            result.loc[exact_match, "SFDA Relevance Status"] = "Exact Batch in SFDA-Relevant Master"
+            return result.loc[keep].copy()
+
+        sfda_bn = Normalizer.text(self.sfda.get(
+            "BN", pd.Series("", index=self.sfda.index, dtype=object)
+        ))
+        sfda_expiry = Normalizer.date(self.sfda.get(
+            "Expiry Date", pd.Series(pd.NaT, index=self.sfda.index)
+        ))
+        sfda_exact_keys = set(
+            (sfda_bn.astype(str) + "|" + date_key(sfda_expiry)).tolist()
+        )
+        keep = row_exact.isin(sfda_exact_keys)
+        result["SFDA Relevance Status"] = "Exact Batch in Current SFDA"
+        return result.loc[keep].copy()
+
     def _run_accept(self) -> Dict[str, pd.DataFrame]:
         if self.asn.empty:
             raise ValueError(
@@ -492,6 +575,11 @@ class ReconciliationEngine:
             "Inbound Shipment",
             pd.Series("", index=self.asn.index, dtype=object),
         ).map(classify_inbound_shipment)
+
+        # Daily Accept must operate on the same SFDA-relevant universe as the
+        # Historical Batch Master. Do not allow unrelated WMS batches/generics
+        # to appear in Accept Details, STO follow-up, or RSD output files.
+        self.asn = self._filter_accept_sfda_relevant(self.asn)
 
         eligible_mask = self.asn["Receipt Type"].isin(ACCEPT_TYPES)
         eligible_asn = self.asn.loc[eligible_mask].copy()
