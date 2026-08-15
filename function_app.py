@@ -1342,9 +1342,12 @@ def historical_status(req: func.HttpRequest) -> func.HttpResponse:
     if denied:
         return denied
     try:
-        from engine.database import get_historical_status
+        # Page load must be a single cached-row read. Heavy historical
+        # aggregation is refreshed only after data-changing jobs complete.
+        from engine.database import get_cached_dashboard_summary
 
-        status = get_historical_status()
+        cached = get_cached_dashboard_summary()
+        status = cached.get("historical") or {}
         return json_response(
             {
                 "status": "Ready",
