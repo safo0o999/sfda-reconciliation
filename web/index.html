@@ -777,7 +777,7 @@
 
         <div class="status-banner info show" id="historicalStatusBanner" style="align-items:center">
           <span>ⓘ</span>
-          <div style="flex:1"><strong>Checking historical data...</strong><br>Please wait while the system reads Azure SQL.</div>
+          <div style="flex:1"><strong>Checking historical data...</strong><br>Loading cached warehouse status.</div>
           <button class="btn btn-secondary" id="downloadHistoricalButton" type="button" disabled style="display:none;white-space:nowrap">⇩ Download Historical Files</button>
         </div>
 
@@ -2625,8 +2625,26 @@ Drug Traceability Reconciliation Platform</textarea></label>
 
   async function refreshHistoricalStatus({silent=false}={}){
     try{
-      const response=await fetch("/api/historical/status",{cache:"no-store"});
-      const result=await parseApiResponse(response);
+      // Full Reconciliation uses the exact same lightweight cached summary as Home.
+      // Do not call /api/historical/status on page load; that separate request path
+      // is unnecessary and previously caused gateway timeouts.
+      const response=await fetch(DASHBOARD_SUMMARY_API_URL,{
+        cache:"no-store",
+        credentials:"same-origin"
+      });
+      const payload=await response.json().catch(()=>({}));
+      if(response.status===401){
+        await logout();
+        throw new Error("Your session has expired. Please sign in again.");
+      }
+      if(!response.ok||payload.status==="Failed"){
+        throw new Error(payload.details||payload.error||"Historical status failed.");
+      }
+
+      const result={
+        status:"Ready",
+        ...(payload.historical||{})
+      };
       applyHistoricalStatus(result);
       return result;
     }catch(error){
