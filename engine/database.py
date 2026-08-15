@@ -1868,20 +1868,40 @@ def get_cached_dashboard_summary() -> Dict[str, Any]:
         with Database().connect() as connection:
             row = connection.cursor().execute(sql, warehouse_id).fetchone()
     except pyodbc.Error as exc:
-        # Friendly deployment fallback if code is deployed before migration.
+        # Page-load endpoints must never fall back to historical aggregation.
+        # If the cache table is unavailable, return an empty lightweight payload
+        # and let a data-changing job rebuild the cache later.
         if "WarehouseDashboardSummary" in str(exc) or "Invalid object name" in str(exc):
-            logger.warning(
-                "WarehouseDashboardSummary is unavailable; computing Home summary directly."
-            )
-            return {
-                "historical": get_historical_status(),
-                "customer": get_dashboard_customer_summary(limit=10),
-                "updated_at": None,
-            }
-        raise
+            logger.warning("WarehouseDashboardSummary is unavailable during page load.")
+            row = None
+        else:
+            raise
 
     if row is None:
-        return refresh_dashboard_summary_cache()
+        return {
+            "historical": {
+                "exists": False,
+                "batch_master_rows": 0,
+                "supplier_history_rows": 0,
+                "customer_history_rows": 0,
+                "last_build_utc": None,
+                "total_sfda_batches": 0,
+                "missing_supplier_batches": 0,
+                "sto_followup_batches": 0,
+                "historical_from": None,
+                "historical_to": None,
+            },
+            "customer": {
+                "summary": {
+                    "customer_count": 0,
+                    "customer_with_gln_count": 0,
+                    "customer_dummy_gln_count": 0,
+                    "customer_unmapped_count": 0,
+                },
+                "customers": [],
+            },
+            "updated_at": None,
+        }
 
     try:
         customers = json.loads(row[13]) if row[13] else []
@@ -1970,7 +1990,6 @@ def reset_current_warehouse_data() -> Dict[str, Any]:
         "FullDispatchSFDABaseline",
         "LatestInventorySnapshot",
         "LatestSFDASnapshot",
-        "WarehouseDashboardSummary",
         "CustomerHistory",
         "SupplierHistory",
         "BatchMaster",
@@ -2044,6 +2063,33 @@ def reset_current_warehouse_data() -> Dict[str, Any]:
                     warehouse_id,
                 )
                 deleted[table_name] = max(0, int(cursor.rowcount or 0))
+
+            # Preserve a lightweight dashboard row after reset. This prevents
+            # Home / Full Reconciliation from rebuilding historical aggregates
+            # during the next page load.
+            if cursor.execute(
+                "SELECT CASE WHEN OBJECT_ID(N'dbo.WarehouseDashboardSummary', N'U') IS NULL THEN 0 ELSE 1 END;"
+            ).fetchone()[0]:
+                cursor.execute(
+                    r"""
+                    MERGE dbo.WarehouseDashboardSummary AS target
+                    USING (SELECT ? AS WarehouseID) AS source
+                      ON target.WarehouseID = source.WarehouseID
+                    WHEN MATCHED THEN UPDATE SET
+                        BatchMasterRows = 0, SupplierHistoryRows = 0, CustomerHistoryRows = 0,
+                        LastBuildUtc = NULL, TotalSFDABatches = 0, MissingSupplierBatches = 0,
+                        STOFollowupBatches = 0, HistoricalFrom = NULL, HistoricalTo = NULL,
+                        CustomerCount = 0, CustomersWithGLN = 0, DummyGLNCustomers = 0,
+                        UnmappedGLNCustomers = 0, CustomersJson = N'[]', UpdatedAt = SYSUTCDATETIME()
+                    WHEN NOT MATCHED THEN INSERT
+                    (WarehouseID, BatchMasterRows, SupplierHistoryRows, CustomerHistoryRows,
+                     LastBuildUtc, TotalSFDABatches, MissingSupplierBatches, STOFollowupBatches,
+                     HistoricalFrom, HistoricalTo, CustomerCount, CustomersWithGLN,
+                     DummyGLNCustomers, UnmappedGLNCustomers, CustomersJson, UpdatedAt)
+                    VALUES (?, 0, 0, 0, NULL, 0, 0, 0, NULL, NULL, 0, 0, 0, 0, N'[]', SYSUTCDATETIME());
+                    """,
+                    warehouse_id, warehouse_id,
+                )
 
             connection.commit()
         except Exception:
