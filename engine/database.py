@@ -1956,12 +1956,14 @@ def clear_dashboard_summary_cache() -> None:
 
 
 def reset_current_warehouse_data(warehouse_id: Optional[int] = None) -> Dict[str, Any]:
-    """Delete uploaded/operational data for exactly one warehouse.
+    """Atomically delete operational data for exactly one warehouse.
 
-    Reset is deliberately idempotent and uses bounded DELETE batches. Large
-    DispatchEvents / ReceiptEvents tables therefore do not require one huge SQL
-    transaction or rollback log. Warehouse/users, GLN mapping, Pack Size and
-    application logic are preserved.
+    The reset is all-or-nothing: every warehouse-scoped operational/audit row is
+    removed in one SQL transaction, or the whole reset is rolled back. Reference
+    data (warehouse/users, GLN mappings and Pack Size) is deliberately preserved.
+    FK dependencies are discovered from SQL metadata and deleted recursively from
+    deepest children to parents, so verification/audit chains cannot leave a
+    partial reset behind.
     """
     initialize_database()
     from engine.warehouse_context import current_warehouse_id
@@ -1970,210 +1972,171 @@ def reset_current_warehouse_data(warehouse_id: Optional[int] = None) -> Dict[str
     if resolved_warehouse_id < 1:
         raise RuntimeError("A valid WarehouseID is required for reset.")
 
-    delete_order = [
-        "DailyDispatchConfirmations",
-        "FullDispatchConfirmations",
-        "DailyProcessedTransactions",
-        "DailyAcceptTransactions",
-        "DailyDispatchTransactions",
-        "FullDispatchTransactions",
-        "DailyAcceptSFDABaseline",
-        "DailyDispatchSFDABaseline",
-        "FullDispatchSFDABaseline",
-        "LatestInventorySnapshot",
-        "LatestSFDASnapshot",
-        "CustomerHistory",
-        "SupplierHistory",
-        "BatchMaster",
-        "DispatchEvents",
-        "ReceiptEvents",
-        "HistoricalBuildJobs",
-        "OutlookDraftRequests",
-        "ReconciliationRuns",
-        "RunHistory",
-    ]
-    # Known legacy/audit children plus any FK children discovered dynamically.
-    # Dynamic discovery prevents reset failures when a new table (for example
-    # VerificationResults) references ReconciliationRuns.RunID.
-    child_tables = (
-        "ReconciliationRunFiles",
-        "BatchEvents",
-        "ReconciliationActions",
-        "SFDAVerifications",
-        "VerificationRuns",
-        "VerificationResults",
+    # Only these roots are reset. Reference/configuration tables are intentionally
+    # absent. Any FK child of these roots is handled recursively below.
+    reset_roots = (
+        "DailyDispatchConfirmations", "FullDispatchConfirmations",
+        "DailyProcessedTransactions", "DailyAcceptTransactions",
+        "DailyDispatchTransactions", "FullDispatchTransactions",
+        "DailyAcceptSFDABaseline", "DailyDispatchSFDABaseline",
+        "FullDispatchSFDABaseline", "LatestInventorySnapshot",
+        "LatestSFDASnapshot", "CustomerHistory", "SupplierHistory",
+        "BatchMaster", "DispatchEvents", "ReceiptEvents",
+        "HistoricalBuildJobs", "OutlookDraftRequests",
+        "ReconciliationRuns", "RunHistory",
     )
-    batch_size = 20000
     deleted: Dict[str, int] = {}
 
-    def table_exists(cursor: pyodbc.Cursor, table_name: str) -> bool:
-        value = cursor.execute(
-            "SELECT CASE WHEN OBJECT_ID(?, N'U') IS NULL THEN 0 ELSE 1 END;",
-            (f"dbo.{table_name}",),
-        ).fetchone()[0]
-        return bool(int(value or 0))
-
-    def has_warehouse_column(cursor: pyodbc.Cursor, table_name: str) -> bool:
-        value = cursor.execute(
-            "SELECT CASE WHEN COL_LENGTH(?, N'WarehouseID') IS NULL THEN 0 ELSE 1 END;",
-            (f"dbo.{table_name}",),
-        ).fetchone()[0]
-        return bool(int(value or 0))
+    def q(name: str) -> str:
+        return "[" + str(name).replace("]", "]]") + "]"
 
     with Database().connect() as connection:
         cursor = connection.cursor()
-
-        # Child audit tables reference ReconciliationRuns and may not carry
-        # WarehouseID themselves. Discover every direct FK child dynamically so
-        # reset remains safe when audit/verification tables are added later.
-        discovered_children = set(child_tables)
         try:
-            fk_rows = cursor.execute(
-                r"""
-                SELECT DISTINCT OBJECT_SCHEMA_NAME(fk.parent_object_id) AS SchemaName,
-                                OBJECT_NAME(fk.parent_object_id) AS TableName
+            # Map dbo FK graph: parent/referenced table -> child table + column pairs.
+            fk_rows = cursor.execute(r"""
+                SELECT
+                    OBJECT_NAME(fk.referenced_object_id) AS ParentTable,
+                    OBJECT_NAME(fk.parent_object_id) AS ChildTable,
+                    pc.name AS ChildColumn,
+                    rc.name AS ParentColumn,
+                    fkc.constraint_column_id
                 FROM sys.foreign_keys fk
-                WHERE fk.referenced_object_id = OBJECT_ID(N'dbo.ReconciliationRuns');
-                """
-            ).fetchall()
-            for fk_row in fk_rows:
-                schema_name = str(fk_row[0] or "dbo")
-                table_name = str(fk_row[1] or "").strip()
-                if schema_name.lower() == "dbo" and table_name:
-                    discovered_children.add(table_name)
-        except Exception:
-            logger.exception("Unable to discover ReconciliationRuns FK children; using known list.")
+                JOIN sys.foreign_key_columns fkc
+                  ON fkc.constraint_object_id = fk.object_id
+                JOIN sys.columns pc
+                  ON pc.object_id = fk.parent_object_id
+                 AND pc.column_id = fkc.parent_column_id
+                JOIN sys.columns rc
+                  ON rc.object_id = fk.referenced_object_id
+                 AND rc.column_id = fkc.referenced_column_id
+                WHERE OBJECT_SCHEMA_NAME(fk.parent_object_id) = N'dbo'
+                  AND OBJECT_SCHEMA_NAME(fk.referenced_object_id) = N'dbo'
+                ORDER BY ParentTable, ChildTable, fk.object_id, fkc.constraint_column_id;
+            """).fetchall()
 
-        # VerificationResults is a second-level child:
-        # ReconciliationRuns.RunID -> VerificationRuns.RunID
-        # VerificationRuns.VerificationID -> VerificationResults.VerificationID.
-        # It does not necessarily carry RunID itself, so it must be removed
-        # explicitly before VerificationRuns. Keep the delete warehouse-scoped
-        # through the parent ReconciliationRuns rows.
-        if table_exists(cursor, "VerificationResults") and table_exists(cursor, "VerificationRuns"):
-            vr_has_run_id = cursor.execute(
-                "SELECT CASE WHEN COL_LENGTH(N'dbo.VerificationRuns', N'RunID') IS NULL THEN 0 ELSE 1 END;"
-            ).fetchone()[0]
-            vr_has_verification_id = cursor.execute(
-                "SELECT CASE WHEN COL_LENGTH(N'dbo.VerificationRuns', N'VerificationID') IS NULL THEN 0 ELSE 1 END;"
-            ).fetchone()[0]
-            results_has_verification_id = cursor.execute(
-                "SELECT CASE WHEN COL_LENGTH(N'dbo.VerificationResults', N'VerificationID') IS NULL THEN 0 ELSE 1 END;"
-            ).fetchone()[0]
+            edges: Dict[str, Dict[str, List[Tuple[str, str]]]] = {}
+            for row in fk_rows:
+                parent, child = str(row[0]), str(row[1])
+                edges.setdefault(parent, {}).setdefault(child, []).append(
+                    (str(row[2]), str(row[3]))
+                )
 
-            if all(int(value or 0) for value in (
-                vr_has_run_id, vr_has_verification_id, results_has_verification_id
-            )):
-                total = 0
-                while True:
-                    cursor.execute(
-                        f"DELETE TOP ({batch_size}) result "
-                        "FROM dbo.VerificationResults result "
-                        "WHERE result.VerificationID IN ("
-                        "    SELECT vr.VerificationID "
-                        "    FROM dbo.VerificationRuns vr "
-                        "    WHERE vr.RunID IN ("
-                        "        SELECT parent.RunID "
-                        "        FROM dbo.ReconciliationRuns parent "
-                        "        WHERE parent.WarehouseID = ?"
-                        "    )"
-                        ");",
-                        resolved_warehouse_id,
+            existing_roots: List[str] = []
+            for table in reset_roots:
+                exists = cursor.execute(
+                    "SELECT CASE WHEN OBJECT_ID(?, N'U') IS NULL THEN 0 ELSE 1 END;",
+                    (f"dbo.{table}",),
+                ).fetchone()[0]
+                if int(exists or 0):
+                    existing_roots.append(table)
+
+            # Seed each root with warehouse-scoped rows. RLS remains an additional
+            # guard, but the explicit predicate makes the target unambiguous.
+            root_predicates: Dict[str, Tuple[str, Tuple[Any, ...]]] = {}
+            for table in existing_roots:
+                has_wh = cursor.execute(
+                    "SELECT CASE WHEN COL_LENGTH(?, N'WarehouseID') IS NULL THEN 0 ELSE 1 END;",
+                    (f"dbo.{table}",),
+                ).fetchone()[0]
+                if int(has_wh or 0):
+                    root_predicates[table] = ("t.WarehouseID = ?", (resolved_warehouse_id,))
+
+            if not root_predicates:
+                raise RuntimeError("No warehouse-scoped operational tables were found for reset.")
+
+            deleting: Set[Tuple[str, str]] = set()
+
+            def delete_tree(table: str, predicate: str, params: Tuple[Any, ...]) -> None:
+                # Predicate is always expressed against alias t for this table.
+                signature = (table, predicate)
+                if signature in deleting:
+                    raise RuntimeError(f"Cyclic FK dependency encountered while resetting {table}.")
+                deleting.add(signature)
+
+                # Delete every FK child first. Child scope is derived by joining to
+                # the already warehouse-scoped parent predicate, so children do not
+                # need their own WarehouseID/RunID columns.
+                for child, pairs in edges.get(table, {}).items():
+                    join_sql = " AND ".join(
+                        f"c.{q(child_col)} = p.{q(parent_col)}"
+                        for child_col, parent_col in pairs
                     )
-                    affected = max(0, int(cursor.rowcount or 0))
-                    connection.commit()
-                    total += affected
-                    if affected < batch_size:
-                        break
-                deleted["VerificationResults"] = total
+                    child_predicate = (
+                        f"EXISTS (SELECT 1 FROM dbo.{q(table)} p "
+                        f"WHERE {join_sql} AND {predicate.replace('t.', 'p.')})"
+                    )
+                    delete_tree(child, child_predicate, params)
 
-        for child_table in sorted(discovered_children):
-            if child_table in {"ReconciliationRuns", "VerificationResults"} or not table_exists(cursor, child_table):
-                continue
+                sql = f"DELETE t FROM dbo.{q(table)} t WHERE {predicate};"
+                cursor.execute(sql, params)
+                affected = max(0, int(cursor.rowcount or 0))
+                deleted[table] = deleted.get(table, 0) + affected
+                deleting.remove(signature)
 
-            has_run_id = cursor.execute(
-                "SELECT CASE WHEN COL_LENGTH(?, N'RunID') IS NULL THEN 0 ELSE 1 END;",
-                (f"dbo.{child_table}",),
+            # Delete roots in the declared business order; recursive FK traversal
+            # guarantees that all dependent rows disappear before each parent.
+            for table in existing_roots:
+                scoped = root_predicates.get(table)
+                if scoped is None:
+                    # A root without WarehouseID is never deleted globally. It may
+                    # still be removed safely when reached as a child of a scoped root.
+                    logger.warning("Warehouse reset skipped unscoped root %s.", table)
+                    continue
+                delete_tree(table, scoped[0], scoped[1])
+
+            # Keep exactly one zero cache row for instant Home/Full page loads.
+            cache_exists = cursor.execute(
+                "SELECT CASE WHEN OBJECT_ID(N'dbo.WarehouseDashboardSummary', N'U') IS NULL THEN 0 ELSE 1 END;"
             ).fetchone()[0]
-            if not int(has_run_id or 0):
-                logger.warning(
-                    "Warehouse reset found FK child %s without RunID; skipping automatic child delete.",
-                    child_table,
-                )
-                continue
+            if int(cache_exists or 0):
+                cursor.execute(r"""
+                    MERGE dbo.WarehouseDashboardSummary AS target
+                    USING (SELECT ? AS WarehouseID) AS source
+                      ON target.WarehouseID = source.WarehouseID
+                    WHEN MATCHED THEN UPDATE SET
+                        BatchMasterRows = 0, SupplierHistoryRows = 0, CustomerHistoryRows = 0,
+                        LastBuildUtc = NULL, TotalSFDABatches = 0, MissingSupplierBatches = 0,
+                        STOFollowupBatches = 0, HistoricalFrom = NULL, HistoricalTo = NULL,
+                        CustomerCount = 0, CustomersWithGLN = 0, DummyGLNCustomers = 0,
+                        UnmappedGLNCustomers = 0, CustomersJson = N'[]', UpdatedAt = SYSUTCDATETIME()
+                    WHEN NOT MATCHED THEN INSERT
+                    (WarehouseID, BatchMasterRows, SupplierHistoryRows, CustomerHistoryRows,
+                     LastBuildUtc, TotalSFDABatches, MissingSupplierBatches, STOFollowupBatches,
+                     HistoricalFrom, HistoricalTo, CustomerCount, CustomersWithGLN,
+                     DummyGLNCustomers, UnmappedGLNCustomers, CustomersJson, UpdatedAt)
+                    VALUES (?, 0, 0, 0, NULL, 0, 0, 0, NULL, NULL, 0, 0, 0, 0, N'[]', SYSUTCDATETIME());
+                """, resolved_warehouse_id, resolved_warehouse_id)
 
-            total = 0
-            while True:
-                cursor.execute(
-                    f"DELETE TOP ({batch_size}) child FROM dbo.[{child_table}] child "
-                    "WHERE child.RunID IN ("
-                    "SELECT parent.RunID FROM dbo.ReconciliationRuns parent "
-                    "WHERE parent.WarehouseID = ?);",
+            # Verification before COMMIT. These are the core historical tables the
+            # user must see empty after a successful reset.
+            remaining: Dict[str, int] = {}
+            for table in ("BatchMaster", "ReceiptEvents", "DispatchEvents",
+                          "SupplierHistory", "CustomerHistory", "LatestSFDASnapshot"):
+                if table not in root_predicates:
+                    continue
+                count = int(cursor.execute(
+                    f"SELECT COUNT_BIG(*) FROM dbo.{q(table)} WHERE WarehouseID = ?;",
                     resolved_warehouse_id,
-                )
-                affected = max(0, int(cursor.rowcount or 0))
-                connection.commit()
-                total += affected
-                if affected < batch_size:
-                    break
-            deleted[child_table] = total
+                ).fetchone()[0] or 0)
+                remaining[table] = count
 
-        # Operational tables: bounded batches and a commit after each batch make
-        # reset reliable for warehouses with hundreds of thousands of events.
-        for table_name in delete_order:
-            if not table_exists(cursor, table_name):
-                continue
-            if not has_warehouse_column(cursor, table_name):
-                logger.warning(
-                    "Warehouse reset skipped %s because WarehouseID is missing.",
-                    table_name,
-                )
-                continue
+            not_empty = {k: v for k, v in remaining.items() if v != 0}
+            if not_empty:
+                raise RuntimeError("Warehouse reset verification failed; rows remain: " + json.dumps(not_empty))
 
-            total = 0
-            while True:
-                cursor.execute(
-                    f"DELETE TOP ({batch_size}) FROM dbo.[{table_name}] WHERE WarehouseID = ?;",
-                    resolved_warehouse_id,
-                )
-                affected = max(0, int(cursor.rowcount or 0))
-                connection.commit()
-                total += affected
-                if affected < batch_size:
-                    break
-            deleted[table_name] = total
-
-        # Keep one zeroed cache row so Home and Full Reconciliation stay instant
-        # immediately after reset instead of trying to rebuild historical totals.
-        if table_exists(cursor, "WarehouseDashboardSummary"):
-            cursor.execute(
-                r"""
-                MERGE dbo.WarehouseDashboardSummary AS target
-                USING (SELECT ? AS WarehouseID) AS source
-                  ON target.WarehouseID = source.WarehouseID
-                WHEN MATCHED THEN UPDATE SET
-                    BatchMasterRows = 0, SupplierHistoryRows = 0, CustomerHistoryRows = 0,
-                    LastBuildUtc = NULL, TotalSFDABatches = 0, MissingSupplierBatches = 0,
-                    STOFollowupBatches = 0, HistoricalFrom = NULL, HistoricalTo = NULL,
-                    CustomerCount = 0, CustomersWithGLN = 0, DummyGLNCustomers = 0,
-                    UnmappedGLNCustomers = 0, CustomersJson = N'[]', UpdatedAt = SYSUTCDATETIME()
-                WHEN NOT MATCHED THEN INSERT
-                (WarehouseID, BatchMasterRows, SupplierHistoryRows, CustomerHistoryRows,
-                 LastBuildUtc, TotalSFDABatches, MissingSupplierBatches, STOFollowupBatches,
-                 HistoricalFrom, HistoricalTo, CustomerCount, CustomersWithGLN,
-                 DummyGLNCustomers, UnmappedGLNCustomers, CustomersJson, UpdatedAt)
-                VALUES (?, 0, 0, 0, NULL, 0, 0, 0, NULL, NULL, 0, 0, 0, 0, N'[]', SYSUTCDATETIME());
-                """,
-                resolved_warehouse_id,
-                resolved_warehouse_id,
-            )
             connection.commit()
+        except Exception:
+            connection.rollback()
+            logger.exception("Atomic warehouse reset failed for WarehouseID=%s; rolled back.", resolved_warehouse_id)
+            raise
 
     return {
         "status": "Completed",
         "warehouse_id": resolved_warehouse_id,
         "deleted_rows": deleted,
         "deleted_rows_total": int(sum(deleted.values())),
+        "verification": {"core_tables_empty": True},
     }
 
 def create_historical_build_job(
