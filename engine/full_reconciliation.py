@@ -315,6 +315,35 @@ class FullReconciliationEngine:
                 return text
         return ""
 
+    @staticmethod
+    def _excluded_item_family_mask(series: pd.Series) -> pd.Series:
+        """Rows that must never establish SFDA/RSD product identity.
+
+        Laboratory supplies are operational WMS stock but are outside the drug
+        reconciliation universe.  They must not be allowed to prove a Generic
+        Item Number merely because their BN + expiry month collides with a drug
+        batch in SFDA.
+        """
+        normalized = (
+            series.fillna("")
+            .astype(str)
+            .str.upper()
+            .str.replace(r"[^A-Z0-9]+", "", regex=True)
+        )
+        return normalized.eq("LABORATORYSUPPLIES")
+
+    @staticmethod
+    def _identity_text(value: Any) -> str:
+        """Stable text key used only to compare already-proven SFDA identities."""
+        if value is None:
+            return ""
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return "".join(ch for ch in str(value).upper().strip() if ch.isalnum())
+
     def normalize(self) -> None:
         started_at = time.perf_counter()
         logger.info(
@@ -448,6 +477,12 @@ class FullReconciliationEngine:
             & frame["Generic Item Number"].astype(str).str.strip().ne("")
             & received_quantity.ne(0)
         )
+
+        # LABORATORYSUPPLIES must never enter the SFDA/RSD receipt universe.
+        # This prevents an unrelated laboratory item from proving its Generic
+        # when BN + expiry month happens to collide with an SFDA drug batch.
+        valid_mask &= ~self._excluded_item_family_mask(frame["Item Family Group"])
+
         frame = frame.loc[valid_mask].copy()
         frame["Received Quantity"] = received_quantity.loc[valid_mask].to_numpy()
 
@@ -600,15 +635,166 @@ class FullReconciliationEngine:
         ]
         sfda = self._ensure_columns(sfda, sfda_columns)
         sfda = sfda.drop_duplicates(subset=self.SFDA_KEYS, keep="first")
-        sfda_match = sfda[sfda_columns].copy()
-        sfda_match["_Batch Exists in SFDA"] = True
 
-        master = master.merge(
-            sfda_match,
+        # ------------------------------------------------------------------
+        # Resolve SFDA batch -> WMS Generic safely.
+        #
+        # BN + Expiry Month is intentionally retained as the operational SFDA
+        # batch key because WMS and SFDA can carry different DAYS within the
+        # same expiry month.  The old bug was different: the code merged the
+        # SFDA row onto *every* WMS Generic sharing BN + month.  A collision
+        # therefore proved unrelated products (for example laboratory stock).
+        #
+        # Resolution rules:
+        #   1) If a BN + month has exactly one eligible WMS Generic, that
+        #      Generic is proven for the SFDA batch.
+        #   2) If several Generics share the same BN + month, use only a Generic
+        #      that was already proven by another unambiguous batch for the same
+        #      SFDA identity (GTIN or normalized Drug Name).
+        #   3) If ambiguity remains, prove NONE. Never guess.
+        # ------------------------------------------------------------------
+        candidate_columns = self.SFDA_KEYS + [
+            "Generic Item Number",
+            "Item Family Group",
+        ]
+        candidates = self._ensure_columns(master, candidate_columns)[candidate_columns].copy()
+        candidates["Generic Item Number"] = (
+            candidates["Generic Item Number"].fillna("").astype(str).str.strip()
+        )
+        candidates = candidates[candidates["Generic Item Number"].ne("")].copy()
+        candidates = candidates[
+            ~self._excluded_item_family_mask(candidates["Item Family Group"])
+        ].copy()
+        candidates = candidates.drop_duplicates(
+            subset=self.SFDA_KEYS + ["Generic Item Number"],
+            keep="first",
+        )
+
+        sfda_identity = sfda[sfda_columns].copy()
+        sfda_identity["_GTIN Identity"] = (
+            sfda_identity["GTIN"].fillna("").astype(str).str.strip()
+        )
+        sfda_identity["_Drug Identity"] = sfda_identity["Drug Name"].map(
+            self._identity_text
+        )
+
+        candidate_counts = (
+            candidates.groupby(self.SFDA_KEYS, dropna=False)["Generic Item Number"]
+            .nunique()
+            .rename("_Candidate Generic Count")
+            .reset_index()
+        )
+        candidate_work = candidates.merge(
+            candidate_counts,
             on=self.SFDA_KEYS,
             how="left",
             validate="many_to_one",
         )
+
+        direct = candidate_work[
+            candidate_work["_Candidate Generic Count"].eq(1)
+        ][self.SFDA_KEYS + ["Generic Item Number"]].copy()
+        direct = direct.merge(
+            sfda_identity,
+            on=self.SFDA_KEYS,
+            how="inner",
+            validate="one_to_one",
+        )
+
+        resolved_parts = [direct]
+
+        # Build identity evidence only from unambiguous BN+month matches.
+        proven_identity = direct[[
+            "Generic Item Number", "_GTIN Identity", "_Drug Identity"
+        ]].drop_duplicates()
+
+        ambiguous = candidate_work[
+            candidate_work["_Candidate Generic Count"].gt(1)
+        ].copy()
+        if not ambiguous.empty and not proven_identity.empty:
+            ambiguous = ambiguous.merge(
+                sfda_identity,
+                on=self.SFDA_KEYS,
+                how="inner",
+                validate="many_to_one",
+            )
+            ambiguous = ambiguous.merge(
+                proven_identity,
+                on="Generic Item Number",
+                how="left",
+                suffixes=("", "_Proven"),
+            )
+
+            gtin_match = (
+                ambiguous["_GTIN Identity"].ne("")
+                & ambiguous["_GTIN Identity"].eq(ambiguous["_GTIN Identity_Proven"])
+            )
+            drug_match = (
+                ambiguous["_Drug Identity"].ne("")
+                & ambiguous["_Drug Identity"].eq(ambiguous["_Drug Identity_Proven"])
+            )
+            ambiguous["_Identity Proven"] = gtin_match | drug_match
+
+            resolved_ambiguous = ambiguous[ambiguous["_Identity Proven"]].copy()
+            if not resolved_ambiguous.empty:
+                winner_counts = (
+                    resolved_ambiguous.groupby(self.SFDA_KEYS, dropna=False)[
+                        "Generic Item Number"
+                    ]
+                    .nunique()
+                    .rename("_Winner Count")
+                    .reset_index()
+                )
+                resolved_ambiguous = resolved_ambiguous.merge(
+                    winner_counts,
+                    on=self.SFDA_KEYS,
+                    how="left",
+                    validate="many_to_one",
+                )
+                resolved_ambiguous = resolved_ambiguous[
+                    resolved_ambiguous["_Winner Count"].eq(1)
+                ].copy()
+                resolved_parts.append(resolved_ambiguous)
+
+        resolved = pd.concat(resolved_parts, ignore_index=True, sort=False)
+        resolved = resolved.drop_duplicates(
+            subset=self.SFDA_KEYS + ["Generic Item Number"],
+            keep="first",
+        )
+
+        resolved_columns = self.SFDA_KEYS + ["Generic Item Number"] + [
+            column for column in sfda_columns if column not in self.SFDA_KEYS
+        ]
+        resolved = self._ensure_columns(resolved, resolved_columns)[resolved_columns]
+        resolved["_Batch Exists in SFDA"] = True
+
+        master = master.merge(
+            resolved,
+            on=self.KEYS,
+            how="left",
+            validate="one_to_one",
+        )
+        master["_Batch Exists in SFDA"] = master["_Batch Exists in SFDA"].fillna(False)
+
+        # Log unresolved collisions for audit, but never force a match.
+        sfda_key_tuples = set(map(tuple, sfda[self.SFDA_KEYS].to_numpy()))
+        collision_keys = set(
+            map(
+                tuple,
+                candidate_work.loc[
+                    candidate_work["_Candidate Generic Count"].gt(1),
+                    self.SFDA_KEYS,
+                ].drop_duplicates().to_numpy(),
+            )
+        )
+        collision_keys &= sfda_key_tuples
+        resolved_keys = set(map(tuple, resolved[self.SFDA_KEYS].drop_duplicates().to_numpy()))
+        unresolved_collision_count = len(collision_keys - resolved_keys)
+        if unresolved_collision_count:
+            logger.warning(
+                "SFDA/WMS batch collisions left unresolved safely: %s BN+expiry-month key(s).",
+                unresolved_collision_count,
+            )
 
         # Expiry priority for Batch Master:
         # 1. Exact SFDA expiry
