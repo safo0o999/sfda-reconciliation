@@ -984,10 +984,13 @@ def warehouse_data_reset_route(req: func.HttpRequest) -> func.HttpResponse:
         from engine.database import reset_current_warehouse_data
         from engine.blob_storage import BlobStorage
 
-        database_result = reset_current_warehouse_data()
-        storage = BlobStorage()
-        storage.initialize_containers()
-        blob_result = storage.delete_current_warehouse_data()
+        from engine.warehouse_context import warehouse_scope
+
+        with warehouse_scope(warehouse_id, warehouse_name):
+            database_result = reset_current_warehouse_data(warehouse_id=warehouse_id)
+            storage = BlobStorage()
+            storage.initialize_containers()
+            blob_result = storage.delete_current_warehouse_data()
 
         # Variance Management keeps a short-lived per-warehouse server cache.
         # Reset must invalidate it immediately so the page cannot show stale
@@ -1363,6 +1366,38 @@ def historical_status(req: func.HttpRequest) -> func.HttpResponse:
             500,
             str(exc),
         )
+
+
+@app.route(route="historical/latest-files", methods=["GET"])
+def historical_latest_files(req: func.HttpRequest) -> func.HttpResponse:
+    """Return the latest completed Historical Build output manifest only.
+
+    This is intentionally metadata-only: opening Full Reconciliation can restore
+    the Batch Master download card without regenerating XLSX from Azure SQL.
+    """
+    denied = _auth_guard(req)
+    if denied:
+        return denied
+    try:
+        from engine.database import list_historical_build_jobs
+
+        jobs = list_historical_build_jobs(limit=20)
+        latest = next(
+            (
+                job for job in jobs
+                if str(job.get("status") or "").strip().lower() == "completed"
+                and isinstance((job.get("output_manifest") or {}).get("files"), list)
+                and (job.get("output_manifest") or {}).get("files")
+            ),
+            None,
+        )
+        return json_response({
+            "status": "Success",
+            "job": latest or {},
+        })
+    except Exception as exc:
+        logger.exception("Latest historical files read failed")
+        return error_response("Failed to read latest historical files.", 500, str(exc))
 
 
 @app.route(route="historical/export-current", methods=["GET"])
