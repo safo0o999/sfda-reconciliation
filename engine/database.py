@@ -3241,65 +3241,49 @@ def get_daily_processed_transactions(process_type: str) -> pd.DataFrame:
 # -----------------------------------------------------------------------------
 
 def _prepare_accept_sfda_state(sfda_df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize SFDA Accept proof state to BN + expiry month grain.
-
-    Day differences inside the same expiry month are intentionally ignored.
-    Ambiguous BN/month combinations that contain more than one GTIN are excluded
-    from automatic confirmation rather than guessed.
-    """
+    """Normalize one SFDA report to the batch grain used for Accept proof."""
     from engine.normalizer import Normalizer
 
     frame = sfda_df.copy() if sfda_df is not None else pd.DataFrame()
     if frame.empty:
-        return pd.DataFrame(columns=[
-            "GTIN", "BN", "Expiry Date", "Active", "Quantity Receive Pending"
-        ])
+        return pd.DataFrame(
+            columns=[
+                "GTIN", "BN", "Expiry Date",
+                "Active", "Quantity Receive Pending",
+            ]
+        )
 
     frame = Normalizer.normalize_sfda(frame)
     required = ["GTIN", "BN", "Expiry Date", "Active", "Quantity Receive Pending"]
     missing = [column for column in required if column not in frame.columns]
     if missing:
         raise ValueError(
-            "SFDA confirmation state is missing required columns: " + ", ".join(missing)
+            "SFDA confirmation state is missing required columns: "
+            + ", ".join(missing)
         )
 
     frame["BN"] = Normalizer.text(frame["BN"])
     frame["Expiry Date"] = Normalizer.date(frame["Expiry Date"])
     frame["GTIN"] = Normalizer.text(frame["GTIN"])
-    frame["Expiry Month Key"] = pd.to_datetime(
-        frame["Expiry Date"], errors="coerce"
-    ).dt.strftime("%Y-%m").fillna("")
     frame["Active"] = pd.to_numeric(frame["Active"], errors="coerce").fillna(0)
     frame["Quantity Receive Pending"] = pd.to_numeric(
         frame["Quantity Receive Pending"], errors="coerce"
     ).fillna(0)
 
-    gtin_count = (
-        frame.loc[frame["GTIN"].ne("")]
-        .groupby(["BN", "Expiry Month Key"], dropna=False)["GTIN"]
-        .nunique()
-        .rename("_GTIN Count")
-        .reset_index()
-    )
-    state = (
-        frame.groupby(["BN", "Expiry Month Key"], dropna=False)
+    return (
+        frame.groupby(["BN", "Expiry Date"], dropna=False)
         .agg(
             GTIN=("GTIN", "first"),
             Active=("Active", "sum"),
-            **{"Quantity Receive Pending": ("Quantity Receive Pending", "sum")},
+            **{
+                "Quantity Receive Pending": (
+                    "Quantity Receive Pending", "sum"
+                )
+            },
         )
         .reset_index()
     )
-    state = state.merge(
-        gtin_count, on=["BN", "Expiry Month Key"], how="left", validate="one_to_one"
-    )
-    state = state.loc[
-        pd.to_numeric(state["_GTIN Count"], errors="coerce").fillna(0).eq(1)
-    ].drop(columns=["_GTIN Count"], errors="ignore")
-    state["Expiry Date"] = pd.to_datetime(
-        state["Expiry Month Key"] + "-01", errors="coerce"
-    )
-    return state[["GTIN", "BN", "Expiry Date", "Active", "Quantity Receive Pending"]]
+
 
 def get_accept_confirmed_transactions() -> pd.DataFrame:
     """Return only SFDA-confirmed Accept quantities for daily de-duplication."""
@@ -3497,7 +3481,7 @@ def confirm_accept_transactions_from_sfda(
 ) -> Dict[str, Any]:
     """Confirm prior Accept submissions only when SFDA proves the movement.
 
-    For each BN + Expiry Month, confirmed packs are the conservative minimum of:
+    For each BN + Expiry Date, confirmed packs are the conservative minimum of:
       * the decrease in Quantity Receive Pending, and
       * the corresponding increase in Active.
 
@@ -3602,12 +3586,11 @@ def confirm_accept_transactions_from_sfda(
                         SubmittedQuantityPack, ConfirmedQuantityPack
                     FROM dbo.DailyAcceptTransactions WITH (UPDLOCK, HOLDLOCK)
                     WHERE BN = ?
-                      AND YEAR(ExpiryDate) = YEAR(?)
-                      AND MONTH(ExpiryDate) = MONTH(?)
+                      AND ExpiryDate = ?
                       AND SubmittedQuantityPack > ConfirmedQuantityPack
                     ORDER BY CreatedAt, TransactionKey;
                     """,
-                    (bn, expiry, expiry),
+                    (bn, expiry),
                 ).fetchall()
 
                 batch_confirmed = 0.0
@@ -3670,48 +3653,34 @@ def confirm_accept_transactions_from_sfda(
 # -----------------------------------------------------------------------------
 
 def _prepare_dispatch_sfda_state(sfda_df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize SFDA Dispatch proof state to BN + expiry month grain.
-
-    Day differences inside the same expiry month are intentionally ignored.
-    Ambiguous BN/month combinations with more than one GTIN are excluded.
-    """
+    """Normalize one SFDA report to the batch grain used for Dispatch proof."""
     from engine.normalizer import Normalizer
 
     frame = sfda_df.copy() if sfda_df is not None else pd.DataFrame()
     if frame.empty:
-        return pd.DataFrame(columns=[
-            "GTIN", "BN", "Expiry Date", "Active", "Quantity sent pending"
-        ])
+        return pd.DataFrame(
+            columns=["GTIN", "BN", "Expiry Date", "Active", "Quantity sent pending"]
+        )
 
     frame = Normalizer.normalize_sfda(frame)
     required = ["GTIN", "BN", "Expiry Date", "Active", "Quantity sent pending"]
     missing = [column for column in required if column not in frame.columns]
     if missing:
         raise ValueError(
-            "SFDA dispatch confirmation state is missing required columns: "
+            "SFDA Dispatch confirmation state is missing required columns: "
             + ", ".join(missing)
         )
 
     frame["BN"] = Normalizer.text(frame["BN"])
     frame["Expiry Date"] = Normalizer.date(frame["Expiry Date"])
     frame["GTIN"] = Normalizer.text(frame["GTIN"])
-    frame["Expiry Month Key"] = pd.to_datetime(
-        frame["Expiry Date"], errors="coerce"
-    ).dt.strftime("%Y-%m").fillna("")
     frame["Active"] = pd.to_numeric(frame["Active"], errors="coerce").fillna(0)
     frame["Quantity sent pending"] = pd.to_numeric(
         frame["Quantity sent pending"], errors="coerce"
     ).fillna(0)
 
-    gtin_count = (
-        frame.loc[frame["GTIN"].ne("")]
-        .groupby(["BN", "Expiry Month Key"], dropna=False)["GTIN"]
-        .nunique()
-        .rename("_GTIN Count")
-        .reset_index()
-    )
-    state = (
-        frame.groupby(["BN", "Expiry Month Key"], dropna=False)
+    return (
+        frame.groupby(["BN", "Expiry Date"], dropna=False)
         .agg(
             GTIN=("GTIN", "first"),
             Active=("Active", "sum"),
@@ -3719,16 +3688,7 @@ def _prepare_dispatch_sfda_state(sfda_df: pd.DataFrame) -> pd.DataFrame:
         )
         .reset_index()
     )
-    state = state.merge(
-        gtin_count, on=["BN", "Expiry Month Key"], how="left", validate="one_to_one"
-    )
-    state = state.loc[
-        pd.to_numeric(state["_GTIN Count"], errors="coerce").fillna(0).eq(1)
-    ].drop(columns=["_GTIN Count"], errors="ignore")
-    state["Expiry Date"] = pd.to_datetime(
-        state["Expiry Month Key"] + "-01", errors="coerce"
-    )
-    return state[["GTIN", "BN", "Expiry Date", "Active", "Quantity sent pending"]]
+
 
 def get_dispatch_confirmed_transactions() -> pd.DataFrame:
     """Return only SFDA-confirmed Dispatch quantities for daily de-duplication."""
@@ -3918,7 +3878,7 @@ def confirm_dispatch_transactions_from_sfda(
 ) -> Dict[str, Any]:
     """Confirm prior Dispatch submissions only when the next SFDA report proves it.
 
-    Conservative evidence per BN + Expiry Month is the minimum of the decrease
+    Conservative evidence per BN + Expiry Date is the minimum of the decrease
     in Active and the increase in Quantity sent pending.  Evidence is allocated
     only to previously submitted, still-unconfirmed dispatch transactions.
     """
@@ -4003,13 +3963,11 @@ def confirm_dispatch_transactions_from_sfda(
                            SubmittedQuantityEach, ConfirmedQuantityEach,
                            SubmittedQuantityPack, ConfirmedQuantityPack
                     FROM dbo.DailyDispatchTransactions WITH (UPDLOCK, HOLDLOCK)
-                    WHERE BN = ?
-                      AND YEAR(ExpiryDate) = YEAR(?)
-                      AND MONTH(ExpiryDate) = MONTH(?)
+                    WHERE BN = ? AND ExpiryDate = ?
                       AND SubmittedQuantityPack > ConfirmedQuantityPack
                     ORDER BY CreatedAt, TransactionKey;
                     """,
-                    (bn, expiry, expiry),
+                    (bn, expiry),
                 ).fetchall()
 
                 batch_confirmed = 0.0
