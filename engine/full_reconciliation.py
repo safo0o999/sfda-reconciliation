@@ -478,11 +478,6 @@ class FullReconciliationEngine:
             & received_quantity.ne(0)
         )
 
-        # LABORATORYSUPPLIES must never enter the SFDA/RSD receipt universe.
-        # This prevents an unrelated laboratory item from proving its Generic
-        # when BN + expiry month happens to collide with an SFDA drug batch.
-        valid_mask &= ~self._excluded_item_family_mask(frame["Item Family Group"])
-
         frame = frame.loc[valid_mask].copy()
         frame["Received Quantity"] = received_quantity.loc[valid_mask].to_numpy()
 
@@ -637,21 +632,26 @@ class FullReconciliationEngine:
         sfda = sfda.drop_duplicates(subset=self.SFDA_KEYS, keep="first")
 
         # ------------------------------------------------------------------
-        # Resolve SFDA batch -> WMS Generic safely.
+        # Resolve SFDA product identity before a BN + expiry-month match is
+        # allowed to prove a WMS Generic.
         #
-        # BN + Expiry Month is intentionally retained as the operational SFDA
-        # batch key because WMS and SFDA can carry different DAYS within the
-        # same expiry month.  The old bug was different: the code merged the
-        # SFDA row onto *every* WMS Generic sharing BN + month.  A collision
-        # therefore proved unrelated products (for example laboratory stock).
+        # BN + Expiry Month remains the operational candidate key.  We do NOT
+        # require the exact expiry day because SFDA and WMS can legitimately
+        # carry different days in the same month.
         #
-        # Resolution rules:
-        #   1) If a BN + month has exactly one eligible WMS Generic, that
-        #      Generic is proven for the SFDA batch.
-        #   2) If several Generics share the same BN + month, use only a Generic
-        #      that was already proven by another unambiguous batch for the same
-        #      SFDA identity (GTIN or normalized Drug Name).
-        #   3) If ambiguity remains, prove NONE. Never guess.
+        # The important protection is product identity:
+        #   * Build every observed SFDA-GTIN <-> WMS-Generic candidate edge.
+        #   * Repeated independent batch/month evidence is used to prove a
+        #     stable product mapping.
+        #   * A single batch/month collision is never allowed to overwrite an
+        #     already-proven mapping.
+        #   * For a product with only one historical batch, accept it only when
+        #     that BN/month has exactly one WMS Generic AND the row is not an
+        #     excluded non-drug family.  This preserves first-time products but
+        #     blocks known LABORATORYSUPPLIES collisions from proving a drug.
+        #   * Once Generic <-> GTIN is proven, only that Generic may consume
+        #     SFDA rows for that GTIN. Other WMS rows sharing BN/month remain
+        #     unrelated and cannot inherit GTIN/Drug/PackageSize.
         # ------------------------------------------------------------------
         candidate_columns = self.SFDA_KEYS + [
             "Generic Item Number",
@@ -662,12 +662,12 @@ class FullReconciliationEngine:
             candidates["Generic Item Number"].fillna("").astype(str).str.strip()
         )
         candidates = candidates[candidates["Generic Item Number"].ne("")].copy()
-        candidates = candidates[
-            ~self._excluded_item_family_mask(candidates["Item Family Group"])
-        ].copy()
         candidates = candidates.drop_duplicates(
             subset=self.SFDA_KEYS + ["Generic Item Number"],
             keep="first",
+        )
+        candidates["_Excluded Family"] = self._excluded_item_family_mask(
+            candidates["Item Family Group"]
         )
 
         sfda_identity = sfda[sfda_columns].copy()
@@ -678,89 +678,150 @@ class FullReconciliationEngine:
             self._identity_text
         )
 
-        candidate_counts = (
-            candidates.groupby(self.SFDA_KEYS, dropna=False)["Generic Item Number"]
-            .nunique()
-            .rename("_Candidate Generic Count")
-            .reset_index()
-        )
-        candidate_work = candidates.merge(
-            candidate_counts,
-            on=self.SFDA_KEYS,
-            how="left",
-            validate="many_to_one",
-        )
-
-        direct = candidate_work[
-            candidate_work["_Candidate Generic Count"].eq(1)
-        ][self.SFDA_KEYS + ["Generic Item Number"]].copy()
-        direct = direct.merge(
+        # All candidate edges created only from the operational BN+month key.
+        edges = candidates.merge(
             sfda_identity,
             on=self.SFDA_KEYS,
             how="inner",
-            validate="one_to_one",
+            validate="many_to_one",
         )
+        # Keep excluded families in ReceiptEvents for warehouse audit/history,
+        # but never let them establish SFDA drug identity.
+        identity_edges = edges[~edges["_Excluded Family"]].copy()
 
-        resolved_parts = [direct]
+        resolved = pd.DataFrame(columns=(
+            self.SFDA_KEYS + ["Generic Item Number"] +
+            [column for column in sfda_columns if column not in self.SFDA_KEYS]
+        ))
 
-        # Build identity evidence only from unambiguous BN+month matches.
-        proven_identity = direct[[
-            "Generic Item Number", "_GTIN Identity", "_Drug Identity"
-        ]].drop_duplicates()
+        if not identity_edges.empty:
+            # Count independent BN/month evidence for every GTIN <-> Generic.
+            edge_counts = (
+                identity_edges.groupby(
+                    ["_GTIN Identity", "_Drug Identity", "Generic Item Number"],
+                    dropna=False,
+                )
+                .size()
+                .rename("_Evidence Count")
+                .reset_index()
+            )
 
-        ambiguous = candidate_work[
-            candidate_work["_Candidate Generic Count"].gt(1)
-        ].copy()
-        if not ambiguous.empty and not proven_identity.empty:
-            ambiguous = ambiguous.merge(
-                sfda_identity,
+            # Strong historical mapping: the pair occurs on at least two
+            # independent SFDA batch/month keys.  Require mutual uniqueness of
+            # the best score so one Generic cannot be proven for two drugs and
+            # one drug cannot be proven for two Generics.
+            gtin_best = edge_counts.groupby(
+                ["_GTIN Identity", "_Drug Identity"], dropna=False
+            )["_Evidence Count"].transform("max")
+            generic_best = edge_counts.groupby(
+                ["Generic Item Number"], dropna=False
+            )["_Evidence Count"].transform("max")
+            strong = edge_counts[
+                edge_counts["_Evidence Count"].ge(2)
+                & edge_counts["_Evidence Count"].eq(gtin_best)
+                & edge_counts["_Evidence Count"].eq(generic_best)
+            ].copy()
+
+            # Remove ties at either side.
+            if not strong.empty:
+                gtin_winners = (
+                    strong.groupby(["_GTIN Identity", "_Drug Identity"], dropna=False)[
+                        "Generic Item Number"
+                    ].nunique()
+                )
+                generic_winners = (
+                    strong.groupby("Generic Item Number", dropna=False)["_GTIN Identity"].nunique()
+                )
+                strong["_GTIN Winner Count"] = strong.set_index(
+                    ["_GTIN Identity", "_Drug Identity"]
+                ).index.map(gtin_winners)
+                strong["_Generic Winner Count"] = strong["Generic Item Number"].map(
+                    generic_winners
+                )
+                strong = strong[
+                    strong["_GTIN Winner Count"].eq(1)
+                    & strong["_Generic Winner Count"].eq(1)
+                ].copy()
+
+            proven_pairs = strong[[
+                "_GTIN Identity", "_Drug Identity", "Generic Item Number"
+            ]].drop_duplicates()
+
+            # First-time/single-batch fallback.  It is deliberately conservative:
+            # one WMS Generic for the BN/month, one SFDA identity for the key,
+            # and the WMS row must not be a known excluded non-drug family.
+            candidate_counts = (
+                candidates.groupby(self.SFDA_KEYS, dropna=False)["Generic Item Number"]
+                .nunique()
+                .rename("_Candidate Generic Count")
+                .reset_index()
+            )
+            single = identity_edges.merge(
+                candidate_counts,
                 on=self.SFDA_KEYS,
-                how="inner",
+                how="left",
                 validate="many_to_one",
             )
-            ambiguous = ambiguous.merge(
-                proven_identity,
-                on="Generic Item Number",
-                how="left",
-                suffixes=("", "_Proven"),
-            )
+            single = single[
+                single["_Candidate Generic Count"].eq(1)
+                & ~single["_Excluded Family"]
+            ].copy()
 
-            gtin_match = (
-                ambiguous["_GTIN Identity"].ne("")
-                & ambiguous["_GTIN Identity"].eq(ambiguous["_GTIN Identity_Proven"])
-            )
-            drug_match = (
-                ambiguous["_Drug Identity"].ne("")
-                & ambiguous["_Drug Identity"].eq(ambiguous["_Drug Identity_Proven"])
-            )
-            ambiguous["_Identity Proven"] = gtin_match | drug_match
+            # Do not create a fallback mapping if either side already has a
+            # different strong historical identity.
+            if not proven_pairs.empty and not single.empty:
+                proven_gtin_to_generic = dict(zip(
+                    proven_pairs["_GTIN Identity"],
+                    proven_pairs["Generic Item Number"],
+                ))
+                proven_generic_to_gtin = dict(zip(
+                    proven_pairs["Generic Item Number"],
+                    proven_pairs["_GTIN Identity"],
+                ))
+                single = single[
+                    single.apply(
+                        lambda row: (
+                            proven_gtin_to_generic.get(row["_GTIN Identity"], row["Generic Item Number"])
+                            == row["Generic Item Number"]
+                            and proven_generic_to_gtin.get(row["Generic Item Number"], row["_GTIN Identity"])
+                            == row["_GTIN Identity"]
+                        ),
+                        axis=1,
+                    )
+                ].copy()
 
-            resolved_ambiguous = ambiguous[ambiguous["_Identity Proven"]].copy()
-            if not resolved_ambiguous.empty:
-                winner_counts = (
-                    resolved_ambiguous.groupby(self.SFDA_KEYS, dropna=False)[
-                        "Generic Item Number"
-                    ]
-                    .nunique()
-                    .rename("_Winner Count")
-                    .reset_index()
-                )
-                resolved_ambiguous = resolved_ambiguous.merge(
-                    winner_counts,
-                    on=self.SFDA_KEYS,
-                    how="left",
+            fallback_pairs = single[[
+                "_GTIN Identity", "_Drug Identity", "Generic Item Number"
+            ]].drop_duplicates()
+
+            all_pairs = pd.concat(
+                [proven_pairs, fallback_pairs],
+                ignore_index=True,
+            ).drop_duplicates()
+
+            # Final mutual uniqueness guard.  Any identity that still points to
+            # multiple products is left unresolved rather than guessed.
+            if not all_pairs.empty:
+                gtin_pair_count = all_pairs.groupby(
+                    ["_GTIN Identity", "_Drug Identity"], dropna=False
+                )["Generic Item Number"].transform("nunique")
+                generic_pair_count = all_pairs.groupby(
+                    "Generic Item Number", dropna=False
+                )["_GTIN Identity"].transform("nunique")
+                all_pairs = all_pairs[
+                    gtin_pair_count.eq(1) & generic_pair_count.eq(1)
+                ].copy()
+
+                resolved = identity_edges.merge(
+                    all_pairs,
+                    on=["_GTIN Identity", "_Drug Identity", "Generic Item Number"],
+                    how="inner",
                     validate="many_to_one",
                 )
-                resolved_ambiguous = resolved_ambiguous[
-                    resolved_ambiguous["_Winner Count"].eq(1)
-                ].copy()
-                resolved_parts.append(resolved_ambiguous)
-
-        resolved = pd.concat(resolved_parts, ignore_index=True, sort=False)
-        resolved = resolved.drop_duplicates(
-            subset=self.SFDA_KEYS + ["Generic Item Number"],
-            keep="first",
-        )
+                resolved = resolved.drop_duplicates(
+                    subset=self.SFDA_KEYS + ["Generic Item Number"],
+                    keep="first",
+                )
 
         resolved_columns = self.SFDA_KEYS + ["Generic Item Number"] + [
             column for column in sfda_columns if column not in self.SFDA_KEYS
@@ -776,24 +837,11 @@ class FullReconciliationEngine:
         )
         master["_Batch Exists in SFDA"] = master["_Batch Exists in SFDA"].fillna(False)
 
-        # Log unresolved collisions for audit, but never force a match.
-        sfda_key_tuples = set(map(tuple, sfda[self.SFDA_KEYS].to_numpy()))
-        collision_keys = set(
-            map(
-                tuple,
-                candidate_work.loc[
-                    candidate_work["_Candidate Generic Count"].gt(1),
-                    self.SFDA_KEYS,
-                ].drop_duplicates().to_numpy(),
-            )
-        )
-        collision_keys &= sfda_key_tuples
-        resolved_keys = set(map(tuple, resolved[self.SFDA_KEYS].drop_duplicates().to_numpy()))
-        unresolved_collision_count = len(collision_keys - resolved_keys)
-        if unresolved_collision_count:
+        unresolved_sfda = len(sfda) - len(resolved[self.SFDA_KEYS].drop_duplicates())
+        if unresolved_sfda > 0:
             logger.warning(
-                "SFDA/WMS batch collisions left unresolved safely: %s BN+expiry-month key(s).",
-                unresolved_collision_count,
+                "SFDA product identity left unresolved safely for %s BN+expiry-month key(s).",
+                unresolved_sfda,
             )
 
         # Expiry priority for Batch Master:
