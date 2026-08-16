@@ -1535,7 +1535,11 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }
  
     if (requestedPage === "full-reconciliation") {
-      Promise.resolve(refreshHistoricalStatus({silent:true})).catch(error=>{
+      Promise.resolve(refreshHistoricalStatus({silent:true})).then(()=>{
+        if(historicalDataReady){
+          Promise.resolve(loadLatestHistoricalFiles({silent:true})).catch(()=>{});
+        }
+      }).catch(error=>{
         console.error("Unable to refresh historical status.", error);
       });
     }
@@ -2856,6 +2860,27 @@ Drug Traceability Reconciliation Platform</textarea></label>
     });
   }
 
+  async function loadLatestHistoricalFiles({silent=true}={}){
+    try{
+      const response=await fetch("/api/historical/latest-files",{
+        cache:"no-store",
+        credentials:"same-origin"
+      });
+      const payload=await response.json().catch(()=>({}));
+      if(response.status===401){await logout();return []}
+      if(!response.ok||payload.status==="Failed") throw new Error(payload.details||payload.error||"Unable to load historical files.");
+      const files=historicalJobFiles(payload.job||{});
+      const batchMasterFiles=files.filter(file=>String(file.name||"").toLowerCase().includes("batch_master"));
+      const visibleFiles=batchMasterFiles.length?batchMasterFiles:files;
+      renderHistoricalJobFiles("fullBatchMasterFiles",visibleFiles,"No saved Batch Master file was found for the latest Historical Build.");
+      renderHistoricalJobFiles("fullMasterPreview",visibleFiles,"No saved Batch Master file was found for the latest Historical Build.");
+      return visibleFiles;
+    }catch(error){
+      if(!silent) toast(error.message||String(error),"error");
+      return [];
+    }
+  }
+
   async function waitForHistoricalJob(statusUrl){
     while(true){
       await new Promise(resolve=>setTimeout(resolve,3000));
@@ -3550,6 +3575,8 @@ Drug Traceability Reconciliation Platform</textarea></label>
 
       historicalStatusData={};
       historicalDataReady=false;
+      renderHistoricalJobFiles("fullBatchMasterFiles",[],"Historical data has been reset.");
+      renderHistoricalJobFiles("fullMasterPreview",[],"Historical data has been reset.");
 
       // Show the clean state immediately, then force reload all affected pages
       // directly from the backend.
