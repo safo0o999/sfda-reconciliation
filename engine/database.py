@@ -1955,29 +1955,21 @@ def clear_dashboard_summary_cache() -> None:
         raise
 
 
-def reset_current_warehouse_data() -> Dict[str, Any]:
-    """Delete only uploaded/operational data owned by the current warehouse.
+def reset_current_warehouse_data(warehouse_id: Optional[int] = None) -> Dict[str, Any]:
+    """Delete uploaded/operational data for exactly one warehouse.
 
-    Preserved deliberately:
-      * Warehouses
-      * ApplicationUsers / AuthSessions
-      * WarehouseGLNMapping
-      * config/pack_size.xlsx and all application/business-rule code
-
-    Every DELETE is explicitly constrained by WarehouseID. Tables that are not
-    present in an older deployment are skipped. This keeps the operation safe
-    across Version 6 transitional databases without touching another warehouse.
+    Reset is deliberately idempotent and uses bounded DELETE batches. Large
+    DispatchEvents / ReceiptEvents tables therefore do not require one huge SQL
+    transaction or rollback log. Warehouse/users, GLN mapping, Pack Size and
+    application logic are preserved.
     """
-
     initialize_database()
     from engine.warehouse_context import current_warehouse_id
 
-    warehouse_id = int(current_warehouse_id())
-    if warehouse_id < 1:
+    resolved_warehouse_id = int(warehouse_id or current_warehouse_id())
+    if resolved_warehouse_id < 1:
         raise RuntimeError("A valid WarehouseID is required for reset.")
 
-    # Child tables first, then parents. Keep this list limited to active Version
-    # 6 operational tables. Legacy backup tables are intentionally untouched.
     delete_order = [
         "DailyDispatchConfirmations",
         "FullDispatchConfirmations",
@@ -2000,109 +1992,118 @@ def reset_current_warehouse_data() -> Dict[str, Any]:
         "ReconciliationRuns",
         "RunHistory",
     ]
-
+    child_tables = (
+        "ReconciliationRunFiles",
+        "BatchEvents",
+        "ReconciliationActions",
+        "SFDAVerifications",
+        "VerificationRuns",
+    )
+    batch_size = 20000
     deleted: Dict[str, int] = {}
+
+    def table_exists(cursor: pyodbc.Cursor, table_name: str) -> bool:
+        value = cursor.execute(
+            "SELECT CASE WHEN OBJECT_ID(?, N'U') IS NULL THEN 0 ELSE 1 END;",
+            (f"dbo.{table_name}",),
+        ).fetchone()[0]
+        return bool(int(value or 0))
+
+    def has_warehouse_column(cursor: pyodbc.Cursor, table_name: str) -> bool:
+        value = cursor.execute(
+            "SELECT CASE WHEN COL_LENGTH(?, N'WarehouseID') IS NULL THEN 0 ELSE 1 END;",
+            (f"dbo.{table_name}",),
+        ).fetchone()[0]
+        return bool(int(value or 0))
 
     with Database().connect() as connection:
         cursor = connection.cursor()
-        try:
-            # Legacy audit children may not have WarehouseID, but they point to
-            # ReconciliationRuns.RunID. Delete only children whose parent run
-            # belongs to the current warehouse before deleting parent runs.
-            for child_table in (
-                "ReconciliationRunFiles",
-                "BatchEvents",
-                "ReconciliationActions",
-                "SFDAVerifications",
-                "VerificationRuns",
-            ):
-                object_name = f"dbo.{child_table}"
-                exists = cursor.execute(
-                    "SELECT CASE WHEN OBJECT_ID(?, N'U') IS NULL THEN 0 ELSE 1 END;",
-                    (object_name,),
-                ).fetchone()[0]
-                if not int(exists or 0):
-                    continue
-                has_run_id = cursor.execute(
-                    "SELECT CASE WHEN COL_LENGTH(?, N'RunID') IS NULL THEN 0 ELSE 1 END;",
-                    (object_name,),
-                ).fetchone()[0]
-                if not int(has_run_id or 0):
-                    continue
+
+        # Child audit tables reference ReconciliationRuns and may not carry
+        # WarehouseID themselves. Delete only children of this warehouse's runs.
+        for child_table in child_tables:
+            if not table_exists(cursor, child_table):
+                continue
+            has_run_id = cursor.execute(
+                "SELECT CASE WHEN COL_LENGTH(?, N'RunID') IS NULL THEN 0 ELSE 1 END;",
+                (f"dbo.{child_table}",),
+            ).fetchone()[0]
+            if not int(has_run_id or 0):
+                continue
+
+            total = 0
+            while True:
                 cursor.execute(
-                    f"DELETE child FROM dbo.[{child_table}] child "
+                    f"DELETE TOP ({batch_size}) child FROM dbo.[{child_table}] child "
                     "WHERE child.RunID IN ("
                     "SELECT parent.RunID FROM dbo.ReconciliationRuns parent "
                     "WHERE parent.WarehouseID = ?);",
-                    warehouse_id,
+                    resolved_warehouse_id,
                 )
-                deleted[child_table] = max(0, int(cursor.rowcount or 0))
+                affected = max(0, int(cursor.rowcount or 0))
+                connection.commit()
+                total += affected
+                if affected < batch_size:
+                    break
+            deleted[child_table] = total
 
-            for table_name in delete_order:
-                object_name = f"dbo.{table_name}"
-                exists = cursor.execute(
-                    "SELECT CASE WHEN OBJECT_ID(?, N'U') IS NULL THEN 0 ELSE 1 END;",
-                    (object_name,),
-                ).fetchone()[0]
-                if not int(exists or 0):
-                    continue
+        # Operational tables: bounded batches and a commit after each batch make
+        # reset reliable for warehouses with hundreds of thousands of events.
+        for table_name in delete_order:
+            if not table_exists(cursor, table_name):
+                continue
+            if not has_warehouse_column(cursor, table_name):
+                logger.warning(
+                    "Warehouse reset skipped %s because WarehouseID is missing.",
+                    table_name,
+                )
+                continue
 
-                has_warehouse = cursor.execute(
-                    "SELECT CASE WHEN COL_LENGTH(?, N'WarehouseID') IS NULL THEN 0 ELSE 1 END;",
-                    (object_name,),
-                ).fetchone()[0]
-                if not int(has_warehouse or 0):
-                    logger.warning(
-                        "Warehouse reset skipped %s because WarehouseID is missing.",
-                        table_name,
-                    )
-                    continue
-
+            total = 0
+            while True:
                 cursor.execute(
-                    f"DELETE FROM dbo.[{table_name}] WHERE WarehouseID = ?;",
-                    warehouse_id,
+                    f"DELETE TOP ({batch_size}) FROM dbo.[{table_name}] WHERE WarehouseID = ?;",
+                    resolved_warehouse_id,
                 )
-                deleted[table_name] = max(0, int(cursor.rowcount or 0))
+                affected = max(0, int(cursor.rowcount or 0))
+                connection.commit()
+                total += affected
+                if affected < batch_size:
+                    break
+            deleted[table_name] = total
 
-            # Preserve a lightweight dashboard row after reset. This prevents
-            # Home / Full Reconciliation from rebuilding historical aggregates
-            # during the next page load.
-            if cursor.execute(
-                "SELECT CASE WHEN OBJECT_ID(N'dbo.WarehouseDashboardSummary', N'U') IS NULL THEN 0 ELSE 1 END;"
-            ).fetchone()[0]:
-                cursor.execute(
-                    r"""
-                    MERGE dbo.WarehouseDashboardSummary AS target
-                    USING (SELECT ? AS WarehouseID) AS source
-                      ON target.WarehouseID = source.WarehouseID
-                    WHEN MATCHED THEN UPDATE SET
-                        BatchMasterRows = 0, SupplierHistoryRows = 0, CustomerHistoryRows = 0,
-                        LastBuildUtc = NULL, TotalSFDABatches = 0, MissingSupplierBatches = 0,
-                        STOFollowupBatches = 0, HistoricalFrom = NULL, HistoricalTo = NULL,
-                        CustomerCount = 0, CustomersWithGLN = 0, DummyGLNCustomers = 0,
-                        UnmappedGLNCustomers = 0, CustomersJson = N'[]', UpdatedAt = SYSUTCDATETIME()
-                    WHEN NOT MATCHED THEN INSERT
-                    (WarehouseID, BatchMasterRows, SupplierHistoryRows, CustomerHistoryRows,
-                     LastBuildUtc, TotalSFDABatches, MissingSupplierBatches, STOFollowupBatches,
-                     HistoricalFrom, HistoricalTo, CustomerCount, CustomersWithGLN,
-                     DummyGLNCustomers, UnmappedGLNCustomers, CustomersJson, UpdatedAt)
-                    VALUES (?, 0, 0, 0, NULL, 0, 0, 0, NULL, NULL, 0, 0, 0, 0, N'[]', SYSUTCDATETIME());
-                    """,
-                    warehouse_id, warehouse_id,
-                )
-
+        # Keep one zeroed cache row so Home and Full Reconciliation stay instant
+        # immediately after reset instead of trying to rebuild historical totals.
+        if table_exists(cursor, "WarehouseDashboardSummary"):
+            cursor.execute(
+                r"""
+                MERGE dbo.WarehouseDashboardSummary AS target
+                USING (SELECT ? AS WarehouseID) AS source
+                  ON target.WarehouseID = source.WarehouseID
+                WHEN MATCHED THEN UPDATE SET
+                    BatchMasterRows = 0, SupplierHistoryRows = 0, CustomerHistoryRows = 0,
+                    LastBuildUtc = NULL, TotalSFDABatches = 0, MissingSupplierBatches = 0,
+                    STOFollowupBatches = 0, HistoricalFrom = NULL, HistoricalTo = NULL,
+                    CustomerCount = 0, CustomersWithGLN = 0, DummyGLNCustomers = 0,
+                    UnmappedGLNCustomers = 0, CustomersJson = N'[]', UpdatedAt = SYSUTCDATETIME()
+                WHEN NOT MATCHED THEN INSERT
+                (WarehouseID, BatchMasterRows, SupplierHistoryRows, CustomerHistoryRows,
+                 LastBuildUtc, TotalSFDABatches, MissingSupplierBatches, STOFollowupBatches,
+                 HistoricalFrom, HistoricalTo, CustomerCount, CustomersWithGLN,
+                 DummyGLNCustomers, UnmappedGLNCustomers, CustomersJson, UpdatedAt)
+                VALUES (?, 0, 0, 0, NULL, 0, 0, 0, NULL, NULL, 0, 0, 0, 0, N'[]', SYSUTCDATETIME());
+                """,
+                resolved_warehouse_id,
+                resolved_warehouse_id,
+            )
             connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
 
     return {
         "status": "Completed",
-        "warehouse_id": warehouse_id,
+        "warehouse_id": resolved_warehouse_id,
         "deleted_rows": deleted,
         "deleted_rows_total": int(sum(deleted.values())),
     }
-
 
 def create_historical_build_job(
     job_id: str,
