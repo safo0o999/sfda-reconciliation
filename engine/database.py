@@ -2044,8 +2044,51 @@ def reset_current_warehouse_data(warehouse_id: Optional[int] = None) -> Dict[str
         except Exception:
             logger.exception("Unable to discover ReconciliationRuns FK children; using known list.")
 
+        # VerificationResults is a second-level child:
+        # ReconciliationRuns.RunID -> VerificationRuns.RunID
+        # VerificationRuns.VerificationID -> VerificationResults.VerificationID.
+        # It does not necessarily carry RunID itself, so it must be removed
+        # explicitly before VerificationRuns. Keep the delete warehouse-scoped
+        # through the parent ReconciliationRuns rows.
+        if table_exists(cursor, "VerificationResults") and table_exists(cursor, "VerificationRuns"):
+            vr_has_run_id = cursor.execute(
+                "SELECT CASE WHEN COL_LENGTH(N'dbo.VerificationRuns', N'RunID') IS NULL THEN 0 ELSE 1 END;"
+            ).fetchone()[0]
+            vr_has_verification_id = cursor.execute(
+                "SELECT CASE WHEN COL_LENGTH(N'dbo.VerificationRuns', N'VerificationID') IS NULL THEN 0 ELSE 1 END;"
+            ).fetchone()[0]
+            results_has_verification_id = cursor.execute(
+                "SELECT CASE WHEN COL_LENGTH(N'dbo.VerificationResults', N'VerificationID') IS NULL THEN 0 ELSE 1 END;"
+            ).fetchone()[0]
+
+            if all(int(value or 0) for value in (
+                vr_has_run_id, vr_has_verification_id, results_has_verification_id
+            )):
+                total = 0
+                while True:
+                    cursor.execute(
+                        f"DELETE TOP ({batch_size}) result "
+                        "FROM dbo.VerificationResults result "
+                        "WHERE result.VerificationID IN ("
+                        "    SELECT vr.VerificationID "
+                        "    FROM dbo.VerificationRuns vr "
+                        "    WHERE vr.RunID IN ("
+                        "        SELECT parent.RunID "
+                        "        FROM dbo.ReconciliationRuns parent "
+                        "        WHERE parent.WarehouseID = ?"
+                        "    )"
+                        ");",
+                        resolved_warehouse_id,
+                    )
+                    affected = max(0, int(cursor.rowcount or 0))
+                    connection.commit()
+                    total += affected
+                    if affected < batch_size:
+                        break
+                deleted["VerificationResults"] = total
+
         for child_table in sorted(discovered_children):
-            if child_table == "ReconciliationRuns" or not table_exists(cursor, child_table):
+            if child_table in {"ReconciliationRuns", "VerificationResults"} or not table_exists(cursor, child_table):
                 continue
 
             has_run_id = cursor.execute(
