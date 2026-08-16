@@ -1992,12 +1992,16 @@ def reset_current_warehouse_data(warehouse_id: Optional[int] = None) -> Dict[str
         "ReconciliationRuns",
         "RunHistory",
     ]
+    # Known legacy/audit children plus any FK children discovered dynamically.
+    # Dynamic discovery prevents reset failures when a new table (for example
+    # VerificationResults) references ReconciliationRuns.RunID.
     child_tables = (
         "ReconciliationRunFiles",
         "BatchEvents",
         "ReconciliationActions",
         "SFDAVerifications",
         "VerificationRuns",
+        "VerificationResults",
     )
     batch_size = 20000
     deleted: Dict[str, int] = {}
@@ -2020,15 +2024,39 @@ def reset_current_warehouse_data(warehouse_id: Optional[int] = None) -> Dict[str
         cursor = connection.cursor()
 
         # Child audit tables reference ReconciliationRuns and may not carry
-        # WarehouseID themselves. Delete only children of this warehouse's runs.
-        for child_table in child_tables:
-            if not table_exists(cursor, child_table):
+        # WarehouseID themselves. Discover every direct FK child dynamically so
+        # reset remains safe when audit/verification tables are added later.
+        discovered_children = set(child_tables)
+        try:
+            fk_rows = cursor.execute(
+                r"""
+                SELECT DISTINCT OBJECT_SCHEMA_NAME(fk.parent_object_id) AS SchemaName,
+                                OBJECT_NAME(fk.parent_object_id) AS TableName
+                FROM sys.foreign_keys fk
+                WHERE fk.referenced_object_id = OBJECT_ID(N'dbo.ReconciliationRuns');
+                """
+            ).fetchall()
+            for fk_row in fk_rows:
+                schema_name = str(fk_row[0] or "dbo")
+                table_name = str(fk_row[1] or "").strip()
+                if schema_name.lower() == "dbo" and table_name:
+                    discovered_children.add(table_name)
+        except Exception:
+            logger.exception("Unable to discover ReconciliationRuns FK children; using known list.")
+
+        for child_table in sorted(discovered_children):
+            if child_table == "ReconciliationRuns" or not table_exists(cursor, child_table):
                 continue
+
             has_run_id = cursor.execute(
                 "SELECT CASE WHEN COL_LENGTH(?, N'RunID') IS NULL THEN 0 ELSE 1 END;",
                 (f"dbo.{child_table}",),
             ).fetchone()[0]
             if not int(has_run_id or 0):
+                logger.warning(
+                    "Warehouse reset found FK child %s without RunID; skipping automatic child delete.",
+                    child_table,
+                )
                 continue
 
             total = 0
