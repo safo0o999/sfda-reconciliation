@@ -33,17 +33,13 @@ class ReconciliationEngine:
         SFDA[Drug Name] -> Pack Size[Trade Name] -> PackageSize
 
     After that, SFDA is matched to ASN / Full Dispatch by:
-        BN + Expiry Month Key
-
-    BN + month only discovers a candidate batch.  Product identity is then
-    verified against the proven Generic Item Number -> SFDA GTIN relationship
-    stored in Batch Master before any SFDA quantity is used.
+        BN + Expiry Date
 
     Batch Master defines the SFDA-relevant universe for Daily Accept. If it is
     unavailable, Daily Accept falls back to exact batches in the current SFDA file.
     """
 
-    MATCH_KEYS = ["BN", "Expiry Month Key"]
+    MATCH_KEYS = ["BN", "Expiry Date"]
     # Preserve Madinah legacy fallback exactly as before. Non-Madinah
     # warehouses use WAREHOUSE_DUMMY_GLN (14 nines) below.
     DUMMY_GLN = "9999999999999"
@@ -95,115 +91,6 @@ class ReconciliationEngine:
         # own SQL mapping; an empty mapping intentionally falls back to the
         # controlled dummy GLN during Dispatch.
         self.gln = load_current_warehouse_gln()
-
-    @staticmethod
-    def _expiry_month_key(values: pd.Series) -> pd.Series:
-        parsed = pd.to_datetime(values, errors="coerce")
-        return parsed.dt.strftime("%Y-%m").fillna("")
-
-    @classmethod
-    def _ensure_expiry_month_key(cls, frame: pd.DataFrame) -> pd.DataFrame:
-        result = frame.copy()
-        if "Expiry Date" not in result.columns:
-            result["Expiry Date"] = pd.NaT
-        result["Expiry Date"] = Normalizer.date(result["Expiry Date"])
-        result["Expiry Month Key"] = cls._expiry_month_key(result["Expiry Date"])
-        return result
-
-    def _generic_identity_reference(self) -> pd.DataFrame:
-        """Return only one-to-one Generic Item Number -> SFDA identity mappings.
-
-        Batch Master is the daily engine's identity authority.  A mapping is
-        trusted only when the Generic resolves to one GTIN and that GTIN resolves
-        back to one Generic.  Ambiguous historical relationships are deliberately
-        excluded rather than guessed.
-        """
-        if self.batch_master.empty or "Generic Item Number" not in self.batch_master.columns:
-            return pd.DataFrame(columns=["Generic Item Number", "_Proven GTIN", "_Proven Drug Name"])
-
-        master = self.batch_master.copy()
-        for column in ["Generic Item Number", "GTIN", "Drug Name"]:
-            if column not in master.columns:
-                master[column] = ""
-            master[column] = Normalizer.text(master[column])
-
-        master = master.loc[
-            master["Generic Item Number"].ne("") & master["GTIN"].ne("")
-        ].copy()
-        if master.empty:
-            return pd.DataFrame(columns=["Generic Item Number", "_Proven GTIN", "_Proven Drug Name"])
-
-        generic_counts = master.groupby("Generic Item Number")["GTIN"].nunique()
-        gtin_counts = master.groupby("GTIN")["Generic Item Number"].nunique()
-        good_generics = set(generic_counts.loc[generic_counts.eq(1)].index.astype(str))
-        good_gtins = set(gtin_counts.loc[gtin_counts.eq(1)].index.astype(str))
-        master = master.loc[
-            master["Generic Item Number"].isin(good_generics)
-            & master["GTIN"].isin(good_gtins)
-        ].copy()
-        if master.empty:
-            return pd.DataFrame(columns=["Generic Item Number", "_Proven GTIN", "_Proven Drug Name"])
-
-        return (
-            master[["Generic Item Number", "GTIN", "Drug Name"]]
-            .drop_duplicates(subset=["Generic Item Number"], keep="first")
-            .rename(columns={"GTIN": "_Proven GTIN", "Drug Name": "_Proven Drug Name"})
-            .reset_index(drop=True)
-        )
-
-    def _verify_current_sfda_identity(self, report: pd.DataFrame) -> pd.DataFrame:
-        """Reject false BN/month collisions before SFDA quantities are consumed."""
-        result = report.copy()
-        if result.empty:
-            return result
-
-        if "Generic Item Number" not in result.columns:
-            result["Generic Item Number"] = ""
-        if "GTIN" not in result.columns:
-            result["GTIN"] = ""
-        result["Generic Item Number"] = Normalizer.text(result["Generic Item Number"])
-        result["GTIN"] = Normalizer.text(result["GTIN"])
-
-        reference = self._generic_identity_reference()
-        if reference.empty:
-            # Without historical identity evidence, never allow a current SFDA
-            # candidate to prove a WMS Generic merely from BN + month.
-            candidate = result["GTIN"].ne("")
-            result.loc[candidate, [
-                "GTIN", "Drug Name", "Quantity", "Active",
-                "Quantity sent pending", "Quantity Receive Pending", "PackageSize"
-            ]] = ["", "", 0, 0, 0, 0, 0]
-            result.loc[candidate, "Package Size Status"] = "Identity Unresolved"
-            result["SFDA Identity Status"] = "Identity Unresolved"
-            return result
-
-        result = result.merge(reference, on="Generic Item Number", how="left", validate="many_to_one")
-        current_gtin = Normalizer.text(result["GTIN"])
-        proven_gtin = Normalizer.text(result["_Proven GTIN"])
-        has_candidate = current_gtin.ne("")
-        has_proven = proven_gtin.ne("")
-        verified = has_candidate & has_proven & current_gtin.eq(proven_gtin)
-        collision = has_candidate & ~verified
-
-        result["SFDA Identity Status"] = "No Current SFDA Batch"
-        result.loc[verified, "SFDA Identity Status"] = "Verified Generic-GTIN"
-        result.loc[collision, "SFDA Identity Status"] = "Rejected BN/Expiry Collision"
-
-        for column in [
-            "Quantity", "Active", "Quantity sent pending",
-            "Quantity Receive Pending", "PackageSize"
-        ]:
-            if column not in result.columns:
-                result[column] = 0
-            result.loc[collision, column] = 0
-        for column in ["GTIN", "Drug Name"]:
-            if column not in result.columns:
-                result[column] = ""
-            result.loc[collision, column] = ""
-        if "Package Size Status" in result.columns:
-            result.loc[collision, "Package Size Status"] = "Identity Rejected"
-
-        return result.drop(columns=["_Proven GTIN", "_Proven Drug Name"], errors="ignore")
 
     @staticmethod
     def _safe_int(value: Any) -> int:
@@ -377,7 +264,6 @@ class ReconciliationEngine:
         self.sfda = Normalizer.normalize_sfda(
             self.sfda
         )
-        self.sfda = self._ensure_expiry_month_key(self.sfda)
         self.packsize = Normalizer.normalize_packsize(
             self.packsize
         )
@@ -393,9 +279,6 @@ class ReconciliationEngine:
 
             if "Expiry Date" in self.batch_master.columns:
                 self.batch_master["Expiry Date"] = Normalizer.date(
-                    self.batch_master["Expiry Date"]
-                )
-                self.batch_master["Expiry Month Key"] = self._expiry_month_key(
                     self.batch_master["Expiry Date"]
                 )
 
@@ -446,47 +329,44 @@ class ReconciliationEngine:
         )
 
     def _sfda_summary(self) -> pd.DataFrame:
-        """Aggregate SFDA by BN + expiry month, then attach PackageSize.
+        """Aggregate SFDA by exact batch and expiry, then attach PackageSize.
 
-        A BN/month that points to more than one GTIN is ambiguous and is
-        removed from automatic daily reconciliation rather than guessed.
-        PackageSize remains mapped from SFDA Drug Name only.
+        Important:
+        PackageSize is mapped from SFDA Drug Name only.
+        It is never mapped from ASN/Dispatch Trade Name.
         """
-        source = self.sfda.copy()
-        source["GTIN"] = Normalizer.text(source["GTIN"])
-        source["Drug Name"] = Normalizer.text(source["Drug Name"])
-
-        identity_counts = (
-            source.loc[source["GTIN"].ne("")]
-            .groupby(self.MATCH_KEYS, dropna=False)["GTIN"]
-            .nunique()
-            .rename("_GTIN Count")
-            .reset_index()
-        )
-
         sfda_summary = (
-            source.groupby(self.MATCH_KEYS, dropna=False)
+            self.sfda.groupby(
+                self.MATCH_KEYS,
+                dropna=False,
+            )
             .agg(
-                **{"SFDA Expiry Date": ("Expiry Date", "first")},
                 GTIN=("GTIN", "first"),
                 **{
-                    "Drug Name": ("Drug Name", "first"),
-                    "Quantity": ("Quantity", "sum"),
-                    "Active": ("Active", "sum"),
-                    "Quantity sent pending": ("Quantity sent pending", "sum"),
-                    "Quantity Receive Pending": ("Quantity Receive Pending", "sum"),
+                    "Drug Name": (
+                        "Drug Name",
+                        "first",
+                    ),
+                    "Quantity": (
+                        "Quantity",
+                        "sum",
+                    ),
+                    "Active": (
+                        "Active",
+                        "sum",
+                    ),
+                    "Quantity sent pending": (
+                        "Quantity sent pending",
+                        "sum",
+                    ),
+                    "Quantity Receive Pending": (
+                        "Quantity Receive Pending",
+                        "sum",
+                    ),
                 },
             )
             .reset_index()
         )
-
-        if not identity_counts.empty:
-            sfda_summary = sfda_summary.merge(
-                identity_counts, on=self.MATCH_KEYS, how="left", validate="one_to_one"
-            )
-            sfda_summary = sfda_summary.loc[
-                pd.to_numeric(sfda_summary["_GTIN Count"], errors="coerce").fillna(0).eq(1)
-            ].drop(columns=["_GTIN Count"], errors="ignore")
 
         sfda_summary = sfda_summary.merge(
             self._pack_lookup(),
@@ -496,12 +376,24 @@ class ReconciliationEngine:
         )
 
         sfda_summary["PackageSize"] = pd.to_numeric(
-            sfda_summary["PackageSize"], errors="coerce"
+            sfda_summary["PackageSize"],
+            errors="coerce",
         )
-        valid_package = sfda_summary["PackageSize"].notna() & sfda_summary["PackageSize"].gt(0)
-        sfda_summary["Package Size Status"] = valid_package.map(
-            {True: "Mapped", False: "Missing"}
+
+        valid_package = (
+            sfda_summary["PackageSize"].notna()
+            & sfda_summary["PackageSize"].gt(0)
         )
+
+        sfda_summary["Package Size Status"] = (
+            valid_package.map(
+                {
+                    True: "Mapped",
+                    False: "Missing",
+                }
+            )
+        )
+
         return sfda_summary
 
     def _enrich_with_master(
@@ -521,7 +413,6 @@ class ReconciliationEngine:
             for column in [
                 "BN",
                 "Expiry Date",
-                "Expiry Month Key",
                 "Generic Item Number",
                 "Total Received Qty",
                 "Total Receive Qty",
@@ -531,21 +422,20 @@ class ReconciliationEngine:
             if column in master.columns
         ]
 
-        identity_keys = self.MATCH_KEYS + ["Generic Item Number"]
-        if not set(identity_keys).issubset(keep) or "Generic Item Number" not in report.columns:
+        if not set(self.MATCH_KEYS).issubset(keep):
             return report
 
         master = (
             master[keep]
             .drop_duplicates(
-                subset=identity_keys,
+                subset=self.MATCH_KEYS,
                 keep="first",
             )
         )
 
         report = report.merge(
             master,
-            on=identity_keys,
+            on=self.MATCH_KEYS,
             how="left",
             suffixes=("", " Master"),
         )
@@ -576,27 +466,80 @@ class ReconciliationEngine:
         return report
 
     def _filter_accept_sfda_relevant(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """Keep only ASN rows whose Generic is proven SFDA-relevant.
+        """Keep only Daily Accept ASN rows connected to the SFDA universe.
 
-        BN + Expiry Month is only a batch candidate.  It never proves product
-        identity.  Daily eligibility comes from the one-to-one Generic -> GTIN
-        relationship already proven in Batch Master.
+        Eligibility follows the same rule used by the historical/STO reports:
+          1. exact BN + Expiry Date exists in Batch Master; OR
+          2. Generic Item Number exists anywhere in Batch Master.
+
+        The second rule intentionally keeps a newly received batch when the
+        generic drug is SFDA-relevant but that exact batch is still missing from
+        the SFDA report. Rows unrelated to SFDA are removed before Accept, STO
+        follow-up, excluded-receipt audit output, and transaction persistence.
+
+        If Batch Master is unavailable, fall back conservatively to exact
+        BN + Expiry Date rows present in the uploaded SFDA report so Daily Accept
+        never expands to every ASN row.
         """
         if frame.empty:
             return frame.copy()
 
-        result = self._ensure_expiry_month_key(frame)
-        result["Generic Item Number"] = Normalizer.text(
-            result.get("Generic Item Number", pd.Series("", index=result.index, dtype=object))
-        )
-        reference = self._generic_identity_reference()
-        if reference.empty:
-            result["SFDA Relevance Status"] = "Identity Unresolved"
-            return result.iloc[0:0].copy()
+        result = frame.copy()
+        bn = Normalizer.text(result.get(
+            "BN", pd.Series("", index=result.index, dtype=object)
+        ))
+        expiry = Normalizer.date(result.get(
+            "Expiry Date", pd.Series(pd.NaT, index=result.index)
+        ))
+        generic = Normalizer.text(result.get(
+            "Generic Item Number", pd.Series("", index=result.index, dtype=object)
+        ))
 
-        proven_generics = set(reference["Generic Item Number"].astype(str))
-        keep = result["Generic Item Number"].astype(str).isin(proven_generics)
-        result["SFDA Relevance Status"] = "Generic Proven in SFDA-Relevant Master"
+        def date_key(series: pd.Series) -> pd.Series:
+            parsed = pd.to_datetime(series, errors="coerce")
+            return parsed.dt.strftime("%Y-%m-%d").fillna("")
+
+        row_exact = bn.astype(str) + "|" + date_key(expiry)
+
+        if not self.batch_master.empty:
+            master = self.batch_master.copy()
+            master_bn = Normalizer.text(master.get(
+                "BN", pd.Series("", index=master.index, dtype=object)
+            ))
+            master_expiry = Normalizer.date(master.get(
+                "Expiry Date", pd.Series(pd.NaT, index=master.index)
+            ))
+            master_generic = Normalizer.text(master.get(
+                "Generic Item Number", pd.Series("", index=master.index, dtype=object)
+            ))
+
+            exact_keys = set(
+                (master_bn.astype(str) + "|" + date_key(master_expiry)).tolist()
+            )
+            generic_keys = {
+                value for value in master_generic.astype(str).tolist() if value.strip()
+            }
+
+            exact_match = row_exact.isin(exact_keys)
+            generic_match = generic.astype(str).isin(generic_keys) & generic.astype(str).str.strip().ne("")
+            keep = exact_match | generic_match
+
+            result["SFDA Relevance Status"] = "Not SFDA Relevant"
+            result.loc[generic_match, "SFDA Relevance Status"] = "Generic Exists in SFDA-Relevant Master"
+            result.loc[exact_match, "SFDA Relevance Status"] = "Exact Batch in SFDA-Relevant Master"
+            return result.loc[keep].copy()
+
+        sfda_bn = Normalizer.text(self.sfda.get(
+            "BN", pd.Series("", index=self.sfda.index, dtype=object)
+        ))
+        sfda_expiry = Normalizer.date(self.sfda.get(
+            "Expiry Date", pd.Series(pd.NaT, index=self.sfda.index)
+        ))
+        sfda_exact_keys = set(
+            (sfda_bn.astype(str) + "|" + date_key(sfda_expiry)).tolist()
+        )
+        keep = row_exact.isin(sfda_exact_keys)
+        result["SFDA Relevance Status"] = "Exact Batch in Current SFDA"
         return result.loc[keep].copy()
 
     def _apply_daily_generic_reference(self, report: pd.DataFrame) -> pd.DataFrame:
@@ -628,28 +571,70 @@ class ReconciliationEngine:
             result["PackageSize"], errors="coerce"
         ).fillna(0)
 
-        reference = self._generic_identity_reference()
-        if not reference.empty:
-            reference = reference.rename(
-                columns={"_Proven GTIN": "_Generic GTIN", "_Proven Drug Name": "_Generic Drug Name"}
+        if not self.batch_master.empty and "Generic Item Number" in self.batch_master.columns:
+            master = self.batch_master.copy()
+            master["Generic Item Number"] = Normalizer.text(
+                master["Generic Item Number"]
             )
-            result["Generic Item Number"] = Normalizer.text(
-                result.get("Generic Item Number", pd.Series("", index=result.index, dtype=object))
+            if "GTIN" not in master.columns:
+                master["GTIN"] = ""
+            if "Drug Name" not in master.columns:
+                master["Drug Name"] = ""
+            master["GTIN"] = Normalizer.text(master["GTIN"])
+            master["Drug Name"] = Normalizer.text(master["Drug Name"])
+
+            # Prefer a row that really has SFDA identity.  Full Reconciliation
+            # already carries the Generic-level SFDA reference into Batch Master.
+            master["_Reference Score"] = (
+                master["GTIN"].ne("").astype(int) * 2
+                + master["Drug Name"].ne("").astype(int)
             )
-            result = result.merge(
-                reference, on="Generic Item Number", how="left", validate="many_to_one"
+            reference = (
+                master.loc[
+                    master["Generic Item Number"].ne("")
+                    & master["_Reference Score"].gt(0),
+                    ["Generic Item Number", "GTIN", "Drug Name", "_Reference Score"],
+                ]
+                .sort_values(
+                    ["Generic Item Number", "_Reference Score"],
+                    ascending=[True, False],
+                    kind="stable",
+                )
+                .drop_duplicates(subset=["Generic Item Number"], keep="first")
+                .drop(columns=["_Reference Score"])
+                .rename(
+                    columns={
+                        "GTIN": "_Generic GTIN",
+                        "Drug Name": "_Generic Drug Name",
+                    }
+                )
             )
-            missing_gtin = result["GTIN"].eq("")
-            missing_drug = result["Drug Name"].eq("")
-            result.loc[missing_gtin, "GTIN"] = Normalizer.text(
-                result.loc[missing_gtin, "_Generic GTIN"]
-            )
-            result.loc[missing_drug, "Drug Name"] = Normalizer.text(
-                result.loc[missing_drug, "_Generic Drug Name"]
-            )
-            result = result.drop(
-                columns=["_Generic GTIN", "_Generic Drug Name"], errors="ignore"
-            )
+
+            if not reference.empty:
+                result["Generic Item Number"] = Normalizer.text(
+                    result.get(
+                        "Generic Item Number",
+                        pd.Series("", index=result.index, dtype=object),
+                    )
+                )
+                result = result.merge(
+                    reference,
+                    on="Generic Item Number",
+                    how="left",
+                    validate="many_to_one",
+                )
+                missing_gtin = result["GTIN"].eq("")
+                missing_drug = result["Drug Name"].eq("")
+                result.loc[missing_gtin, "GTIN"] = Normalizer.text(
+                    result.loc[missing_gtin, "_Generic GTIN"]
+                )
+                result.loc[missing_drug, "Drug Name"] = Normalizer.text(
+                    result.loc[missing_drug, "_Generic Drug Name"]
+                )
+                result = result.drop(
+                    columns=["_Generic GTIN", "_Generic Drug Name"],
+                    errors="ignore",
+                )
 
         # PackageSize is ALWAYS resolved from the approved Pack Size master.
         # Exact current-SFDA mappings already have PackageSize; fill only missing
@@ -682,7 +667,6 @@ class ReconciliationEngine:
             )
 
         self.asn = Normalizer.normalize_asn(self.asn)
-        self.asn = self._ensure_expiry_month_key(self.asn)
         Validator.validate(self.asn, "ASN")
         self.asn = self._apply_processing_status(
             self.asn, "ACCEPT", "Received Quantity"
@@ -733,12 +717,12 @@ class ReconciliationEngine:
 
         receiving = (
             eligible_asn.groupby(
-                self.MATCH_KEYS + ["Generic Item Number", "Receipt Type"],
+                self.MATCH_KEYS + ["Receipt Type"],
                 dropna=False,
             )
             .agg(
                 **{
-                    "Expiry Date": ("Expiry Date", "first"),
+                    "Generic Item Number": ("Generic Item Number", "first"),
                     "Trade Name": ("Trade Name", "first"),
                     "Received Quantity Each": ("Effective Quantity Each", "sum"),
                     "Description": ("Description", self._join_unique),
@@ -768,11 +752,7 @@ class ReconciliationEngine:
                 how="left",
                 validate="many_to_one",
             )
-            report = self._verify_current_sfda_identity(report)
             report = self._apply_daily_generic_reference(report)
-            if "SFDA Expiry Date" in report.columns:
-                verified = report.get("SFDA Identity Status", "").eq("Verified Generic-GTIN")
-                report.loc[verified, "Expiry Date"] = report.loc[verified, "SFDA Expiry Date"]
 
         for column in [
             "Quantity", "Active", "Quantity sent pending", "Quantity Receive Pending",
@@ -808,17 +788,14 @@ class ReconciliationEngine:
             {SUPPLIER: 0, STO_INCOMING: 1}
         ).fillna(9)
         report = report.sort_values(
-            self.MATCH_KEYS + ["Generic Item Number", "Receipt Type Priority"],
-            kind="stable",
+            self.MATCH_KEYS + ["Receipt Type Priority"], kind="stable"
         ).reset_index(drop=True)
 
         valid_package = pd.to_numeric(
             report["PackageSize"], errors="coerce"
         ).fillna(0).gt(0)
 
-        for _, group in report.groupby(
-            self.MATCH_KEYS + ["Generic Item Number"], dropna=False, sort=False
-        ):
+        for _, group in report.groupby(self.MATCH_KEYS, dropna=False, sort=False):
             pending = float(
                 pd.to_numeric(
                     pd.Series([group["Quantity Receive Pending"].iloc[0]]),
@@ -952,12 +929,12 @@ class ReconciliationEngine:
         if not sto_return_asn.empty:
             sto_return_cancel = (
                 sto_return_asn.groupby(
-                    self.MATCH_KEYS + ["Generic Item Number"],
+                    self.MATCH_KEYS,
                     dropna=False,
                 )
                 .agg(
                     **{
-                        "Expiry Date": ("Expiry Date", "first"),
+                        "Generic Item Number": ("Generic Item Number", "first"),
                         "Trade Name": ("Trade Name", "first"),
                         "Received Quantity Each": ("Effective Quantity Each", "sum"),
                         "Description": ("Description", self._join_unique),
@@ -980,7 +957,6 @@ class ReconciliationEngine:
                 how="left",
                 validate="many_to_one",
             )
-            sto_return_cancel = self._verify_current_sfda_identity(sto_return_cancel)
             sto_return_cancel = self._apply_daily_generic_reference(sto_return_cancel)
             for column in [
                 "Quantity", "Active", "Quantity sent pending",
@@ -1021,11 +997,11 @@ class ReconciliationEngine:
         # Return and excluded TRKs can never be marked as SFDA Accept processed.
         accept_transactions = eligible_asn.copy()
         batch_limits = report[
-            self.MATCH_KEYS + ["Generic Item Number", "Receipt Type", "PackageSize", "To Be Accept"]
+            self.MATCH_KEYS + ["Receipt Type", "PackageSize", "To Be Accept"]
         ].copy()
         accept_transactions = accept_transactions.merge(
             batch_limits,
-            on=self.MATCH_KEYS + ["Generic Item Number", "Receipt Type"],
+            on=self.MATCH_KEYS + ["Receipt Type"],
             how="left",
             validate="many_to_one",
         )
@@ -1062,10 +1038,6 @@ class ReconciliationEngine:
 
             mask = accept_transactions["Receipt Type"].eq(
                 limit_row.get("Receipt Type", "")
-            )
-            mask = mask & (
-                Normalizer.text(accept_transactions["Generic Item Number"])
-                == str(limit_row.get("Generic Item Number", "")).strip()
             )
             for key in self.MATCH_KEYS:
                 if key == "Expiry Date":
@@ -1144,7 +1116,6 @@ class ReconciliationEngine:
         self.dispatch = Normalizer.normalize_dispatch(
             self.dispatch
         )
-        self.dispatch = self._ensure_expiry_month_key(self.dispatch)
         Validator.validate(
             self.dispatch,
             "DISPATCH",
@@ -1155,8 +1126,7 @@ class ReconciliationEngine:
 
         # SFDA receives PackageSize first through:
         # SFDA[Drug Name] -> Pack Size[Trade Name].
-        # BN + Expiry Month locates the candidate SFDA batch; Batch Master
-        # Generic -> GTIN identity must verify it before SFDA Active can be used.
+        # Full Dispatch is then matched only by BN + Expiry Date.
         sfda_batches = self._sfda_summary()
 
         details = self.dispatch.merge(
@@ -1165,12 +1135,6 @@ class ReconciliationEngine:
             how="inner",
             validate="many_to_one",
         )
-        details = self._verify_current_sfda_identity(details)
-        details = details.loc[
-            details["SFDA Identity Status"].eq("Verified Generic-GTIN")
-        ].copy()
-        if "SFDA Expiry Date" in details.columns:
-            details["Expiry Date"] = details["SFDA Expiry Date"]
 
         details = details.reset_index(drop=True)
         details["_Source Order"] = range(len(details))
@@ -1232,7 +1196,7 @@ class ReconciliationEngine:
         details["Allocated To Be Dispatch"] = 0
 
         for _, indexes in details.groupby(
-            self.MATCH_KEYS + ["Generic Item Number"],
+            self.MATCH_KEYS,
             sort=False,
             dropna=False,
         ).groups.items():
