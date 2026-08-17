@@ -1,4 +1,6 @@
 import os
+import json
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -9,6 +11,9 @@ from azure.storage.blob import BlobServiceClient, ContentSettings
 INPUTS_CONTAINER = "runs-inputs"
 OUTPUTS_CONTAINER = "runs-outputs"
 METADATA_CONTAINER = "runs-metadata"
+RESET_LOCK_BLOB = "system/reset-active.json"
+
+logger = logging.getLogger("SFDA-Reconciliation.BlobStorage")
 
 
 class BlobStorage:
@@ -349,6 +354,106 @@ class BlobStorage:
             raise ValueError("Background job status is invalid.")
         return parsed
 
+    def list_active_background_jobs(
+        self,
+        exclude_job_id: str = "",
+        max_age_hours: int = 48,
+    ) -> List[Dict[str, Any]]:
+        """List recent queued/running background reconciliation jobs for this warehouse."""
+        prefix = self.scoped_blob_name("background-jobs/")
+        container = self.service.get_container_client(METADATA_CONTAINER)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=max(1, int(max_age_hours)))
+        active: List[Dict[str, Any]] = []
+        excluded = str(exclude_job_id or "").strip()
+
+        for blob in container.list_blobs(name_starts_with=prefix):
+            if blob.last_modified is not None and blob.last_modified < cutoff:
+                continue
+            name = str(blob.name or "")
+            if not name.endswith(".json"):
+                continue
+            job_id = name.rsplit("/", 1)[-1][:-5]
+            if excluded and job_id == self.sanitize_file_name(excluded):
+                continue
+            try:
+                downloaded = self.download_blob(METADATA_CONTAINER, name)
+                payload = json.loads(downloaded["data"].decode("utf-8"))
+            except Exception:
+                logger.exception("Unable to inspect background job status %s", name)
+                continue
+            status = str((payload or {}).get("status") or "").strip().lower()
+            if status in {"queued", "running"}:
+                active.append(payload)
+        return active
+
+    def write_warehouse_reset_lock(
+        self,
+        job_id: str,
+        warehouse_name: str,
+        expires_hours: int = 6,
+    ) -> Dict[str, Any]:
+        """Create/update the warehouse-scoped reset lock marker."""
+        created_at = datetime.now(timezone.utc)
+        payload = {
+            "job_id": str(job_id),
+            "warehouse_name": str(warehouse_name or ""),
+            "status": "Active",
+            "created_at": created_at.isoformat(),
+            "expires_at": (created_at + timedelta(hours=max(1, int(expires_hours)))).isoformat(),
+        }
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return self.upload_bytes(
+            METADATA_CONTAINER,
+            self.scoped_blob_name(RESET_LOCK_BLOB),
+            data,
+            "application/json; charset=utf-8",
+            {"job_id": str(job_id), "category": "warehouse-reset-lock"},
+        )
+
+    def read_warehouse_reset_lock(self) -> Optional[Dict[str, Any]]:
+        """Return the active reset lock, automatically ignoring stale locks."""
+        try:
+            downloaded = self.download_blob(
+                METADATA_CONTAINER,
+                self.scoped_blob_name(RESET_LOCK_BLOB),
+            )
+        except (FileNotFoundError, ResourceNotFoundError):
+            return None
+
+        try:
+            payload = json.loads(downloaded["data"].decode("utf-8"))
+        except Exception:
+            logger.exception("Invalid warehouse reset lock payload; treating it as active for safety.")
+            return {"status": "Active", "job_id": "unknown"}
+
+        expires_at = str(payload.get("expires_at") or "").strip()
+        if expires_at:
+            try:
+                expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                if expiry <= datetime.now(timezone.utc):
+                    self.clear_warehouse_reset_lock(str(payload.get("job_id") or ""), force=True)
+                    return None
+            except Exception:
+                logger.exception("Unable to evaluate warehouse reset lock expiry.")
+        return payload if isinstance(payload, dict) else None
+
+    def clear_warehouse_reset_lock(self, job_id: str = "", force: bool = False) -> None:
+        """Remove the reset lock only for the owning job unless force=True."""
+        blob_name = self.scoped_blob_name(RESET_LOCK_BLOB)
+        if not force and job_id:
+            current = self.read_warehouse_reset_lock()
+            if current and str(current.get("job_id") or "") not in {"", str(job_id)}:
+                return
+        try:
+            self.service.get_blob_client(
+                container=METADATA_CONTAINER,
+                blob=blob_name,
+            ).delete_blob(delete_snapshots="include")
+        except ResourceNotFoundError:
+            pass
+
     def upload_job_input(
         self,
         job_id: str,
@@ -402,7 +507,10 @@ class BlobStorage:
         result["file_name"] = safe_name
         return result
 
-    def delete_current_warehouse_data(self) -> Dict[str, Any]:
+    def delete_current_warehouse_data(
+        self,
+        preserve_blob_names: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """Delete only Blob data stored under the current warehouse prefix.
 
         Reference/configuration files are not stored in these run containers, so
@@ -418,7 +526,10 @@ class BlobStorage:
             raise RuntimeError("A valid WarehouseID is required for Blob reset.")
 
         prefix = f"w{warehouse_id}/"
-        deleted = {}
+        preserved = {str(name) for name in (preserve_blob_names or []) if str(name).strip()}
+        deleted: Dict[str, int] = {}
+        failed: Dict[str, List[str]] = {}
+
         for container_name in (
             INPUTS_CONTAINER,
             OUTPUTS_CONTAINER,
@@ -428,24 +539,56 @@ class BlobStorage:
             names = [
                 str(blob.name)
                 for blob in container.list_blobs(name_starts_with=prefix)
+                if str(blob.name) not in preserved
             ]
-            # Warehouse 1 owns the legacy unscoped run archives that existed
-            # before Multi-Warehouse. An explicitly confirmed Warehouse 1 reset
-            # must remove those too; never touch another wN/ prefix.
+            # Warehouse 1 owns legacy unscoped run archives created before
+            # Multi-Warehouse. Preserve only the explicit reset status/lock names.
             if warehouse_id == 1:
                 for blob in container.list_blobs():
                     name = str(blob.name or "")
+                    if name in preserved:
+                        continue
                     if name.startswith("w") and "/" in name and name.split("/", 1)[0][1:].isdigit():
                         continue
                     if name and name not in names:
                         names.append(name)
-            deleted[container_name] = self._delete_blob_names(container, names)
+
+            container_deleted = 0
+            container_failed: List[str] = []
+            for chunk in self._chunks(names, 256):
+                if not chunk:
+                    continue
+                try:
+                    container.delete_blobs(*chunk, delete_snapshots="include")
+                    container_deleted += len(chunk)
+                except Exception:
+                    # Do not turn an otherwise successful SQL reset into a generic
+                    # failure because one archived Blob could not be removed.
+                    for blob_name in chunk:
+                        try:
+                            container.delete_blob(blob_name, delete_snapshots="include")
+                            container_deleted += 1
+                        except ResourceNotFoundError:
+                            pass
+                        except Exception:
+                            logger.exception(
+                                "Warehouse reset could not delete blob %s/%s",
+                                container_name,
+                                blob_name,
+                            )
+                            container_failed.append(blob_name)
+
+            deleted[container_name] = container_deleted
+            if container_failed:
+                failed[container_name] = container_failed
 
         return {
-            "status": "Completed",
+            "status": "CompletedWithWarnings" if failed else "Completed",
             "warehouse_id": warehouse_id,
             "deleted_blobs": deleted,
             "deleted_blobs_total": int(sum(deleted.values())),
+            "failed_blobs": failed,
+            "failed_blobs_total": int(sum(len(items) for items in failed.values())),
             "legacy_unscoped_madinah_blobs_deleted": warehouse_id == 1,
         }
 
