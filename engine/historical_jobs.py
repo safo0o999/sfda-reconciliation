@@ -23,6 +23,8 @@ from engine.database import (
     replace_customer_history,
     replace_supplier_history,
     replace_latest_sfda_snapshot,
+    refresh_accept_history_incremental,
+    refresh_dispatch_history_incremental,
     reset_history,
     update_historical_build_job,
 )
@@ -196,48 +198,52 @@ def process_historical_build_job(
             or inserted.get("dispatch_events", 0) > 0
         )
 
-        if operation == "append" and not has_new_events:
-            update_historical_build_job(
-                job_id,
-                progress=82,
-                current_stage=(
-                    "No new events found; loading existing historical tables"
-                ),
-            )
+        if operation == "append":
+            if not has_new_events:
+                update_historical_build_job(
+                    job_id, progress=82,
+                    current_stage="No new events found; loading existing historical tables",
+                )
+            else:
+                # Append mode is genuinely incremental: only keys represented by
+                # newly inserted receipt/dispatch events are recalculated.
+                update_historical_build_job(
+                    job_id, progress=68,
+                    current_stage="Updating affected historical batches",
+                )
+                if inserted.get("receipt_events", 0) > 0:
+                    refresh_accept_history_incremental(
+                        prepared["receipt_records"].to_dict(orient="records"), sfda_df
+                    )
+                if inserted.get("dispatch_events", 0) > 0:
+                    refresh_dispatch_history_incremental(
+                        prepared["dispatch_records"].to_dict(orient="records")
+                    )
+                mark_stage("incremental_historical_refresh")
+
             master = get_batch_master_df()
             supplier_history = get_supplier_history_df()
             customer_history = get_customer_history_df()
             sto_incoming_history = get_sto_incoming_history_df()
             sto_return_history = get_sto_return_history_df()
         else:
+            # Explicit rebuild remains the maintenance/recovery path.
             update_historical_build_job(
-                job_id,
-                progress=68,
-                current_stage="Building Batch Master",
+                job_id, progress=68, current_stage="Building Batch Master",
             )
             receipt_summary, dispatch_summary = get_event_summaries()
             master = engine.build_master_from_summaries(
-                receipt_summary,
-                dispatch_summary,
-                prepared["sfda_summary"],
+                receipt_summary, dispatch_summary, prepared["sfda_summary"],
             )
             replace_batch_master(master)
             mark_stage("build_and_save_batch_master")
 
             update_historical_build_job(
-                job_id,
-                progress=80,
-                current_stage="Building Supplier and Customer History",
+                job_id, progress=80, current_stage="Building Supplier and Customer History",
             )
             supplier_summary, customer_summary = get_history_summaries()
-            supplier_history = engine.build_supplier_history(
-                supplier_summary,
-                master,
-            )
-            customer_history = engine.build_customer_history(
-                customer_summary,
-                master,
-            )
+            supplier_history = engine.build_supplier_history(supplier_summary, master)
+            customer_history = engine.build_customer_history(customer_summary, master)
             replace_supplier_history(supplier_history)
             replace_customer_history(customer_history)
             sto_incoming_history = get_sto_incoming_history_df()
