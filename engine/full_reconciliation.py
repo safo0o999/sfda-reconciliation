@@ -410,6 +410,15 @@ class FullReconciliationEngine:
         )
 
     def _sfda_keys(self) -> pd.DataFrame:
+        """Return only unambiguous SFDA BN + expiry-month rows.
+
+        Product identity is established only when one BN + Expiry Month points
+        to exactly one SFDA GTIN.  If the same operational key exists for more
+        than one GTIN, the key is left unresolved rather than selecting the
+        first row.
+
+        The exact SFDA expiry date is retained for every SFDA-facing output.
+        """
         required = [
             "BN",
             "Expiry Month Key",
@@ -428,6 +437,8 @@ class FullReconciliationEngine:
             & sfda["Expiry Month Key"].astype(str).str.strip().ne("")
         ].copy()
 
+        sfda["GTIN"] = Normalizer.text(sfda["GTIN"])
+        sfda["Drug Name"] = Normalizer.text(sfda["Drug Name"])
         sfda["Expiry Date"] = Normalizer.date(sfda["Expiry Date"])
         for column in [
             "Quantity",
@@ -436,6 +447,14 @@ class FullReconciliationEngine:
             "Quantity Receive Pending",
         ]:
             sfda[column] = pd.to_numeric(sfda[column], errors="coerce").fillna(0)
+
+        identity_counts = (
+            sfda.loc[sfda["GTIN"].ne("")]
+            .groupby(self.SFDA_KEYS, dropna=False)["GTIN"]
+            .nunique()
+            .rename("_GTIN Count")
+            .reset_index()
+        )
 
         sfda = (
             sfda.groupby(self.SFDA_KEYS, dropna=False)
@@ -452,6 +471,30 @@ class FullReconciliationEngine:
             )
             .reset_index()
         )
+
+        if not identity_counts.empty:
+            sfda = sfda.merge(
+                identity_counts,
+                on=self.SFDA_KEYS,
+                how="left",
+                validate="one_to_one",
+            )
+            ambiguous_count = int(
+                pd.to_numeric(sfda["_GTIN Count"], errors="coerce")
+                .fillna(0)
+                .gt(1)
+                .sum()
+            )
+            if ambiguous_count:
+                logger.warning(
+                    "Excluded %s ambiguous SFDA BN+expiry-month key(s) with multiple GTINs.",
+                    ambiguous_count,
+                )
+            sfda = sfda.loc[
+                pd.to_numeric(sfda["_GTIN Count"], errors="coerce")
+                .fillna(0)
+                .eq(1)
+            ].drop(columns=["_GTIN Count"], errors="ignore")
 
         sfda = sfda.merge(
             self._pack_lookup(),
@@ -632,26 +675,19 @@ class FullReconciliationEngine:
         sfda = sfda.drop_duplicates(subset=self.SFDA_KEYS, keep="first")
 
         # ------------------------------------------------------------------
-        # Resolve SFDA product identity before a BN + expiry-month match is
-        # allowed to prove a WMS Generic.
+        # Establish product identity strictly from an exact, unambiguous
+        # BN + Expiry Month match.
         #
-        # BN + Expiry Month remains the operational candidate key.  We do NOT
-        # require the exact expiry day because SFDA and WMS can legitimately
-        # carry different days in the same month.
+        # Rule:
+        #   1. SFDA BN + Expiry Month must exist in WMS on the same key.
+        #   2. That WMS key must resolve to exactly one Generic Item Number.
+        #   3. The SFDA key must already be unambiguous (one GTIN only).
+        #   4. The resulting Generic <-> GTIN relationship must be one-to-one.
         #
-        # The important protection is product identity:
-        #   * Build every observed SFDA-GTIN <-> WMS-Generic candidate edge.
-        #   * Repeated independent batch/month evidence is used to prove a
-        #     stable product mapping.
-        #   * A single batch/month collision is never allowed to overwrite an
-        #     already-proven mapping.
-        #   * For a product with only one historical batch, accept it only when
-        #     that BN/month has exactly one WMS Generic AND the row is not an
-        #     excluded non-drug family.  This preserves first-time products but
-        #     blocks known LABORATORYSUPPLIES collisions from proving a drug.
-        #   * Once Generic <-> GTIN is proven, only that Generic may consume
-        #     SFDA rows for that GTIN. Other WMS rows sharing BN/month remain
-        #     unrelated and cannot inherit GTIN/Drug/PackageSize.
+        # Only those exact rows are allowed to establish identity.  After that,
+        # the proven Generic is used to retain other WMS batches for the same
+        # product as "Missing Batch in SFDA".  No BN-only, exact-day, trade-name,
+        # or historical-voting fallback is allowed to create product identity.
         # ------------------------------------------------------------------
         candidate_columns = self.SFDA_KEYS + [
             "Generic Item Number",
@@ -662,175 +698,70 @@ class FullReconciliationEngine:
             candidates["Generic Item Number"].fillna("").astype(str).str.strip()
         )
         candidates = candidates[candidates["Generic Item Number"].ne("")].copy()
+        candidates["_Excluded Family"] = self._excluded_item_family_mask(
+            candidates["Item Family Group"]
+        )
+        candidates = candidates.loc[~candidates["_Excluded Family"]].copy()
+
+        candidate_counts = (
+            candidates.groupby(self.SFDA_KEYS, dropna=False)["Generic Item Number"]
+            .nunique()
+            .rename("_Candidate Generic Count")
+            .reset_index()
+        )
+        candidates = candidates.merge(
+            candidate_counts,
+            on=self.SFDA_KEYS,
+            how="left",
+            validate="many_to_one",
+        )
+        candidates = candidates.loc[
+            candidates["_Candidate Generic Count"].eq(1)
+        ].drop(columns=["_Candidate Generic Count", "_Excluded Family"], errors="ignore")
         candidates = candidates.drop_duplicates(
             subset=self.SFDA_KEYS + ["Generic Item Number"],
             keep="first",
         )
-        candidates["_Excluded Family"] = self._excluded_item_family_mask(
-            candidates["Item Family Group"]
-        )
 
-        sfda_identity = sfda[sfda_columns].copy()
-        sfda_identity["_GTIN Identity"] = (
-            sfda_identity["GTIN"].fillna("").astype(str).str.strip()
-        )
-        sfda_identity["_Drug Identity"] = sfda_identity["Drug Name"].map(
-            self._identity_text
-        )
-
-        # All candidate edges created only from the operational BN+month key.
-        edges = candidates.merge(
-            sfda_identity,
+        exact_edges = candidates.merge(
+            sfda[sfda_columns],
             on=self.SFDA_KEYS,
             how="inner",
             validate="many_to_one",
         )
-        # Keep excluded families in ReceiptEvents for warehouse audit/history,
-        # but never let them establish SFDA drug identity.
-        identity_edges = edges[~edges["_Excluded Family"]].copy()
 
         resolved = pd.DataFrame(columns=(
             self.SFDA_KEYS + ["Generic Item Number"] +
             [column for column in sfda_columns if column not in self.SFDA_KEYS]
         ))
 
-        if not identity_edges.empty:
-            # Count independent BN/month evidence for every GTIN <-> Generic.
-            edge_counts = (
-                identity_edges.groupby(
-                    ["_GTIN Identity", "_Drug Identity", "Generic Item Number"],
-                    dropna=False,
-                )
-                .size()
-                .rename("_Evidence Count")
-                .reset_index()
+        if not exact_edges.empty:
+            exact_edges["GTIN"] = Normalizer.text(exact_edges["GTIN"])
+            exact_edges["Generic Item Number"] = (
+                exact_edges["Generic Item Number"].fillna("").astype(str).str.strip()
             )
-
-            # Strong historical mapping: the pair occurs on at least two
-            # independent SFDA batch/month keys.  Require mutual uniqueness of
-            # the best score so one Generic cannot be proven for two drugs and
-            # one drug cannot be proven for two Generics.
-            gtin_best = edge_counts.groupby(
-                ["_GTIN Identity", "_Drug Identity"], dropna=False
-            )["_Evidence Count"].transform("max")
-            generic_best = edge_counts.groupby(
-                ["Generic Item Number"], dropna=False
-            )["_Evidence Count"].transform("max")
-            strong = edge_counts[
-                edge_counts["_Evidence Count"].ge(2)
-                & edge_counts["_Evidence Count"].eq(gtin_best)
-                & edge_counts["_Evidence Count"].eq(generic_best)
+            exact_edges = exact_edges.loc[
+                exact_edges["GTIN"].ne("")
+                & exact_edges["Generic Item Number"].ne("")
             ].copy()
 
-            # Remove ties at either side.
-            if not strong.empty:
-                gtin_winners = (
-                    strong.groupby(["_GTIN Identity", "_Drug Identity"], dropna=False)[
-                        "Generic Item Number"
-                    ].nunique()
-                )
-                generic_winners = (
-                    strong.groupby("Generic Item Number", dropna=False)["_GTIN Identity"].nunique()
-                )
-                strong["_GTIN Winner Count"] = strong.set_index(
-                    ["_GTIN Identity", "_Drug Identity"]
-                ).index.map(gtin_winners)
-                strong["_Generic Winner Count"] = strong["Generic Item Number"].map(
-                    generic_winners
-                )
-                strong = strong[
-                    strong["_GTIN Winner Count"].eq(1)
-                    & strong["_Generic Winner Count"].eq(1)
-                ].copy()
+            pair_map = exact_edges[["Generic Item Number", "GTIN"]].drop_duplicates()
+            generic_gtin_count = pair_map.groupby("Generic Item Number")["GTIN"].transform("nunique")
+            gtin_generic_count = pair_map.groupby("GTIN")["Generic Item Number"].transform("nunique")
+            trusted_pairs = pair_map.loc[
+                generic_gtin_count.eq(1) & gtin_generic_count.eq(1)
+            ].copy()
 
-            proven_pairs = strong[[
-                "_GTIN Identity", "_Drug Identity", "Generic Item Number"
-            ]].drop_duplicates()
-
-            # First-time/single-batch fallback.  It is deliberately conservative:
-            # one WMS Generic for the BN/month, one SFDA identity for the key,
-            # and the WMS row must not be a known excluded non-drug family.
-            candidate_counts = (
-                candidates.groupby(self.SFDA_KEYS, dropna=False)["Generic Item Number"]
-                .nunique()
-                .rename("_Candidate Generic Count")
-                .reset_index()
-            )
-            single = identity_edges.merge(
-                candidate_counts,
-                on=self.SFDA_KEYS,
-                how="left",
+            resolved = exact_edges.merge(
+                trusted_pairs,
+                on=["Generic Item Number", "GTIN"],
+                how="inner",
                 validate="many_to_one",
             )
-            single = single[
-                single["_Candidate Generic Count"].eq(1)
-                & ~single["_Excluded Family"]
-            ].copy()
-
-            # Do not create a fallback mapping if either side already has a
-            # different strong historical identity.  Keep this fully
-            # vectorized: historical builds can contain hundreds of thousands
-            # of candidate rows and DataFrame.apply(axis=1) becomes a major
-            # CPU bottleneck.
-            if not proven_pairs.empty and not single.empty:
-                proven_gtin_to_generic = dict(zip(
-                    proven_pairs["_GTIN Identity"],
-                    proven_pairs["Generic Item Number"],
-                ))
-                proven_generic_to_gtin = dict(zip(
-                    proven_pairs["Generic Item Number"],
-                    proven_pairs["_GTIN Identity"],
-                ))
-
-                mapped_generic = single["_GTIN Identity"].map(
-                    proven_gtin_to_generic
-                )
-                mapped_gtin = single["Generic Item Number"].map(
-                    proven_generic_to_gtin
-                )
-
-                gtin_side_ok = (
-                    mapped_generic.isna()
-                    | mapped_generic.eq(single["Generic Item Number"])
-                )
-                generic_side_ok = (
-                    mapped_gtin.isna()
-                    | mapped_gtin.eq(single["_GTIN Identity"])
-                )
-                single = single[gtin_side_ok & generic_side_ok].copy()
-
-            fallback_pairs = single[[
-                "_GTIN Identity", "_Drug Identity", "Generic Item Number"
-            ]].drop_duplicates()
-
-            all_pairs = pd.concat(
-                [proven_pairs, fallback_pairs],
-                ignore_index=True,
-            ).drop_duplicates()
-
-            # Final mutual uniqueness guard.  Any identity that still points to
-            # multiple products is left unresolved rather than guessed.
-            if not all_pairs.empty:
-                gtin_pair_count = all_pairs.groupby(
-                    ["_GTIN Identity", "_Drug Identity"], dropna=False
-                )["Generic Item Number"].transform("nunique")
-                generic_pair_count = all_pairs.groupby(
-                    "Generic Item Number", dropna=False
-                )["_GTIN Identity"].transform("nunique")
-                all_pairs = all_pairs[
-                    gtin_pair_count.eq(1) & generic_pair_count.eq(1)
-                ].copy()
-
-                resolved = identity_edges.merge(
-                    all_pairs,
-                    on=["_GTIN Identity", "_Drug Identity", "Generic Item Number"],
-                    how="inner",
-                    validate="many_to_one",
-                )
-                resolved = resolved.drop_duplicates(
-                    subset=self.SFDA_KEYS + ["Generic Item Number"],
-                    keep="first",
-                )
+            resolved = resolved.drop_duplicates(
+                subset=self.SFDA_KEYS + ["Generic Item Number"],
+                keep="first",
+            )
 
         resolved_columns = self.SFDA_KEYS + ["Generic Item Number"] + [
             column for column in sfda_columns if column not in self.SFDA_KEYS
