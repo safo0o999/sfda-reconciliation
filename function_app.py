@@ -3636,49 +3636,36 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             from engine.database import (
                 append_events,
                 get_dispatch_confirmed_history_records,
-                get_event_summaries,
-                get_history_summaries,
-                replace_batch_master,
-                replace_customer_history,
+                refresh_dispatch_history_incremental,
                 replace_dispatch_sfda_baseline,
                 replace_latest_sfda_snapshot,
-                replace_supplier_history,
                 save_dispatch_pending_transactions,
             )
-            from engine.full_reconciliation import FullReconciliationEngine
 
-            # Synchronize only confirmations already proven by the SFDA delta.
+            # Only SFDA-confirmed quantities may enter cumulative dispatch
+            # history.  Crucially, Daily Dispatch no longer rebuilds the full
+            # Batch Master / Supplier History / Customer History.
             confirmed_history_rows = get_dispatch_confirmed_history_records()
             inserted = append_events([], confirmed_history_rows)
-            history_engine = FullReconciliationEngine(
-                pd.DataFrame(), pd.DataFrame(), sfda_df
+
+            history_refresh = refresh_dispatch_history_incremental(
+                confirmed_history_rows if int(inserted.get("dispatch_events", 0)) > 0 else []
             )
-            prepared_sfda = history_engine.prepare_incremental()["sfda_summary"]
-            receipt_summary, dispatch_summary = get_event_summaries()
-            master = history_engine.build_master_from_summaries(
-                receipt_summary, dispatch_summary, prepared_sfda
-            )
-            replace_batch_master(master)
-            supplier_summary, customer_summary = get_history_summaries()
-            supplier_history = history_engine.build_supplier_history(
-                supplier_summary, master
-            )
-            customer_history = history_engine.build_customer_history(
-                customer_summary, master
-            )
-            replace_supplier_history(supplier_history)
-            replace_customer_history(customer_history)
             sfda_snapshot_rows = replace_latest_sfda_snapshot(sfda_df, sfda_name)
 
             historical_update = {
                 "receipt_events_added": 0,
                 "dispatch_events_added": int(inserted.get("dispatch_events", 0)),
-                "batch_master_rows": int(len(master)),
-                "supplier_history_rows": int(len(supplier_history)),
-                "customer_history_rows": int(len(customer_history)),
+                "batch_master_rows": int(history_refresh.get("batch_master_rows", 0)),
+                "supplier_history_rows": int(history_refresh.get("supplier_history_rows", 0)),
+                "customer_history_rows": int(history_refresh.get("customer_history_rows", 0)),
+                "batch_master_rows_updated": int(history_refresh.get("batch_master_rows_updated", 0)),
+                "customer_history_rows_rebuilt": int(history_refresh.get("customer_history_rows_rebuilt", 0)),
+                "affected_batch_keys": int(history_refresh.get("affected_batch_keys", 0)),
                 "sfda_snapshot_rows": int(sfda_snapshot_rows),
                 "source_file": sfda_name,
                 "confirmation_only": True,
+                "incremental_history_refresh": True,
             }
 
             pending_rows = result.get(
@@ -3691,9 +3678,11 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
                     run_number,
                 )
 
-            # Store the current SFDA state as the proof baseline for the next
-            # Dispatch run.  This does not alter Batch Master quantities.
-            replace_dispatch_sfda_baseline(sfda_df, sfda_name)
+            # confirm_dispatch_transactions_from_sfda() already advances the
+            # baseline when a prior baseline exists.  Write it here only on
+            # the first Dispatch run, avoiding a duplicate full baseline save.
+            if not dispatch_confirmation.get("baseline_available", False):
+                replace_dispatch_sfda_baseline(sfda_df, sfda_name)
 
         summary.update(
             {
