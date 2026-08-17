@@ -768,7 +768,10 @@ class FullReconciliationEngine:
             ].copy()
 
             # Do not create a fallback mapping if either side already has a
-            # different strong historical identity.
+            # different strong historical identity.  Keep this fully
+            # vectorized: historical builds can contain hundreds of thousands
+            # of candidate rows and DataFrame.apply(axis=1) becomes a major
+            # CPU bottleneck.
             if not proven_pairs.empty and not single.empty:
                 proven_gtin_to_generic = dict(zip(
                     proven_pairs["_GTIN Identity"],
@@ -778,17 +781,23 @@ class FullReconciliationEngine:
                     proven_pairs["Generic Item Number"],
                     proven_pairs["_GTIN Identity"],
                 ))
-                single = single[
-                    single.apply(
-                        lambda row: (
-                            proven_gtin_to_generic.get(row["_GTIN Identity"], row["Generic Item Number"])
-                            == row["Generic Item Number"]
-                            and proven_generic_to_gtin.get(row["Generic Item Number"], row["_GTIN Identity"])
-                            == row["_GTIN Identity"]
-                        ),
-                        axis=1,
-                    )
-                ].copy()
+
+                mapped_generic = single["_GTIN Identity"].map(
+                    proven_gtin_to_generic
+                )
+                mapped_gtin = single["Generic Item Number"].map(
+                    proven_generic_to_gtin
+                )
+
+                gtin_side_ok = (
+                    mapped_generic.isna()
+                    | mapped_generic.eq(single["Generic Item Number"])
+                )
+                generic_side_ok = (
+                    mapped_gtin.isna()
+                    | mapped_gtin.eq(single["_GTIN Identity"])
+                )
+                single = single[gtin_side_ok & generic_side_ok].copy()
 
             fallback_pairs = single[[
                 "_GTIN Identity", "_Drug Identity", "Generic Item Number"
