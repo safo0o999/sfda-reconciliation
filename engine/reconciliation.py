@@ -130,6 +130,14 @@ class ReconciliationEngine:
         master = master.loc[
             master["Generic Item Number"].ne("") & master["GTIN"].ne("")
         ].copy()
+
+        # Only exact Batch Master rows that were proven by BN + Expiry Month
+        # against SFDA may establish the daily Generic <-> GTIN authority.
+        # Rows marked "Missing Batch in SFDA" inherit identity for reporting,
+        # but inherited identity must never become new proof on a later run.
+        if "Generic Exists in SFDA" in master.columns:
+            exact_status = Normalizer.text(master["Generic Exists in SFDA"])
+            master = master.loc[exact_status.eq("YES")].copy()
         if master.empty:
             return pd.DataFrame(columns=["Generic Item Number", "_Proven GTIN", "_Proven Drug Name"])
 
