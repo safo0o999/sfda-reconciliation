@@ -4138,6 +4138,452 @@ def get_dispatch_confirmed_history_records() -> List[Dict[str, Any]]:
     return records
 
 
+def refresh_accept_history_incremental(
+    receipt_history_rows: List[Dict[str, Any]],
+    sfda_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    """Refresh only historical rows affected by one successful Daily Accept.
+
+    Daily Accept must not rebuild the complete historical database. ReceiptEvents
+    remain the durable source of truth; only BN + expiry-month + Generic keys
+    represented by the uploaded ASN are recalculated here.
+
+    Batch Master includes physical receipt classes TRK5060, TRK800 and TRK49.
+    SupplierHistory remains TRK5060-only. CustomerHistory is intentionally
+    untouched because an Accept run cannot change customer dispatch history.
+    """
+    initialize_database()
+    started_at = time.perf_counter()
+
+    def _eligible_physical_receipt(row: Dict[str, Any]) -> bool:
+        shipment = str(row.get("Inbound Shipment") or "").strip().upper()
+        return (
+            shipment.startswith("TRK5060")
+            or shipment.startswith("TRK800")
+            or shipment.startswith("TRK49")
+        )
+
+    affected = sorted({
+        (
+            str(row.get("BN") or "").strip(),
+            str(row.get("Expiry Month Key") or "").strip(),
+            str(row.get("Generic Item Number") or "").strip(),
+        )
+        for row in (receipt_history_rows or [])
+        if _eligible_physical_receipt(row)
+        and str(row.get("BN") or "").strip()
+        and str(row.get("Expiry Month Key") or "").strip()
+        and str(row.get("Generic Item Number") or "").strip()
+    })
+
+    from engine.full_reconciliation import FullReconciliationEngine
+    from engine.normalizer import Normalizer
+
+    current_sfda = Normalizer.normalize_sfda(
+        sfda_df.copy() if sfda_df is not None else pd.DataFrame()
+    )
+    if not current_sfda.empty:
+        current_sfda["Expiry Month Key"] = FullReconciliationEngine._month_key(
+            current_sfda["Expiry Date"]
+        )
+        for column in [
+            "Quantity", "Active", "Quantity sent pending",
+            "Quantity Receive Pending",
+        ]:
+            current_sfda[column] = pd.to_numeric(
+                current_sfda[column], errors="coerce"
+            ).fillna(0)
+
+    sfda_rows = [
+        (
+            _text(row, "GTIN"),
+            _text(row, "Drug Name"),
+            _text(row, "BN"),
+            _text(row, "Expiry Month Key"),
+            _value(row, "Expiry Date"),
+            _number(row, "Quantity"),
+            _number(row, "Active"),
+            _number(row, "Quantity sent pending"),
+            _number(row, "Quantity Receive Pending"),
+        )
+        for row in current_sfda.to_dict(orient="records")
+        if _text(row, "BN") and _text(row, "Expiry Month Key")
+    ]
+
+    if not affected:
+        with Database().connect() as connection:
+            counts = connection.cursor().execute(
+                r"""
+                SELECT
+                    (SELECT COUNT_BIG(*) FROM dbo.BatchMaster),
+                    (SELECT COUNT_BIG(*) FROM dbo.SupplierHistory),
+                    (SELECT COUNT_BIG(*) FROM dbo.CustomerHistory);
+                """
+            ).fetchone()
+        return {
+            "affected_batch_keys": 0,
+            "batch_master_rows_updated": 0,
+            "batch_master_rows_inserted": 0,
+            "supplier_history_rows_rebuilt": 0,
+            "batch_master_rows": int(counts[0] or 0),
+            "supplier_history_rows": int(counts[1] or 0),
+            "customer_history_rows": int(counts[2] or 0),
+        }
+
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(r"""
+                CREATE TABLE #AffectedAcceptKeys
+                (
+                    BN nvarchar(255) NOT NULL,
+                    ExpiryMonthKey nvarchar(20) NOT NULL,
+                    GenericItemNumber nvarchar(255) NOT NULL,
+                    PRIMARY KEY (BN, ExpiryMonthKey, GenericItemNumber)
+                );
+            """)
+            cursor.fast_executemany = True
+            cursor.executemany(
+                "INSERT INTO #AffectedAcceptKeys (BN, ExpiryMonthKey, GenericItemNumber) VALUES (?, ?, ?);",
+                affected,
+            )
+
+            cursor.execute(r"""
+                CREATE TABLE #CurrentAcceptSFDA
+                (
+                    GTIN nvarchar(255) NULL,
+                    DrugName nvarchar(500) NULL,
+                    BN nvarchar(255) NOT NULL,
+                    ExpiryMonthKey nvarchar(20) NOT NULL,
+                    ExpiryDate date NULL,
+                    Quantity decimal(38, 6) NULL,
+                    Active decimal(38, 6) NULL,
+                    QuantitySentPending decimal(38, 6) NULL,
+                    QuantityReceivePending decimal(38, 6) NULL
+                );
+            """)
+            if sfda_rows:
+                cursor.executemany(
+                    r"""
+                    INSERT INTO #CurrentAcceptSFDA
+                    (GTIN, DrugName, BN, ExpiryMonthKey, ExpiryDate, Quantity,
+                     Active, QuantitySentPending, QuantityReceivePending)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    sfda_rows,
+                )
+
+            # Aggregate only the affected physical receipt keys.
+            cursor.execute(r"""
+                ;WITH ReceiptAggregate AS
+                (
+                    SELECT
+                        r.BN,
+                        r.ExpiryMonthKey,
+                        r.GenericItemNumber,
+                        MAX(r.ExpiryDate) AS ExpiryDate,
+                        MAX(NULLIF(r.TradeItemNumber, N'')) AS TradeItemNumber,
+                        MAX(NULLIF(r.TradeName, N'')) AS TradeName,
+                        MAX(NULLIF(r.Description, N'')) AS Description,
+                        MAX(NULLIF(r.ItemFamilyGroup, N'')) AS ItemFamilyGroup,
+                        MAX(NULLIF(r.SupplierName, N'')) AS SupplierName,
+                        MAX(NULLIF(r.SupplierCode, N'')) AS SupplierCode,
+                        SUM(COALESCE(r.ReceivedQuantity, 0)) AS TotalReceiveQty,
+                        COUNT_BIG(*) AS ReceiveRuns,
+                        MIN(r.ReceivedDate) AS FirstReceivedDate,
+                        MAX(r.ReceivedDate) AS LastReceivedDate
+                    FROM dbo.ReceiptEvents r
+                    INNER JOIN #AffectedAcceptKeys a
+                        ON a.BN = r.BN
+                       AND a.ExpiryMonthKey = r.ExpiryMonthKey
+                       AND a.GenericItemNumber = r.GenericItemNumber
+                    WHERE
+                        UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK5060%'
+                        OR UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK800%'
+                        OR UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK49%'
+                    GROUP BY r.BN, r.ExpiryMonthKey, r.GenericItemNumber
+                )
+                UPDATE bm
+                SET
+                    bm.ExpiryDate = COALESCE(sf.ExpiryDate, ra.ExpiryDate, bm.ExpiryDate),
+                    bm.TradeItemNumber = COALESCE(NULLIF(ra.TradeItemNumber, N''), bm.TradeItemNumber),
+                    bm.TradeName = COALESCE(NULLIF(ra.TradeName, N''), bm.TradeName),
+                    bm.Description = COALESCE(NULLIF(ra.Description, N''), bm.Description),
+                    bm.ItemFamilyGroup = COALESCE(NULLIF(ra.ItemFamilyGroup, N''), bm.ItemFamilyGroup),
+                    bm.SupplierName = COALESCE(NULLIF(ra.SupplierName, N''), bm.SupplierName),
+                    bm.SupplierCode = COALESCE(NULLIF(ra.SupplierCode, N''), bm.SupplierCode),
+                    bm.TotalReceiveQty = COALESCE(ra.TotalReceiveQty, 0),
+                    bm.ReceiveRuns = COALESCE(ra.ReceiveRuns, 0),
+                    bm.FirstReceivedDate = ra.FirstReceivedDate,
+                    bm.LastReceivedDate = ra.LastReceivedDate,
+                    bm.GTIN = COALESCE(NULLIF(sf.GTIN, N''), bm.GTIN),
+                    bm.DrugName = COALESCE(NULLIF(sf.DrugName, N''), bm.DrugName),
+                    bm.SFDAQuantity = COALESCE(sf.Quantity, bm.SFDAQuantity),
+                    bm.Active = COALESCE(sf.Active, bm.Active),
+                    bm.QuantitySentPending = COALESCE(sf.QuantitySentPending, bm.QuantitySentPending),
+                    bm.QuantityReceivePending = COALESCE(sf.QuantityReceivePending, bm.QuantityReceivePending),
+                    bm.GenericExistsInSFDA = CASE WHEN sf.BN IS NOT NULL THEN N'Yes' ELSE bm.GenericExistsInSFDA END,
+                    bm.LastUpdated = SYSUTCDATETIME()
+                FROM dbo.BatchMaster bm
+                INNER JOIN ReceiptAggregate ra
+                    ON ra.BN = bm.BN
+                   AND ra.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND ra.GenericItemNumber = bm.GenericItemNumber
+                OUTER APPLY
+                (
+                    SELECT TOP (1)
+                        s.BN, s.ExpiryDate, s.GTIN, s.DrugName, s.Quantity, s.Active,
+                        s.QuantitySentPending, s.QuantityReceivePending
+                    FROM #CurrentAcceptSFDA s
+                    WHERE s.BN = bm.BN
+                      AND s.ExpiryMonthKey = bm.ExpiryMonthKey
+                      AND NULLIF(bm.GTIN, N'') IS NOT NULL
+                      AND s.GTIN = bm.GTIN
+                    ORDER BY CASE WHEN s.GTIN = bm.GTIN THEN 0 ELSE 1 END, s.GTIN
+                ) sf;
+            """)
+            batch_updated = max(0, int(cursor.rowcount or 0))
+
+            # Insert newly seen batches only when their Generic already has a
+            # proven identity in Batch Master. This preserves the Generic↔GTIN
+            # authority and prevents BN/expiry collisions from inventing a drug.
+            cursor.execute(r"""
+                ;WITH ReceiptAggregate AS
+                (
+                    SELECT
+                        r.BN,
+                        r.ExpiryMonthKey,
+                        r.GenericItemNumber,
+                        MAX(r.ExpiryDate) AS ExpiryDate,
+                        MAX(NULLIF(r.TradeItemNumber, N'')) AS TradeItemNumber,
+                        MAX(NULLIF(r.TradeName, N'')) AS TradeName,
+                        MAX(NULLIF(r.Description, N'')) AS Description,
+                        MAX(NULLIF(r.ItemFamilyGroup, N'')) AS ItemFamilyGroup,
+                        MAX(NULLIF(r.SupplierName, N'')) AS SupplierName,
+                        MAX(NULLIF(r.SupplierCode, N'')) AS SupplierCode,
+                        SUM(COALESCE(r.ReceivedQuantity, 0)) AS TotalReceiveQty,
+                        COUNT_BIG(*) AS ReceiveRuns,
+                        MIN(r.ReceivedDate) AS FirstReceivedDate,
+                        MAX(r.ReceivedDate) AS LastReceivedDate
+                    FROM dbo.ReceiptEvents r
+                    INNER JOIN #AffectedAcceptKeys a
+                        ON a.BN = r.BN
+                       AND a.ExpiryMonthKey = r.ExpiryMonthKey
+                       AND a.GenericItemNumber = r.GenericItemNumber
+                    WHERE
+                        UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK5060%'
+                        OR UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK800%'
+                        OR UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK49%'
+                    GROUP BY r.BN, r.ExpiryMonthKey, r.GenericItemNumber
+                ),
+                GenericReference AS
+                (
+                    SELECT *
+                    FROM
+                    (
+                        SELECT
+                            bm.GenericItemNumber,
+                            bm.GTIN,
+                            bm.DrugName,
+                            bm.PackageSize,
+                            bm.TradeItemNumber,
+                            bm.TradeName,
+                            ROW_NUMBER() OVER
+                            (
+                                PARTITION BY bm.GenericItemNumber
+                                ORDER BY
+                                    CASE WHEN NULLIF(bm.GTIN, N'') IS NOT NULL THEN 0 ELSE 1 END,
+                                    bm.LastUpdated DESC
+                            ) AS rn
+                        FROM dbo.BatchMaster bm
+                        WHERE NULLIF(bm.GTIN, N'') IS NOT NULL
+                          AND EXISTS
+                        (
+                            SELECT 1
+                            FROM #AffectedAcceptKeys a
+                            WHERE a.GenericItemNumber = bm.GenericItemNumber
+                        )
+                    ) x
+                    WHERE rn = 1
+                ),
+                DispatchAggregate AS
+                (
+                    SELECT
+                        d.BN,
+                        d.ExpiryMonthKey,
+                        d.GenericItemNumber,
+                        SUM(COALESCE(d.DispatchedQuantity, 0)) AS TotalDispatchedQty,
+                        COUNT_BIG(*) AS DispatchRuns,
+                        MIN(d.DispatchDate) AS FirstDispatchDate,
+                        MAX(d.DispatchDate) AS LastDispatchDate
+                    FROM dbo.DispatchEvents d
+                    INNER JOIN #AffectedAcceptKeys a
+                        ON a.BN = d.BN
+                       AND a.ExpiryMonthKey = d.ExpiryMonthKey
+                       AND a.GenericItemNumber = d.GenericItemNumber
+                    GROUP BY d.BN, d.ExpiryMonthKey, d.GenericItemNumber
+                )
+                INSERT INTO dbo.BatchMaster
+                (
+                    BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                    TradeItemNumber, TradeName, GTIN, DrugName, PackageSize,
+                    SFDAQuantity, Active, QuantitySentPending, QuantityReceivePending,
+                    Description, ItemFamilyGroup, SupplierName, SupplierCode,
+                    TotalReceiveQty, TotalDispatchedQty, ReceiveRuns, DispatchRuns,
+                    FirstReceivedDate, LastReceivedDate, FirstDispatchDate, LastDispatchDate,
+                    GenericExistsInSFDA, LastUpdated
+                )
+                SELECT
+                    ra.BN,
+                    ra.ExpiryMonthKey,
+                    COALESCE(sf.ExpiryDate, ra.ExpiryDate),
+                    ra.GenericItemNumber,
+                    COALESCE(NULLIF(ra.TradeItemNumber, N''), gr.TradeItemNumber, N''),
+                    COALESCE(NULLIF(ra.TradeName, N''), gr.TradeName, N''),
+                    COALESCE(NULLIF(sf.GTIN, N''), gr.GTIN, N''),
+                    COALESCE(NULLIF(sf.DrugName, N''), gr.DrugName, N''),
+                    COALESCE(gr.PackageSize, 0),
+                    COALESCE(sf.Quantity, 0),
+                    COALESCE(sf.Active, 0),
+                    COALESCE(sf.QuantitySentPending, 0),
+                    COALESCE(sf.QuantityReceivePending, 0),
+                    COALESCE(ra.Description, N''),
+                    COALESCE(ra.ItemFamilyGroup, N''),
+                    COALESCE(ra.SupplierName, N''),
+                    COALESCE(ra.SupplierCode, N''),
+                    COALESCE(ra.TotalReceiveQty, 0),
+                    COALESCE(da.TotalDispatchedQty, 0),
+                    COALESCE(ra.ReceiveRuns, 0),
+                    COALESCE(da.DispatchRuns, 0),
+                    ra.FirstReceivedDate,
+                    ra.LastReceivedDate,
+                    da.FirstDispatchDate,
+                    da.LastDispatchDate,
+                    CASE WHEN sf.BN IS NOT NULL THEN N'Yes' ELSE N'Missing Batch in SFDA' END,
+                    SYSUTCDATETIME()
+                FROM ReceiptAggregate ra
+                INNER JOIN GenericReference gr
+                    ON gr.GenericItemNumber = ra.GenericItemNumber
+                LEFT JOIN DispatchAggregate da
+                    ON da.BN = ra.BN
+                   AND da.ExpiryMonthKey = ra.ExpiryMonthKey
+                   AND da.GenericItemNumber = ra.GenericItemNumber
+                OUTER APPLY
+                (
+                    SELECT TOP (1)
+                        s.BN, s.ExpiryDate, s.GTIN, s.DrugName, s.Quantity, s.Active,
+                        s.QuantitySentPending, s.QuantityReceivePending
+                    FROM #CurrentAcceptSFDA s
+                    WHERE s.BN = ra.BN
+                      AND s.ExpiryMonthKey = ra.ExpiryMonthKey
+                      AND s.GTIN = gr.GTIN
+                    ORDER BY s.GTIN
+                ) sf
+                WHERE NOT EXISTS
+                (
+                    SELECT 1
+                    FROM dbo.BatchMaster bm
+                    WHERE bm.BN = ra.BN
+                      AND bm.ExpiryMonthKey = ra.ExpiryMonthKey
+                      AND bm.GenericItemNumber = ra.GenericItemNumber
+                );
+            """)
+            batch_inserted = max(0, int(cursor.rowcount or 0))
+
+            # Rebuild SupplierHistory only for the affected batch keys. It stays
+            # strictly TRK5060-only, exactly matching the historical business rule.
+            cursor.execute(r"""
+                DELETE sh
+                FROM dbo.SupplierHistory sh
+                INNER JOIN #AffectedAcceptKeys a
+                    ON a.BN = sh.BN
+                   AND a.ExpiryMonthKey = sh.ExpiryMonthKey
+                   AND a.GenericItemNumber = sh.GenericItemNumber;
+            """)
+
+            cursor.execute(r"""
+                INSERT INTO dbo.SupplierHistory
+                (
+                    SupplierName, SupplierCode, GTIN, DrugName, GenericItemNumber,
+                    Description, TradeDescription, BN, ExpiryMonthKey, ExpiryDate,
+                    PackageSize, ReceivedQuantityEach, ReceivedQuantityPack,
+                    FirstReceivedDate, LastReceivedDate, ItemFamilyGroup,
+                    TradeItemNumber, LastUpdated
+                )
+                SELECT
+                    r.SupplierName,
+                    r.SupplierCode,
+                    bm.GTIN,
+                    bm.DrugName,
+                    r.GenericItemNumber,
+                    COALESCE(NULLIF(MAX(r.Description), N''), bm.Description, N''),
+                    COALESCE(NULLIF(MAX(r.TradeName), N''), bm.TradeName, N''),
+                    r.BN,
+                    r.ExpiryMonthKey,
+                    COALESCE(bm.ExpiryDate, MAX(r.ExpiryDate)),
+                    COALESCE(bm.PackageSize, 0),
+                    SUM(COALESCE(r.ReceivedQuantity, 0)),
+                    CASE
+                        WHEN COALESCE(bm.PackageSize, 0) > 0
+                            THEN SUM(COALESCE(r.ReceivedQuantity, 0)) / bm.PackageSize
+                        ELSE 0
+                    END,
+                    MIN(r.ReceivedDate),
+                    MAX(r.ReceivedDate),
+                    COALESCE(NULLIF(MAX(r.ItemFamilyGroup), N''), bm.ItemFamilyGroup, N''),
+                    COALESCE(NULLIF(MAX(r.TradeItemNumber), N''), bm.TradeItemNumber, N''),
+                    SYSUTCDATETIME()
+                FROM dbo.ReceiptEvents r
+                INNER JOIN #AffectedAcceptKeys a
+                    ON a.BN = r.BN
+                   AND a.ExpiryMonthKey = r.ExpiryMonthKey
+                   AND a.GenericItemNumber = r.GenericItemNumber
+                INNER JOIN dbo.BatchMaster bm
+                    ON bm.BN = r.BN
+                   AND bm.ExpiryMonthKey = r.ExpiryMonthKey
+                   AND bm.GenericItemNumber = r.GenericItemNumber
+                WHERE UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK5060%'
+                GROUP BY
+                    r.SupplierName, r.SupplierCode, r.BN, r.ExpiryMonthKey,
+                    r.GenericItemNumber, bm.GTIN, bm.DrugName, bm.Description,
+                    bm.TradeName, bm.ExpiryDate, bm.PackageSize,
+                    bm.ItemFamilyGroup, bm.TradeItemNumber;
+            """)
+            supplier_rebuilt = max(0, int(cursor.rowcount or 0))
+
+            counts = cursor.execute(
+                r"""
+                SELECT
+                    (SELECT COUNT_BIG(*) FROM dbo.BatchMaster),
+                    (SELECT COUNT_BIG(*) FROM dbo.SupplierHistory),
+                    (SELECT COUNT_BIG(*) FROM dbo.CustomerHistory);
+                """
+            ).fetchone()
+
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    logger.info(
+        "Incremental Daily Accept history refresh completed in %.2f seconds. affected_keys=%s batch_updated=%s batch_inserted=%s supplier_rows=%s",
+        time.perf_counter() - started_at,
+        len(affected),
+        batch_updated,
+        batch_inserted,
+        supplier_rebuilt,
+    )
+    return {
+        "affected_batch_keys": len(affected),
+        "batch_master_rows_updated": batch_updated,
+        "batch_master_rows_inserted": batch_inserted,
+        "supplier_history_rows_rebuilt": supplier_rebuilt,
+        "batch_master_rows": int(counts[0] or 0),
+        "supplier_history_rows": int(counts[1] or 0),
+        "customer_history_rows": int(counts[2] or 0),
+    }
+
+
 def refresh_dispatch_history_incremental(
     confirmed_history_rows: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
