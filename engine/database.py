@@ -2184,6 +2184,40 @@ def reset_current_warehouse_data(
             )
             raise
 
+def _expire_stale_historical_build_jobs(
+    connection,
+    warehouse_id: int,
+) -> int:
+    """Mark abandoned Historical Build rows as Failed so they cannot lock a warehouse forever.
+
+    Historical jobs are expected to update UpdatedAt while progressing. A queue/worker
+    crash can otherwise leave a row permanently in Queued/Running and block Reset or
+    future Historical Builds indefinitely. The timeout is intentionally generous and
+    configurable.
+    """
+    stale_minutes = max(60, int(os.getenv("HISTORICAL_JOB_STALE_MINUTES", "360") or 360))
+    cursor = connection.cursor()
+    cursor.execute(
+        r"""
+        UPDATE dbo.HistoricalBuildJobs
+        SET Status = 'Failed',
+            CurrentStage = 'Expired stale Historical Build lock',
+            ErrorMessage = COALESCE(NULLIF(ErrorMessage, ''),
+                'Historical Build was automatically marked Failed because it stopped updating.'),
+            CompletedAt = COALESCE(CompletedAt, SYSUTCDATETIME()),
+            UpdatedAt = SYSUTCDATETIME()
+        WHERE WarehouseID = ?
+          AND Status IN ('Queued', 'Running')
+          AND COALESCE(UpdatedAt, CreatedAt) < DATEADD(MINUTE, -?, SYSUTCDATETIME());
+        """,
+        (int(warehouse_id), int(stale_minutes)),
+    )
+    expired = int(cursor.rowcount or 0)
+    if expired:
+        connection.commit()
+    return expired
+
+
 def get_active_historical_build_job(warehouse_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """Return the newest genuinely active Historical Build for one warehouse, if any."""
     initialize_database()
