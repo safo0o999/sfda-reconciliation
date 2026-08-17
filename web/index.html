@@ -3523,6 +3523,26 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }
   }
 
+  async function waitForWarehouseResetJob(statusUrl,button){
+    if(!statusUrl) throw new Error("Reset job status URL was not returned.");
+    while(true){
+      await new Promise(resolve=>setTimeout(resolve,2000));
+      const response=await fetch(statusUrl,{cache:"no-store",credentials:"same-origin"});
+      const payload=await response.json().catch(()=>({}));
+      if(response.status===401){await logout();throw new Error("Authentication required.");}
+      if(!response.ok) throw new Error(payload.details||payload.error||`Unable to read reset status (HTTP ${response.status}).`);
+      const job=payload.job||{};
+      const status=String(job.status||"").toLowerCase();
+      const progress=Math.max(0,Math.min(100,Number(job.progress||0)));
+      const stage=String(job.current_stage||"Resetting warehouse data...");
+      if(button){
+        button.textContent=`${stage} ${progress ? `(${progress}%)` : ""}`.trim();
+      }
+      if(status==="completed") return job.result||{};
+      if(status==="failed") throw new Error(job.error||"Warehouse reset failed.");
+    }
+  }
+
   async function resetWarehouseData(){
     const button=$("warehouseResetButton");
     const warehouseName=String(currentUser?.WarehouseName||"this warehouse");
@@ -3550,6 +3570,15 @@ Drug Traceability Reconciliation Platform</textarea></label>
       const payload=await response.json().catch(()=>({}));
       if(response.status===401){await logout();return;}
       if(!response.ok) throw new Error(payload.details||payload.error||"Warehouse reset failed.");
+
+      let resetResult=payload;
+      if(String(payload.status||"").toLowerCase()==="accepted"){
+        if(button) button.textContent="Reset queued...";
+        resetResult=await waitForWarehouseResetJob(payload.status_url,button);
+      }
+      if(!resetResult||String(resetResult.status||"").toLowerCase()==="failed"){
+        throw new Error(resetResult?.details||resetResult?.error||"Warehouse reset failed.");
+      }
 
       const key=dashboardPreviewStorageKey();
       if(key) localStorage.removeItem(key);
@@ -3596,7 +3625,11 @@ Drug Traceability Reconciliation Platform</textarea></label>
       renderHistory();
       renderReports();
 
-      if(failedReloads.length){
+      const resetWarnings=Array.isArray(resetResult?.warnings)?resetResult.warnings:[];
+      if(resetWarnings.length){
+        console.warn("Warehouse reset completed with warnings.",resetWarnings);
+        toast(`${warehouseName} database reset completed. ${resetWarnings.join(" ")}`,"warning");
+      }else if(failedReloads.length){
         console.warn("Warehouse reset completed, but one or more page refreshes failed.",failedReloads);
         toast(`${warehouseName} data was reset. Refresh the page once to reload all views.`,"warning");
       }else{
