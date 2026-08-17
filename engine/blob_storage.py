@@ -352,6 +352,42 @@ class BlobStorage:
         parsed = json.loads(downloaded["data"].decode("utf-8"))
         if not isinstance(parsed, dict):
             raise ValueError("Background job status is invalid.")
+
+        # Reset jobs must heartbeat while running. A Function App restart can
+        # stop the queue invocation while the persisted status blob still says
+        # Running forever. Detect that condition from the blob Last-Modified
+        # timestamp, mark the job Interrupted, and release its reset lock.
+        status = str(parsed.get("status") or "").strip().lower()
+        job_type = str(parsed.get("job_type") or "").strip().lower()
+        if job_type == "warehouse_reset" and status in {"queued", "running"}:
+            stale_minutes = max(
+                2,
+                int(os.getenv("WAREHOUSE_RESET_STALE_MINUTES", "10") or 10),
+            )
+            last_modified = downloaded.get("last_modified")
+            if last_modified is not None:
+                if last_modified.tzinfo is None:
+                    last_modified = last_modified.replace(tzinfo=timezone.utc)
+                age = datetime.now(timezone.utc) - last_modified
+                if age >= timedelta(minutes=stale_minutes):
+                    parsed = {
+                        **parsed,
+                        "status": "Failed",
+                        "progress": 100,
+                        "current_stage": "Reset interrupted or worker restarted",
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "error": (
+                            "Reset stopped updating for "
+                            f"{int(age.total_seconds() // 60)} minute(s). "
+                            "The previous worker is treated as interrupted. "
+                            "It is safe to start Reset again; committed reset batches are idempotent."
+                        ),
+                    }
+                    self.write_background_job_status(job_id, parsed)
+                    try:
+                        self.clear_warehouse_reset_lock(job_id, force=True)
+                    except Exception:
+                        logger.exception("Unable to clear stale warehouse reset lock for %s", job_id)
         return parsed
 
     def list_active_background_jobs(
@@ -425,6 +461,20 @@ class BlobStorage:
         except Exception:
             logger.exception("Invalid warehouse reset lock payload; treating it as active for safety.")
             return {"status": "Active", "job_id": "unknown"}
+
+        # If the owning Reset job was interrupted/restarted, release the lock
+        # immediately instead of keeping the warehouse blocked for hours.
+        lock_job_id = str(payload.get("job_id") or "").strip()
+        if lock_job_id:
+            try:
+                job = self.read_background_job_status(lock_job_id)
+                if str(job.get("status") or "").strip().lower() not in {"queued", "running"}:
+                    self.clear_warehouse_reset_lock(lock_job_id, force=True)
+                    return None
+            except FileNotFoundError:
+                pass
+            except Exception:
+                logger.exception("Unable to inspect reset job while evaluating reset lock.")
 
         expires_at = str(payload.get("expires_at") or "").strip()
         if expires_at:
