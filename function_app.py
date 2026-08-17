@@ -3659,11 +3659,12 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
                     run_number,
                 )
 
-            # On the first run there is no proof baseline yet. Store the current
-            # SFDA report only after this Accept run has successfully reached
-            # the persistence stage. On later runs this is idempotent because
-            # confirmation already advanced the baseline before reconciliation.
-            replace_accept_sfda_baseline(sfda_df, sfda_name)
+            # confirm_accept_transactions_from_sfda() already advances the
+            # baseline atomically when a previous baseline exists. Do NOT delete
+            # and reinsert the whole SFDA baseline a second time. Only the first
+            # ever Accept run needs to create the baseline here.
+            if not bool((accept_confirmation or {}).get("baseline_available")):
+                replace_accept_sfda_baseline(sfda_df, sfda_name)
         else:
             from engine.database import (
                 append_events,
