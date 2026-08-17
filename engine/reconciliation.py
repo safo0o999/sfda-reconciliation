@@ -285,8 +285,40 @@ class ReconciliationEngine:
         quantity_column: str,
     ) -> pd.DataFrame:
         result = frame.copy()
-        result["Transaction Key"] = result.apply(
-            lambda row: self._transaction_key(transaction_type, row), axis=1
+
+        # Build transaction identities column-wise instead of DataFrame.apply(axis=1).
+        # Daily ASN files can contain tens/hundreds of thousands of rows; the old
+        # row-wise pandas apply was one of the main Accept CPU bottlenecks.
+        if transaction_type == "ACCEPT":
+            field_names = [
+                "Inbound Shipment", "ASN Line", "BN", "Expiry Date",
+                "Received Date", "Generic Item Number",
+            ]
+        else:
+            field_names = [
+                "Sales Order Number", "Order Line", "BN", "Expiry Date",
+                "To Address", "Dispatch Date", "Generic Item Number",
+            ]
+
+        pieces = []
+        for field_name in field_names:
+            series = result.get(
+                field_name, pd.Series("", index=result.index, dtype=object)
+            )
+            if pd.api.types.is_datetime64_any_dtype(series):
+                text = pd.to_datetime(series, errors="coerce").dt.strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                ).fillna("")
+            else:
+                text = series.map(self._key_value)
+            pieces.append(text.astype(str))
+
+        payload = pieces[0]
+        for piece in pieces[1:]:
+            payload = payload.str.cat(piece, sep="|")
+        prefixed = transaction_type + "|" + payload
+        result["Transaction Key"] = prefixed.map(
+            lambda value: hashlib.sha256(value.encode("utf-8")).hexdigest()
         )
         previous_map = {}
         previous_date_map = {}
