@@ -4356,33 +4356,62 @@ def refresh_accept_history_incremental(
                         OR UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK49%'
                     GROUP BY r.BN, r.ExpiryMonthKey, r.GenericItemNumber
                 ),
+                ExactIdentityRows AS
+                (
+                    SELECT
+                        bm.GenericItemNumber,
+                        bm.GTIN,
+                        bm.DrugName,
+                        bm.PackageSize,
+                        bm.TradeItemNumber,
+                        bm.TradeName,
+                        bm.LastUpdated
+                    FROM dbo.BatchMaster bm
+                    WHERE NULLIF(bm.GTIN, N'') IS NOT NULL
+                      AND UPPER(LTRIM(RTRIM(ISNULL(bm.GenericExistsInSFDA, N'')))) = N'YES'
+                      AND EXISTS
+                    (
+                        SELECT 1
+                        FROM #AffectedAcceptKeys a
+                        WHERE a.GenericItemNumber = bm.GenericItemNumber
+                    )
+                ),
+                TrustedGeneric AS
+                (
+                    SELECT GenericItemNumber
+                    FROM ExactIdentityRows
+                    GROUP BY GenericItemNumber
+                    HAVING COUNT(DISTINCT GTIN) = 1
+                ),
+                TrustedGTIN AS
+                (
+                    SELECT GTIN
+                    FROM ExactIdentityRows
+                    GROUP BY GTIN
+                    HAVING COUNT(DISTINCT GenericItemNumber) = 1
+                ),
                 GenericReference AS
                 (
                     SELECT *
                     FROM
                     (
                         SELECT
-                            bm.GenericItemNumber,
-                            bm.GTIN,
-                            bm.DrugName,
-                            bm.PackageSize,
-                            bm.TradeItemNumber,
-                            bm.TradeName,
+                            e.GenericItemNumber,
+                            e.GTIN,
+                            e.DrugName,
+                            e.PackageSize,
+                            e.TradeItemNumber,
+                            e.TradeName,
                             ROW_NUMBER() OVER
                             (
-                                PARTITION BY bm.GenericItemNumber
-                                ORDER BY
-                                    CASE WHEN NULLIF(bm.GTIN, N'') IS NOT NULL THEN 0 ELSE 1 END,
-                                    bm.LastUpdated DESC
+                                PARTITION BY e.GenericItemNumber
+                                ORDER BY e.LastUpdated DESC
                             ) AS rn
-                        FROM dbo.BatchMaster bm
-                        WHERE NULLIF(bm.GTIN, N'') IS NOT NULL
-                          AND EXISTS
-                        (
-                            SELECT 1
-                            FROM #AffectedAcceptKeys a
-                            WHERE a.GenericItemNumber = bm.GenericItemNumber
-                        )
+                        FROM ExactIdentityRows e
+                        INNER JOIN TrustedGeneric tg
+                            ON tg.GenericItemNumber = e.GenericItemNumber
+                        INNER JOIN TrustedGTIN tgi
+                            ON tgi.GTIN = e.GTIN
                     ) x
                     WHERE rn = 1
                 ),
