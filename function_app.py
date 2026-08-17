@@ -3603,19 +3603,51 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
         # or Customer History.  Only SFDA-confirmed dispatch quantities are
         # synchronized to cumulative history.
         if mode == "accept":
-            historical_update = refresh_historical_data_after_daily_run(
-                mode=mode,
-                asn_df=asn_df,
-                dispatch_df=dispatch_df,
-                sfda_df=sfda_df,
-                asn_file_name=asn_name,
-                dispatch_file_name=dispatch_name,
-                sfda_file_name=sfda_name,
-            )
             from engine.database import (
+                append_events,
+                refresh_accept_history_incremental,
                 replace_accept_sfda_baseline,
+                replace_latest_sfda_snapshot,
                 save_accept_pending_transactions,
             )
+            from engine.full_reconciliation import FullReconciliationEngine
+
+            # Daily Accept keeps every normalized ASN receipt event for audit,
+            # but no longer rebuilds the complete historical database. Only
+            # receipt-affected Batch Master and SupplierHistory keys are
+            # recalculated; CustomerHistory is untouched.
+            history_engine = FullReconciliationEngine(
+                asn_df,
+                pd.DataFrame(),
+                sfda_df,
+            )
+            prepared_history = history_engine.prepare_incremental()
+            receipt_history_rows = prepared_history.get("receipt_records", [])
+            inserted = append_events(receipt_history_rows, [])
+
+            history_refresh = refresh_accept_history_incremental(
+                receipt_history_rows
+                if int(inserted.get("receipt_events", 0)) > 0
+                else [],
+                sfda_df,
+            )
+            sfda_snapshot_rows = replace_latest_sfda_snapshot(sfda_df, sfda_name)
+
+            historical_update = {
+                "receipt_events_added": int(inserted.get("receipt_events", 0)),
+                "dispatch_events_added": 0,
+                "batch_master_rows": int(history_refresh.get("batch_master_rows", 0)),
+                "supplier_history_rows": int(history_refresh.get("supplier_history_rows", 0)),
+                "customer_history_rows": int(history_refresh.get("customer_history_rows", 0)),
+                "batch_master_rows_updated": int(history_refresh.get("batch_master_rows_updated", 0)),
+                "batch_master_rows_inserted": int(history_refresh.get("batch_master_rows_inserted", 0)),
+                "supplier_history_rows_rebuilt": int(history_refresh.get("supplier_history_rows_rebuilt", 0)),
+                "affected_batch_keys": int(history_refresh.get("affected_batch_keys", 0)),
+                "sfda_snapshot_rows": int(sfda_snapshot_rows),
+                "source_file": asn_name,
+                "incremental_history_refresh": True,
+            }
+
 
             pending_rows = result.get(
                 "pending_confirmation_transactions",
