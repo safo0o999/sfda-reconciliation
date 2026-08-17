@@ -2325,6 +2325,41 @@ def reset_current_warehouse_data(warehouse_id: Optional[int] = None) -> Dict[str
         },
     }
 
+def get_active_historical_build_job(warehouse_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """Return the newest active Historical Build for one warehouse, if any."""
+    initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+
+    resolved_warehouse_id = int(warehouse_id or current_warehouse_id())
+    if resolved_warehouse_id < 1:
+        raise RuntimeError("A valid WarehouseID is required.")
+
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        row = cursor.execute(
+            r"""
+            SELECT TOP (1) JobID, Operation, Status, Progress, CurrentStage, CreatedAt, UpdatedAt
+            FROM dbo.HistoricalBuildJobs
+            WHERE WarehouseID = ?
+              AND Status IN ('Queued', 'Running')
+            ORDER BY CreatedAt DESC;
+            """,
+            resolved_warehouse_id,
+        ).fetchone()
+
+    if not row:
+        return None
+    return {
+        "JobID": str(row[0] or ""),
+        "Operation": str(row[1] or ""),
+        "Status": str(row[2] or ""),
+        "Progress": int(row[3] or 0),
+        "CurrentStage": str(row[4] or ""),
+        "CreatedAt": row[5],
+        "UpdatedAt": row[6],
+    }
+
+
 def create_historical_build_job(
     job_id: str,
     operation: str,
