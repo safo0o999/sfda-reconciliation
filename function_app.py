@@ -3404,7 +3404,25 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
                         "error": "",
                     },
                 )
-                database_result = reset_current_warehouse_data(warehouse_id=warehouse_id)
+                def _reset_progress(progress: int, stage: str, extra: Dict[str, Any]) -> None:
+                    storage.write_background_job_status(
+                        job_id,
+                        {
+                            **base_status,
+                            "status": "Running",
+                            "progress": max(30, min(int(progress), 72)),
+                            "current_stage": str(stage),
+                            "started_at": started_at,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                            "result": {"database_progress": dict(extra or {})},
+                            "error": "",
+                        },
+                    )
+
+                database_result = reset_current_warehouse_data(
+                    warehouse_id=warehouse_id,
+                    progress_callback=_reset_progress,
+                )
 
                 storage.write_background_job_status(
                     job_id,
