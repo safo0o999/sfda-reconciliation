@@ -23,6 +23,8 @@ logger = logging.getLogger("SFDA-Reconciliation")
 APPLICATION_NAME = "SFDA Reconciliation"
 APPLICATION_VERSION = "6.0.0"
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
+_PROCESS_STARTED_AT = datetime.now(timezone.utc)
+_RESET_ENGINE_VERSION = "WAREHOUSE_RESET_V6_FAST"
 
 
 _VARIANCE_CACHE: Dict[int, Dict[str, Any]] = {}
@@ -959,6 +961,101 @@ def dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
         return error_response("Dashboard summary failed.", 500, str(exc))
 
 
+@app.route(route="warehouse-data/reset/recover", methods=["POST"])
+def warehouse_data_reset_recover_route(req: func.HttpRequest) -> func.HttpResponse:
+    """Recover a reset lock left by a worker that existed before this Function process started."""
+    denied = _auth_guard(req)
+    if denied:
+        return denied
+
+    try:
+        payload = req.get_json() or {}
+        if str(payload.get("confirm") or "").strip().upper() != "RECOVER_RESET":
+            return error_response(
+                "Reset recovery confirmation is required.",
+                400,
+                "Send {confirm: 'RECOVER_RESET'} only after restarting the Function App.",
+            )
+
+        user = _current_user(req) or {}
+        warehouse_id = int(user.get("WarehouseID") or 0)
+        warehouse_name = str(user.get("WarehouseName") or f"Warehouse {warehouse_id}")
+        if warehouse_id < 1:
+            return error_response("A valid warehouse is required.", 400)
+
+        from engine.blob_storage import BlobStorage, METADATA_CONTAINER
+        from engine.warehouse_context import warehouse_scope
+
+        with warehouse_scope(warehouse_id, warehouse_name):
+            storage = BlobStorage()
+            storage.initialize_containers()
+            active_lock = storage.read_warehouse_reset_lock()
+            if not active_lock:
+                return json_response({
+                    "status": "Success",
+                    "message": "No active reset lock exists.",
+                    "warehouse_id": warehouse_id,
+                })
+
+            active_job_id = str(active_lock.get("job_id") or "").strip()
+            if not active_job_id:
+                storage.clear_warehouse_reset_lock(force=True)
+                return json_response({
+                    "status": "Success",
+                    "message": "Invalid reset lock was cleared.",
+                    "warehouse_id": warehouse_id,
+                })
+
+            safe_job_id = storage.sanitize_file_name(active_job_id)
+            status_blob_name = storage.scoped_blob_name(f"background-jobs/{safe_job_id}.json")
+            try:
+                downloaded = storage.download_blob(METADATA_CONTAINER, status_blob_name)
+                status_payload = json.loads(downloaded["data"].decode("utf-8"))
+                last_modified = downloaded.get("last_modified")
+            except FileNotFoundError:
+                status_payload = {}
+                last_modified = None
+
+            # Recovery is allowed only when the current Function process started
+            # AFTER the abandoned reset status was last updated. This makes the
+            # operation safe after a real Function App restart and prevents a user
+            # from cancelling a reset that is still executing in the same process.
+            if last_modified is not None:
+                if last_modified.tzinfo is None:
+                    last_modified = last_modified.replace(tzinfo=timezone.utc)
+                if last_modified >= _PROCESS_STARTED_AT:
+                    return error_response(
+                        "The reset may still be running in this Function process.",
+                        409,
+                        "Restart the Function App first, then use Reset again. Recovery is intentionally blocked while the owning process may still be alive.",
+                    )
+
+            interrupted = {
+                **(status_payload if isinstance(status_payload, dict) else {}),
+                "job_id": active_job_id,
+                "job_type": "warehouse_reset",
+                "reset_engine_version": str((status_payload or {}).get("reset_engine_version") or "legacy"),
+                "status": "Failed",
+                "progress": 100,
+                "current_stage": "Previous reset recovered after Function App restart",
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "error": "Previous reset worker was interrupted by a Function App restart. The warehouse lock was released and Reset can be started again safely.",
+            }
+            storage.write_background_job_status(active_job_id, interrupted)
+            storage.clear_warehouse_reset_lock(active_job_id, force=True)
+
+            return json_response({
+                "status": "Success",
+                "message": "Previous reset was marked interrupted and its lock was released.",
+                "recovered_job_id": active_job_id,
+                "warehouse_id": warehouse_id,
+                "warehouse_name": warehouse_name,
+            })
+    except Exception as exc:
+        logger.exception("Warehouse reset recovery failed")
+        return error_response("Unable to recover the previous warehouse reset.", 500, str(exc))
+
+
 @app.route(route="warehouse-data/reset", methods=["POST"])
 def warehouse_data_reset_route(req: func.HttpRequest) -> func.HttpResponse:
     """Queue a destructive warehouse reset and return immediately."""
@@ -1028,6 +1125,7 @@ def warehouse_data_reset_route(req: func.HttpRequest) -> func.HttpResponse:
                 {
                     "job_id": job_id,
                     "job_type": "warehouse_reset",
+                    "reset_engine_version": _RESET_ENGINE_VERSION,
                     "status": "Queued",
                     "progress": 5,
                     "current_stage": "Reset queued; waiting for background worker",
@@ -3369,6 +3467,7 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
         base_status = {
             "job_id": job_id,
             "job_type": job_type,
+            **({"reset_engine_version": _RESET_ENGINE_VERSION} if job_type == "warehouse_reset" else {}),
             "submitted_by": submitted_by,
             "warehouse_id": warehouse_id,
             "warehouse_name": warehouse_name or f"Warehouse {warehouse_id}",
