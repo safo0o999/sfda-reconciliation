@@ -3495,15 +3495,13 @@ def confirm_accept_transactions_from_sfda(
     sfda_df: pd.DataFrame,
     source_file_name: str = "",
 ) -> Dict[str, Any]:
-    """Confirm prior Accept submissions only when SFDA proves the movement.
+    """Confirm prior Accept submissions from SFDA, optimized for large runs.
 
-    For each BN + Expiry Month, confirmed packs are the conservative minimum of:
-      * the decrease in Quantity Receive Pending, and
-      * the corresponding increase in Active.
-
-    The evidence is allocated to previously submitted, still-unconfirmed ASN
-    transaction identities. The baseline is advanced in the same SQL
-    transaction so the same SFDA delta can never be applied twice.
+    Confirmation grain is BN + expiry month.  All still-open Accept transactions
+    are read once, evidence is allocated in memory, and SQL updates are sent as
+    one executemany batch.  The previous implementation issued one SELECT and
+    many UPDATE round-trips per confirmed batch, which became very slow when a
+    new SFDA report confirmed many batches at once.
     """
     initialize_database()
     current = _prepare_accept_sfda_state(sfda_df)
@@ -3529,54 +3527,67 @@ def confirm_accept_transactions_from_sfda(
                 "confirmed_batches": 0,
             }
 
-        # SQL DATE values are returned by pyodbc/pandas as Python date/object
-        # values, while the freshly normalized SFDA file uses datetime64[ns].
-        # Normalize both sides to the exact same merge-key types before
-        # comparing the previous SFDA baseline with the newly uploaded report.
-        previous["BN"] = previous["BN"].fillna("").astype(str).str.strip()
-        current["BN"] = current["BN"].fillna("").astype(str).str.strip()
-        previous["Expiry Date"] = pd.to_datetime(
-            previous["Expiry Date"],
-            errors="coerce",
-        ).dt.normalize()
-        current["Expiry Date"] = pd.to_datetime(
-            current["Expiry Date"],
-            errors="coerce",
-        ).dt.normalize()
+        for frame in (previous, current):
+            frame["BN"] = frame["BN"].fillna("").astype(str).str.strip()
+            frame["Expiry Month Key"] = pd.to_datetime(
+                frame["Expiry Date"], errors="coerce"
+            ).dt.strftime("%Y-%m").fillna("")
 
-        comparison = previous.merge(
-            current,
-            on=["BN", "Expiry Date"],
-            how="inner",
-            suffixes=(" Previous", " Current"),
+        previous_month = (
+            previous.groupby(["BN", "Expiry Month Key"], dropna=False)
+            .agg(
+                **{
+                    "Active Previous": ("Active", "sum"),
+                    "Quantity Receive Pending Previous": (
+                        "Quantity Receive Pending", "sum"
+                    ),
+                }
+            )
+            .reset_index()
         )
-        if comparison.empty:
-            evidence_rows = []
-        else:
+        current_month = (
+            current.groupby(["BN", "Expiry Month Key"], dropna=False)
+            .agg(
+                **{
+                    "Active Current": ("Active", "sum"),
+                    "Quantity Receive Pending Current": (
+                        "Quantity Receive Pending", "sum"
+                    ),
+                }
+            )
+            .reset_index()
+        )
+        comparison = previous_month.merge(
+            current_month,
+            on=["BN", "Expiry Month Key"],
+            how="inner",
+            validate="one_to_one",
+        )
+
+        if not comparison.empty:
             comparison["Pending Decrease"] = (
                 pd.to_numeric(
-                    comparison["Quantity Receive Pending Previous"],
-                    errors="coerce",
+                    comparison["Quantity Receive Pending Previous"], errors="coerce"
                 ).fillna(0)
                 - pd.to_numeric(
-                    comparison["Quantity Receive Pending Current"],
-                    errors="coerce",
+                    comparison["Quantity Receive Pending Current"], errors="coerce"
                 ).fillna(0)
             ).clip(lower=0)
             comparison["Active Increase"] = (
-                pd.to_numeric(
-                    comparison["Active Current"], errors="coerce"
-                ).fillna(0)
-                - pd.to_numeric(
-                    comparison["Active Previous"], errors="coerce"
-                ).fillna(0)
+                pd.to_numeric(comparison["Active Current"], errors="coerce").fillna(0)
+                - pd.to_numeric(comparison["Active Previous"], errors="coerce").fillna(0)
             ).clip(lower=0)
             comparison["Confirmed Pack Evidence"] = comparison[
                 ["Pending Decrease", "Active Increase"]
             ].min(axis=1)
-            evidence_rows = comparison.loc[
-                comparison["Confirmed Pack Evidence"].gt(0)
-            ].to_dict(orient="records")
+            evidence = comparison.loc[
+                comparison["Confirmed Pack Evidence"].gt(0),
+                ["BN", "Expiry Month Key", "Confirmed Pack Evidence"],
+            ].copy()
+        else:
+            evidence = pd.DataFrame(
+                columns=["BN", "Expiry Month Key", "Confirmed Pack Evidence"]
+            )
 
         cursor = connection.cursor()
         confirmed_pack_total = 0.0
@@ -3585,70 +3596,90 @@ def confirm_accept_transactions_from_sfda(
         confirmed_batches = 0
 
         try:
-            for evidence in evidence_rows:
-                bn = _text(evidence, "BN")
-                expiry = _value(evidence, "Expiry Date")
-                remaining_pack = max(
-                    0.0, _number(evidence, "Confirmed Pack Evidence")
-                )
-                if remaining_pack <= 0:
-                    continue
-
-                pending_rows = cursor.execute(
+            updates: List[Tuple[float, float, str]] = []
+            if not evidence.empty:
+                open_rows = pd.read_sql(
                     r"""
                     SELECT
                         TransactionKey,
-                        SubmittedQuantityEach, ConfirmedQuantityEach,
-                        SubmittedQuantityPack, ConfirmedQuantityPack
-                    FROM dbo.DailyAcceptTransactions WITH (UPDLOCK, HOLDLOCK)
-                    WHERE BN = ?
-                      AND YEAR(ExpiryDate) = YEAR(?)
-                      AND MONTH(ExpiryDate) = MONTH(?)
-                      AND SubmittedQuantityPack > ConfirmedQuantityPack
+                        BN,
+                        ExpiryMonthKey,
+                        SubmittedQuantityEach,
+                        ConfirmedQuantityEach,
+                        SubmittedQuantityPack,
+                        ConfirmedQuantityPack,
+                        CreatedAt
+                    FROM dbo.DailyAcceptTransactions
+                    WHERE SubmittedQuantityPack > ConfirmedQuantityPack
                     ORDER BY CreatedAt, TransactionKey;
                     """,
-                    (bn, expiry, expiry),
-                ).fetchall()
+                    connection,
+                )
 
-                batch_confirmed = 0.0
-                for pending in pending_rows:
-                    if remaining_pack <= 0.0000001:
-                        break
-                    transaction_key = str(pending[0])
-                    submitted_each = float(pending[1] or 0)
-                    confirmed_each = float(pending[2] or 0)
-                    submitted_pack = float(pending[3] or 0)
-                    confirmed_pack = float(pending[4] or 0)
-                    open_pack = max(0.0, submitted_pack - confirmed_pack)
-                    open_each = max(0.0, submitted_each - confirmed_each)
-                    if open_pack <= 0:
-                        continue
-
-                    allocate_pack = min(remaining_pack, open_pack)
-                    each_per_pack = open_each / open_pack if open_pack > 0 else 0
-                    allocate_each = min(open_each, allocate_pack * each_per_pack)
-
-                    cursor.execute(
-                        r"""
-                        UPDATE dbo.DailyAcceptTransactions
-                        SET ConfirmedQuantityPack = ConfirmedQuantityPack + ?,
-                            ConfirmedQuantityEach = ConfirmedQuantityEach + ?,
-                            LastConfirmedAt = SYSUTCDATETIME(),
-                            UpdatedAt = SYSUTCDATETIME()
-                        WHERE TransactionKey = ?;
-                        """,
-                        (allocate_pack, allocate_each, transaction_key),
+                if not open_rows.empty:
+                    open_rows["BN"] = open_rows["BN"].fillna("").astype(str).str.strip()
+                    open_rows["ExpiryMonthKey"] = (
+                        open_rows["ExpiryMonthKey"].fillna("").astype(str).str.strip()
                     )
-                    remaining_pack -= allocate_pack
-                    batch_confirmed += allocate_pack
-                    confirmed_pack_total += allocate_pack
-                    confirmed_each_total += allocate_each
-                    confirmed_transaction_keys.add(transaction_key)
+                    grouped_open = {
+                        (str(bn), str(month)): group
+                        for (bn, month), group in open_rows.groupby(
+                            ["BN", "ExpiryMonthKey"], sort=False, dropna=False
+                        )
+                    }
 
-                if batch_confirmed > 0:
-                    confirmed_batches += 1
+                    for ev in evidence.to_dict(orient="records"):
+                        bn = str(ev.get("BN") or "").strip()
+                        month = str(ev.get("Expiry Month Key") or "").strip()
+                        remaining_pack = max(
+                            0.0, float(ev.get("Confirmed Pack Evidence") or 0)
+                        )
+                        if remaining_pack <= 0:
+                            continue
+                        pending_group = grouped_open.get((bn, month))
+                        if pending_group is None or pending_group.empty:
+                            continue
 
-            # Advance the proof baseline atomically with the confirmations.
+                        batch_confirmed = 0.0
+                        for pending in pending_group.itertuples(index=False):
+                            if remaining_pack <= 0.0000001:
+                                break
+                            transaction_key = str(pending.TransactionKey)
+                            submitted_each = float(pending.SubmittedQuantityEach or 0)
+                            confirmed_each = float(pending.ConfirmedQuantityEach or 0)
+                            submitted_pack = float(pending.SubmittedQuantityPack or 0)
+                            confirmed_pack = float(pending.ConfirmedQuantityPack or 0)
+                            open_pack = max(0.0, submitted_pack - confirmed_pack)
+                            open_each = max(0.0, submitted_each - confirmed_each)
+                            if open_pack <= 0:
+                                continue
+                            allocate_pack = min(remaining_pack, open_pack)
+                            each_per_pack = open_each / open_pack if open_pack > 0 else 0
+                            allocate_each = min(open_each, allocate_pack * each_per_pack)
+                            updates.append((allocate_pack, allocate_each, transaction_key))
+                            remaining_pack -= allocate_pack
+                            batch_confirmed += allocate_pack
+                            confirmed_pack_total += allocate_pack
+                            confirmed_each_total += allocate_each
+                            confirmed_transaction_keys.add(transaction_key)
+
+                        if batch_confirmed > 0:
+                            confirmed_batches += 1
+
+            if updates:
+                cursor.fast_executemany = True
+                cursor.executemany(
+                    r"""
+                    UPDATE dbo.DailyAcceptTransactions
+                    SET ConfirmedQuantityPack = ConfirmedQuantityPack + ?,
+                        ConfirmedQuantityEach = ConfirmedQuantityEach + ?,
+                        LastConfirmedAt = SYSUTCDATETIME(),
+                        UpdatedAt = SYSUTCDATETIME()
+                    WHERE TransactionKey = ?;
+                    """,
+                    updates,
+                )
+
             _replace_accept_sfda_baseline_with_connection(
                 connection, current, source_file_name
             )
