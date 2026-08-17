@@ -1302,6 +1302,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   const WAREHOUSE_GLN_STATUS_URL = "/api/warehouse-gln/status";
   const WAREHOUSE_GLN_UPLOAD_URL = "/api/warehouse-gln/upload";
   const WAREHOUSE_RESET_URL = "/api/warehouse-data/reset";
+  const WAREHOUSE_RESET_RECOVER_URL = "/api/warehouse-data/reset/recover";
   const DASHBOARD_PREVIEW_KEY_PREFIX = "sfda_dashboard_preview_v3_w";
   const LEGACY_DASHBOARD_PREVIEW_KEY = "sfda_dashboard_preview_v2";
   let currentResult = null;
@@ -3569,7 +3570,40 @@ Drug Traceability Reconciliation Platform</textarea></label>
       });
       const payload=await response.json().catch(()=>({}));
       if(response.status===401){await logout();return;}
-      if(!response.ok) throw new Error(payload.details||payload.error||"Warehouse reset failed.");
+      if(!response.ok){
+        const detail=String(payload.details||payload.error||"Warehouse reset failed.");
+        const activeReset=response.status===409 && /Active reset job:/i.test(detail);
+        if(activeReset){
+          const recover=window.confirm(
+            `${detail}\n\nIf you already restarted the Azure Function App after the previous reset, press OK to recover the interrupted reset lock and start a fresh Fast Reset.\n\nIf you have NOT restarted the Function App, press Cancel.`
+          );
+          if(recover){
+            if(button) button.textContent="Recovering previous reset...";
+            const recoverResponse=await fetch(WAREHOUSE_RESET_RECOVER_URL,{
+              method:"POST",
+              credentials:"same-origin",
+              headers:{"Content-Type":"application/json"},
+              body:JSON.stringify({confirm:"RECOVER_RESET"})
+            });
+            const recoverPayload=await recoverResponse.json().catch(()=>({}));
+            if(!recoverResponse.ok) throw new Error(recoverPayload.details||recoverPayload.error||"Previous reset could not be recovered.");
+            if(button) button.textContent="Starting Fast Reset...";
+            const retryResponse=await fetch(WAREHOUSE_RESET_URL,{
+              method:"POST",
+              credentials:"same-origin",
+              headers:{"Content-Type":"application/json"},
+              body:JSON.stringify({confirm:"RESET"})
+            });
+            const retryPayload=await retryResponse.json().catch(()=>({}));
+            if(!retryResponse.ok) throw new Error(retryPayload.details||retryPayload.error||"Warehouse reset failed after recovery.");
+            payload=retryPayload;
+          }else{
+            throw new Error(detail);
+          }
+        }else{
+          throw new Error(detail);
+        }
+      }
 
       let resetResult=payload;
       if(String(payload.status||"").toLowerCase()==="accepted"){
