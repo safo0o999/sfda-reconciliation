@@ -817,101 +817,53 @@ class Exporter:
             )
             cell.border = border
 
-        for row_index, row in report.iterrows():
-            excel_row = (
-                header_row
-                + row_index
-                + 1
-            )
+        column_names = list(report.columns)
+        column_texts = [str(name).lower() for name in column_names]
+        identifier_flags = [
+            any(identifier in text for identifier in [
+                "gtin", "generic item", "trade item", "sales order",
+                "order number", "order line", "inbound shipment", "gln", "bn",
+            ])
+            for text in column_texts
+        ]
+        date_flags = [("date" in text or "expiry" in text) for text in column_texts]
+        max_lengths = [len(str(name)) for name in column_names]
+        stripe_fill = PatternFill(fill_type="solid", fgColor="EAF2F8")
 
-            for column_index, column_name in enumerate(
-                report.columns,
-                start=1,
-            ):
-                value = row[column_name]
-                column_text = str(
-                    column_name
-                ).lower()
-
+        # itertuples avoids the per-row Series construction cost of iterrows().
+        # Width statistics are collected during the same pass, eliminating a
+        # second full scan of every report column.
+        for row_index, values in enumerate(report.itertuples(index=False, name=None)):
+            excel_row = header_row + row_index + 1
+            for offset, value in enumerate(values):
+                column_index = offset + 1
                 if pd.isna(value):
                     value = None
-                elif (
-                    "date" in column_text
-                    or "expiry" in column_text
-                ):
-                    converted = pd.to_datetime(
-                        value,
-                        errors="coerce",
-                    )
+                elif date_flags[offset]:
+                    converted = pd.to_datetime(value, errors="coerce")
                     if not pd.isna(converted):
-                        value = (
-                            converted.to_pydatetime()
-                        )
-                elif any(
-                    identifier in column_text
-                    for identifier in [
-                        "gtin",
-                        "generic item",
-                        "trade item",
-                        "sales order",
-                        "order number",
-                        "order line",
-                        "inbound shipment",
-                        "gln",
-                        "bn",
-                    ]
-                ):
-                    value = (
-                        Exporter._normalize_identifier(
-                            value
-                        )
-                    )
+                        value = converted.to_pydatetime()
+                elif identifier_flags[offset]:
+                    value = Exporter._normalize_identifier(value)
                 elif hasattr(value, "item"):
                     try:
                         value = value.item()
                     except Exception:
                         pass
 
-                cell = worksheet.cell(
-                    row=excel_row,
-                    column=column_index,
-                    value=value,
-                )
+                if value is not None:
+                    max_lengths[offset] = max(max_lengths[offset], len(str(value)))
+
+                cell = worksheet.cell(row=excel_row, column=column_index, value=value)
                 cell.border = border
-
-                if any(
-                    identifier in column_text
-                    for identifier in [
-                        "gtin",
-                        "generic item",
-                        "trade item",
-                        "sales order",
-                        "order number",
-                        "order line",
-                        "inbound shipment",
-                        "gln",
-                        "bn",
-                    ]
-                ):
+                if identifier_flags[offset]:
                     cell.number_format = "@"
-                elif (
-                    "date" in column_text
-                    or "expiry" in column_text
-                ):
-                    cell.number_format = (
-                        "dd-mm-yyyy"
-                    )
-                elif isinstance(
-                    value,
-                    (int, float),
-                ):
+                elif date_flags[offset]:
+                    cell.number_format = "dd-mm-yyyy"
+                elif isinstance(value, (int, float)):
                     cell.number_format = "#,##0.##"
-
                 if row_index % 2 == 1:
-                    cell.fill = PatternFill(
-                        fill_type="solid",
-                        fgColor="EAF2F8",
-                    )
+                    cell.fill = stripe_fill
 
         if len(report) > 0:
             report_range = (
@@ -945,25 +897,9 @@ class Exporter:
         )
         worksheet.sheet_view.showGridLines = False
 
-        for column_index, column_name in enumerate(
-            report.columns,
-            start=1,
-        ):
-            max_length = len(str(column_name))
-
-            for value in report[column_name]:
-                if pd.isna(value):
-                    continue
-                max_length = max(
-                    max_length,
-                    len(str(value)),
-                )
-
-            worksheet.column_dimensions[
-                get_column_letter(column_index)
-            ].width = min(
-                max(max_length + 2, 12),
-                45,
+        for column_index, max_length in enumerate(max_lengths, start=1):
+            worksheet.column_dimensions[get_column_letter(column_index)].width = min(
+                max(max_length + 2, 12), 45
             )
 
         output = io.BytesIO()
