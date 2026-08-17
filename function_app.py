@@ -961,7 +961,7 @@ def dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
 
 @app.route(route="warehouse-data/reset", methods=["POST"])
 def warehouse_data_reset_route(req: func.HttpRequest) -> func.HttpResponse:
-    """Reset only uploaded/operational data for the signed-in warehouse."""
+    """Queue a destructive warehouse reset and return immediately."""
     denied = _auth_guard(req)
     if denied:
         return denied
@@ -981,41 +981,114 @@ def warehouse_data_reset_route(req: func.HttpRequest) -> func.HttpResponse:
         if warehouse_id < 1:
             return error_response("A valid warehouse is required.", 400)
 
-        from engine.database import reset_current_warehouse_data
         from engine.blob_storage import BlobStorage
-
         from engine.warehouse_context import warehouse_scope
 
+        job_id = build_run_number("RESET")
+        submitted_by = get_submitted_by(req)
+
         with warehouse_scope(warehouse_id, warehouse_name):
-            database_result = reset_current_warehouse_data(warehouse_id=warehouse_id)
             storage = BlobStorage()
             storage.initialize_containers()
-            blob_result = storage.delete_current_warehouse_data()
+            active_lock = storage.read_warehouse_reset_lock()
+            if active_lock:
+                active_job = str(active_lock.get("job_id") or "unknown")
+                return error_response(
+                    "A warehouse reset is already running.",
+                    409,
+                    f"Active reset job: {active_job}",
+                )
 
-        # Variance Management keeps a short-lived per-warehouse server cache.
-        # Reset must invalidate it immediately so the page cannot show stale
-        # discrepancies after the warehouse data has been deleted.
-        with _VARIANCE_CACHE_LOCK:
-            _VARIANCE_CACHE.pop(warehouse_id, None)
+            # Acquire the reset lock before checking other job types so no new
+            # Historical/Daily/Full job can enter after this point.
+            storage.write_warehouse_reset_lock(job_id, warehouse_name)
 
-        return json_response({
-            "status": "Completed",
-            "message": "Warehouse operational data was reset successfully.",
-            "warehouse_id": warehouse_id,
-            "warehouse_name": warehouse_name,
-            "database": database_result,
-            "blob": blob_result,
-            "preserved": [
-                "Warehouse account and users",
-                "Warehouse GLN mapping",
-                "Pack Size reference",
-                "Business rules and application logic",
-            ],
-        })
+            from engine.database import get_active_historical_build_job
+            active_historical = get_active_historical_build_job(warehouse_id)
+            if active_historical:
+                storage.clear_warehouse_reset_lock(job_id, force=True)
+                return error_response(
+                    "Historical Build is still active for this warehouse.",
+                    409,
+                    f"Wait for job {active_historical.get('JobID')} to finish before Reset.",
+                )
+
+            active_background = storage.list_active_background_jobs(exclude_job_id=job_id)
+            if active_background:
+                storage.clear_warehouse_reset_lock(job_id, force=True)
+                active = active_background[0]
+                return error_response(
+                    "A reconciliation job is still active for this warehouse.",
+                    409,
+                    f"Wait for job {active.get('job_id') or 'unknown'} to finish before Reset.",
+                )
+
+            storage.write_background_job_status(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "job_type": "warehouse_reset",
+                    "status": "Queued",
+                    "progress": 5,
+                    "current_stage": "Reset queued; waiting for background worker",
+                    "submitted_by": submitted_by,
+                    "warehouse_id": warehouse_id,
+                    "warehouse_name": warehouse_name,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "result": {},
+                    "error": "",
+                },
+            )
+
+            connection_string = os.getenv("AzureWebJobsStorage")
+            if not connection_string:
+                storage.clear_warehouse_reset_lock(job_id, force=True)
+                raise RuntimeError("AzureWebJobsStorage is missing.")
+
+            queue = QueueClient.from_connection_string(
+                connection_string,
+                "reconciliation-jobs",
+                message_encode_policy=TextBase64EncodePolicy(),
+            )
+            try:
+                queue.create_queue()
+            except ResourceExistsError:
+                pass
+
+            try:
+                queue.send_message(
+                    json.dumps(
+                        {
+                            "job_id": job_id,
+                            "job_type": "warehouse_reset",
+                            "input_manifest": {},
+                            "submitted_by": submitted_by,
+                            "warehouse_id": warehouse_id,
+                            "warehouse_name": warehouse_name,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+            except Exception:
+                storage.clear_warehouse_reset_lock(job_id, force=True)
+                raise
+
+        return json_response(
+            {
+                "status": "Accepted",
+                "application": APPLICATION_NAME,
+                "version": APPLICATION_VERSION,
+                "job_id": job_id,
+                "job_type": "warehouse_reset",
+                "status_url": f"/api/reconciliation-job/{job_id}",
+                "message": "Warehouse reset was queued and will continue in the background.",
+            },
+            202,
+        )
     except Exception as exc:
-        logger.exception("Warehouse data reset failed")
+        logger.exception("Warehouse reset submission failed")
         return error_response(
-            "Unable to reset warehouse operational data.",
+            "Unable to queue warehouse reset.",
             500,
             str(exc),
         )
@@ -1504,6 +1577,13 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
         submitted_by = get_submitted_by(req)
         storage = BlobStorage()
         storage.initialize_containers()
+        reset_lock = storage.read_warehouse_reset_lock()
+        if reset_lock:
+            return error_response(
+                "Warehouse reset is in progress.",
+                409,
+                f"Reset job {reset_lock.get('job_id') or 'unknown'} must finish before Historical Build.",
+            )
 
         manifest: Dict[str, Any] = {
             "asn_files": [],
@@ -3128,6 +3208,13 @@ def _queue_reconciliation_job(
     job_id = build_run_number("JOB")
     storage = BlobStorage()
     storage.initialize_containers()
+    reset_lock = storage.read_warehouse_reset_lock()
+    if reset_lock:
+        return error_response(
+            "Warehouse reset is in progress.",
+            409,
+            f"Reset job {reset_lock.get('job_id') or 'unknown'} must finish before reconciliation.",
+        )
 
     manifest: Dict[str, Any] = {}
     for field in required_fields:
@@ -3286,6 +3373,137 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
             "warehouse_id": warehouse_id,
             "warehouse_name": warehouse_name or f"Warehouse {warehouse_id}",
         }
+
+        if job_type == "warehouse_reset":
+            started_at = datetime.now(timezone.utc).isoformat()
+            try:
+                storage.write_background_job_status(
+                    job_id,
+                    {
+                        **base_status,
+                        "status": "Running",
+                        "progress": 15,
+                        "current_stage": "Preparing warehouse reset",
+                        "started_at": started_at,
+                        "result": {},
+                        "error": "",
+                    },
+                )
+
+                from engine.database import reset_current_warehouse_data
+
+                storage.write_background_job_status(
+                    job_id,
+                    {
+                        **base_status,
+                        "status": "Running",
+                        "progress": 30,
+                        "current_stage": "Resetting warehouse database",
+                        "started_at": started_at,
+                        "result": {},
+                        "error": "",
+                    },
+                )
+                database_result = reset_current_warehouse_data(warehouse_id=warehouse_id)
+
+                storage.write_background_job_status(
+                    job_id,
+                    {
+                        **base_status,
+                        "status": "Running",
+                        "progress": 75,
+                        "current_stage": "Removing uploaded and generated run files",
+                        "started_at": started_at,
+                        "result": {"database": database_result},
+                        "error": "",
+                    },
+                )
+
+                # Keep the current reset status + lock alive while the rest of
+                # this warehouse's run metadata is removed.
+                status_blob_name = storage.scoped_blob_name(
+                    f"background-jobs/{storage.sanitize_file_name(job_id)}.json"
+                )
+                lock_blob_name = storage.scoped_blob_name("system/reset-active.json")
+                blob_result = storage.delete_current_warehouse_data(
+                    preserve_blob_names=[status_blob_name, lock_blob_name]
+                )
+
+                storage.write_background_job_status(
+                    job_id,
+                    {
+                        **base_status,
+                        "status": "Running",
+                        "progress": 92,
+                        "current_stage": "Verifying clean warehouse state",
+                        "started_at": started_at,
+                        "result": {
+                            "database": database_result,
+                            "blob": blob_result,
+                        },
+                        "error": "",
+                    },
+                )
+
+                with _VARIANCE_CACHE_LOCK:
+                    _VARIANCE_CACHE.pop(warehouse_id, None)
+
+                warnings = []
+                failed_blob_count = int(blob_result.get("failed_blobs_total") or 0)
+                if failed_blob_count:
+                    warnings.append(
+                        f"Database reset completed, but {failed_blob_count} archived run file(s) could not be deleted."
+                    )
+
+                result = {
+                    "status": "Completed",
+                    "message": "Warehouse operational data was reset successfully.",
+                    "warehouse_id": warehouse_id,
+                    "warehouse_name": base_status["warehouse_name"],
+                    "database": database_result,
+                    "blob": blob_result,
+                    "warnings": warnings,
+                    "preserved": [
+                        "Warehouse account and users",
+                        "Warehouse GLN mapping",
+                        "Pack Size reference",
+                        "Business rules and application logic",
+                    ],
+                }
+                storage.write_background_job_status(
+                    job_id,
+                    {
+                        **base_status,
+                        "status": "Completed",
+                        "progress": 100,
+                        "current_stage": "Warehouse reset completed",
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "result": result,
+                        "error": "",
+                    },
+                )
+                return
+            except Exception as exc:
+                logger.exception("Warehouse reset background job failed. job_id=%s", job_id)
+                storage.write_background_job_status(
+                    job_id,
+                    {
+                        **base_status,
+                        "status": "Failed",
+                        "progress": 100,
+                        "current_stage": "Warehouse reset failed",
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "result": {},
+                        "error": str(exc),
+                    },
+                )
+                raise
+            finally:
+                try:
+                    storage.clear_warehouse_reset_lock(job_id)
+                except Exception:
+                    logger.exception("Failed to clear warehouse reset lock. job_id=%s", job_id)
+
         storage.write_background_job_status(
             job_id,
             {
