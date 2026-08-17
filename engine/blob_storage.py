@@ -464,15 +464,57 @@ class BlobStorage:
 
         # If the owning Reset job was interrupted/restarted, release the lock
         # immediately instead of keeping the warehouse blocked for hours.
+        # IMPORTANT: do not depend on the persisted status payload containing
+        # job_type=warehouse_reset. Older reset status blobs may not contain
+        # that field, which previously allowed a stale lock to survive forever.
         lock_job_id = str(payload.get("job_id") or "").strip()
         if lock_job_id:
             try:
-                job = self.read_background_job_status(lock_job_id)
-                if str(job.get("status") or "").strip().lower() not in {"queued", "running"}:
+                safe_job_id = self.sanitize_file_name(lock_job_id)
+                status_blob_name = self.scoped_blob_name(
+                    f"background-jobs/{safe_job_id}.json"
+                )
+                status_download = self.download_blob(METADATA_CONTAINER, status_blob_name)
+                status_payload = json.loads(status_download["data"].decode("utf-8"))
+                status_value = str((status_payload or {}).get("status") or "").strip().lower()
+
+                if status_value not in {"queued", "running"}:
                     self.clear_warehouse_reset_lock(lock_job_id, force=True)
                     return None
+
+                stale_minutes = max(
+                    2,
+                    int(os.getenv("WAREHOUSE_RESET_STALE_MINUTES", "10") or 10),
+                )
+                last_modified = status_download.get("last_modified")
+                if last_modified is not None:
+                    if last_modified.tzinfo is None:
+                        last_modified = last_modified.replace(tzinfo=timezone.utc)
+                    age = datetime.now(timezone.utc) - last_modified
+                    if age >= timedelta(minutes=stale_minutes):
+                        interrupted = {
+                            **(status_payload if isinstance(status_payload, dict) else {}),
+                            "job_id": lock_job_id,
+                            "job_type": "warehouse_reset",
+                            "status": "Failed",
+                            "progress": 100,
+                            "current_stage": "Reset interrupted or worker restarted",
+                            "completed_at": datetime.now(timezone.utc).isoformat(),
+                            "error": (
+                                "Reset stopped updating for "
+                                f"{int(age.total_seconds() // 60)} minute(s). "
+                                "The previous worker is treated as interrupted. "
+                                "Committed reset batches are safe to resume."
+                            ),
+                        }
+                        self.write_background_job_status(lock_job_id, interrupted)
+                        self.clear_warehouse_reset_lock(lock_job_id, force=True)
+                        return None
             except FileNotFoundError:
-                pass
+                # A lock without its owning status record cannot represent a
+                # live reset worker. Release it so the warehouse can recover.
+                self.clear_warehouse_reset_lock(lock_job_id, force=True)
+                return None
             except Exception:
                 logger.exception("Unable to inspect reset job while evaluating reset lock.")
 
