@@ -2325,8 +2325,42 @@ def reset_current_warehouse_data(warehouse_id: Optional[int] = None) -> Dict[str
         },
     }
 
+def _expire_stale_historical_build_jobs(
+    connection,
+    warehouse_id: int,
+) -> int:
+    """Mark abandoned Historical Build rows as Failed so they cannot lock a warehouse forever.
+
+    Historical jobs are expected to update UpdatedAt while progressing. A queue/worker
+    crash can otherwise leave a row permanently in Queued/Running and block Reset or
+    future Historical Builds indefinitely. The timeout is intentionally generous and
+    configurable.
+    """
+    stale_minutes = max(60, int(os.getenv("HISTORICAL_JOB_STALE_MINUTES", "360") or 360))
+    cursor = connection.cursor()
+    cursor.execute(
+        r"""
+        UPDATE dbo.HistoricalBuildJobs
+        SET Status = 'Failed',
+            CurrentStage = 'Expired stale Historical Build lock',
+            ErrorMessage = COALESCE(NULLIF(ErrorMessage, ''),
+                'Historical Build was automatically marked Failed because it stopped updating.'),
+            CompletedAt = COALESCE(CompletedAt, SYSUTCDATETIME()),
+            UpdatedAt = SYSUTCDATETIME()
+        WHERE WarehouseID = ?
+          AND Status IN ('Queued', 'Running')
+          AND COALESCE(UpdatedAt, CreatedAt) < DATEADD(MINUTE, -?, SYSUTCDATETIME());
+        """,
+        (int(warehouse_id), int(stale_minutes)),
+    )
+    expired = int(cursor.rowcount or 0)
+    if expired:
+        connection.commit()
+    return expired
+
+
 def get_active_historical_build_job(warehouse_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
-    """Return the newest active Historical Build for one warehouse, if any."""
+    """Return the newest genuinely active Historical Build for one warehouse, if any."""
     initialize_database()
     from engine.warehouse_context import current_warehouse_id
 
@@ -2335,6 +2369,7 @@ def get_active_historical_build_job(warehouse_id: Optional[int] = None) -> Optio
         raise RuntimeError("A valid WarehouseID is required.")
 
     with Database().connect() as connection:
+        _expire_stale_historical_build_jobs(connection, resolved_warehouse_id)
         cursor = connection.cursor()
         row = cursor.execute(
             r"""
@@ -2392,8 +2427,11 @@ def create_historical_build_job(
         cursor = connection.cursor()
         try:
             # Serialize creation per warehouse and reject an equivalent heavy
-            # job while another Historical Build is still active.
+            # job while another Historical Build is still active. Expire abandoned
+            # queue/worker rows first so a dead job cannot lock the warehouse forever.
             cursor.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;")
+            _expire_stale_historical_build_jobs(connection, warehouse_id)
+            cursor = connection.cursor()
             active = cursor.execute(
                 r"""
                 SELECT TOP (1) JobID
