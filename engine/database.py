@@ -1548,15 +1548,18 @@ def reset_history() -> None:
     with Database().connect() as connection:
         cursor = connection.cursor()
         try:
+            from engine.warehouse_context import current_warehouse_id
+            warehouse_id = int(current_warehouse_id())
             cursor.execute(
                 """
-                DELETE FROM dbo.CustomerHistory;
-                DELETE FROM dbo.SupplierHistory;
-                DELETE FROM dbo.BatchMaster;
-                DELETE FROM dbo.DispatchEvents;
-                DELETE FROM dbo.ReceiptEvents;
-                DELETE FROM dbo.RunHistory;
-                """
+                DELETE FROM dbo.CustomerHistory WHERE WarehouseID = ?;
+                DELETE FROM dbo.SupplierHistory WHERE WarehouseID = ?;
+                DELETE FROM dbo.BatchMaster WHERE WarehouseID = ?;
+                DELETE FROM dbo.DispatchEvents WHERE WarehouseID = ?;
+                DELETE FROM dbo.ReceiptEvents WHERE WarehouseID = ?;
+                DELETE FROM dbo.RunHistory WHERE WarehouseID = ?;
+                """,
+                (warehouse_id, warehouse_id, warehouse_id, warehouse_id, warehouse_id, warehouse_id),
             )
             connection.commit()
         except Exception:
@@ -2353,6 +2356,23 @@ def create_historical_build_job(
     with Database().connect() as connection:
         cursor = connection.cursor()
         try:
+            # Serialize creation per warehouse and reject an equivalent heavy
+            # job while another Historical Build is still active.
+            cursor.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;")
+            active = cursor.execute(
+                r"""
+                SELECT TOP (1) JobID
+                FROM dbo.HistoricalBuildJobs WITH (UPDLOCK, HOLDLOCK)
+                WHERE WarehouseID = ?
+                  AND Status IN ('Queued', 'Running')
+                ORDER BY CreatedAt DESC;
+                """,
+                (warehouse_id,),
+            ).fetchone()
+            if active:
+                raise ValueError(
+                    f"A Historical Build is already active for this warehouse: {active[0]}"
+                )
             cursor.execute(
                 sql,
                 (
@@ -2561,18 +2581,13 @@ def list_historical_build_jobs(limit: int = 500) -> List[Dict[str, Any]]:
 def sync_batch_master_sfda_snapshot(
     sfda_df: pd.DataFrame,
 ) -> Dict[str, int]:
-    """Synchronize the current SFDA position into persisted Batch Master.
+    """Synchronize SFDA-controlled BatchMaster fields safely and in bulk.
 
-    Full Accept / Full Dispatch use the latest SFDA Drug Count as the regulatory
-    source of truth. Product Intelligence already reads the latest SFDA
-    snapshot, but Batch Master historically retained the older SFDA values from
-    the historical build. This function updates only the SFDA-controlled fields
-    while preserving WMS receipt/dispatch history.
-
-    Matching follows the existing Full Reconciliation grain of
-    BN + ExpiryMonthKey. The exact ExpiryDate stored in Batch Master is replaced
-    with the date from the latest SFDA report so exported Batch_Master.xlsx uses
-    the current regulatory expiry date.
+    BN + expiry month is only the operational candidate key.  A BatchMaster
+    row is updated only when its already-resolved GTIN agrees with the SFDA
+    GTIN for that candidate.  The exact SFDA expiry date is persisted so every
+    SFDA-facing export uses the regulatory date, even when the WMS expiry day
+    differs within the same month.
     """
 
     initialize_database()
@@ -2583,93 +2598,89 @@ def sync_batch_master_sfda_snapshot(
     from engine.normalizer import Normalizer
 
     frame = Normalizer.normalize_sfda(sfda_df.copy())
-    frame["Expiry Month Key"] = FullReconciliationEngine._month_key(
-        frame["Expiry Date"]
-    )
+    frame["Expiry Month Key"] = FullReconciliationEngine._month_key(frame["Expiry Date"])
+    for column in ["Quantity", "Active", "Quantity sent pending", "Quantity Receive Pending"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0)
+    frame["GTIN"] = frame["GTIN"].fillna("").astype(str).str.strip()
 
-    for column in [
-        "Quantity",
-        "Active",
-        "Quantity sent pending",
-        "Quantity Receive Pending",
-    ]:
-        frame[column] = pd.to_numeric(
-            frame[column],
-            errors="coerce",
-        ).fillna(0)
-
+    # Keep GTIN in the grain. Different products may legitimately share BN/month.
     grouped = (
-        frame.groupby(["BN", "Expiry Month Key"], dropna=False)
-        .agg(
-            **{
-                "Expiry Date": ("Expiry Date", "first"),
-                "GTIN": ("GTIN", "first"),
-                "Drug Name": ("Drug Name", "first"),
-                "Quantity": ("Quantity", "sum"),
-                "Active": ("Active", "sum"),
-                "Quantity sent pending": ("Quantity sent pending", "sum"),
-                "Quantity Receive Pending": (
-                    "Quantity Receive Pending",
-                    "sum",
-                ),
-            }
-        )
+        frame.groupby(["GTIN", "BN", "Expiry Month Key"], dropna=False)
+        .agg(**{
+            "Expiry Date": ("Expiry Date", "first"),
+            "Drug Name": ("Drug Name", "first"),
+            "Quantity": ("Quantity", "sum"),
+            "Active": ("Active", "sum"),
+            "Quantity sent pending": ("Quantity sent pending", "sum"),
+            "Quantity Receive Pending": ("Quantity Receive Pending", "sum"),
+        })
         .reset_index()
     )
 
     rows = [
         (
-            _value(row, "Expiry Date"),
-            _text(row, "GTIN"),
-            _text(row, "Drug Name"),
-            _number(row, "Quantity"),
-            _number(row, "Active"),
-            _number(row, "Quantity sent pending"),
-            _number(row, "Quantity Receive Pending"),
-            _text(row, "BN"),
-            _text(row, "Expiry Month Key"),
+            _text(row, "GTIN"), _text(row, "BN"), _text(row, "Expiry Month Key"),
+            _value(row, "Expiry Date"), _text(row, "Drug Name"),
+            _number(row, "Quantity"), _number(row, "Active"),
+            _number(row, "Quantity sent pending"), _number(row, "Quantity Receive Pending"),
         )
         for row in grouped.to_dict(orient="records")
-        if _text(row, "BN") and _text(row, "Expiry Month Key")
+        if _text(row, "GTIN") and _text(row, "BN") and _text(row, "Expiry Month Key")
     ]
-
     if not rows:
         return {"sfda_rows": int(len(grouped)), "updated_rows": 0}
 
-    sql = r"""
-        UPDATE dbo.BatchMaster
-        SET
-            ExpiryDate = ?,
-            GTIN = ?,
-            DrugName = ?,
-            SFDAQuantity = ?,
-            Active = ?,
-            QuantitySentPending = ?,
-            QuantityReceivePending = ?,
-            LastUpdated = SYSUTCDATETIME()
-        WHERE BN = ?
-          AND ExpiryMonthKey = ?;
-    """
+    from engine.warehouse_context import current_warehouse_id
+    warehouse_id = int(current_warehouse_id())
 
-    updated = 0
     with Database().connect() as connection:
         cursor = connection.cursor()
         try:
-            # Regular executemany avoids ODBC variable-string buffer inference
-            # issues previously seen on snapshot persistence.
+            cursor.execute(r"""
+                CREATE TABLE #SFDABatchState (
+                    GTIN nvarchar(100) NOT NULL,
+                    BN nvarchar(255) NOT NULL,
+                    ExpiryMonthKey nvarchar(20) NOT NULL,
+                    ExpiryDate date NULL,
+                    DrugName nvarchar(1000) NULL,
+                    SFDAQuantity decimal(38,6) NOT NULL,
+                    Active decimal(38,6) NOT NULL,
+                    QuantitySentPending decimal(38,6) NOT NULL,
+                    QuantityReceivePending decimal(38,6) NOT NULL,
+                    PRIMARY KEY (GTIN, BN, ExpiryMonthKey)
+                );
+            """)
+            cursor.fast_executemany = True
+            cursor.executemany(r"""
+                INSERT INTO #SFDABatchState
+                (GTIN, BN, ExpiryMonthKey, ExpiryDate, DrugName, SFDAQuantity, Active,
+                 QuantitySentPending, QuantityReceivePending)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """, rows)
             cursor.fast_executemany = False
-            for row in rows:
-                cursor.execute(sql, row)
-                updated += max(0, int(cursor.rowcount or 0))
+            cursor.execute(r"""
+                UPDATE bm
+                SET bm.ExpiryDate = s.ExpiryDate,
+                    bm.DrugName = s.DrugName,
+                    bm.SFDAQuantity = s.SFDAQuantity,
+                    bm.Active = s.Active,
+                    bm.QuantitySentPending = s.QuantitySentPending,
+                    bm.QuantityReceivePending = s.QuantityReceivePending,
+                    bm.LastUpdated = SYSUTCDATETIME()
+                FROM dbo.BatchMaster AS bm
+                INNER JOIN #SFDABatchState AS s
+                    ON s.BN = bm.BN
+                   AND s.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND s.GTIN = bm.GTIN
+                WHERE bm.WarehouseID = ?;
+            """, (warehouse_id,))
+            updated = max(0, int(cursor.rowcount or 0))
             connection.commit()
         except Exception:
             connection.rollback()
             raise
 
-    return {
-        "sfda_rows": int(len(grouped)),
-        "updated_rows": int(updated),
-    }
+    return {"sfda_rows": int(len(grouped)), "updated_rows": updated}
 
 
 def test_database_connection() -> Dict[str, Optional[Any]]:
@@ -3985,10 +3996,16 @@ def confirm_dispatch_transactions_from_sfda(
         current["Expiry Date"] = pd.to_datetime(
             current["Expiry Date"], errors="coerce"
         ).dt.normalize()
+        previous["Expiry Month Key"] = previous["Expiry Date"].dt.strftime("%Y-%m")
+        current["Expiry Month Key"] = current["Expiry Date"].dt.strftime("%Y-%m")
+        previous["GTIN"] = previous["GTIN"].fillna("").astype(str).str.strip()
+        current["GTIN"] = current["GTIN"].fillna("").astype(str).str.strip()
 
+        # Confirmation uses verified SFDA identity + BN + expiry month. Exact
+        # SFDA expiry day is an output/regulatory value, not a WMS match key.
         comparison = previous.merge(
             current,
-            on=["BN", "Expiry Date"],
+            on=["GTIN", "BN", "Expiry Month Key"],
             how="inner",
             suffixes=(" Previous", " Current"),
         )
@@ -4023,7 +4040,7 @@ def confirm_dispatch_transactions_from_sfda(
         try:
             for evidence in evidence_rows:
                 bn = _text(evidence, "BN")
-                expiry = _value(evidence, "Expiry Date")
+                expiry = _value(evidence, "Expiry Date Current")
                 remaining_pack = max(0.0, _number(evidence, "Confirmed Pack Evidence"))
                 if remaining_pack <= 0:
                     continue
@@ -5128,10 +5145,14 @@ def confirm_full_dispatch_transactions_from_sfda(
             current["Expiry Date"],
             errors="coerce",
         ).dt.normalize()
+        previous["Expiry Month Key"] = previous["Expiry Date"].dt.strftime("%Y-%m")
+        current["Expiry Month Key"] = current["Expiry Date"].dt.strftime("%Y-%m")
+        previous["GTIN"] = previous["GTIN"].fillna("").astype(str).str.strip()
+        current["GTIN"] = current["GTIN"].fillna("").astype(str).str.strip()
 
         comparison = previous.merge(
             current,
-            on=["BN", "Expiry Date"],
+            on=["GTIN", "BN", "Expiry Month Key"],
             how="inner",
             suffixes=(" Previous", " Current"),
         )
@@ -5178,7 +5199,7 @@ def confirm_full_dispatch_transactions_from_sfda(
         try:
             for evidence in evidence_rows:
                 bn = _text(evidence, "BN")
-                expiry = _value(evidence, "Expiry Date")
+                expiry = _value(evidence, "Expiry Date Current")
                 remaining_pack = max(
                     0.0,
                     _number(evidence, "Confirmed Pack Evidence"),
