@@ -4,6 +4,7 @@ import base64
 import io
 import logging
 import mimetypes
+from time import perf_counter
 from typing import Any, Dict, List
 
 import pandas as pd
@@ -108,6 +109,24 @@ def process_historical_build_job(
     storage = BlobStorage()
     storage.initialize_containers()
 
+    job_started_at = perf_counter()
+    stage_started_at = job_started_at
+    timings: Dict[str, float] = {}
+
+    def mark_stage(name: str) -> None:
+        nonlocal stage_started_at
+        now = perf_counter()
+        elapsed = now - stage_started_at
+        timings[name] = round(elapsed, 3)
+        stage_started_at = now
+        logger.info(
+            "HISTORICAL_PERF job_id=%s stage=%s seconds=%.3f total_seconds=%.3f",
+            job_id,
+            name,
+            elapsed,
+            now - job_started_at,
+        )
+
     try:
         update_historical_build_job(
             job_id,
@@ -134,6 +153,7 @@ def process_historical_build_job(
         sfda_df = _read_input_group(storage, sfda_items)
         sfda_source_name = str(sfda_items[0].get("file_name", "") or "")
         replace_latest_sfda_snapshot(sfda_df, sfda_source_name)
+        mark_stage("read_inputs_and_sfda_snapshot")
 
         update_historical_build_job(
             job_id,
@@ -147,6 +167,7 @@ def process_historical_build_job(
             sfda_df,
         )
         prepared = engine.prepare_incremental()
+        mark_stage("validate_normalize_prepare_events")
 
         if operation == "rebuild":
             update_historical_build_job(
@@ -155,6 +176,7 @@ def process_historical_build_job(
                 current_stage="Resetting previous historical data",
             )
             reset_history()
+            mark_stage("reset_previous_history")
 
         update_historical_build_job(
             job_id,
@@ -166,6 +188,8 @@ def process_historical_build_job(
             prepared["dispatch_records"],
             assume_empty=(operation == "rebuild"),
         )
+
+        mark_stage("save_receipt_dispatch_events")
 
         has_new_events = (
             inserted.get("receipt_events", 0) > 0
@@ -198,6 +222,7 @@ def process_historical_build_job(
                 prepared["sfda_summary"],
             )
             replace_batch_master(master)
+            mark_stage("build_and_save_batch_master")
 
             update_historical_build_job(
                 job_id,
@@ -217,6 +242,7 @@ def process_historical_build_job(
             replace_customer_history(customer_history)
             sto_incoming_history = get_sto_incoming_history_df()
             sto_return_history = get_sto_return_history_df()
+            mark_stage("build_and_save_histories")
 
         update_historical_build_job(
             job_id,
@@ -224,60 +250,72 @@ def process_historical_build_job(
             current_stage="Generating downloadable audit files",
         )
 
-        generated = [
-            Exporter.build_formatted_excel_file(
-                df=master,
-                file_name="Batch_Master.xlsx",
-                sheet_name="Batch Master",
-                title="SFDA Historical Batch Master",
-                sort_columns=[
-                    "Generic Item Number",
-                    "BN",
-                    "Expiry Date",
-                ],
+        # Generate and upload one workbook at a time.  The old code built
+        # all five base64-encoded workbooks in memory before uploading any of
+        # them.  Customer History can be very large, so that caused avoidable
+        # memory pressure and garbage-collection pauses.
+        export_specs = [
+            (
+                master,
+                "Batch_Master.xlsx",
+                "Batch Master",
+                "SFDA Historical Batch Master",
+                ["Generic Item Number", "BN", "Expiry Date"],
             ),
-            Exporter.build_formatted_excel_file(
-                df=supplier_history,
-                file_name="Supplier_History.xlsx",
-                sheet_name="Supplier History",
-                title="Historical Supplier Receipt History",
-                sort_columns=[
-                    "Supplier Name",
-                    "Generic Item Number",
-                    "BN",
-                    "Expiry Date",
-                ],
+            (
+                supplier_history,
+                "Supplier_History.xlsx",
+                "Supplier History",
+                "Historical Supplier Receipt History",
+                ["Supplier Name", "Generic Item Number", "BN", "Expiry Date"],
             ),
-            Exporter.build_formatted_excel_file(
-                df=customer_history,
-                file_name="Customer_History.xlsx",
-                sheet_name="Customer History",
-                title="Historical Customer Dispatch History",
-                sort_columns=[
-                    "To Address",
-                    "Generic Item Number",
-                    "BN",
-                    "Expiry Date",
-                ],
+            (
+                customer_history,
+                "Customer_History.xlsx",
+                "Customer History",
+                "Historical Customer Dispatch History",
+                ["To Address", "Generic Item Number", "BN", "Expiry Date"],
             ),
-            Exporter.build_formatted_excel_file(
-                df=sto_incoming_history,
-                file_name="STO_Incoming_History.xlsx",
-                sheet_name="STO Incoming",
-                title="Historical STO Incoming Receipt History",
-                sort_columns=["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
+            (
+                sto_incoming_history,
+                "STO_Incoming_History.xlsx",
+                "STO Incoming",
+                "Historical STO Incoming Receipt History",
+                ["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
             ),
-            Exporter.build_formatted_excel_file(
-                df=sto_return_history,
-                file_name="STO_Return_Cancel_Dispatch.xlsx",
-                sheet_name="STO Return",
-                title="STO Returns - Cancel Previous RSD Dispatch",
-                sort_columns=["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
+            (
+                sto_return_history,
+                "STO_Return_Cancel_Dispatch.xlsx",
+                "STO Return",
+                "STO Returns - Cancel Previous RSD Dispatch",
+                ["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
             ),
         ]
 
         output_files: List[Dict[str, Any]] = []
-        for exported in generated:
+        for export_index, (
+            export_df,
+            export_file_name,
+            export_sheet_name,
+            export_title,
+            export_sort_columns,
+        ) in enumerate(export_specs, start=1):
+            update_historical_build_job(
+                job_id,
+                progress=min(98, 90 + export_index),
+                current_stage=(
+                    f"Generating audit file {export_index}/{len(export_specs)}: "
+                    f"{export_file_name}"
+                ),
+            )
+            export_started = perf_counter()
+            exported = Exporter.build_formatted_excel_file(
+                df=export_df,
+                file_name=export_file_name,
+                sheet_name=export_sheet_name,
+                title=export_title,
+                sort_columns=export_sort_columns,
+            )
             file_name, file_bytes, mime_type = _decode_exported_file(exported)
             saved = storage.upload_job_output(
                 job_id,
@@ -297,6 +335,16 @@ def process_historical_build_job(
                     ),
                 }
             )
+            logger.info(
+                "HISTORICAL_PERF job_id=%s export=%s rows=%s seconds=%.3f",
+                job_id,
+                file_name,
+                len(export_df),
+                perf_counter() - export_started,
+            )
+            del exported, file_bytes
+
+        mark_stage("generate_and_upload_audit_files")
 
         summary = {
             "asn_files": len(input_manifest.get("asn_files", [])),
@@ -310,6 +358,8 @@ def process_historical_build_job(
             "customer_history_rows": len(customer_history),
             "sto_incoming_rows": len(sto_incoming_history),
             "sto_return_rows": len(sto_return_history),
+            "stage_timings_seconds": timings,
+            "total_seconds": round(perf_counter() - job_started_at, 3),
         }
 
         update_historical_build_job(
