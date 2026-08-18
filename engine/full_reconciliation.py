@@ -364,6 +364,16 @@ class FullReconciliationEngine:
 
         if not self.dispatch.empty:
             self.dispatch = Normalizer.normalize_dispatch(self.dispatch)
+
+            # Business rule:
+            # A Full Dispatch row is considered dispatched ONLY when Confirm Date
+            # (normalized as Dispatch Date) is populated. Unconfirmed rows must not
+            # create Dispatch Events, dispatched quantities in Batch Master, Customer
+            # History, or any downstream Full Reconciliation output.
+            self.dispatch = self.dispatch.loc[
+                pd.to_datetime(self.dispatch["Dispatch Date"], errors="coerce").notna()
+            ].copy()
+
             self.dispatch["Expiry Month Key"] = self._month_key(
                 self.dispatch["Expiry Date"]
             )
@@ -564,10 +574,16 @@ class FullReconciliationEngine:
             errors="coerce",
         ).fillna(0)
 
+        dispatch_date = pd.to_datetime(
+            frame["Dispatch Date"],
+            errors="coerce",
+        )
+
         valid_mask = (
             frame["BN"].astype(str).str.strip().ne("")
             & frame["Expiry Month Key"].astype(str).str.strip().ne("")
             & frame["Generic Item Number"].astype(str).str.strip().ne("")
+            & dispatch_date.notna()
             & dispatched_quantity.ne(0)
         )
         frame = frame.loc[valid_mask].copy()
