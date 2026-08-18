@@ -1965,10 +1965,10 @@ def reset_current_warehouse_data(
 ) -> Dict[str, Any]:
     """Fast, explicit reset of operational data for exactly one warehouse.
 
-    WAREHOUSE_RESET_V6_FAST deliberately does NOT discover or recursively walk
-    the database FK graph.  The SFDA application has a known set of operational
-    tables, so reset uses a fixed child-first delete plan and an explicit
-    ``WHERE WarehouseID = ?`` predicate for every table.
+    WAREHOUSE_RESET_V6_FAST uses a fixed WarehouseID-scoped delete plan for
+    operational tables. Before deleting FullReconciliationRuns it also discovers
+    only its direct FK children, because legacy child tables may not carry a
+    WarehouseID column and must be scoped safely through the parent FullRunID.
 
     Each table is committed immediately after deletion.  This keeps locks and
     transaction-log pressure bounded without turning a reset into thousands of
@@ -1985,9 +1985,10 @@ def reset_current_warehouse_data(
     if resolved_warehouse_id < 1:
         raise RuntimeError("A valid WarehouseID is required for reset.")
 
-    # Explicit child-first plan.  Optional/legacy tables are included so old
-    # deployments are cleaned as well, but only when the table exists and has
-    # a WarehouseID column.  No FK traversal is performed at runtime.
+    # Explicit warehouse-scoped plan. Optional/legacy tables are included when
+    # they carry WarehouseID. Direct children of FullReconciliationRuns are
+    # handled separately through FullRunID so legacy tables without WarehouseID
+    # can still be removed safely for only the selected warehouse.
     reset_tables: Tuple[str, ...] = (
         # Confirmation / pending / daily state first.
         "DailyDispatchConfirmations",
@@ -2055,6 +2056,64 @@ def reset_current_warehouse_data(
             )
             emit(32, "Starting fast warehouse database reset", {"deleted_rows_total": 0})
 
+            # Discover direct FK children of FullReconciliationRuns before the
+            # normal WarehouseID-scoped delete plan. Some legacy child tables do
+            # not have their own WarehouseID column, so they must be scoped via
+            # the parent FullReconciliationRuns row instead. This is especially
+            # important for older Warehouse 1 / admin data.
+            full_run_children = cursor.execute(
+                """
+                SELECT DISTINCT
+                    OBJECT_SCHEMA_NAME(fk.parent_object_id) AS ChildSchema,
+                    OBJECT_NAME(fk.parent_object_id) AS ChildTable,
+                    pc.name AS ChildColumn,
+                    rc.name AS ParentColumn
+                FROM sys.foreign_keys AS fk
+                INNER JOIN sys.foreign_key_columns AS fkc
+                    ON fk.object_id = fkc.constraint_object_id
+                INNER JOIN sys.columns AS pc
+                    ON pc.object_id = fkc.parent_object_id
+                   AND pc.column_id = fkc.parent_column_id
+                INNER JOIN sys.columns AS rc
+                    ON rc.object_id = fkc.referenced_object_id
+                   AND rc.column_id = fkc.referenced_column_id
+                WHERE fk.referenced_object_id = OBJECT_ID(N'dbo.FullReconciliationRuns')
+                  AND rc.name = N'FullRunID';
+                """
+            ).fetchall()
+
+            if full_run_children:
+                emit(33, "Clearing Full Reconciliation child records", {"deleted_rows_total": 0})
+
+            for child in full_run_children:
+                child_schema = str(child[0] or "dbo")
+                child_table = str(child[1] or "")
+                child_column = str(child[2] or "")
+                parent_column = str(child[3] or "")
+                if not child_table or not child_column or not parent_column:
+                    continue
+
+                cursor.execute(
+                    f"""
+                    DELETE child
+                    FROM {q(child_schema)}.{q(child_table)} AS child
+                    INNER JOIN dbo.FullReconciliationRuns AS parent
+                        ON child.{q(child_column)} = parent.{q(parent_column)}
+                    WHERE parent.WarehouseID = ?;
+                    """,
+                    resolved_warehouse_id,
+                )
+                affected = max(0, int(cursor.rowcount or 0))
+                connection.commit()
+                deleted[child_table] = deleted.get(child_table, 0) + affected
+                logger.info(
+                    "WAREHOUSE_RESET_V6_FAST cleared %s FK child row(s) from %s.%s for WarehouseID=%s.",
+                    affected,
+                    child_schema,
+                    child_table,
+                    resolved_warehouse_id,
+                )
+
             existing_tables: List[str] = []
             for table in reset_tables:
                 metadata = cursor.execute(
@@ -2102,7 +2161,7 @@ def reset_current_warehouse_data(
                 )
                 affected = max(0, int(cursor.rowcount or 0))
                 connection.commit()
-                deleted[table] = affected
+                deleted[table] = deleted.get(table, 0) + affected
 
                 logger.info(
                     "WAREHOUSE_RESET_V6_FAST cleared %s row(s) from %s for WarehouseID=%s.",
