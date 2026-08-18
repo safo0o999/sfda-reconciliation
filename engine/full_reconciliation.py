@@ -682,7 +682,6 @@ class FullReconciliationEngine:
         #   1. SFDA BN + Expiry Month must exist in WMS on the same key.
         #   2. That WMS key must resolve to exactly one Generic Item Number.
         #   3. The SFDA key must already be unambiguous (one GTIN only).
-        #   4. The resulting Generic <-> GTIN relationship must be one-to-one.
         #
         # Only those exact rows are allowed to establish identity.  After that,
         # the proven Generic is used to retain other WMS batches for the same
@@ -745,20 +744,13 @@ class FullReconciliationEngine:
                 & exact_edges["Generic Item Number"].ne("")
             ].copy()
 
-            pair_map = exact_edges[["Generic Item Number", "GTIN"]].drop_duplicates()
-            generic_gtin_count = pair_map.groupby("Generic Item Number")["GTIN"].transform("nunique")
-            gtin_generic_count = pair_map.groupby("GTIN")["Generic Item Number"].transform("nunique")
-            trusted_pairs = pair_map.loc[
-                generic_gtin_count.eq(1) & gtin_generic_count.eq(1)
-            ].copy()
-
-            resolved = exact_edges.merge(
-                trusted_pairs,
-                on=["Generic Item Number", "GTIN"],
-                how="inner",
-                validate="many_to_one",
-            )
-            resolved = resolved.drop_duplicates(
+            # IMPORTANT: identity is established per exact BN + Expiry Month
+            # candidate.  Do not impose a global Generic <-> GTIN one-to-one
+            # rule here: one Generic can legitimately have more than one SFDA
+            # trade/GTIN identity across historical data.  The only required
+            # proof for this stage is that THIS BN+month is unambiguous in both
+            # WMS (one Generic) and SFDA (one GTIN).
+            resolved = exact_edges.drop_duplicates(
                 subset=self.SFDA_KEYS + ["Generic Item Number"],
                 keep="first",
             )
