@@ -771,6 +771,23 @@ class ReconciliationEngine:
             ignore_index=True,
         )
 
+        receiving_columns = self.MATCH_KEYS + [
+            "Generic Item Number",
+            "Receipt Type",
+            "Expiry Date",
+            "Trade Name",
+            "Received Quantity Each",
+            "Description",
+            "Inbound Shipment",
+            "Supplier Name",
+            "Supplier Code",
+            "Item Family Group",
+            "Processing Status",
+            "Previous Run Date",
+            "Previous Quantity Each",
+            "Current Quantity Each",
+            "Quantity Difference",
+        ]
         receiving = (
             eligible_asn.groupby(
                 self.MATCH_KEYS + ["Generic Item Number", "Receipt Type"],
@@ -795,7 +812,7 @@ class ReconciliationEngine:
             )
             .reset_index()
             if not eligible_asn.empty
-            else pd.DataFrame()
+            else pd.DataFrame(columns=receiving_columns)
         )
 
         sfda_summary = self._sfda_summary()
@@ -813,6 +830,32 @@ class ReconciliationEngine:
             if "SFDA Expiry Date" in report.columns:
                 verified = report.get("SFDA Identity Status", "").eq("Verified Generic-GTIN")
                 report.loc[verified, "Expiry Date"] = report.loc[verified, "SFDA Expiry Date"]
+
+        # A strict identity filter can legitimately leave zero Supplier/STO-In rows.
+        # Keep the empty report schema-complete so a no-action run returns valid
+        # empty outputs instead of failing on downstream column access.
+        empty_safe_defaults = {
+            "BN": "",
+            "Expiry Month Key": "",
+            "Generic Item Number": "",
+            "Receipt Type": "",
+            "Expiry Date": pd.NaT,
+            "Trade Name": "",
+            "Received Quantity Each": 0.0,
+            "Description": "",
+            "Inbound Shipment": "",
+            "Supplier Name": "",
+            "Supplier Code": "",
+            "Item Family Group": "",
+            "Processing Status": "New",
+            "Previous Run Date": pd.NaT,
+            "Previous Quantity Each": 0.0,
+            "Current Quantity Each": 0.0,
+            "Quantity Difference": 0.0,
+        }
+        for column, default in empty_safe_defaults.items():
+            if column not in report.columns:
+                report[column] = default
 
         for column in [
             "Quantity", "Active", "Quantity sent pending", "Quantity Receive Pending",
