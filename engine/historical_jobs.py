@@ -212,13 +212,16 @@ def process_historical_build_job(
                     current_stage="Updating affected historical batches",
                 )
                 if inserted.get("receipt_events", 0) > 0:
-                    refresh_accept_history_incremental(
-                        prepared["receipt_records"].to_dict(orient="records"), sfda_df
-                    )
+                    receipt_records = prepared.get("receipt_records") or []
+                    if hasattr(receipt_records, "to_dict"):
+                        receipt_records = receipt_records.to_dict(orient="records")
+                    refresh_accept_history_incremental(receipt_records, sfda_df)
+
                 if inserted.get("dispatch_events", 0) > 0:
-                    refresh_dispatch_history_incremental(
-                        prepared["dispatch_records"].to_dict(orient="records")
-                    )
+                    dispatch_records = prepared.get("dispatch_records") or []
+                    if hasattr(dispatch_records, "to_dict"):
+                        dispatch_records = dispatch_records.to_dict(orient="records")
+                    refresh_dispatch_history_incremental(dispatch_records)
                 mark_stage("incremental_historical_refresh")
 
             master = get_batch_master_df()
