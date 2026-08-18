@@ -622,28 +622,35 @@ class ReconciliationEngine:
         return report
 
     def _filter_accept_sfda_relevant(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """Keep only ASN rows whose Generic is proven SFDA-relevant.
+        """Keep ASN rows whose BN + Expiry Month exists in CURRENT SFDA.
 
-        BN + Expiry Month is only a batch candidate.  It never proves product
-        identity.  Daily eligibility comes from the one-to-one Generic -> GTIN
-        relationship already proven in Batch Master.
+        Upload & Run is intentionally independent from Historical Build /
+        Batch Master.  The current SFDA file defines the daily batch universe.
+        Product identity is then taken from the matching WMS row and optionally
+        cross-checked against trusted Batch Master identity when available.
         """
         if frame.empty:
             return frame.copy()
 
         result = self._ensure_expiry_month_key(frame)
-        result["Generic Item Number"] = Normalizer.text(
-            result.get("Generic Item Number", pd.Series("", index=result.index, dtype=object))
-        )
-        reference = self._generic_identity_reference()
-        if reference.empty:
-            result["SFDA Relevance Status"] = "Identity Unresolved"
+
+        # _sfda_summary() already excludes ambiguous SFDA BN/month keys that
+        # point to more than one GTIN, so only safe current-SFDA keys survive.
+        sfda_keys = self._sfda_summary()[self.MATCH_KEYS].drop_duplicates()
+        if sfda_keys.empty:
+            result["SFDA Relevance Status"] = "No Current SFDA Batch"
             return result.iloc[0:0].copy()
 
-        proven_generics = set(reference["Generic Item Number"].astype(str))
-        keep = result["Generic Item Number"].astype(str).isin(proven_generics)
-        result["SFDA Relevance Status"] = "Generic Proven in SFDA-Relevant Master"
-        return result.loc[keep].copy()
+        result = result.merge(
+            sfda_keys.assign(_CurrentSFDAKey=True),
+            on=self.MATCH_KEYS,
+            how="left",
+            validate="many_to_one",
+        )
+        keep = result["_CurrentSFDAKey"].fillna(False).astype(bool)
+        result["SFDA Relevance Status"] = "No Current SFDA Batch"
+        result.loc[keep, "SFDA Relevance Status"] = "BN + Expiry Month Found in Current SFDA"
+        return result.loc[keep].drop(columns=["_CurrentSFDAKey"], errors="ignore").copy()
 
     def _apply_daily_generic_reference(self, report: pd.DataFrame) -> pd.DataFrame:
         """Fill SFDA identity for a relevant missing batch using its Generic.
@@ -755,7 +762,8 @@ class ReconciliationEngine:
             pd.Series("", index=self.asn.index, dtype=object),
         ).map(classify_inbound_shipment)
 
-        # First remove every ASN row that is not connected to the SFDA universe.
+        # Daily Accept universe comes from CURRENT SFDA BN + Expiry Month.
+        # Batch Master is not required for Upload & Run.
         self.asn = self._filter_accept_sfda_relevant(self.asn)
 
         # Regulatory routing:
@@ -1244,8 +1252,8 @@ class ReconciliationEngine:
 
         # SFDA receives PackageSize first through:
         # SFDA[Drug Name] -> Pack Size[Trade Name].
-        # BN + Expiry Month locates the candidate SFDA batch; Batch Master
-        # Generic -> GTIN identity must verify it before SFDA Active can be used.
+        # BN + Expiry Month locates the current SFDA batch.  The matching WMS
+        # row supplies Generic identity; Batch Master is only an optional cross-check.
         sfda_batches = self._sfda_summary()
 
         details = self.dispatch.merge(
