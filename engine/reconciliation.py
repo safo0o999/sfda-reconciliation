@@ -1031,8 +1031,16 @@ class ReconciliationEngine:
         ]
 
         # Main Accept Details = Supplier ONLY.
+        # Business rule: batches with zero received quantity are not actionable
+        # receipts and must not appear in Accept Details.
+        supplier_received_qty = pd.to_numeric(
+            report["Received Quantity Each"], errors="coerce"
+        ).fillna(0)
         supplier_details = self._ensure_output_columns(
-            report.loc[report["Receipt Type"].eq(SUPPLIER)].copy(),
+            report.loc[
+                report["Receipt Type"].eq(SUPPLIER)
+                & supplier_received_qty.gt(0)
+            ].copy(),
             details_columns,
         )
 
