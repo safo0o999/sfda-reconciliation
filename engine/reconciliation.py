@@ -173,25 +173,31 @@ class ReconciliationEngine:
         result["GTIN"] = Normalizer.text(result["GTIN"])
 
         reference = self._generic_identity_reference()
-        if reference.empty:
-            # Without historical identity evidence, never allow a current SFDA
-            # candidate to prove a WMS Generic merely from BN + month.
-            candidate = result["GTIN"].ne("")
-            result.loc[candidate, [
-                "GTIN", "Drug Name", "Quantity", "Active",
-                "Quantity sent pending", "Quantity Receive Pending", "PackageSize"
-            ]] = ["", "", 0, 0, 0, 0, 0]
-            result.loc[candidate, "Package Size Status"] = "Identity Unresolved"
-            result["SFDA Identity Status"] = "Identity Unresolved"
-            return result
 
-        result = result.merge(reference, on="Generic Item Number", how="left", validate="many_to_one")
+        # Upload & Run must NOT depend on Historical Build / Batch Master.
+        # The current WMS row can establish identity when it has an exact
+        # BN + Expiry Month candidate in the current SFDA file.
+        # Historical identity, when available, is only an additional cross-check.
+        if reference.empty:
+            result["_Proven GTIN"] = ""
+            result["_Proven Drug Name"] = ""
+        else:
+            result = result.merge(
+                reference,
+                on="Generic Item Number",
+                how="left",
+                validate="many_to_one",
+            )
+
         current_gtin = Normalizer.text(result["GTIN"])
         proven_gtin = Normalizer.text(result["_Proven GTIN"])
         has_candidate = current_gtin.ne("")
         has_proven = proven_gtin.ne("")
-        verified = has_candidate & has_proven & current_gtin.eq(proven_gtin)
-        collision = has_candidate & ~verified
+
+        # BN + Expiry Month is the primary proof for the current daily candidate.
+        # If Batch Master already has trusted identity, the GTIN must also agree.
+        verified = has_candidate & (~has_proven | current_gtin.eq(proven_gtin))
+        collision = has_candidate & has_proven & current_gtin.ne(proven_gtin)
 
         result["SFDA Identity Status"] = "No Current SFDA Batch"
         result.loc[verified, "SFDA Identity Status"] = "Verified Generic-GTIN"
