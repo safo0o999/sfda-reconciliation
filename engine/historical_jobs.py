@@ -25,7 +25,7 @@ from engine.database import (
     replace_latest_sfda_snapshot,
     refresh_accept_history_incremental,
     refresh_dispatch_history_incremental,
-    reconcile_batch_master_event_totals,
+    reconcile_affected_batch_master_event_totals,
     reset_history,
     update_historical_build_job,
 )
@@ -232,14 +232,18 @@ def process_historical_build_job(
             if dispatch_records:
                 refresh_dispatch_history_incremental(dispatch_records)
 
-            # Final consistency guard: event tables are the durable movement
-            # source of truth. Repair any Batch Master row whose receipt/dispatch
-            # totals or movement dates drifted because an earlier job failed
-            # after saving events but before refreshing derived history.
-            repair_result = reconcile_batch_master_event_totals()
+            # Final production self-healing guard:
+            # reconcile ONLY keys represented by this upload directly from the
+            # durable SQL event tables. Duplicate events remain deduplicated, but
+            # their Batch Master rows are still recalculated.
+            reconcile_result = reconcile_affected_batch_master_event_totals(
+                receipt_records,
+                dispatch_records,
+            )
             logger.info(
-                "Historical append consistency repair completed. repaired_rows=%s",
-                int(repair_result.get("batch_master_rows_repaired", 0)),
+                "Historical append affected-key reconciliation completed. affected_keys=%s reconciled_rows=%s",
+                int(reconcile_result.get("affected_batch_keys", 0)),
+                int(reconcile_result.get("batch_master_rows_reconciled", 0)),
             )
 
             mark_stage("incremental_historical_refresh")
