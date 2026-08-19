@@ -199,30 +199,39 @@ def process_historical_build_job(
         )
 
         if operation == "append":
-            if not has_new_events:
-                update_historical_build_job(
-                    job_id, progress=82,
-                    current_stage="No new events found; loading existing historical tables",
-                )
-            else:
-                # Append mode is genuinely incremental: only keys represented by
-                # newly inserted receipt/dispatch events are recalculated.
-                update_historical_build_job(
-                    job_id, progress=68,
-                    current_stage="Updating affected historical batches",
-                )
-                if inserted.get("receipt_events", 0) > 0:
-                    receipt_records = prepared.get("receipt_records") or []
-                    if hasattr(receipt_records, "to_dict"):
-                        receipt_records = receipt_records.to_dict(orient="records")
-                    refresh_accept_history_incremental(receipt_records, sfda_df)
+            # Append remains deduplicated at the event level, but Batch Master
+            # refresh must be self-healing. A previous job may have successfully
+            # saved ReceiptEvents / DispatchEvents and then failed before the
+            # derived Batch Master was refreshed. In that case, re-uploading the
+            # same historical file produces duplicate events (correctly skipped)
+            # but MUST still recalculate every BN + Expiry Month + Generic key
+            # represented by the uploaded file from the durable SQL event tables.
+            #
+            # Therefore refresh is driven by PREPARED INPUT KEYS, not only by
+            # newly inserted-event counts.
+            update_historical_build_job(
+                job_id,
+                progress=68,
+                current_stage=(
+                    "Reconciling affected historical batches"
+                    if has_new_events
+                    else "Rechecking existing historical batches"
+                ),
+            )
 
-                if inserted.get("dispatch_events", 0) > 0:
-                    dispatch_records = prepared.get("dispatch_records") or []
-                    if hasattr(dispatch_records, "to_dict"):
-                        dispatch_records = dispatch_records.to_dict(orient="records")
-                    refresh_dispatch_history_incremental(dispatch_records)
-                mark_stage("incremental_historical_refresh")
+            receipt_records = prepared.get("receipt_records") or []
+            if hasattr(receipt_records, "to_dict"):
+                receipt_records = receipt_records.to_dict(orient="records")
+            if receipt_records:
+                refresh_accept_history_incremental(receipt_records, sfda_df)
+
+            dispatch_records = prepared.get("dispatch_records") or []
+            if hasattr(dispatch_records, "to_dict"):
+                dispatch_records = dispatch_records.to_dict(orient="records")
+            if dispatch_records:
+                refresh_dispatch_history_incremental(dispatch_records)
+
+            mark_stage("incremental_historical_refresh")
 
             master = get_batch_master_df()
             supplier_history = get_supplier_history_df()
