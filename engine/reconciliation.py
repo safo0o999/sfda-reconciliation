@@ -757,13 +757,28 @@ class ReconciliationEngine:
             ["Item Family Group", "Item Family", "Family Group"],
         )
 
+        # Daily Accept scope rule:
+        # Laboratory Supplies are excluded BEFORE matching, grouping, Batch Master
+        # lookup, history persistence, or any Daily classification/output.
+        item_family = Normalizer.text(
+            self.asn.get(
+                "Item Family Group",
+                pd.Series("", index=self.asn.index, dtype=object),
+            )
+        ).str.upper()
+        self.asn = self.asn.loc[item_family.ne("LABORATORY SUPPLIES")].copy()
+
         self.asn["Receipt Type"] = self.asn.get(
             "Inbound Shipment",
             pd.Series("", index=self.asn.index, dtype=object),
         ).map(classify_inbound_shipment)
 
-        # Daily Accept universe comes from CURRENT SFDA BN + Expiry Month.
-        # Batch Master is not required for Upload & Run.
+        # Preserve the non-LAB daily receipt source for:
+        #   1) Daily Missing From SFDA detection, and
+        #   2) incremental receipt history persistence.
+        daily_receipt_source = self.asn.copy()
+
+        # Normal Accept remains driven by CURRENT SFDA BN + Expiry Month.
         self.asn = self._filter_accept_sfda_relevant(self.asn)
 
         # Regulatory routing:
@@ -1030,6 +1045,105 @@ class ReconciliationEngine:
             "Batch Master Status",
         ]
 
+        # Daily Missing From SFDA
+        # -----------------------
+        # A daily receipt batch is considered "Missing from SFDA" only when:
+        #   - its BN + Expiry Month is NOT present in the current SFDA report;
+        #   - its Generic Item Number has a trusted identity in Batch Master;
+        #   - it is an eligible receipt type (Supplier or STO Incoming);
+        #   - Received Quantity Each is greater than zero.
+        #
+        # Batch Master is therefore required only for this missing-batch
+        # classification. It is NOT required for normal Daily Accept matching.
+        daily_missing_columns = [
+            "Receipt Type",
+            "GTIN",
+            "Drug Name",
+            "BN",
+            "Expiry Date",
+            "Generic Item Number",
+            "Received Quantity Each",
+            "Description",
+            "Inbound Shipment",
+            "Supplier Name",
+            "Supplier Code",
+            "Item Family Group",
+            "Status",
+            "Required Action",
+        ]
+        daily_missing_from_sfda = pd.DataFrame(columns=daily_missing_columns)
+
+        missing_source = daily_receipt_source.loc[
+            daily_receipt_source["Receipt Type"].isin([SUPPLIER, STO_INCOMING])
+        ].copy()
+
+        if not missing_source.empty:
+            current_sfda_keys = self._sfda_summary()[self.MATCH_KEYS].drop_duplicates()
+            if not current_sfda_keys.empty:
+                missing_source = missing_source.merge(
+                    current_sfda_keys.assign(_ExistsInCurrentSFDA=True),
+                    on=self.MATCH_KEYS,
+                    how="left",
+                    validate="many_to_one",
+                )
+                missing_source = missing_source.loc[
+                    ~missing_source["_ExistsInCurrentSFDA"].fillna(False).astype(bool)
+                ].drop(columns=["_ExistsInCurrentSFDA"], errors="ignore")
+            # If the current SFDA key set is empty, every eligible non-LAB receipt
+            # is a candidate, but it still must pass the trusted Generic test below.
+
+            trusted_generic = self._generic_identity_reference()
+            if not missing_source.empty and not trusted_generic.empty:
+                missing_source["Generic Item Number"] = Normalizer.text(
+                    missing_source["Generic Item Number"]
+                )
+                missing_source = missing_source.merge(
+                    trusted_generic,
+                    on="Generic Item Number",
+                    how="inner",
+                    validate="many_to_one",
+                )
+
+                missing_source["GTIN"] = Normalizer.text(
+                    missing_source["_Proven GTIN"]
+                )
+                missing_source["Drug Name"] = Normalizer.text(
+                    missing_source["_Proven Drug Name"]
+                )
+
+                daily_missing_from_sfda = (
+                    missing_source.groupby(
+                        self.MATCH_KEYS
+                        + ["Generic Item Number", "Receipt Type", "GTIN", "Drug Name"],
+                        dropna=False,
+                    )
+                    .agg(
+                        **{
+                            "Expiry Date": ("Expiry Date", "first"),
+                            "Received Quantity Each": ("Effective Quantity Each", "sum"),
+                            "Description": ("Description", self._join_unique),
+                            "Inbound Shipment": ("Inbound Shipment", self._join_unique),
+                            "Supplier Name": ("Supplier Name", self._join_unique),
+                            "Supplier Code": ("Supplier Code", self._join_unique),
+                            "Item Family Group": ("Item Family Group", self._join_unique),
+                        }
+                    )
+                    .reset_index()
+                )
+                daily_missing_from_sfda["Received Quantity Each"] = pd.to_numeric(
+                    daily_missing_from_sfda["Received Quantity Each"],
+                    errors="coerce",
+                ).fillna(0)
+                daily_missing_from_sfda = daily_missing_from_sfda.loc[
+                    daily_missing_from_sfda["Received Quantity Each"].gt(0)
+                ].copy()
+                daily_missing_from_sfda["Status"] = "Missing Batch in SFDA"
+                daily_missing_from_sfda["Required Action"] = "Register Batch in SFDA"
+                daily_missing_from_sfda = self._ensure_output_columns(
+                    daily_missing_from_sfda,
+                    daily_missing_columns,
+                )
+
         # Main Accept Details = Supplier ONLY.
         # Business rule: batches with zero received quantity are not actionable
         # receipts and must not appear in Accept Details.
@@ -1237,6 +1351,10 @@ class ReconciliationEngine:
             "pending_confirmation_transactions": pending_transactions,
             "sto_incoming_followup": sto_incoming_details.reset_index(drop=True),
             "sto_return_cancel_dispatch": sto_return_cancel.reset_index(drop=True),
+            "daily_missing_from_sfda": daily_missing_from_sfda.reset_index(drop=True),
+            # Internal source used by function_app for incremental history.
+            # It is intentionally non-LAB and is not exported directly.
+            "history_asn": daily_receipt_source.reset_index(drop=True),
         }
 
     def _run_dispatch(self) -> Dict[str, pd.DataFrame]:
