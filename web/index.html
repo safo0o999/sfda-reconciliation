@@ -7,7 +7,9 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>SFDA Drug Traceability & Reconciliation Platform</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js">  passwordResetToken=readPasswordResetToken();
+  if(passwordResetToken) showAuthPanel("reset");
+</script>
   <style>
     :root {
       --navy-950:#05172c;
@@ -533,7 +535,27 @@
         <label>Password<input class="control" id="loginPassword" type="password" autocomplete="current-password"></label>
         <button class="btn btn-primary" id="loginButton" type="button">Sign In</button>
       </div>
+      <div class="auth-switch">Forgot your password? <button type="button" id="showForgotPasswordButton">Reset Password</button></div>
       <div class="auth-switch">Need access? <button type="button" id="showRegisterButton">Create New User</button></div>
+    </div>
+    <div id="forgotPasswordPanel" hidden>
+      <h1>Reset Password</h1>
+      <p>Enter your approved company email. If an active account exists, a secure reset link will be emailed to you.</p>
+      <div class="auth-form">
+        <label>Company Email<input class="control" id="forgotPasswordEmail" type="email" autocomplete="username" placeholder="name@nupco.com"></label>
+        <button class="btn btn-primary" id="requestPasswordResetButton" type="button">Send Reset Link</button>
+      </div>
+      <div class="auth-switch"><button type="button" id="forgotBackToLoginButton">Back to Sign In</button></div>
+    </div>
+    <div id="resetPasswordPanel" hidden>
+      <h1>Choose New Password</h1>
+      <p>Enter a new password for your account. The reset link can be used only once.</p>
+      <div class="auth-form">
+        <label>New Password<input class="control" id="resetPasswordNew" type="password" autocomplete="new-password" placeholder="Minimum 10 characters"></label>
+        <label>Confirm Password<input class="control" id="resetPasswordConfirm" type="password" autocomplete="new-password"></label>
+        <button class="btn btn-primary" id="completePasswordResetButton" type="button">Update Password</button>
+      </div>
+      <div class="auth-switch"><button type="button" id="resetBackToLoginButton">Back to Sign In</button></div>
     </div>
     <div id="registerPanel" hidden>
       <h1>Create New User</h1>
@@ -1295,6 +1317,8 @@ Drug Traceability Reconciliation Platform</textarea></label>
   const VARIANCE_OUTLOOK_START_URL = "/api/variance-management/outlook/start";
   const AUTH_STATUS_URL = "/api/auth/status";
   const AUTH_LOGIN_URL = "/api/auth/login";
+  const AUTH_PASSWORD_RESET_REQUEST_URL = "/api/auth/password-reset/request";
+  const AUTH_PASSWORD_RESET_URL = "/api/auth/password-reset";
   const AUTH_REGISTER_URL = "/api/auth/register";
   const AUTH_WAREHOUSES_URL = "/api/auth/warehouses";
   const AUTH_LOGOUT_URL = "/api/auth/logout";
@@ -1361,6 +1385,8 @@ Drug Traceability Reconciliation Platform</textarea></label>
   function showAuthPanel(panel){
     $("loginPanel").hidden=panel!=="login";
     $("registerPanel").hidden=panel!=="register";
+    $("forgotPasswordPanel").hidden=panel!=="forgot";
+    $("resetPasswordPanel").hidden=panel!=="reset";
     clearAuthMessage();
   }
 
@@ -1390,7 +1416,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
     if(!response.ok) throw new Error(payload.details||payload.error||"Unable to check authentication.");
     authSettings=payload.settings||{};
     const domain=authSettings.allowed_domain||"nupco.com";
-    ["loginEmail","registerEmail"].forEach(id=>{const el=$(id);if(el)el.placeholder=`name@${domain}`;});
+    ["loginEmail","registerEmail","forgotPasswordEmail"].forEach(id=>{const el=$(id);if(el)el.placeholder=`name@${domain}`;});
     return payload;
   }
 
@@ -1411,6 +1437,69 @@ Drug Traceability Reconciliation Platform</textarea></label>
       await startApplication();
     }catch(error){setAuthMessage(error.message||String(error),"error");}
     finally{button.disabled=false;button.textContent="Sign In";}
+  }
+
+  let passwordResetToken="";
+
+  function readPasswordResetToken(){
+    const hash=String(window.location.hash||"");
+    const prefix="#reset-password=";
+    if(!hash.startsWith(prefix)) return "";
+    try{return decodeURIComponent(hash.slice(prefix.length));}
+    catch(_){return hash.slice(prefix.length);}
+  }
+
+  async function requestPasswordReset(){
+    clearAuthMessage();
+    const button=$("requestPasswordResetButton");
+    button.disabled=true;button.textContent="Sending...";
+    try{
+      const response=await fetch(AUTH_PASSWORD_RESET_REQUEST_URL,{
+        method:"POST",credentials:"same-origin",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({email:$("forgotPasswordEmail").value.trim()})
+      });
+      const payload=await response.json().catch(()=>({}));
+      if(!response.ok) throw new Error(payload.details||payload.error||"Unable to request password reset.");
+      setAuthMessage(payload.message||"If the account exists, a reset link will be sent shortly.","success");
+    }catch(error){
+      setAuthMessage(error.message||String(error),"error");
+    }finally{
+      button.disabled=false;button.textContent="Send Reset Link";
+    }
+  }
+
+  async function completePasswordReset(){
+    clearAuthMessage();
+    const button=$("completePasswordResetButton");
+    const password=$("resetPasswordNew").value;
+    const confirm=$("resetPasswordConfirm").value;
+    if(password!==confirm){
+      setAuthMessage("The new passwords do not match.","error");
+      return;
+    }
+    if(!passwordResetToken){
+      setAuthMessage("The password reset link is missing or invalid.","error");
+      return;
+    }
+    button.disabled=true;button.textContent="Updating...";
+    try{
+      const response=await fetch(AUTH_PASSWORD_RESET_URL,{
+        method:"POST",credentials:"same-origin",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({token:passwordResetToken,password})
+      });
+      const payload=await response.json().catch(()=>({}));
+      if(!response.ok) throw new Error(payload.details||payload.error||"Password reset failed.");
+      passwordResetToken="";
+      history.replaceState(null,"",window.location.pathname+window.location.search);
+      showAuthPanel("login");
+      setAuthMessage(payload.message||"Your password has been reset. You can sign in now.","success");
+    }catch(error){
+      setAuthMessage(error.message||String(error),"error");
+    }finally{
+      button.disabled=false;button.textContent="Update Password";
+    }
   }
 
   async function loadRegistrationWarehouses(){
@@ -3757,6 +3846,15 @@ Drug Traceability Reconciliation Platform</textarea></label>
   $("showRegisterButton")?.addEventListener("click",async()=>{showAuthPanel("register");await loadRegistrationWarehouses();});
   $("showLoginButton")?.addEventListener("click",()=>showAuthPanel("login"));
   $("loginButton")?.addEventListener("click",()=>login());
+  $("showForgotPasswordButton")?.addEventListener("click",()=>showAuthPanel("forgot"));
+  $("forgotBackToLoginButton")?.addEventListener("click",()=>showAuthPanel("login"));
+  $("resetBackToLoginButton")?.addEventListener("click",()=>{
+    passwordResetToken="";
+    history.replaceState(null,"",window.location.pathname+window.location.search);
+    showAuthPanel("login");
+  });
+  $("requestPasswordResetButton")?.addEventListener("click",requestPasswordReset);
+  $("completePasswordResetButton")?.addEventListener("click",completePasswordReset);
   $("registerButton")?.addEventListener("click",()=>registerUser());
   $("logoutButton")?.addEventListener("click",()=>logout());
   $("adminRefreshUsers")?.addEventListener("click",()=>loadAdminUsers().catch(error=>toast(error.message||String(error),"error")));
