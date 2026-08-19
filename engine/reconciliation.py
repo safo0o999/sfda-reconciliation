@@ -1142,7 +1142,7 @@ class ReconciliationEngine:
                 # Missing batches inherit the proven SFDA product identity from
                 # Batch Master. Use that Drug Name to resolve PackageSize and
                 # calculate the received quantity in packs.
-                missing_pack_map = self._prepare_packsize()
+                missing_pack_map = self._pack_lookup()
                 daily_missing_from_sfda = daily_missing_from_sfda.merge(
                     missing_pack_map,
                     on="Drug Name",
