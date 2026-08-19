@@ -205,6 +205,8 @@ def verify_auth_schema() -> None:
             "Status",
             "WarehouseID",
             "RequestedWarehouseName",
+            "PasswordResetTokenHash",
+            "PasswordResetExpiresAt",
         ),
         "AuthSessions": ("SessionID", "UserID", "TokenHash", "ExpiresAt"),
     }
@@ -5920,6 +5922,84 @@ def approve_user_by_token_hash(token_hash: str) -> Optional[Dict[str, Any]]:
         return result
 
 
+
+def set_password_reset_token(
+    user_id: int,
+    token_hash: str,
+    expires_at: Any,
+) -> None:
+    """Store a one-time password reset token for an active user."""
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE dbo.ApplicationUsers
+            SET PasswordResetTokenHash=?,
+                PasswordResetExpiresAt=?,
+                UpdatedAt=SYSUTCDATETIME()
+            WHERE UserID=? AND Status=N'Active';
+            """,
+            (token_hash, expires_at, int(user_id)),
+        )
+        connection.commit()
+
+
+def reset_password_by_token_hash(
+    token_hash: str,
+    password_salt: str,
+    password_hash: str,
+) -> Optional[Dict[str, Any]]:
+    """Consume a valid reset token, replace password, and revoke all sessions."""
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        row = cursor.execute(
+            """
+            SELECT TOP (1) UserID
+            FROM dbo.ApplicationUsers WITH (UPDLOCK, HOLDLOCK)
+            WHERE PasswordResetTokenHash=?
+              AND PasswordResetExpiresAt>=SYSUTCDATETIME()
+              AND Status=N'Active';
+            """,
+            (token_hash,),
+        ).fetchone()
+        if not row:
+            connection.rollback()
+            return None
+
+        user_id = int(row[0])
+        cursor.execute(
+            """
+            UPDATE dbo.ApplicationUsers
+            SET PasswordSalt=?,
+                PasswordHash=?,
+                PasswordResetTokenHash=NULL,
+                PasswordResetExpiresAt=NULL,
+                UpdatedAt=SYSUTCDATETIME()
+            WHERE UserID=?;
+            """,
+            (password_salt, password_hash, user_id),
+        )
+        cursor.execute(
+            "DELETE FROM dbo.AuthSessions WHERE UserID=?;",
+            (user_id,),
+        )
+
+        result_row = cursor.execute(
+            """
+            SELECT u.UserID,u.Email,u.Role,u.Status,u.ApprovedAt,u.CreatedAt,u.UpdatedAt,u.LastLoginAt,
+                   u.WarehouseID,w.WarehouseName,w.WarehouseCode,u.RequestedWarehouseName
+            FROM dbo.ApplicationUsers u
+            LEFT JOIN dbo.Warehouses w ON w.WarehouseID=u.WarehouseID
+            WHERE u.UserID=?;
+            """,
+            (user_id,),
+        ).fetchone()
+        result = _auth_row(cursor, result_row)
+        connection.commit()
+        return result
+
+
+
 def create_auth_session(user_id: int, token_hash: str, expires_at: Any) -> None:
     with Database().connect() as connection:
         cursor = connection.cursor()
@@ -5979,11 +6059,22 @@ def set_user_status(user_id: int, status: str) -> Dict[str, Any]:
             """
             UPDATE dbo.ApplicationUsers
             SET Status=?,
-                ApprovedAt=CASE WHEN ?=N'Active' AND ApprovedAt IS NULL THEN SYSUTCDATETIME() ELSE ApprovedAt END,
+                ApprovedAt=CASE
+                    WHEN ?=N'Active' AND ApprovedAt IS NULL THEN SYSUTCDATETIME()
+                    ELSE ApprovedAt
+                END,
+                ApprovalTokenHash=CASE
+                    WHEN ?=N'Active' THEN NULL
+                    ELSE ApprovalTokenHash
+                END,
+                ApprovalExpiresAt=CASE
+                    WHEN ?=N'Active' THEN NULL
+                    ELSE ApprovalExpiresAt
+                END,
                 UpdatedAt=SYSUTCDATETIME()
             WHERE UserID=?;
             """,
-            (status, status, int(user_id)),
+            (status, status, status, status, int(user_id)),
         )
         if status != "Active":
             cursor.execute("DELETE FROM dbo.AuthSessions WHERE UserID=?;", (int(user_id),))
