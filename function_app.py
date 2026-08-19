@@ -1669,7 +1669,7 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         from engine.blob_storage import BlobStorage
-        from engine.database import create_historical_build_job
+        from engine.database import create_historical_build_job, update_historical_build_job
 
         job_id = build_run_number("historical")
         submitted_by = get_submitted_by(req)
@@ -1745,28 +1745,49 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
                 "Historical build queue already exists; continuing."
             )
 
-        queue.send_message(
-            json.dumps(
-                {
-                    "job_id": job_id,
-                    "operation": operation,
-                    "input_manifest": manifest,
-                    "warehouse_id": int(
-                        __import__(
-                            "engine.warehouse_context",
-                            fromlist=["current_warehouse_id"],
-                        ).current_warehouse_id()
-                    ),
-                    "warehouse_name": str(
-                        __import__(
-                            "engine.warehouse_context",
-                            fromlist=["current_warehouse_name"],
-                        ).current_warehouse_name()
-                    ),
-                },
-                ensure_ascii=False,
+        try:
+            queue.send_message(
+                json.dumps(
+                    {
+                        "job_id": job_id,
+                        "operation": operation,
+                        "input_manifest": manifest,
+                        "warehouse_id": int(
+                            __import__(
+                                "engine.warehouse_context",
+                                fromlist=["current_warehouse_id"],
+                            ).current_warehouse_id()
+                        ),
+                        "warehouse_name": str(
+                            __import__(
+                                "engine.warehouse_context",
+                                fromlist=["current_warehouse_name"],
+                            ).current_warehouse_name()
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
             )
-        )
+        except Exception as enqueue_exc:
+            # SQL job creation happens before queue submission so the worker has a
+            # durable record to update. If queue submission fails, release that
+            # record immediately instead of leaving a ghost Queued job that blocks
+            # the warehouse until the stale timeout expires.
+            try:
+                update_historical_build_job(
+                    job_id,
+                    status="Failed",
+                    progress=0,
+                    current_stage="Queue submission failed",
+                    error_message=f"Unable to enqueue Historical Build: {enqueue_exc}",
+                    mark_completed=True,
+                )
+            except Exception:
+                logger.exception(
+                    "Unable to mark Historical Build failed after enqueue error. job_id=%s",
+                    job_id,
+                )
+            raise
 
         return json_response(
             {
