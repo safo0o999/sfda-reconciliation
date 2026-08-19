@@ -782,24 +782,33 @@ def auth_password_reset_request(req: func.HttpRequest) -> func.HttpResponse:
     try:
         from engine.auth import request_password_reset
         payload = req.get_json() or {}
-        result = request_password_reset(
-            str(payload.get("email") or ""),
-            _request_base_url(req),
-        )
+        result = request_password_reset(str(payload.get("email") or ""))
         return json_response({
             "status": "Success",
             **result,
         })
+    except ValueError as exc:
+        return error_response("Password reset request failed.", 400, str(exc))
     except Exception as exc:
         logger.exception("Password reset request failed")
-        # Do not reveal whether an account exists.
+        return error_response("Password reset request failed.", 500, str(exc))
+
+
+@app.route(route="auth/password-reset/status", methods=["POST"])
+def auth_password_reset_status(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        from engine.auth import password_reset_status
+        payload = req.get_json() or {}
+        result = password_reset_status(str(payload.get("token") or ""))
         return json_response({
             "status": "Success",
-            "message": (
-                "If an active account exists for that company email, "
-                "a password reset link will be sent shortly."
-            ),
+            "reset": result,
         })
+    except ValueError as exc:
+        return error_response("Unable to read password reset status.", 400, str(exc))
+    except Exception as exc:
+        logger.exception("Password reset status failed")
+        return error_response("Unable to read password reset status.", 500, str(exc))
 
 
 @app.route(route="auth/password-reset", methods=["POST"])
@@ -905,6 +914,31 @@ def admin_user_status_route(req: func.HttpRequest) -> func.HttpResponse:
         return error_response("Unable to update user.", 400, str(exc))
     except Exception as exc:
         return error_response("Unable to update user.", 500, str(exc))
+
+
+@app.route(route="user-management/users/{user_id}/password-reset", methods=["POST"])
+def admin_password_reset_status_route(req: func.HttpRequest) -> func.HttpResponse:
+    denied = _auth_guard(req, admin=True)
+    if denied:
+        return denied
+    try:
+        from engine.auth import admin_set_password_reset_status
+        payload = req.get_json() or {}
+        admin_user = _current_user(req) or {}
+        result = admin_set_password_reset_status(
+            int(req.route_params.get("user_id")),
+            str(payload.get("action") or ""),
+            str(admin_user.get("Email") or ""),
+        )
+        return json_response({
+            "status": "Completed",
+            "user": result,
+        })
+    except ValueError as exc:
+        return error_response("Unable to update password reset request.", 400, str(exc))
+    except Exception as exc:
+        logger.exception("Admin password reset approval failed")
+        return error_response("Unable to update password reset request.", 500, str(exc))
 
 
 @app.route(route="warehouse-gln/status", methods=["GET"])
