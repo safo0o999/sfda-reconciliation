@@ -4177,6 +4177,100 @@ def get_dispatch_confirmed_history_records() -> List[Dict[str, Any]]:
     return records
 
 
+
+def reconcile_batch_master_event_totals() -> Dict[str, int]:
+    """Self-heal Batch Master movement totals from durable event tables.
+
+    ReceiptEvents and DispatchEvents are the source of truth. Historical jobs can
+    legitimately save events and then fail before refreshing BatchMaster. This
+    set-based repair removes that inconsistency by recalculating movement totals,
+    run counts, and first/last movement dates directly from SQL events for every
+    BatchMaster row visible to the current warehouse RLS context.
+
+    Only physical receipt classes (TRK5060/TRK800/TRK49) contribute to receipt
+    totals. DispatchEvents already contain only confirmed Full Dispatch rows.
+    """
+    initialize_database()
+    started_at = time.perf_counter()
+
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(r"""
+                ;WITH ReceiptAggregate AS
+                (
+                    SELECT
+                        r.BN,
+                        r.ExpiryMonthKey,
+                        r.GenericItemNumber,
+                        SUM(COALESCE(r.ReceivedQuantity, 0)) AS TotalReceiveQty,
+                        COUNT_BIG(*) AS ReceiveRuns,
+                        MIN(r.ReceivedDate) AS FirstReceivedDate,
+                        MAX(r.ReceivedDate) AS LastReceivedDate
+                    FROM dbo.ReceiptEvents r
+                    WHERE
+                        UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK5060%'
+                        OR UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK800%'
+                        OR UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK49%'
+                    GROUP BY r.BN, r.ExpiryMonthKey, r.GenericItemNumber
+                ),
+                DispatchAggregate AS
+                (
+                    SELECT
+                        d.BN,
+                        d.ExpiryMonthKey,
+                        d.GenericItemNumber,
+                        SUM(COALESCE(d.DispatchedQuantity, 0)) AS TotalDispatchedQty,
+                        COUNT_BIG(*) AS DispatchRuns,
+                        MIN(d.DispatchDate) AS FirstDispatchDate,
+                        MAX(d.DispatchDate) AS LastDispatchDate
+                    FROM dbo.DispatchEvents d
+                    GROUP BY d.BN, d.ExpiryMonthKey, d.GenericItemNumber
+                )
+                UPDATE bm
+                SET
+                    bm.TotalReceiveQty = COALESCE(ra.TotalReceiveQty, 0),
+                    bm.ReceiveRuns = COALESCE(ra.ReceiveRuns, 0),
+                    bm.FirstReceivedDate = ra.FirstReceivedDate,
+                    bm.LastReceivedDate = ra.LastReceivedDate,
+                    bm.TotalDispatchedQty = COALESCE(da.TotalDispatchedQty, 0),
+                    bm.DispatchRuns = COALESCE(da.DispatchRuns, 0),
+                    bm.FirstDispatchDate = da.FirstDispatchDate,
+                    bm.LastDispatchDate = da.LastDispatchDate,
+                    bm.LastUpdated = SYSUTCDATETIME()
+                FROM dbo.BatchMaster bm
+                LEFT JOIN ReceiptAggregate ra
+                    ON ra.BN = bm.BN
+                   AND ra.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND ra.GenericItemNumber = bm.GenericItemNumber
+                LEFT JOIN DispatchAggregate da
+                    ON da.BN = bm.BN
+                   AND da.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND da.GenericItemNumber = bm.GenericItemNumber
+                WHERE
+                    COALESCE(bm.TotalReceiveQty, 0) <> COALESCE(ra.TotalReceiveQty, 0)
+                    OR COALESCE(bm.ReceiveRuns, 0) <> COALESCE(ra.ReceiveRuns, 0)
+                    OR ISNULL(bm.FirstReceivedDate, '19000101') <> ISNULL(ra.FirstReceivedDate, '19000101')
+                    OR ISNULL(bm.LastReceivedDate, '19000101') <> ISNULL(ra.LastReceivedDate, '19000101')
+                    OR COALESCE(bm.TotalDispatchedQty, 0) <> COALESCE(da.TotalDispatchedQty, 0)
+                    OR COALESCE(bm.DispatchRuns, 0) <> COALESCE(da.DispatchRuns, 0)
+                    OR ISNULL(bm.FirstDispatchDate, '19000101') <> ISNULL(da.FirstDispatchDate, '19000101')
+                    OR ISNULL(bm.LastDispatchDate, '19000101') <> ISNULL(da.LastDispatchDate, '19000101');
+            """)
+            repaired = max(0, int(cursor.rowcount or 0))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    logger.info(
+        "Batch Master event-total consistency repair completed in %.2f seconds. repaired_rows=%s",
+        time.perf_counter() - started_at,
+        repaired,
+    )
+    return {"batch_master_rows_repaired": repaired}
+
+
 def refresh_accept_history_incremental(
     receipt_history_rows: List[Dict[str, Any]],
     sfda_df: pd.DataFrame,
