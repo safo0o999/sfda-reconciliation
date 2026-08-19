@@ -776,6 +776,52 @@ def auth_approve(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(html, status_code=400, mimetype="text/html", charset="utf-8")
 
 
+
+@app.route(route="auth/password-reset/request", methods=["POST"])
+def auth_password_reset_request(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        from engine.auth import request_password_reset
+        payload = req.get_json() or {}
+        result = request_password_reset(
+            str(payload.get("email") or ""),
+            _request_base_url(req),
+        )
+        return json_response({
+            "status": "Success",
+            **result,
+        })
+    except Exception as exc:
+        logger.exception("Password reset request failed")
+        # Do not reveal whether an account exists.
+        return json_response({
+            "status": "Success",
+            "message": (
+                "If an active account exists for that company email, "
+                "a password reset link will be sent shortly."
+            ),
+        })
+
+
+@app.route(route="auth/password-reset", methods=["POST"])
+def auth_password_reset(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        from engine.auth import reset_password
+        payload = req.get_json() or {}
+        reset_password(
+            str(payload.get("token") or ""),
+            str(payload.get("password") or ""),
+        )
+        return json_response({
+            "status": "Success",
+            "message": "Your password has been reset successfully. You can sign in now.",
+        })
+    except ValueError as exc:
+        return error_response("Password reset failed.", 400, str(exc))
+    except Exception as exc:
+        logger.exception("Password reset failed")
+        return error_response("Password reset failed.", 500, str(exc))
+
+
 @app.route(route="auth/login", methods=["POST"])
 def auth_login(req: func.HttpRequest) -> func.HttpResponse:
     try:
