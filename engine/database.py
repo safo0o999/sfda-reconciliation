@@ -4178,6 +4178,158 @@ def get_dispatch_confirmed_history_records() -> List[Dict[str, Any]]:
 
 
 
+
+def reconcile_affected_batch_master_event_totals(
+    receipt_history_rows: List[Dict[str, Any]],
+    dispatch_history_rows: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """Reconcile ONLY Batch Master keys represented by the current uploaded files.
+
+    This is the production self-healing path for Historical Append.
+
+    Event tables remain the durable source of truth and event deduplication remains
+    unchanged.  The uploaded file determines the affected
+    BN + ExpiryMonthKey + GenericItemNumber keys.  For those keys only, SQL
+    recalculates cumulative receipt/dispatch totals and first/last movement dates
+    directly from ReceiptEvents / DispatchEvents, then overwrites the derived
+    BatchMaster movement fields.
+
+    This repairs cases where a previous job saved an event successfully but failed
+    before refreshing BatchMaster, without rebuilding or scanning the full master.
+    """
+    initialize_database()
+    started_at = time.perf_counter()
+
+    def _key(row: Dict[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(row.get("BN") or "").strip(),
+            str(row.get("Expiry Month Key") or "").strip(),
+            str(row.get("Generic Item Number") or "").strip(),
+        )
+
+    affected = sorted({
+        key
+        for row in list(receipt_history_rows or []) + list(dispatch_history_rows or [])
+        for key in [_key(row)]
+        if all(key)
+    })
+
+    if not affected:
+        return {
+            "affected_batch_keys": 0,
+            "batch_master_rows_reconciled": 0,
+        }
+
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(r"""
+                CREATE TABLE #AffectedMovementKeys
+                (
+                    BN nvarchar(255) NOT NULL,
+                    ExpiryMonthKey nvarchar(20) NOT NULL,
+                    GenericItemNumber nvarchar(255) NOT NULL,
+                    PRIMARY KEY (BN, ExpiryMonthKey, GenericItemNumber)
+                );
+            """)
+            cursor.fast_executemany = True
+            cursor.executemany(
+                """
+                INSERT INTO #AffectedMovementKeys
+                    (BN, ExpiryMonthKey, GenericItemNumber)
+                VALUES (?, ?, ?);
+                """,
+                affected,
+            )
+
+            cursor.execute(r"""
+                ;WITH ReceiptAggregate AS
+                (
+                    SELECT
+                        r.BN,
+                        r.ExpiryMonthKey,
+                        r.GenericItemNumber,
+                        SUM(COALESCE(r.ReceivedQuantity, 0)) AS TotalReceiveQty,
+                        COUNT_BIG(*) AS ReceiveRuns,
+                        MIN(r.ReceivedDate) AS FirstReceivedDate,
+                        MAX(r.ReceivedDate) AS LastReceivedDate
+                    FROM dbo.ReceiptEvents AS r
+                    INNER JOIN #AffectedMovementKeys AS a
+                        ON a.BN = r.BN
+                       AND a.ExpiryMonthKey = r.ExpiryMonthKey
+                       AND a.GenericItemNumber = r.GenericItemNumber
+                    WHERE
+                        UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK5060%'
+                        OR UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK800%'
+                        OR UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK49%'
+                    GROUP BY
+                        r.BN,
+                        r.ExpiryMonthKey,
+                        r.GenericItemNumber
+                ),
+                DispatchAggregate AS
+                (
+                    SELECT
+                        d.BN,
+                        d.ExpiryMonthKey,
+                        d.GenericItemNumber,
+                        SUM(COALESCE(d.DispatchedQuantity, 0)) AS TotalDispatchedQty,
+                        COUNT_BIG(*) AS DispatchRuns,
+                        MIN(d.DispatchDate) AS FirstDispatchDate,
+                        MAX(d.DispatchDate) AS LastDispatchDate
+                    FROM dbo.DispatchEvents AS d
+                    INNER JOIN #AffectedMovementKeys AS a
+                        ON a.BN = d.BN
+                       AND a.ExpiryMonthKey = d.ExpiryMonthKey
+                       AND a.GenericItemNumber = d.GenericItemNumber
+                    GROUP BY
+                        d.BN,
+                        d.ExpiryMonthKey,
+                        d.GenericItemNumber
+                )
+                UPDATE bm
+                SET
+                    bm.TotalReceiveQty = COALESCE(ra.TotalReceiveQty, 0),
+                    bm.ReceiveRuns = COALESCE(ra.ReceiveRuns, 0),
+                    bm.FirstReceivedDate = ra.FirstReceivedDate,
+                    bm.LastReceivedDate = ra.LastReceivedDate,
+                    bm.TotalDispatchedQty = COALESCE(da.TotalDispatchedQty, 0),
+                    bm.DispatchRuns = COALESCE(da.DispatchRuns, 0),
+                    bm.FirstDispatchDate = da.FirstDispatchDate,
+                    bm.LastDispatchDate = da.LastDispatchDate,
+                    bm.LastUpdated = SYSUTCDATETIME()
+                FROM dbo.BatchMaster AS bm
+                INNER JOIN #AffectedMovementKeys AS a
+                    ON a.BN = bm.BN
+                   AND a.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND a.GenericItemNumber = bm.GenericItemNumber
+                LEFT JOIN ReceiptAggregate AS ra
+                    ON ra.BN = bm.BN
+                   AND ra.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND ra.GenericItemNumber = bm.GenericItemNumber
+                LEFT JOIN DispatchAggregate AS da
+                    ON da.BN = bm.BN
+                   AND da.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND da.GenericItemNumber = bm.GenericItemNumber;
+            """)
+            reconciled = max(0, int(cursor.rowcount or 0))
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    logger.info(
+        "Affected Batch Master reconciliation completed in %.2f seconds. affected_keys=%s reconciled_rows=%s",
+        time.perf_counter() - started_at,
+        len(affected),
+        reconciled,
+    )
+    return {
+        "affected_batch_keys": int(len(affected)),
+        "batch_master_rows_reconciled": int(reconciled),
+    }
+
+
 def reconcile_batch_master_event_totals() -> Dict[str, int]:
     """Self-heal Batch Master movement totals from durable event tables.
 
