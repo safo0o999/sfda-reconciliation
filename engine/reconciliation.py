@@ -1063,6 +1063,7 @@ class ReconciliationEngine:
             "Expiry Date",
             "Generic Item Number",
             "Received Quantity Each",
+            "Received Quantity Pack",
             "Description",
             "Inbound Shipment",
             "Supplier Name",
@@ -1137,6 +1138,34 @@ class ReconciliationEngine:
                 daily_missing_from_sfda = daily_missing_from_sfda.loc[
                     daily_missing_from_sfda["Received Quantity Each"].gt(0)
                 ].copy()
+
+                # Missing batches inherit the proven SFDA product identity from
+                # Batch Master. Use that Drug Name to resolve PackageSize and
+                # calculate the received quantity in packs.
+                missing_pack_map = self._prepare_packsize()
+                daily_missing_from_sfda = daily_missing_from_sfda.merge(
+                    missing_pack_map,
+                    on="Drug Name",
+                    how="left",
+                    validate="many_to_one",
+                )
+                daily_missing_from_sfda["PackageSize"] = pd.to_numeric(
+                    daily_missing_from_sfda["PackageSize"],
+                    errors="coerce",
+                ).fillna(0)
+                daily_missing_from_sfda["Received Quantity Pack"] = 0.0
+                valid_missing_pack = daily_missing_from_sfda["PackageSize"].gt(0)
+                daily_missing_from_sfda.loc[
+                    valid_missing_pack, "Received Quantity Pack"
+                ] = (
+                    daily_missing_from_sfda.loc[
+                        valid_missing_pack, "Received Quantity Each"
+                    ]
+                    / daily_missing_from_sfda.loc[
+                        valid_missing_pack, "PackageSize"
+                    ]
+                )
+
                 daily_missing_from_sfda["Status"] = "Missing Batch in SFDA"
                 daily_missing_from_sfda["Required Action"] = "Register Batch in SFDA"
                 daily_missing_from_sfda = self._ensure_output_columns(
