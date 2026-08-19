@@ -207,6 +207,10 @@ def verify_auth_schema() -> None:
             "RequestedWarehouseName",
             "PasswordResetTokenHash",
             "PasswordResetExpiresAt",
+            "PasswordResetStatus",
+            "PasswordResetRequestedAt",
+            "PasswordResetApprovedAt",
+            "PasswordResetApprovedBy",
         ),
         "AuthSessions": ("SessionID", "UserID", "TokenHash", "ExpiresAt"),
     }
@@ -5923,12 +5927,12 @@ def approve_user_by_token_hash(token_hash: str) -> Optional[Dict[str, Any]]:
 
 
 
-def set_password_reset_token(
+def create_password_reset_request(
     user_id: int,
     token_hash: str,
     expires_at: Any,
 ) -> None:
-    """Store a one-time password reset token for an active user."""
+    """Create or replace an admin-approved password reset request."""
     with Database().connect() as connection:
         cursor = connection.cursor()
         cursor.execute(
@@ -5936,6 +5940,10 @@ def set_password_reset_token(
             UPDATE dbo.ApplicationUsers
             SET PasswordResetTokenHash=?,
                 PasswordResetExpiresAt=?,
+                PasswordResetStatus=N'Pending',
+                PasswordResetRequestedAt=SYSUTCDATETIME(),
+                PasswordResetApprovedAt=NULL,
+                PasswordResetApprovedBy=NULL,
                 UpdatedAt=SYSUTCDATETIME()
             WHERE UserID=? AND Status=N'Active';
             """,
@@ -5944,12 +5952,96 @@ def set_password_reset_token(
         connection.commit()
 
 
+def get_password_reset_request_by_token_hash(
+    token_hash: str,
+) -> Optional[Dict[str, Any]]:
+    """Return reset request state without exposing password material."""
+    sql = """
+        SELECT TOP (1)
+            u.UserID,u.Email,u.PasswordResetStatus,u.PasswordResetRequestedAt,
+            u.PasswordResetApprovedAt,u.PasswordResetApprovedBy,
+            u.PasswordResetExpiresAt,u.Status,
+            u.WarehouseID,w.WarehouseName
+        FROM dbo.ApplicationUsers u
+        LEFT JOIN dbo.Warehouses w ON w.WarehouseID=u.WarehouseID
+        WHERE u.PasswordResetTokenHash=?;
+    """
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        row = cursor.execute(sql, (token_hash,)).fetchone()
+        if not row:
+            return None
+        names = [column[0] for column in cursor.description]
+        return dict(zip(names, row))
+
+
+def set_password_reset_request_status(
+    user_id: int,
+    action: str,
+    approved_by: str,
+) -> Dict[str, Any]:
+    """Approve or reject a pending password reset request."""
+    normalized = str(action or "").strip().title()
+    if normalized not in {"Approved", "Rejected"}:
+        raise ValueError("Reset action must be Approved or Rejected.")
+
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE dbo.ApplicationUsers
+            SET PasswordResetStatus=?,
+                PasswordResetApprovedAt=CASE
+                    WHEN ?=N'Approved' THEN SYSUTCDATETIME()
+                    ELSE NULL
+                END,
+                PasswordResetApprovedBy=CASE
+                    WHEN ?=N'Approved' THEN ?
+                    ELSE ?
+                END,
+                UpdatedAt=SYSUTCDATETIME()
+            WHERE UserID=?
+              AND Status=N'Active'
+              AND PasswordResetStatus=N'Pending'
+              AND PasswordResetTokenHash IS NOT NULL
+              AND PasswordResetExpiresAt>=SYSUTCDATETIME();
+            """,
+            (
+                normalized,
+                normalized,
+                normalized,
+                str(approved_by or "").strip(),
+                str(approved_by or "").strip(),
+                int(user_id),
+            ),
+        )
+        if int(cursor.rowcount or 0) <= 0:
+            connection.rollback()
+            raise ValueError("No active pending password reset request was found for this user.")
+
+        row = cursor.execute(
+            """
+            SELECT u.UserID,u.Email,u.Role,u.Status,u.ApprovedAt,u.CreatedAt,u.UpdatedAt,u.LastLoginAt,
+                   u.WarehouseID,w.WarehouseName,w.WarehouseCode,u.RequestedWarehouseName,
+                   u.PasswordResetStatus,u.PasswordResetRequestedAt,u.PasswordResetApprovedAt,
+                   u.PasswordResetApprovedBy,u.PasswordResetExpiresAt
+            FROM dbo.ApplicationUsers u
+            LEFT JOIN dbo.Warehouses w ON w.WarehouseID=u.WarehouseID
+            WHERE u.UserID=?;
+            """,
+            (int(user_id),),
+        ).fetchone()
+        result = _auth_row(cursor, row)
+        connection.commit()
+        return result
+
+
 def reset_password_by_token_hash(
     token_hash: str,
     password_salt: str,
     password_hash: str,
 ) -> Optional[Dict[str, Any]]:
-    """Consume a valid reset token, replace password, and revoke all sessions."""
+    """Consume an ADMIN-APPROVED reset token, replace password, revoke sessions."""
     with Database().connect() as connection:
         cursor = connection.cursor()
         row = cursor.execute(
@@ -5957,6 +6049,7 @@ def reset_password_by_token_hash(
             SELECT TOP (1) UserID
             FROM dbo.ApplicationUsers WITH (UPDLOCK, HOLDLOCK)
             WHERE PasswordResetTokenHash=?
+              AND PasswordResetStatus=N'Approved'
               AND PasswordResetExpiresAt>=SYSUTCDATETIME()
               AND Status=N'Active';
             """,
@@ -5974,6 +6067,7 @@ def reset_password_by_token_hash(
                 PasswordHash=?,
                 PasswordResetTokenHash=NULL,
                 PasswordResetExpiresAt=NULL,
+                PasswordResetStatus=N'Completed',
                 UpdatedAt=SYSUTCDATETIME()
             WHERE UserID=?;
             """,
@@ -6040,7 +6134,9 @@ def delete_auth_session(token_hash: str) -> None:
 def list_auth_users() -> List[Dict[str, Any]]:
     sql = """
         SELECT u.UserID,u.Email,u.Role,u.Status,u.ApprovedAt,u.CreatedAt,u.UpdatedAt,u.LastLoginAt,
-               u.WarehouseID,w.WarehouseName,w.WarehouseCode,u.RequestedWarehouseName
+               u.WarehouseID,w.WarehouseName,w.WarehouseCode,u.RequestedWarehouseName,
+               u.PasswordResetStatus,u.PasswordResetRequestedAt,u.PasswordResetApprovedAt,
+               u.PasswordResetApprovedBy,u.PasswordResetExpiresAt
         FROM dbo.ApplicationUsers u
         LEFT JOIN dbo.Warehouses w ON w.WarehouseID=u.WarehouseID
         ORDER BY CASE u.Status WHEN N'Pending' THEN 0 WHEN N'Active' THEN 1 ELSE 2 END,u.CreatedAt DESC;
