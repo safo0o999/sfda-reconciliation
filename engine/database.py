@@ -2247,33 +2247,71 @@ def _expire_stale_historical_build_jobs(
     connection,
     warehouse_id: int,
 ) -> int:
-    """Mark abandoned Historical Build rows as Failed so they cannot lock a warehouse forever.
+    """Expire abandoned Historical Build locks using separate queue/run timeouts.
 
-    Historical jobs are expected to update UpdatedAt while progressing. A queue/worker
-    crash can otherwise leave a row permanently in Queued/Running and block Reset or
-    future Historical Builds indefinitely. The timeout is intentionally generous and
-    configurable.
+    Queued jobs that never receive a worker start are ghost submissions and must not
+    block a warehouse for hours. Running jobs are allowed a much longer inactivity
+    window because a legitimate historical build can be heavy. Both thresholds are
+    configurable through application settings.
     """
-    stale_minutes = max(60, int(os.getenv("HISTORICAL_JOB_STALE_MINUTES", "360") or 360))
+    queued_stale_minutes = max(2, int(
+        os.getenv("HISTORICAL_QUEUED_STALE_MINUTES", "10") or 10
+    ))
+    running_stale_minutes = max(30, int(
+        os.getenv(
+            "HISTORICAL_RUNNING_STALE_MINUTES",
+            os.getenv("HISTORICAL_JOB_STALE_MINUTES", "360") or 360,
+        ) or 360
+    ))
+
     cursor = connection.cursor()
+
+    # A job that never started and stopped updating is a stale queue submission.
     cursor.execute(
         r"""
         UPDATE dbo.HistoricalBuildJobs
         SET Status = 'Failed',
-            CurrentStage = 'Expired stale Historical Build lock',
+            CurrentStage = 'Expired stale queued Historical Build',
             ErrorMessage = COALESCE(NULLIF(ErrorMessage, ''),
-                'Historical Build was automatically marked Failed because it stopped updating.'),
+                'Historical Build stayed Queued without a worker start and was automatically released.'),
             CompletedAt = COALESCE(CompletedAt, SYSUTCDATETIME()),
             UpdatedAt = SYSUTCDATETIME()
         WHERE WarehouseID = ?
-          AND Status IN ('Queued', 'Running')
+          AND Status = 'Queued'
+          AND StartedAt IS NULL
           AND COALESCE(UpdatedAt, CreatedAt) < DATEADD(MINUTE, -?, SYSUTCDATETIME());
         """,
-        (int(warehouse_id), int(stale_minutes)),
+        (int(warehouse_id), int(queued_stale_minutes)),
     )
-    expired = int(cursor.rowcount or 0)
+    expired_queued = int(cursor.rowcount or 0)
+
+    # Running jobs get the longer inactivity timeout and are judged by UpdatedAt.
+    cursor.execute(
+        r"""
+        UPDATE dbo.HistoricalBuildJobs
+        SET Status = 'Failed',
+            CurrentStage = 'Expired stale running Historical Build',
+            ErrorMessage = COALESCE(NULLIF(ErrorMessage, ''),
+                'Historical Build stopped updating while Running and was automatically released.'),
+            CompletedAt = COALESCE(CompletedAt, SYSUTCDATETIME()),
+            UpdatedAt = SYSUTCDATETIME()
+        WHERE WarehouseID = ?
+          AND Status = 'Running'
+          AND COALESCE(UpdatedAt, StartedAt, CreatedAt) < DATEADD(MINUTE, -?, SYSUTCDATETIME());
+        """,
+        (int(warehouse_id), int(running_stale_minutes)),
+    )
+    expired_running = int(cursor.rowcount or 0)
+
+    expired = expired_queued + expired_running
     if expired:
         connection.commit()
+        logger.warning(
+            "Expired stale Historical Build lock(s). WarehouseID=%s queued=%s running=%s",
+            warehouse_id,
+            expired_queued,
+            expired_running,
+        )
     return expired
 
 
