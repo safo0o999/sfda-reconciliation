@@ -1831,7 +1831,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
     });
   }
   function reportGroups(outputs={}){
-    return [["Reconciliation Report",outputs.reconciliation_report],["Accept Details",outputs.accept_details],["Dispatch Details",outputs.dispatch_details],["Variance",outputs.variance],["Details",outputs.details],["Reports",outputs.reports]];
+    return [["Reconciliation Report",outputs.reconciliation_report],["Accept Details",outputs.accept_details],["Daily Missing From SFDA",outputs.daily_missing_from_sfda],["Dispatch Details",outputs.dispatch_details],["Variance",outputs.variance],["Details",outputs.details],["Reports",outputs.reports]];
   }
   function countReports(outputs={}){ return reportGroups(outputs).reduce((t,[,g])=>t+normalizeFileGroup(g).length,0); }
   function firstFile(group){ const files=normalizeFileGroup(group); return files.length?files[0]:null; }
