@@ -7,9 +7,7 @@
   <meta http-equiv="Pragma" content="no-cache" />
   <meta http-equiv="Expires" content="0" />
   <title>SFDA Drug Traceability & Reconciliation Platform</title>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js">  passwordResetToken=readPasswordResetToken();
-  if(passwordResetToken) showAuthPanel("reset");
-</script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
   <style>
     :root {
       --navy-950:#05172c;
@@ -540,16 +538,24 @@
     </div>
     <div id="forgotPasswordPanel" hidden>
       <h1>Reset Password</h1>
-      <p>Enter your approved company email. If an active account exists, a secure reset link will be emailed to you.</p>
+      <p>Enter your approved company email. A reset request will be sent to the platform administrator for approval.</p>
       <div class="auth-form">
         <label>Company Email<input class="control" id="forgotPasswordEmail" type="email" autocomplete="username" placeholder="name@nupco.com"></label>
-        <button class="btn btn-primary" id="requestPasswordResetButton" type="button">Send Reset Link</button>
+        <button class="btn btn-primary" id="requestPasswordResetButton" type="button">Request Password Reset</button>
       </div>
       <div class="auth-switch"><button type="button" id="forgotBackToLoginButton">Back to Sign In</button></div>
     </div>
+    <div id="passwordResetPendingPanel" hidden>
+      <h1>Reset Request Submitted</h1>
+      <p id="passwordResetPendingText">Your request is waiting for administrator approval.</p>
+      <div class="auth-form">
+        <button class="btn btn-primary" id="checkPasswordResetButton" type="button">Check Approval Status</button>
+      </div>
+      <div class="auth-switch"><button type="button" id="pendingResetBackToLoginButton">Back to Sign In</button></div>
+    </div>
     <div id="resetPasswordPanel" hidden>
       <h1>Choose New Password</h1>
-      <p>Enter a new password for your account. The reset link can be used only once.</p>
+      <p>Your reset request has been approved. Choose your new password below.</p>
       <div class="auth-form">
         <label>New Password<input class="control" id="resetPasswordNew" type="password" autocomplete="new-password" placeholder="Minimum 10 characters"></label>
         <label>Confirm Password<input class="control" id="resetPasswordConfirm" type="password" autocomplete="new-password"></label>
@@ -1318,6 +1324,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   const AUTH_STATUS_URL = "/api/auth/status";
   const AUTH_LOGIN_URL = "/api/auth/login";
   const AUTH_PASSWORD_RESET_REQUEST_URL = "/api/auth/password-reset/request";
+  const AUTH_PASSWORD_RESET_STATUS_URL = "/api/auth/password-reset/status";
   const AUTH_PASSWORD_RESET_URL = "/api/auth/password-reset";
   const AUTH_REGISTER_URL = "/api/auth/register";
   const AUTH_WAREHOUSES_URL = "/api/auth/warehouses";
@@ -1386,6 +1393,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
     $("loginPanel").hidden=panel!=="login";
     $("registerPanel").hidden=panel!=="register";
     $("forgotPasswordPanel").hidden=panel!=="forgot";
+    $("passwordResetPendingPanel").hidden=panel!=="reset-pending";
     $("resetPasswordPanel").hidden=panel!=="reset";
     clearAuthMessage();
   }
@@ -1439,20 +1447,18 @@ Drug Traceability Reconciliation Platform</textarea></label>
     finally{button.disabled=false;button.textContent="Sign In";}
   }
 
-  let passwordResetToken="";
+  const PASSWORD_RESET_STORAGE_KEY="sfda_password_reset_request_token";
+  let passwordResetToken=localStorage.getItem(PASSWORD_RESET_STORAGE_KEY)||"";
 
-  function readPasswordResetToken(){
-    const hash=String(window.location.hash||"");
-    const prefix="#reset-password=";
-    if(!hash.startsWith(prefix)) return "";
-    try{return decodeURIComponent(hash.slice(prefix.length));}
-    catch(_){return hash.slice(prefix.length);}
+  function clearPasswordResetRequest(){
+    passwordResetToken="";
+    localStorage.removeItem(PASSWORD_RESET_STORAGE_KEY);
   }
 
   async function requestPasswordReset(){
     clearAuthMessage();
     const button=$("requestPasswordResetButton");
-    button.disabled=true;button.textContent="Sending...";
+    button.disabled=true;button.textContent="Submitting...";
     try{
       const response=await fetch(AUTH_PASSWORD_RESET_REQUEST_URL,{
         method:"POST",credentials:"same-origin",
@@ -1461,11 +1467,53 @@ Drug Traceability Reconciliation Platform</textarea></label>
       });
       const payload=await response.json().catch(()=>({}));
       if(!response.ok) throw new Error(payload.details||payload.error||"Unable to request password reset.");
-      setAuthMessage(payload.message||"If the account exists, a reset link will be sent shortly.","success");
+      passwordResetToken=String(payload.request_token||"");
+      if(!passwordResetToken) throw new Error("Password reset request token was not returned.");
+      localStorage.setItem(PASSWORD_RESET_STORAGE_KEY,passwordResetToken);
+      if($("passwordResetPendingText")) $("passwordResetPendingText").textContent=payload.message||"Waiting for administrator approval.";
+      showAuthPanel("reset-pending");
+      setAuthMessage("Request submitted. Ask the administrator to approve it, then check the status here.","success");
     }catch(error){
       setAuthMessage(error.message||String(error),"error");
     }finally{
-      button.disabled=false;button.textContent="Send Reset Link";
+      button.disabled=false;button.textContent="Request Password Reset";
+    }
+  }
+
+  async function checkPasswordResetStatus(options={}){
+    if(!passwordResetToken){
+      if(!options.silent) setAuthMessage("No active password reset request was found on this browser.","error");
+      showAuthPanel("forgot");
+      return;
+    }
+    const button=$("checkPasswordResetButton");
+    if(button){button.disabled=true;button.textContent="Checking...";}
+    try{
+      const response=await fetch(AUTH_PASSWORD_RESET_STATUS_URL,{
+        method:"POST",credentials:"same-origin",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({token:passwordResetToken})
+      });
+      const payload=await response.json().catch(()=>({}));
+      if(!response.ok) throw new Error(payload.details||payload.error||"Unable to check password reset status.");
+      const reset=payload.reset||{};
+      const status=String(reset.status||"Pending");
+      if(status==="Approved"){
+        showAuthPanel("reset");
+        setAuthMessage(reset.message||"Approved. Choose a new password.","success");
+      }else if(status==="Pending"){
+        showAuthPanel("reset-pending");
+        if($("passwordResetPendingText")) $("passwordResetPendingText").textContent=reset.message||"Waiting for administrator approval.";
+        if(!options.silent) setAuthMessage("Still waiting for administrator approval.","info");
+      }else{
+        clearPasswordResetRequest();
+        showAuthPanel("forgot");
+        setAuthMessage(reset.message||`Password reset request is ${status}.`,"error");
+      }
+    }catch(error){
+      if(!options.silent) setAuthMessage(error.message||String(error),"error");
+    }finally{
+      if(button){button.disabled=false;button.textContent="Check Approval Status";}
     }
   }
 
@@ -1479,7 +1527,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       return;
     }
     if(!passwordResetToken){
-      setAuthMessage("The password reset link is missing or invalid.","error");
+      setAuthMessage("The password reset request is missing. Submit a new request.","error");
       return;
     }
     button.disabled=true;button.textContent="Updating...";
@@ -1491,8 +1539,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       });
       const payload=await response.json().catch(()=>({}));
       if(!response.ok) throw new Error(payload.details||payload.error||"Password reset failed.");
-      passwordResetToken="";
-      history.replaceState(null,"",window.location.pathname+window.location.search);
+      clearPasswordResetRequest();
       showAuthPanel("login");
       setAuthMessage(payload.message||"Your password has been reset. You can sign in now.","success");
     }catch(error){
@@ -1571,7 +1618,12 @@ Drug Traceability Reconciliation Platform</textarea></label>
       }else{
         applySignedInUser(null);
         $("authOverlay").classList.remove("hidden");
-        showAuthPanel("login");
+        if(passwordResetToken){
+          showAuthPanel("reset-pending");
+          setTimeout(()=>checkPasswordResetStatus({silent:true}),100);
+        }else{
+          showAuthPanel("login");
+        }
       }
     }catch(error){
       $("authOverlay").classList.remove("hidden");
@@ -3791,13 +3843,21 @@ Drug Traceability Reconciliation Platform</textarea></label>
         <td><strong>${escapeHtml(user.Email||"—")}</strong>${isCurrent?'<div class="file-info">Current user</div>':""}</td>
         <td>${escapeHtml(user.WarehouseName||user.RequestedWarehouseName||"—")}</td>
         <td>${escapeHtml(user.Role||"User")}</td>
-        <td><span class="badge ${active?"success":disabled?"failed":"warning"}">${escapeHtml(status)}</span></td>
+        <td>
+          <span class="badge ${active?"success":disabled?"failed":"warning"}">${escapeHtml(status)}</span>
+          ${user.PasswordResetStatus==="Pending"?`<div class="file-info" style="color:#d97706;font-weight:700">Password Reset Pending · ${escapeHtml(formatSaudiDateTime(user.PasswordResetRequestedAt))}</div>`:""}
+          ${user.PasswordResetStatus==="Approved"?`<div class="file-info" style="color:#107c41;font-weight:700">Password Reset Approved</div>`:""}
+        </td>
         <td>${escapeHtml(formatSaudiDateTime(user.CreatedAt))}</td>
         <td>${escapeHtml(formatSaudiDateTime(user.LastLoginAt))}</td>
         <td><div class="admin-user-actions">
           ${status==="Pending"?`<button class="btn btn-secondary admin-user-status" data-user-id="${id}" data-status="Active">Approve</button>`:""}
           ${active&&!isCurrent?`<button class="btn btn-secondary admin-user-status" data-user-id="${id}" data-status="Disabled">Disable</button>`:""}
           ${disabled?`<button class="btn btn-secondary admin-user-status" data-user-id="${id}" data-status="Active">Enable</button>`:""}
+          ${user.PasswordResetStatus==="Pending"?`
+            <button class="btn btn-secondary admin-password-reset" data-user-id="${id}" data-action="Approved">Approve Reset</button>
+            <button class="btn btn-secondary admin-password-reset" data-user-id="${id}" data-action="Rejected">Reject Reset</button>
+          `:""}
         </div></td>
       </tr>`;
     }).join("")||'<tr><td colspan="7"><div class="empty"><strong>No users</strong>No application users have been created.</div></td></tr>';
@@ -3817,6 +3877,23 @@ Drug Traceability Reconciliation Platform</textarea></label>
         await loadAdminUsers();
       }catch(error){toast(error.message||String(error),"error");button.disabled=false;}
     }));
+
+    document.querySelectorAll(".admin-password-reset").forEach(button=>button.addEventListener("click",async()=>{
+      const id=button.dataset.userId,action=button.dataset.action;
+      button.disabled=true;
+      try{
+        const response=await fetch(`/api/user-management/users/${encodeURIComponent(id)}/password-reset`,{
+          method:"POST",credentials:"same-origin",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({action})
+        });
+        const payload=await response.json().catch(()=>({}));
+        if(!response.ok) throw new Error(payload.details||payload.error||"Unable to update password reset request.");
+        toast(`Password reset request ${action.toLowerCase()}.`,"success");
+        await loadAdminUsers();
+      }catch(error){toast(error.message||String(error),"error");button.disabled=false;}
+    }));
+
   }
 
   async function startApplication(){
@@ -3848,12 +3925,10 @@ Drug Traceability Reconciliation Platform</textarea></label>
   $("loginButton")?.addEventListener("click",()=>login());
   $("showForgotPasswordButton")?.addEventListener("click",()=>showAuthPanel("forgot"));
   $("forgotBackToLoginButton")?.addEventListener("click",()=>showAuthPanel("login"));
-  $("resetBackToLoginButton")?.addEventListener("click",()=>{
-    passwordResetToken="";
-    history.replaceState(null,"",window.location.pathname+window.location.search);
-    showAuthPanel("login");
-  });
+  $("pendingResetBackToLoginButton")?.addEventListener("click",()=>showAuthPanel("login"));
+  $("resetBackToLoginButton")?.addEventListener("click",()=>showAuthPanel("login"));
   $("requestPasswordResetButton")?.addEventListener("click",requestPasswordReset);
+  $("checkPasswordResetButton")?.addEventListener("click",()=>checkPasswordResetStatus());
   $("completePasswordResetButton")?.addEventListener("click",completePasswordReset);
   $("registerButton")?.addEventListener("click",()=>registerUser());
   $("logoutButton")?.addEventListener("click",()=>logout());
