@@ -26,7 +26,9 @@ from engine.database import (
     get_registration_warehouse_by_id,
     list_registration_warehouses,
     list_warehouses,
-    set_password_reset_token,
+    create_password_reset_request,
+    get_password_reset_request_by_token_hash,
+    set_password_reset_request_status,
     reset_password_by_token_hash,
 )
 from engine.email_service import email_settings, send_email
@@ -73,7 +75,7 @@ def ensure_auth_schema() -> None:
 PBKDF2_ITERATIONS = 310_000
 SESSION_HOURS = 12
 APPROVAL_HOURS = 48
-PASSWORD_RESET_MINUTES = 30
+PASSWORD_RESET_HOURS = 24
 
 
 def allowed_domain() -> str:
@@ -292,77 +294,102 @@ def approve_registration(token: str) -> Dict[str, Any]:
 
 
 
-def request_password_reset(email: str, base_url: str) -> Dict[str, Any]:
-    """Create and email a short-lived reset token without leaking account existence."""
+def request_password_reset(email: str) -> Dict[str, Any]:
+    """Create an admin-approved reset request and return the browser token."""
     ensure_auth_schema()
-
-    # Always return the same public response to prevent account enumeration.
-    public_result = {
-        "message": (
-            "If an active account exists for that company email, "
-            "a password reset link will be sent shortly."
-        )
-    }
-
-    try:
-        normalized = validate_corporate_email(email)
-    except ValueError:
-        return public_result
-
+    normalized = validate_corporate_email(email)
     user = find_user_by_email(normalized)
     if not user or str(user.get("Status", "")).strip().lower() != "active":
-        logger.info("Password reset request ignored for non-active/unknown account: %s", normalized)
-        return public_result
+        raise ValueError("No active account was found for this company email.")
 
     token = secrets.token_urlsafe(48)
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=PASSWORD_RESET_MINUTES)
-    set_password_reset_token(
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=PASSWORD_RESET_HOURS)
+    create_password_reset_request(
         user_id=int(user["UserID"]),
         token_hash=_token_hash(token),
         expires_at=expires_at,
     )
+    logger.info("Password reset request created for %s and is waiting for admin approval.", normalized)
+    return {
+        "request_token": token,
+        "reset_status": "Pending",
+        "expires_at": expires_at,
+        "message": (
+            "Password reset request submitted. "
+            "Wait for administrator approval, then check the request status."
+        ),
+    }
 
-    # Use a URL fragment so the raw reset token is not sent to the web server
-    # in the initial HTTP request or ordinary access logs.
-    reset_url = f"{base_url.rstrip('/')}/#reset-password={token}"
-    body = (
-        "A password reset was requested for your SFDA Reconciliation account.\n\n"
-        f"Reset your password using this link:\n{reset_url}\n\n"
-        f"This link expires in {PASSWORD_RESET_MINUTES} minutes and can be used once.\n"
-        "If you did not request this change, you can ignore this email."
+
+def password_reset_status(token: str) -> Dict[str, Any]:
+    ensure_auth_schema()
+    if not token:
+        raise ValueError("Password reset request token is required.")
+
+    request = get_password_reset_request_by_token_hash(_token_hash(token))
+    if not request:
+        raise ValueError("Password reset request was not found.")
+
+    expires_at = request.get("PasswordResetExpiresAt")
+    if expires_at is not None:
+        expiry = expires_at
+        if getattr(expiry, "tzinfo", None) is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        if expiry < datetime.now(timezone.utc):
+            return {
+                "status": "Expired",
+                "message": "This password reset request has expired. Submit a new request.",
+            }
+
+    status = str(request.get("PasswordResetStatus") or "Pending")
+    messages = {
+        "Pending": "Waiting for administrator approval.",
+        "Approved": "Approved. You can now choose a new password.",
+        "Rejected": "The administrator rejected this password reset request.",
+        "Completed": "This password reset request has already been completed.",
+    }
+    return {
+        "status": status,
+        "message": messages.get(status, f"Password reset status: {status}."),
+        "expires_at": request.get("PasswordResetExpiresAt"),
+    }
+
+
+def admin_set_password_reset_status(
+    user_id: int,
+    action: str,
+    approved_by: str,
+) -> Dict[str, Any]:
+    ensure_auth_schema()
+    return set_password_reset_request_status(
+        user_id=int(user_id),
+        action=action,
+        approved_by=normalize_email(approved_by),
     )
-
-    try:
-        send_email(
-            normalized,
-            "SFDA Reconciliation - Reset Password",
-            body,
-        )
-        logger.info("Password reset email sent for %s.", normalized)
-    except Exception as exc:
-        # Keep the public response generic while recording the operational error.
-        logger.exception("Password reset email failed for %s: %s", normalized, exc)
-
-    return public_result
 
 
 def reset_password(token: str, new_password: str) -> Dict[str, Any]:
     ensure_auth_schema()
     if not token:
-        raise ValueError("Password reset token is required.")
+        raise ValueError("Password reset request token is required.")
 
     password = validate_password(new_password)
     password_salt, password_hash = _password_hash(password)
-
     user = reset_password_by_token_hash(
         _token_hash(token),
         password_salt,
         password_hash,
     )
     if not user:
-        raise ValueError("The password reset link is invalid, expired, or already used.")
+        raise ValueError(
+            "The reset request is not approved, has expired, or has already been used."
+        )
 
-    logger.info("Password reset completed for %s.", user.get("Email"))
+    # Remove any cached sessions for this user. SQL sessions were revoked by DB.
+    with _SESSION_CACHE_LOCK:
+        _SESSION_CACHE.clear()
+
+    logger.info("Admin-approved password reset completed for %s.", user.get("Email"))
     return user
 
 
