@@ -25,6 +25,7 @@ from engine.database import (
     replace_latest_sfda_snapshot,
     refresh_accept_history_incremental,
     refresh_dispatch_history_incremental,
+    reconcile_batch_master_event_totals,
     reset_history,
     update_historical_build_job,
 )
@@ -230,6 +231,16 @@ def process_historical_build_job(
                 dispatch_records = dispatch_records.to_dict(orient="records")
             if dispatch_records:
                 refresh_dispatch_history_incremental(dispatch_records)
+
+            # Final consistency guard: event tables are the durable movement
+            # source of truth. Repair any Batch Master row whose receipt/dispatch
+            # totals or movement dates drifted because an earlier job failed
+            # after saving events but before refreshing derived history.
+            repair_result = reconcile_batch_master_event_totals()
+            logger.info(
+                "Historical append consistency repair completed. repaired_rows=%s",
+                int(repair_result.get("batch_master_rows_repaired", 0)),
+            )
 
             mark_stage("incremental_historical_refresh")
 
