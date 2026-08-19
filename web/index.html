@@ -516,6 +516,37 @@
     .auth-message.show{display:block}.auth-message.error{background:#feecec;color:#a31f25}.auth-message.success{background:#e8f7ee;color:#107c41}.auth-message.info{background:#e8f2ff;color:#075fc8}
     .admin-users-table{min-width:760px}.admin-user-actions{display:flex;gap:6px;flex-wrap:wrap}
     .user-card .user-name,.user-card .user-role{max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  .password-field-wrap{
+    position:relative;
+    display:flex;
+    align-items:center;
+  }
+  .password-field-wrap .control{
+    width:100%;
+    padding-right:44px;
+  }
+  .password-toggle{
+    position:absolute;
+    right:10px;
+    top:50%;
+    transform:translateY(-50%);
+    border:0;
+    background:transparent;
+    cursor:pointer;
+    padding:4px 6px;
+    font-size:18px;
+    line-height:1;
+    color:inherit;
+    opacity:.72;
+  }
+  .password-toggle:hover{opacity:1;}
+  .password-toggle:focus-visible{
+    outline:2px solid currentColor;
+    outline-offset:2px;
+    border-radius:6px;
+  }
+
 </style>
 </head>
 <body>
@@ -530,7 +561,7 @@
       <p>Use your approved company account to access the platform.</p>
       <div class="auth-form">
         <label>Company Email<input class="control" id="loginEmail" type="email" autocomplete="username" placeholder="name@nupco.com"></label>
-        <label>Password<input class="control" id="loginPassword" type="password" autocomplete="current-password"></label>
+        <label>Password<div class="password-field-wrap"><input class="control" id="loginPassword" type="password" autocomplete="current-password"><button type="button" class="password-toggle" aria-label="Show password" title="Show password">👁</button></div></label>
         <button class="btn btn-primary" id="loginButton" type="button">Sign In</button>
       </div>
       <div class="auth-switch">Forgot your password? <button type="button" id="showForgotPasswordButton">Reset Password</button></div>
@@ -557,8 +588,8 @@
       <h1>Choose New Password</h1>
       <p>Your reset request has been approved. Choose your new password below.</p>
       <div class="auth-form">
-        <label>New Password<input class="control" id="resetPasswordNew" type="password" autocomplete="new-password" placeholder="Minimum 10 characters"></label>
-        <label>Confirm Password<input class="control" id="resetPasswordConfirm" type="password" autocomplete="new-password"></label>
+        <label>New Password<div class="password-field-wrap"><input class="control" id="resetPasswordNew" type="password" autocomplete="new-password" placeholder="Minimum 10 characters"><button type="button" class="password-toggle" aria-label="Show password" title="Show password">👁</button></div></label>
+        <label>Confirm Password<div class="password-field-wrap"><input class="control" id="resetPasswordConfirm" type="password" autocomplete="new-password"><button type="button" class="password-toggle" aria-label="Show password" title="Show password">👁</button></div></label>
         <button class="btn btn-primary" id="completePasswordResetButton" type="button">Update Password</button>
       </div>
       <div class="auth-switch"><button type="button" id="resetBackToLoginButton">Back to Sign In</button></div>
@@ -573,8 +604,8 @@
             <option value="">Loading warehouses...</option>
           </select>
         </label>
-        <label>Password<input class="control" id="registerPassword" type="password" autocomplete="new-password" placeholder="Minimum 10 characters"></label>
-        <label>Confirm Password<input class="control" id="registerPasswordConfirm" type="password" autocomplete="new-password"></label>
+        <label>Password<div class="password-field-wrap"><input class="control" id="registerPassword" type="password" autocomplete="new-password" placeholder="Minimum 10 characters"><button type="button" class="password-toggle" aria-label="Show password" title="Show password">👁</button></div></label>
+        <label>Confirm Password<div class="password-field-wrap"><input class="control" id="registerPasswordConfirm" type="password" autocomplete="new-password"><button type="button" class="password-toggle" aria-label="Show password" title="Show password">👁</button></div></label>
         <button class="btn btn-primary" id="registerButton" type="button">Create Access Request</button>
       </div>
       <div class="auth-switch">Already approved? <button type="button" id="showLoginButton">Back to Sign In</button></div>
@@ -3968,6 +3999,22 @@ Drug Traceability Reconciliation Platform</textarea></label>
   $("registerPasswordConfirm")?.addEventListener("keydown",event=>{if(event.key==="Enter")registerUser();});
 
   initializeAuthentication();
+
+  document.addEventListener("click",event=>{
+    const toggle=event.target.closest?.(".password-toggle");
+    if(!toggle) return;
+
+    const wrapper=toggle.closest(".password-field-wrap");
+    const input=wrapper?.querySelector('input');
+    if(!input) return;
+
+    const showing=input.type==="text";
+    input.type=showing?"password":"text";
+    toggle.textContent=showing?"👁":"🙈";
+    toggle.setAttribute("aria-label",showing?"Show password":"Hide password");
+    toggle.setAttribute("title",showing?"Show password":"Hide password");
+  });
+
 </script>
 
 <div style="text-align:center; padding:10px 16px 18px; font-size:12px; color:#7a8594;">
