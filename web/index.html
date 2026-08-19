@@ -1448,9 +1448,28 @@ Drug Traceability Reconciliation Platform</textarea></label>
   }
 
   const PASSWORD_RESET_STORAGE_KEY="sfda_password_reset_request_token";
+  const PASSWORD_RESET_POLL_MS=3000;
   let passwordResetToken=localStorage.getItem(PASSWORD_RESET_STORAGE_KEY)||"";
+  let passwordResetPollTimer=null;
+  let passwordResetStatusCheckRunning=false;
+
+  function stopPasswordResetPolling(){
+    if(passwordResetPollTimer){
+      clearInterval(passwordResetPollTimer);
+      passwordResetPollTimer=null;
+    }
+  }
+
+  function startPasswordResetPolling(){
+    stopPasswordResetPolling();
+    if(!passwordResetToken) return;
+    passwordResetPollTimer=setInterval(()=>{
+      checkPasswordResetStatus({silent:true});
+    },PASSWORD_RESET_POLL_MS);
+  }
 
   function clearPasswordResetRequest(){
+    stopPasswordResetPolling();
     passwordResetToken="";
     localStorage.removeItem(PASSWORD_RESET_STORAGE_KEY);
   }
@@ -1472,7 +1491,8 @@ Drug Traceability Reconciliation Platform</textarea></label>
       localStorage.setItem(PASSWORD_RESET_STORAGE_KEY,passwordResetToken);
       if($("passwordResetPendingText")) $("passwordResetPendingText").textContent=payload.message||"Waiting for administrator approval.";
       showAuthPanel("reset-pending");
-      setAuthMessage("Request submitted. Ask the administrator to approve it, then check the status here.","success");
+      startPasswordResetPolling();
+      setAuthMessage("Request submitted. Waiting for administrator approval. This page will update automatically.","success");
     }catch(error){
       setAuthMessage(error.message||String(error),"error");
     }finally{
@@ -1481,13 +1501,17 @@ Drug Traceability Reconciliation Platform</textarea></label>
   }
 
   async function checkPasswordResetStatus(options={}){
+    if(passwordResetStatusCheckRunning) return;
     if(!passwordResetToken){
+      stopPasswordResetPolling();
       if(!options.silent) setAuthMessage("No active password reset request was found on this browser.","error");
       showAuthPanel("forgot");
       return;
     }
+
+    passwordResetStatusCheckRunning=true;
     const button=$("checkPasswordResetButton");
-    if(button){button.disabled=true;button.textContent="Checking...";}
+    if(button && !options.silent){button.disabled=true;button.textContent="Checking...";}
     try{
       const response=await fetch(AUTH_PASSWORD_RESET_STATUS_URL,{
         method:"POST",credentials:"same-origin",
@@ -1499,10 +1523,13 @@ Drug Traceability Reconciliation Platform</textarea></label>
       const reset=payload.reset||{};
       const status=String(reset.status||"Pending");
       if(status==="Approved"){
+        stopPasswordResetPolling();
         showAuthPanel("reset");
         setAuthMessage(reset.message||"Approved. Choose a new password.","success");
+        $("resetPasswordNew")?.focus();
       }else if(status==="Pending"){
         showAuthPanel("reset-pending");
+        startPasswordResetPolling();
         if($("passwordResetPendingText")) $("passwordResetPendingText").textContent=reset.message||"Waiting for administrator approval.";
         if(!options.silent) setAuthMessage("Still waiting for administrator approval.","info");
       }else{
@@ -1513,6 +1540,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }catch(error){
       if(!options.silent) setAuthMessage(error.message||String(error),"error");
     }finally{
+      passwordResetStatusCheckRunning=false;
       if(button){button.disabled=false;button.textContent="Check Approval Status";}
     }
   }
@@ -1620,6 +1648,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
         $("authOverlay").classList.remove("hidden");
         if(passwordResetToken){
           showAuthPanel("reset-pending");
+          startPasswordResetPolling();
           setTimeout(()=>checkPasswordResetStatus({silent:true}),100);
         }else{
           showAuthPanel("login");
@@ -3924,9 +3953,9 @@ Drug Traceability Reconciliation Platform</textarea></label>
   $("showLoginButton")?.addEventListener("click",()=>showAuthPanel("login"));
   $("loginButton")?.addEventListener("click",()=>login());
   $("showForgotPasswordButton")?.addEventListener("click",()=>showAuthPanel("forgot"));
-  $("forgotBackToLoginButton")?.addEventListener("click",()=>showAuthPanel("login"));
+  $("forgotBackToLoginButton")?.addEventListener("click",()=>{stopPasswordResetPolling();showAuthPanel("login");});
   $("pendingResetBackToLoginButton")?.addEventListener("click",()=>showAuthPanel("login"));
-  $("resetBackToLoginButton")?.addEventListener("click",()=>showAuthPanel("login"));
+  $("resetBackToLoginButton")?.addEventListener("click",()=>{stopPasswordResetPolling();showAuthPanel("login");});
   $("requestPasswordResetButton")?.addEventListener("click",requestPasswordReset);
   $("checkPasswordResetButton")?.addEventListener("click",()=>checkPasswordResetStatus());
   $("completePasswordResetButton")?.addEventListener("click",completePasswordReset);
