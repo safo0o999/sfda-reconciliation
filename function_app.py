@@ -3851,6 +3851,8 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
         dispatch = result["dispatch"]
         sto_incoming_followup = result.get("sto_incoming_followup", pd.DataFrame())
         sto_return_cancel = result.get("sto_return_cancel_dispatch", pd.DataFrame())
+        daily_missing_from_sfda = result.get("daily_missing_from_sfda", pd.DataFrame())
+        history_asn = result.get("history_asn", asn_df)
 
         outputs: Dict[str, Any] = {}
         if mode == "accept":
@@ -3871,6 +3873,12 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
                 "STO_Return_Cancel_Dispatch.xlsx",
                 "STO Return",
                 "STO Return - Cancel Previous RSD Dispatch",
+            )
+            outputs["daily_missing_from_sfda"] = build_excel(
+                daily_missing_from_sfda,
+                "Daily_Missing_From_SFDA.xlsx",
+                "Daily Missing",
+                "Daily Received Batches Missing From SFDA",
             )
             outputs["accept_files"] = Exporter.build_sfda_upload_files(
                 accept,
@@ -3918,6 +3926,8 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             "dispatch_files": len(outputs.get("dispatch_files", {})),
             "sto_incoming_followup_rows": int(len(sto_incoming_followup)),
             "sto_return_rows": int(len(sto_return_cancel)),
+            "daily_missing_from_sfda_rows": int(len(daily_missing_from_sfda)),
+            "variance_rows": int(len(daily_missing_from_sfda)) if mode == "accept" else 0,
             "generated_files": generated_output_files,
             "processed_transactions_saved": 0,
             "accept_confirmation": accept_confirmation if mode == "accept" else {},
@@ -3952,7 +3962,7 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             # receipt-affected Batch Master and SupplierHistory keys are
             # recalculated; CustomerHistory is untouched.
             history_engine = FullReconciliationEngine(
-                asn_df,
+                history_asn,
                 pd.DataFrame(),
                 sfda_df,
             )
