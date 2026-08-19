@@ -26,6 +26,8 @@ from engine.database import (
     get_registration_warehouse_by_id,
     list_registration_warehouses,
     list_warehouses,
+    set_password_reset_token,
+    reset_password_by_token_hash,
 )
 from engine.email_service import email_settings, send_email
 
@@ -71,6 +73,7 @@ def ensure_auth_schema() -> None:
 PBKDF2_ITERATIONS = 310_000
 SESSION_HOURS = 12
 APPROVAL_HOURS = 48
+PASSWORD_RESET_MINUTES = 30
 
 
 def allowed_domain() -> str:
@@ -288,15 +291,103 @@ def approve_registration(token: str) -> Dict[str, Any]:
     return user
 
 
+
+def request_password_reset(email: str, base_url: str) -> Dict[str, Any]:
+    """Create and email a short-lived reset token without leaking account existence."""
+    ensure_auth_schema()
+
+    # Always return the same public response to prevent account enumeration.
+    public_result = {
+        "message": (
+            "If an active account exists for that company email, "
+            "a password reset link will be sent shortly."
+        )
+    }
+
+    try:
+        normalized = validate_corporate_email(email)
+    except ValueError:
+        return public_result
+
+    user = find_user_by_email(normalized)
+    if not user or str(user.get("Status", "")).strip().lower() != "active":
+        logger.info("Password reset request ignored for non-active/unknown account: %s", normalized)
+        return public_result
+
+    token = secrets.token_urlsafe(48)
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=PASSWORD_RESET_MINUTES)
+    set_password_reset_token(
+        user_id=int(user["UserID"]),
+        token_hash=_token_hash(token),
+        expires_at=expires_at,
+    )
+
+    # Use a URL fragment so the raw reset token is not sent to the web server
+    # in the initial HTTP request or ordinary access logs.
+    reset_url = f"{base_url.rstrip('/')}/#reset-password={token}"
+    body = (
+        "A password reset was requested for your SFDA Reconciliation account.\n\n"
+        f"Reset your password using this link:\n{reset_url}\n\n"
+        f"This link expires in {PASSWORD_RESET_MINUTES} minutes and can be used once.\n"
+        "If you did not request this change, you can ignore this email."
+    )
+
+    try:
+        send_email(
+            normalized,
+            "SFDA Reconciliation - Reset Password",
+            body,
+        )
+        logger.info("Password reset email sent for %s.", normalized)
+    except Exception as exc:
+        # Keep the public response generic while recording the operational error.
+        logger.exception("Password reset email failed for %s: %s", normalized, exc)
+
+    return public_result
+
+
+def reset_password(token: str, new_password: str) -> Dict[str, Any]:
+    ensure_auth_schema()
+    if not token:
+        raise ValueError("Password reset token is required.")
+
+    password = validate_password(new_password)
+    password_salt, password_hash = _password_hash(password)
+
+    user = reset_password_by_token_hash(
+        _token_hash(token),
+        password_salt,
+        password_hash,
+    )
+    if not user:
+        raise ValueError("The password reset link is invalid, expired, or already used.")
+
+    logger.info("Password reset completed for %s.", user.get("Email"))
+    return user
+
+
+
 def login_user(email: str, password: str) -> Tuple[Dict[str, Any], str, datetime]:
     ensure_auth_schema()
     email = validate_corporate_email(email)
     user = find_user_by_email(email)
-    if not user or str(user.get("Status", "")).lower() != "active":
-        raise ValueError("Invalid credentials or the account is not approved.")
+
+    if not user:
+        logger.warning("Login rejected for %s: user not found.", email)
+        raise ValueError("Invalid email or password.")
+
+    status = str(user.get("Status", "")).strip().lower()
+    if status != "active":
+        logger.info("Login rejected for %s: account status is %s.", email, user.get("Status"))
+        if status == "pending":
+            raise ValueError("Your account is still pending administrator approval.")
+        if status == "disabled":
+            raise ValueError("Your account is disabled. Contact the administrator.")
+        raise ValueError("Your account is not active. Contact the administrator.")
 
     if not verify_password(password, user.get("PasswordSalt", ""), user.get("PasswordHash", "")):
-        raise ValueError("Invalid credentials or the account is not approved.")
+        logger.info("Login rejected for %s: Active account but password verification failed.", email)
+        raise ValueError("Incorrect password. Your account is already approved and active.")
 
     token = secrets.token_urlsafe(48)
     expires_at = datetime.now(timezone.utc) + timedelta(hours=SESSION_HOURS)
