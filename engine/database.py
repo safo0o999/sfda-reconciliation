@@ -4287,6 +4287,12 @@ def reconcile_affected_batch_master_event_totals(
                         r.BN,
                         r.ExpiryMonthKey,
                         r.GenericItemNumber,
+                        MAX(NULLIF(r.Description, N'')) AS Description,
+                        MAX(NULLIF(r.SupplierName, N'')) AS SupplierName,
+                        MAX(NULLIF(r.SupplierCode, N'')) AS SupplierCode,
+                        MAX(NULLIF(r.TradeName, N'')) AS TradeName,
+                        MAX(NULLIF(r.ItemFamilyGroup, N'')) AS ItemFamilyGroup,
+                        MAX(NULLIF(r.TradeItemNumber, N'')) AS TradeItemNumber,
                         SUM(COALESCE(r.ReceivedQuantity, 0)) AS TotalReceiveQty,
                         COUNT_BIG(*) AS ReceiveRuns,
                         MIN(r.ReceivedDate) AS FirstReceivedDate,
@@ -4327,6 +4333,12 @@ def reconcile_affected_batch_master_event_totals(
                 )
                 UPDATE bm
                 SET
+                    bm.Description = COALESCE(NULLIF(ra.Description, N''), bm.Description),
+                    bm.SupplierName = COALESCE(NULLIF(ra.SupplierName, N''), bm.SupplierName),
+                    bm.SupplierCode = COALESCE(NULLIF(ra.SupplierCode, N''), bm.SupplierCode),
+                    bm.TradeName = COALESCE(NULLIF(ra.TradeName, N''), bm.TradeName),
+                    bm.ItemFamilyGroup = COALESCE(NULLIF(ra.ItemFamilyGroup, N''), bm.ItemFamilyGroup),
+                    bm.TradeItemNumber = COALESCE(NULLIF(ra.TradeItemNumber, N''), bm.TradeItemNumber),
                     bm.TotalReceiveQty = COALESCE(ra.TotalReceiveQty, 0),
                     bm.ReceiveRuns = COALESCE(ra.ReceiveRuns, 0),
                     bm.FirstReceivedDate = ra.FirstReceivedDate,
