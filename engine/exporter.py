@@ -308,6 +308,48 @@ class Exporter:
         return records
 
     @staticmethod
+    def _aggregate_dispatch_records(records):
+        """Aggregate identical SFDA batch rows before Dummy-GLN file splitting.
+
+        Only the final regulatory identity is relevant to SFDA here:
+            GTIN + BN + exact SFDA expiry date (XD).
+
+        This is intentionally used only for the Dummy GLN pool. Real GLN
+        exports preserve the existing customer-level behavior.
+        """
+        if not records:
+            return []
+
+        aggregated = {}
+        order = []
+
+        for record in records:
+            key = (
+                str(record.get("GTIN", "")).strip(),
+                str(record.get("BN", "")).strip(),
+                str(record.get("XD", "")).strip(),
+            )
+
+            if key not in aggregated:
+                aggregated[key] = {
+                    "GTIN": key[0],
+                    "QUANTITY": 0,
+                    "BN": key[1],
+                    "XD": key[2],
+                }
+                order.append(key)
+
+            aggregated[key]["QUANTITY"] += int(
+                record.get("QUANTITY", 0) or 0
+            )
+
+        return [
+            aggregated[key]
+            for key in order
+            if int(aggregated[key]["QUANTITY"]) > 0
+        ]
+
+    @staticmethod
     def _split_into_files(records):
         files = []
         current_rows = []
@@ -411,6 +453,10 @@ class Exporter:
         working["Export GLN"] = working["GLN"].apply(
             Exporter._normalize_identifier
         )
+
+        # Missing GLN rows belong to ONE regulatory Dummy-GLN pool.
+        # Customer / To Address remains available in Dispatch Details, but it
+        # must not create separate SFDA upload files.
         missing_gln = (
             working["Export GLN"].eq("")
             | working["Export GLN"].str.upper().eq("DUMMY")
@@ -429,12 +475,33 @@ class Exporter:
             sort=True,
         ):
             safe_gln = Exporter._safe_file_name(customer_gln)
-            groups = Exporter._split_into_files(
-                Exporter._prepare_records(
-                    customer_df,
-                    quantity_column,
+
+            records = Exporter._prepare_records(
+                customer_df,
+                quantity_column,
+            )
+
+            # Dummy GLN:
+            #   1) consolidate all customers into one pool;
+            #   2) combine the same GTIN + BN + exact SFDA expiry;
+            #   3) split only by the regulatory limits:
+            #        - max 20 rows per CSV
+            #        - max 100,000 total quantity per CSV.
+            #
+            # Real GLNs intentionally keep the existing behavior unchanged.
+            normalized_gln = Exporter._normalize_identifier(customer_gln)
+            is_dummy_gln = (
+                normalized_gln == Exporter.DUMMY_GLN
+                or (
+                    normalized_gln != ""
+                    and set(normalized_gln) == {"9"}
+                    and len(normalized_gln) in {13, 14}
                 )
             )
+            if is_dummy_gln:
+                records = Exporter._aggregate_dispatch_records(records)
+
+            groups = Exporter._split_into_files(records)
 
             for index, records_group in enumerate(groups, start=1):
                 file_name = f"{safe_gln}_{index:03d}.csv"
