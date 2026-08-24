@@ -237,6 +237,12 @@ class FullReconciliationEngine:
         self.dispatch = dispatch_df.copy() if dispatch_df is not None else pd.DataFrame()
         self.sfda = sfda_df.copy() if sfda_df is not None else pd.DataFrame()
 
+        # Keys excluded by the current historical upload. They are returned to
+        # the worker so Append can also remove matching legacy rows that may
+        # have been stored before the scope rules existed.
+        self.excluded_receipt_keys: list[dict[str, str]] = []
+        self.excluded_dispatch_keys: list[dict[str, str]] = []
+
         config_path = Path(__file__).resolve().parent.parent / "config" / "pack_size.xlsx"
         self.packsize = pd.read_excel(
             config_path,
@@ -333,6 +339,17 @@ class FullReconciliationEngine:
         return normalized.eq("LABORATORYSUPPLIES")
 
     @staticmethod
+    def _excluded_dispatch_custody_mask(series: pd.Series) -> pd.Series:
+        """Full Dispatch rows outside the SFDA drug reconciliation scope."""
+        normalized = (
+            series.fillna("")
+            .astype(str)
+            .str.upper()
+            .str.replace(r"[^A-Z0-9]+", "", regex=True)
+        )
+        return normalized.eq("BIOCHEMICALS")
+
+    @staticmethod
     def _identity_text(value: Any) -> str:
         """Stable text key used only to compare already-proven SFDA identities."""
         if value is None:
@@ -356,6 +373,45 @@ class FullReconciliationEngine:
         if not self.asn.empty:
             self.asn = Normalizer.normalize_asn(self.asn)
             self.asn["Expiry Month Key"] = self._month_key(self.asn["Expiry Date"])
+
+            # Historical scope rule: Laboratory Supplies are completely outside
+            # the SFDA reconciliation universe. Capture their exact historical
+            # keys first so Append can also remove matching legacy data that was
+            # stored before this rule existed, then exclude them before Events,
+            # Supplier History, Batch Master, or Generic matching.
+            lab_mask = self._excluded_item_family_mask(
+                self.asn.get(
+                    "Item Family Group",
+                    pd.Series("", index=self.asn.index, dtype=object),
+                )
+            )
+            excluded_lab = self.asn.loc[
+                lab_mask,
+                ["BN", "Expiry Month Key", "Generic Item Number"],
+            ].copy()
+            excluded_lab = excluded_lab[
+                excluded_lab["BN"].astype(str).str.strip().ne("")
+                & excluded_lab["Expiry Month Key"].astype(str).str.strip().ne("")
+                & excluded_lab["Generic Item Number"].astype(str).str.strip().ne("")
+            ].drop_duplicates()
+            self.excluded_receipt_keys = [
+                {
+                    "BN": str(row["BN"]).strip(),
+                    "Expiry Month Key": str(row["Expiry Month Key"]).strip(),
+                    "Generic Item Number": str(row["Generic Item Number"]).strip(),
+                }
+                for _, row in excluded_lab.iterrows()
+            ]
+
+            excluded_lab_rows = int(lab_mask.sum())
+            if excluded_lab_rows:
+                logger.info(
+                    "Historical normalization excluded %s Laboratory Supplies ASN row(s) across %s key(s).",
+                    excluded_lab_rows,
+                    len(self.excluded_receipt_keys),
+                )
+            self.asn = self.asn.loc[~lab_mask].copy()
+
             self.asn["Received Quantity"] = self._normalize_quantity(
                 self.asn["Received Quantity"]
             )
@@ -367,16 +423,50 @@ class FullReconciliationEngine:
 
             # Business rule:
             # A Full Dispatch row is considered dispatched ONLY when Confirm Date
-            # (normalized as Dispatch Date) is populated. Unconfirmed rows must not
-            # create Dispatch Events, dispatched quantities in Batch Master, Customer
-            # History, or any downstream Full Reconciliation output.
+            # (normalized as Dispatch Date) is populated.
             self.dispatch = self.dispatch.loc[
                 pd.to_datetime(self.dispatch["Dispatch Date"], errors="coerce").notna()
             ].copy()
-
             self.dispatch["Expiry Month Key"] = self._month_key(
                 self.dispatch["Expiry Date"]
             )
+
+            # Historical Full Dispatch scope rule:
+            # Custody = Biochemicals is the dispatch-side equivalent of
+            # Item Family Group = Laboratory Supplies and must never enter
+            # DispatchEvents, Customer History, Batch Master, or Stage 2.
+            custody_series = (
+                self.dispatch["Custody"]
+                if "Custody" in self.dispatch.columns
+                else pd.Series("", index=self.dispatch.index, dtype=object)
+            )
+            biochemical_mask = self._excluded_dispatch_custody_mask(custody_series)
+            excluded_biochemical = self.dispatch.loc[
+                biochemical_mask,
+                ["BN", "Expiry Month Key", "Generic Item Number"],
+            ].copy()
+            excluded_biochemical = excluded_biochemical[
+                excluded_biochemical["BN"].astype(str).str.strip().ne("")
+                & excluded_biochemical["Expiry Month Key"].astype(str).str.strip().ne("")
+                & excluded_biochemical["Generic Item Number"].astype(str).str.strip().ne("")
+            ].drop_duplicates()
+            self.excluded_dispatch_keys = [
+                {
+                    "BN": str(row["BN"]).strip(),
+                    "Expiry Month Key": str(row["Expiry Month Key"]).strip(),
+                    "Generic Item Number": str(row["Generic Item Number"]).strip(),
+                }
+                for _, row in excluded_biochemical.iterrows()
+            ]
+            excluded_biochemical_rows = int(biochemical_mask.sum())
+            if excluded_biochemical_rows:
+                logger.info(
+                    "Historical normalization excluded %s Biochemicals Full Dispatch row(s) across %s key(s).",
+                    excluded_biochemical_rows,
+                    len(self.excluded_dispatch_keys),
+                )
+            self.dispatch = self.dispatch.loc[~biochemical_mask].copy()
+
             self.dispatch["Dispatched Quantity"] = self._normalize_quantity(
                 self.dispatch["Dispatched Quantity"]
             )
@@ -524,11 +614,18 @@ class FullReconciliationEngine:
             errors="coerce",
         ).fillna(0)
 
+        lab_mask = self._excluded_item_family_mask(
+            frame.get(
+                "Item Family Group",
+                pd.Series("", index=frame.index, dtype=object),
+            )
+        )
         valid_mask = (
             frame["BN"].astype(str).str.strip().ne("")
             & frame["Expiry Month Key"].astype(str).str.strip().ne("")
             & frame["Generic Item Number"].astype(str).str.strip().ne("")
             & received_quantity.ne(0)
+            & ~lab_mask
         )
 
         frame = frame.loc[valid_mask].copy()
@@ -675,6 +772,20 @@ class FullReconciliationEngine:
         )
 
         master = receipt.merge(dispatch, on=self.KEYS, how="outer", validate="one_to_one")
+
+        # Enforce the Historical LAB exclusion again at the cumulative-summary
+        # boundary. This is intentionally defensive so old ReceiptEvents created
+        # before the LAB rule cannot re-enter Batch Master during Append/Rebuild.
+        master = self._ensure_columns(master, ["Item Family Group"])
+        historical_lab_mask = self._excluded_item_family_mask(
+            master["Item Family Group"]
+        )
+        if historical_lab_mask.any():
+            logger.info(
+                "Batch Master builder excluded %s Laboratory Supplies historical group(s).",
+                int(historical_lab_mask.sum()),
+            )
+            master = master.loc[~historical_lab_mask].copy()
 
         sfda = self._sfda_keys() if sfda_summary is None else sfda_summary.copy()
         sfda_columns = self.SFDA_KEYS + [
@@ -1870,9 +1981,11 @@ class FullReconciliationEngine:
         sfda = self._prepare_stage2_sfda(sfda_df)
         inventory = self._prepare_stage2_inventory(inventory_df)
         customer = self._rename_history_columns(customer_history_df)
-        if customer.empty:
-            return pd.DataFrame(columns=self.DISPATCH_RECONCILIATION_COLUMNS)
 
+        customer = self._ensure_columns(
+            customer,
+            self.CUSTOMER_HISTORY_COLUMNS,
+        )
         for column in ["BN", "Generic Item Number", "Expiry Month Key"]:
             customer[column] = Normalizer.text(customer[column])
         customer["Expiry Date"] = Normalizer.date(customer["Expiry Date"])
@@ -1901,24 +2014,46 @@ class FullReconciliationEngine:
             target["Current Inventory Quantity Each"], errors="coerce"
         ).fillna(0)
 
-        # Use PackageSize stored in Customer History to convert WMS inventory
-        # to packs. The first valid package size per batch is sufficient because
-        # SFDA matching is at BN + expiry month grain.
-        pack_lookup = (
-            customer.loc[pd.to_numeric(customer.get("PackageSize", 0), errors="coerce").gt(0)]
+        # Resolve PackageSize for Inventory Each -> Pack conversion.
+        # Prefer the historical Customer value when available; otherwise use the
+        # configured Drug Name mapping so a batch can still be reconciled even
+        # when Customer History has no usable row for it.
+        customer_pack_lookup = (
+            customer.loc[
+                pd.to_numeric(customer.get("PackageSize", 0), errors="coerce").gt(0)
+            ]
             .groupby(["BN", "Expiry Month Key"], dropna=False)["PackageSize"]
             .first()
             .reset_index()
+            .rename(columns={"PackageSize": "_Customer PackageSize"})
         )
         target = target.merge(
-            pack_lookup,
+            customer_pack_lookup,
             on=["BN", "Expiry Month Key"],
             how="left",
             validate="one_to_one",
         )
+
+        configured_pack_lookup = self._pack_lookup().rename(
+            columns={"PackageSize": "_Configured PackageSize"}
+        )
+        target = target.merge(
+            configured_pack_lookup,
+            on="Drug Name",
+            how="left",
+            validate="many_to_one",
+        )
         target["PackageSize"] = pd.to_numeric(
-            target.get("PackageSize", 0), errors="coerce"
+            target.get("_Customer PackageSize", 0), errors="coerce"
         ).fillna(0)
+        fallback_pack = pd.to_numeric(
+            target.get("_Configured PackageSize", 0), errors="coerce"
+        ).fillna(0)
+        target.loc[target["PackageSize"].le(0), "PackageSize"] = fallback_pack
+        target = target.drop(
+            columns=["_Customer PackageSize", "_Configured PackageSize"],
+            errors="ignore",
+        )
         target["Current Inventory Quantity Pack"] = 0.0
         valid_pack = target["PackageSize"].gt(0)
         target.loc[valid_pack, "Current Inventory Quantity Pack"] = (
@@ -2172,6 +2307,136 @@ class FullReconciliationEngine:
                 details.loc[row_index, "To Be Dispatch"] = allocated
                 remaining -= allocated
 
+        # Any required SFDA dispatch that cannot be explained by remaining
+        # Customer History must still be used to align SFDA Active to Current
+        # Inventory. Allocate that residual to the regulatory Dummy GLN.
+        #
+        # This is dispatch-only logic. Full Dispatch never creates/assumes Accept.
+        allocated_by_batch = (
+            details.groupby(["BN", "Expiry Month Key"], dropna=False)["To Be Dispatch"]
+            .sum()
+            .reset_index()
+            .rename(columns={"To Be Dispatch": "_Known Customer Allocation"})
+            if not details.empty
+            else pd.DataFrame(
+                columns=["BN", "Expiry Month Key", "_Known Customer Allocation"]
+            )
+        )
+        residual_target = target.merge(
+            allocated_by_batch,
+            on=["BN", "Expiry Month Key"],
+            how="left",
+            validate="one_to_one",
+        )
+        residual_target["_Known Customer Allocation"] = pd.to_numeric(
+            residual_target["_Known Customer Allocation"], errors="coerce"
+        ).fillna(0)
+        residual_target["_Residual Dummy Dispatch"] = (
+            pd.to_numeric(residual_target["Required Dispatch Pack"], errors="coerce").fillna(0)
+            - residual_target["_Known Customer Allocation"]
+        ).clip(lower=0).astype(int)
+
+        residual_target = residual_target.loc[
+            residual_target["_Residual Dummy Dispatch"].gt(0)
+        ].copy()
+
+        if not residual_target.empty:
+            # Prefer a Generic already represented by Customer History for this
+            # batch; otherwise fall back to Inventory's Generic when available.
+            customer_generic = (
+                customer.loc[
+                    customer["Generic Item Number"].astype(str).str.strip().ne("")
+                ]
+                .groupby(["BN", "Expiry Month Key"], dropna=False)["Generic Item Number"]
+                .first()
+                .reset_index()
+                .rename(columns={"Generic Item Number": "_Customer Generic"})
+            )
+            inventory_generic = (
+                inventory.loc[
+                    inventory["Generic Item Number"].astype(str).str.strip().ne("")
+                ]
+                .groupby(["BN", "Expiry Month Key"], dropna=False)["Generic Item Number"]
+                .first()
+                .reset_index()
+                .rename(columns={"Generic Item Number": "_Inventory Generic"})
+            )
+            residual_target = residual_target.merge(
+                customer_generic,
+                on=["BN", "Expiry Month Key"],
+                how="left",
+                validate="one_to_one",
+            ).merge(
+                inventory_generic,
+                on=["BN", "Expiry Month Key"],
+                how="left",
+                validate="one_to_one",
+            )
+            residual_target["Generic Item Number"] = (
+                residual_target["_Customer Generic"]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+            )
+            no_customer_generic = residual_target["Generic Item Number"].eq("")
+            residual_target.loc[
+                no_customer_generic, "Generic Item Number"
+            ] = (
+                residual_target.loc[
+                    no_customer_generic, "_Inventory Generic"
+                ]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+            )
+
+            dummy_rows = pd.DataFrame()
+            dummy_rows["To Address"] = pd.Series(
+                ["UNMAPPED / DUMMY GLN"] * len(residual_target),
+                index=residual_target.index,
+            )
+            dummy_rows["GLN"] = "99999999999999"
+            dummy_rows["GTIN"] = residual_target["GTIN"].to_numpy()
+            dummy_rows["Drug Name"] = residual_target["Drug Name"].to_numpy()
+            dummy_rows["BN"] = residual_target["BN"].to_numpy()
+            dummy_rows["Expiry Date"] = residual_target["SFDA Expiry Date"].to_numpy()
+            dummy_rows["Expiry Month Key"] = residual_target["Expiry Month Key"].to_numpy()
+            dummy_rows["Generic Item Number"] = residual_target["Generic Item Number"].to_numpy()
+            dummy_rows["PackageSize"] = residual_target["PackageSize"].to_numpy()
+            dummy_rows["Historical Dispatch Quantity Each"] = 0.0
+            dummy_rows["Historical Dispatch Quantity Pack"] = 0.0
+            dummy_rows[confirmed_each_column] = 0.0
+            dummy_rows[confirmed_pack_column] = 0.0
+            dummy_rows[reserved_each_column] = 0.0
+            dummy_rows[reserved_pack_column] = 0.0
+            dummy_rows["Available Historical Dispatch Quantity Each"] = 0.0
+            dummy_rows["Available Historical Dispatch Quantity Pack"] = 0.0
+            dummy_rows["Current Inventory Quantity Each"] = residual_target[
+                "Current Inventory Quantity Each"
+            ].to_numpy()
+            dummy_rows["Current Inventory Quantity Pack"] = residual_target[
+                "Current Inventory Quantity Pack"
+            ].to_numpy()
+            dummy_rows["Quantity"] = residual_target["Quantity"].to_numpy()
+            dummy_rows["Active"] = residual_target["Active"].to_numpy()
+            dummy_rows["Quantity sent pending"] = residual_target[
+                "Quantity sent pending"
+            ].to_numpy()
+            dummy_rows["Quantity Receive Pending"] = residual_target[
+                "Quantity Receive Pending"
+            ].to_numpy()
+            dummy_rows["To Be Dispatch"] = residual_target[
+                "_Residual Dummy Dispatch"
+            ].to_numpy()
+            dummy_rows["Customer Status"] = "DUMMY"
+            dummy_rows["Reconciliation Status"] = "Dispatch Required - Dummy GLN"
+
+            details = pd.concat(
+                [details, dummy_rows],
+                ignore_index=True,
+                sort=False,
+            )
+
         details["SFDA Quantity"] = pd.to_numeric(
             details.get("Quantity", 0),
             errors="coerce",
@@ -2423,6 +2688,8 @@ class FullReconciliationEngine:
             "dispatch_events": dispatch_events,
             "receipt_records": receipt_records,
             "dispatch_records": dispatch_records,
+            "excluded_receipt_keys": list(self.excluded_receipt_keys),
+            "excluded_dispatch_keys": list(self.excluded_dispatch_keys),
             "sfda_summary": sfda_summary,
         }
 
