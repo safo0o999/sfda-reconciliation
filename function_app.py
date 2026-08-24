@@ -1708,6 +1708,46 @@ def historical_export_current(req: func.HttpRequest) -> func.HttpResponse:
         return error_response("Failed to export current historical files.", 500, str(exc))
 
 
+def _enqueue_historical_build_message(
+    job_id: str,
+    operation: str,
+    input_manifest: Dict[str, Any],
+    warehouse_id: int,
+    warehouse_name: str,
+) -> None:
+    """Send one durable Historical Build message using AzureWebJobsStorage.
+
+    Used by both the initial submission and ghost-queue recovery so both paths
+    produce an identical worker payload.
+    """
+    connection_string = os.getenv("AzureWebJobsStorage")
+    if not connection_string:
+        raise RuntimeError("AzureWebJobsStorage is missing.")
+
+    queue = QueueClient.from_connection_string(
+        connection_string,
+        "historical-build-jobs",
+        message_encode_policy=TextBase64EncodePolicy(),
+    )
+    try:
+        queue.create_queue()
+    except ResourceExistsError:
+        pass
+
+    queue.send_message(
+        json.dumps(
+            {
+                "job_id": str(job_id),
+                "operation": str(operation or "append").strip().lower(),
+                "input_manifest": input_manifest or {},
+                "warehouse_id": int(warehouse_id),
+                "warehouse_name": str(warehouse_name or f"Warehouse {warehouse_id}"),
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 @app.route(route="batch-master/build", methods=["GET", "POST"])
 def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
     denied = _auth_guard(req)
@@ -1802,56 +1842,18 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
             manifest,
         )
 
-        # The producer must use the exact same storage account as the
-        # Queue Trigger binding below. Using a different optional storage
-        # connection can leave jobs permanently in Queued status.
-        connection_string = os.getenv("AzureWebJobsStorage")
-        if not connection_string:
-            raise RuntimeError(
-                "AzureWebJobsStorage is missing."
-            )
-
-        queue = QueueClient.from_connection_string(
-            connection_string,
-            "historical-build-jobs",
-            message_encode_policy=TextBase64EncodePolicy(),
-        )
-
+        # Producer and Queue Trigger use the exact same storage account.
+        # The helper is also reused by status-based ghost queue recovery.
+        from engine.warehouse_context import current_warehouse_id, current_warehouse_name
         try:
-            queue.create_queue()
-        except ResourceExistsError:
-            logger.info(
-                "Historical build queue already exists; continuing."
-            )
-
-        try:
-            queue.send_message(
-                json.dumps(
-                    {
-                        "job_id": job_id,
-                        "operation": operation,
-                        "input_manifest": manifest,
-                        "warehouse_id": int(
-                            __import__(
-                                "engine.warehouse_context",
-                                fromlist=["current_warehouse_id"],
-                            ).current_warehouse_id()
-                        ),
-                        "warehouse_name": str(
-                            __import__(
-                                "engine.warehouse_context",
-                                fromlist=["current_warehouse_name"],
-                            ).current_warehouse_name()
-                        ),
-                    },
-                    ensure_ascii=False,
-                )
+            _enqueue_historical_build_message(
+                job_id,
+                operation,
+                manifest,
+                int(current_warehouse_id()),
+                str(current_warehouse_name()),
             )
         except Exception as enqueue_exc:
-            # SQL job creation happens before queue submission so the worker has a
-            # durable record to update. If queue submission fails, release that
-            # record immediately instead of leaving a ghost Queued job that blocks
-            # the warehouse until the stale timeout expires.
             try:
                 update_historical_build_job(
                     job_id,
@@ -1918,9 +1920,53 @@ def historical_build_status(req: func.HttpRequest) -> func.HttpResponse:
         return error_response("job_id is required.", 400)
 
     try:
-        from engine.database import get_historical_build_job
+        from engine.database import (
+            get_historical_build_job,
+            acquire_historical_requeue_lease,
+        )
 
         job = get_historical_build_job(job_id)
+
+        # Self-heal a ghost queue submission. A host recycle can occur after the
+        # HTTP producer commits the DB row / sends a queue message but before the
+        # Python queue worker starts. If the browser still sees an untouched
+        # Queued job for >= 60 seconds, re-enqueue the SAME JobID. The worker
+        # performs an atomic Queued->Running claim, so a later return of the
+        # original queue message cannot execute the build twice.
+        if (
+            str(job.get("status") or "") == "Queued"
+            and not job.get("started_at")
+            and acquire_historical_requeue_lease(
+                job_id,
+                int(os.getenv("HISTORICAL_QUEUE_RECOVERY_SECONDS", "60") or 60),
+            )
+        ):
+            try:
+                warehouse_id = int(job.get("warehouse_id") or 0)
+                if warehouse_id < 1:
+                    raise RuntimeError("Historical recovery job has no WarehouseID.")
+                from engine.warehouse_context import current_warehouse_name
+                _enqueue_historical_build_message(
+                    job_id,
+                    str(job.get("operation") or "append"),
+                    job.get("input_manifest") or {},
+                    warehouse_id,
+                    str(current_warehouse_name() or f"Warehouse {warehouse_id}"),
+                )
+                logger.warning(
+                    "Recovered ghost Historical Build by re-enqueueing same JobID. job_id=%s warehouse_id=%s",
+                    job_id, warehouse_id,
+                )
+                job = get_historical_build_job(job_id)
+            except Exception as recovery_exc:
+                logger.exception(
+                    "Historical queue recovery enqueue failed. job_id=%s", job_id
+                )
+                # Keep it Queued. UpdatedAt recovery lease throttles retries; the
+                # next status poll can retry after the configured recovery window.
+                job["current_stage"] = "Queued - recovery enqueue retry pending"
+                job["error"] = f"Queue recovery retry pending: {recovery_exc}"
+
         return json_response(
             {
                 "status": "Success",
@@ -1995,12 +2041,25 @@ def historical_build_worker(
         )
 
     from engine.historical_jobs import process_historical_build_job
+    from engine.database import claim_historical_build_job, get_historical_build_job
     from engine.warehouse_context import warehouse_scope
 
     with warehouse_scope(
         warehouse_id,
         warehouse_name or f"Warehouse {warehouse_id}",
     ):
+        # Queue delivery is at-least-once. Recovery may enqueue the same JobID
+        # while an older invisible message later returns. Claim only after the
+        # warehouse scope is established so SQL RLS remains fully isolated.
+        if not claim_historical_build_job(job_id):
+            existing = get_historical_build_job(job_id)
+            logger.warning(
+                "Historical build queue delivery skipped because JobID was already claimed/finalized. "
+                "job_id=%s status=%s warehouse_id=%s",
+                job_id, existing.get("status"), warehouse_id,
+            )
+            return
+
         logger.info(
             "Historical build worker scoped to WarehouseID=%s (%s), job_id=%s",
             warehouse_id,
