@@ -555,6 +555,115 @@ def _bulk_insert_rows(
     return inserted
 
 
+
+def remove_excluded_historical_keys(
+    receipt_keys: List[Dict[str, Any]],
+    dispatch_keys: List[Dict[str, Any]],
+) -> Dict[str, int]:
+    """Remove legacy rows for keys explicitly excluded by the current upload.
+
+    Receipt exclusions are Laboratory Supplies from ASN.
+    Dispatch exclusions are Custody=Biochemicals from Full Dispatch.
+
+    Keys include BN + ExpiryMonthKey + GenericItemNumber so a drug row that
+    happens to share the same BN/month with a LAB row is not removed.
+    """
+    initialize_database()
+
+    def _clean_keys(items: List[Dict[str, Any]]) -> list[tuple[str, str, str]]:
+        return sorted({
+            (
+                str(item.get("BN") or "").strip(),
+                str(item.get("Expiry Month Key") or "").strip(),
+                str(item.get("Generic Item Number") or "").strip(),
+            )
+            for item in (items or [])
+            if str(item.get("BN") or "").strip()
+            and str(item.get("Expiry Month Key") or "").strip()
+            and str(item.get("Generic Item Number") or "").strip()
+        })
+
+    receipt = _clean_keys(receipt_keys)
+    dispatch = _clean_keys(dispatch_keys)
+    deleted = {
+        "receipt_events": 0,
+        "dispatch_events": 0,
+        "supplier_history": 0,
+        "customer_history": 0,
+        "batch_master": 0,
+    }
+
+    if not receipt and not dispatch:
+        return deleted
+
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            if receipt:
+                for table, counter in [
+                    ("ReceiptEvents", "receipt_events"),
+                    ("SupplierHistory", "supplier_history"),
+                ]:
+                    for bn, month, generic in receipt:
+                        cursor.execute(
+                            f"""
+                            DELETE FROM dbo.{table}
+                            WHERE BN=?
+                              AND ExpiryMonthKey=?
+                              AND GenericItemNumber=?;
+                            """,
+                            (bn, month, generic),
+                        )
+                        deleted[counter] += max(0, int(cursor.rowcount or 0))
+
+            if dispatch:
+                for table, counter in [
+                    ("DispatchEvents", "dispatch_events"),
+                    ("CustomerHistory", "customer_history"),
+                ]:
+                    for bn, month, generic in dispatch:
+                        cursor.execute(
+                            f"""
+                            DELETE FROM dbo.{table}
+                            WHERE BN=?
+                              AND ExpiryMonthKey=?
+                              AND GenericItemNumber=?;
+                            """,
+                            (bn, month, generic),
+                        )
+                        deleted[counter] += max(0, int(cursor.rowcount or 0))
+
+            # BatchMaster is derived from both movement types. A key explicitly
+            # excluded on either side must be removed so it cannot remain as a
+            # stale Matched/Missing row.
+            all_keys = sorted(set(receipt) | set(dispatch))
+            for bn, month, generic in all_keys:
+                cursor.execute(
+                    """
+                    DELETE FROM dbo.BatchMaster
+                    WHERE BN=?
+                      AND ExpiryMonthKey=?
+                      AND GenericItemNumber=?;
+                    """,
+                    (bn, month, generic),
+                )
+                deleted["batch_master"] += max(0, int(cursor.rowcount or 0))
+
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    logger.info(
+        "Historical scope cleanup completed. receipt_keys=%s dispatch_keys=%s deleted=%s",
+        len(receipt),
+        len(dispatch),
+        deleted,
+    )
+    return deleted
+
+
+
 def append_events(
     receipt_rows: List[Dict[str, Any]],
     dispatch_rows: List[Dict[str, Any]],
@@ -631,8 +740,21 @@ def append_events(
         );
     """
 
+    receipt_rows = [
+        row
+        for row in (receipt_rows or [])
+        if (
+            "".join(
+                ch
+                for ch in str(row.get("Item Family Group") or "").upper()
+                if ch.isalnum()
+            )
+            != "LABORATORYSUPPLIES"
+        )
+    ]
+
     prepared_receipts = _deduplicate_parameters(
-        receipt_rows or [],
+        receipt_rows,
         _receipt_parameters,
     )
     prepared_dispatches = _deduplicate_parameters(
@@ -755,9 +877,14 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             SELECT *
             FROM dbo.ReceiptEvents
             WHERE
-                UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK5060%'
-                OR UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK800%'
-                OR UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK49%'
+                (
+                    UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK5060%'
+                    OR UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK800%'
+                    OR UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK49%'
+                )
+                AND REPLACE(REPLACE(REPLACE(
+                        UPPER(LTRIM(RTRIM(ISNULL(ItemFamilyGroup, '')))),
+                        ' ', ''), '-', ''), '_', '') <> 'LABORATORYSUPPLIES'
         ),
         ReceiptAggregate AS
         (
@@ -870,6 +997,9 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             MAX(ReceivedDate) AS [Last Received Date]
         FROM dbo.ReceiptEvents
         WHERE UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK5060%'
+          AND REPLACE(REPLACE(REPLACE(
+                UPPER(LTRIM(RTRIM(ISNULL(ItemFamilyGroup, '')))),
+                ' ', ''), '-', ''), '_', '') <> 'LABORATORYSUPPLIES'
         GROUP BY SupplierName, SupplierCode, BN, ExpiryMonthKey, GenericItemNumber;
     """
 
@@ -4932,6 +5062,9 @@ def refresh_accept_history_incremental(
                    AND bm.ExpiryMonthKey = r.ExpiryMonthKey
                    AND bm.GenericItemNumber = r.GenericItemNumber
                 WHERE UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK5060%'
+                  AND REPLACE(REPLACE(REPLACE(
+                        UPPER(LTRIM(RTRIM(ISNULL(r.ItemFamilyGroup, N'')))),
+                        N' ', N''), N'-', N''), N'_', N'') <> N'LABORATORYSUPPLIES'
                 GROUP BY
                     r.SupplierName, r.SupplierCode, r.BN, r.ExpiryMonthKey,
                     r.GenericItemNumber, bm.GTIN, bm.DrugName, bm.Description,
