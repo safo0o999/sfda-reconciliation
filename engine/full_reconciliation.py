@@ -704,6 +704,22 @@ class FullReconciliationEngine:
         # product as "Missing Batch in SFDA".  No BN-only, exact-day, trade-name,
         # or historical-voting fallback is allowed to create product identity.
         # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # TWO-STAGE BATCH MASTER DESIGN
+        #
+        # Stage 1 / Sheet 1 - Matched SFDA Batches
+        #   Match every eligible WMS batch directly to the current SFDA file by
+        #   BN + Expiry Month.  A direct batch match is the ONLY thing that can
+        #   establish a trusted Generic for Stage 2.  Do not reject a direct
+        #   match merely because the same operational BN/month appeared against
+        #   another Generic somewhere else in WMS history; each WMS Generic row
+        #   is evaluated against the exact SFDA batch independently.
+        #
+        # Stage 2 / Sheet 2 - Missing From SFDA
+        #   Take only Generics proven by Stage 1, retrieve their remaining WMS
+        #   batches, and exclude every BN + Expiry Month already present in
+        #   Stage 1.  Those remaining rows are Missing Batch in SFDA.
+        # ------------------------------------------------------------------
         candidate_columns = self.SFDA_KEYS + [
             "Generic Item Number",
             "Item Family Group",
@@ -717,27 +733,14 @@ class FullReconciliationEngine:
             candidates["Item Family Group"]
         )
         candidates = candidates.loc[~candidates["_Excluded Family"]].copy()
-
-        candidate_counts = (
-            candidates.groupby(self.SFDA_KEYS, dropna=False)["Generic Item Number"]
-            .nunique()
-            .rename("_Candidate Generic Count")
-            .reset_index()
-        )
-        candidates = candidates.merge(
-            candidate_counts,
-            on=self.SFDA_KEYS,
-            how="left",
-            validate="many_to_one",
-        )
-        candidates = candidates.loc[
-            candidates["_Candidate Generic Count"].eq(1)
-        ].drop(columns=["_Candidate Generic Count", "_Excluded Family"], errors="ignore")
+        candidates = candidates.drop(columns=["_Excluded Family"], errors="ignore")
         candidates = candidates.drop_duplicates(
             subset=self.SFDA_KEYS + ["Generic Item Number"],
             keep="first",
         )
 
+        # Direct SFDA anchor: BN + Expiry Month only. SFDA itself was already
+        # reduced to unambiguous BN/month -> one GTIN rows by _sfda_keys().
         exact_edges = candidates.merge(
             sfda[sfda_columns],
             on=self.SFDA_KEYS,
@@ -745,36 +748,25 @@ class FullReconciliationEngine:
             validate="many_to_one",
         )
 
-        resolved = pd.DataFrame(columns=(
-            self.SFDA_KEYS + ["Generic Item Number"] +
-            [column for column in sfda_columns if column not in self.SFDA_KEYS]
-        ))
-
-        if not exact_edges.empty:
-            exact_edges["GTIN"] = Normalizer.text(exact_edges["GTIN"])
-            exact_edges["Generic Item Number"] = (
-                exact_edges["Generic Item Number"].fillna("").astype(str).str.strip()
-            )
-            exact_edges = exact_edges.loc[
-                exact_edges["GTIN"].ne("")
-                & exact_edges["Generic Item Number"].ne("")
-            ].copy()
-
-            # IMPORTANT: identity is established per exact BN + Expiry Month
-            # candidate.  Do not impose a global Generic <-> GTIN one-to-one
-            # rule here: one Generic can legitimately have more than one SFDA
-            # trade/GTIN identity across historical data.  The only required
-            # proof for this stage is that THIS BN+month is unambiguous in both
-            # WMS (one Generic) and SFDA (one GTIN).
-            resolved = exact_edges.drop_duplicates(
-                subset=self.SFDA_KEYS + ["Generic Item Number"],
-                keep="first",
-            )
-
         resolved_columns = self.SFDA_KEYS + ["Generic Item Number"] + [
             column for column in sfda_columns if column not in self.SFDA_KEYS
         ]
-        resolved = self._ensure_columns(resolved, resolved_columns)[resolved_columns]
+        resolved = self._ensure_columns(
+            exact_edges, resolved_columns
+        )[resolved_columns].copy()
+        if not resolved.empty:
+            resolved["GTIN"] = Normalizer.text(resolved["GTIN"])
+            resolved["Generic Item Number"] = (
+                resolved["Generic Item Number"].fillna("").astype(str).str.strip()
+            )
+            resolved = resolved.loc[
+                resolved["GTIN"].ne("")
+                & resolved["Generic Item Number"].ne("")
+            ].copy()
+            resolved = resolved.drop_duplicates(
+                subset=self.KEYS, keep="first"
+            )
+
         resolved["_Batch Exists in SFDA"] = True
 
         master = master.merge(
@@ -787,57 +779,57 @@ class FullReconciliationEngine:
 
         unresolved_sfda = len(sfda) - len(resolved[self.SFDA_KEYS].drop_duplicates())
         if unresolved_sfda > 0:
-            logger.warning(
-                "SFDA product identity left unresolved safely for %s BN+expiry-month key(s).",
-                unresolved_sfda,
+            logger.info(
+                "Historical Stage 1 matched %s of %s unambiguous SFDA BN+expiry-month keys against WMS history.",
+                len(resolved[self.SFDA_KEYS].drop_duplicates()),
+                len(sfda),
             )
 
         # Expiry priority for Batch Master:
         # 1. Exact SFDA expiry
         # 2. ASN Receipt Expiration Date
         # 3. Full Dispatch Best Before Date
-        sfda_expiry = pd.to_datetime(
-            master["Expiry Date"],
-            errors="coerce",
-        )
-        receipt_expiry = pd.to_datetime(
-            master["Receipt Expiry Date"],
-            errors="coerce",
-        )
-        dispatch_expiry = pd.to_datetime(
-            master["Dispatch Expiry Date"],
-            errors="coerce",
-        )
+        sfda_expiry = pd.to_datetime(master["Expiry Date"], errors="coerce")
+        receipt_expiry = pd.to_datetime(master["Receipt Expiry Date"], errors="coerce")
+        dispatch_expiry = pd.to_datetime(master["Dispatch Expiry Date"], errors="coerce")
         master["Expiry Date"] = (
-            sfda_expiry
-            .combine_first(receipt_expiry)
-            .combine_first(dispatch_expiry)
+            sfda_expiry.combine_first(receipt_expiry).combine_first(dispatch_expiry)
         )
 
+        # Generics proven ONLY by direct Stage-1 matches.
         matched_generics = set(
             master.loc[
                 master["_Batch Exists in SFDA"].eq(True),
                 "Generic Item Number",
-            ]
-            .fillna("")
-            .astype(str)
-            .str.strip()
+            ].fillna("").astype(str).str.strip()
         )
         matched_generics.discard("")
 
-        master["Generic Exists in SFDA"] = "Generic Not in SFDA"
-        master.loc[
-            master["Generic Item Number"].isin(matched_generics),
-            "Generic Exists in SFDA",
-        ] = "Missing Batch in SFDA"
+        # Stage 2 universe is limited to Generics proven in Stage 1.
+        # This deliberately prevents inherited/missing rows from becoming proof.
+        master = master.loc[
+            master["Generic Item Number"].fillna("").astype(str).str.strip().isin(matched_generics)
+        ].copy()
+
+        master["Generic Exists in SFDA"] = "Missing Batch in SFDA"
         master.loc[
             master["_Batch Exists in SFDA"].eq(True),
             "Generic Exists in SFDA",
         ] = "Yes"
 
-        master = master[
-            master["Generic Exists in SFDA"].ne("Generic Not in SFDA")
-        ].copy()
+        # Stage 2 is a RECEIPT discovery page by business definition: it shows
+        # batches that were actually received in WMS for a proven Generic but
+        # are absent from SFDA. Dispatch-only historical batches must not appear
+        # on the Missing From SFDA sheet.
+        received_qty_for_stage2 = pd.to_numeric(
+            master.get("Total Receive Qty", 0), errors="coerce"
+        ).fillna(0)
+        keep_stage1 = master["_Batch Exists in SFDA"].eq(True)
+        keep_stage2 = (
+            master["_Batch Exists in SFDA"].eq(False)
+            & received_qty_for_stage2.gt(0)
+        )
+        master = master.loc[keep_stage1 | keep_stage2].copy()
 
         # Build a Generic-to-SFDA reference from exact matches. This allows a
         # missing batch to show the correct drug and package size while its
