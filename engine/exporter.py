@@ -42,6 +42,7 @@ class Exporter:
         "Generic Exists in SFDA",
         "Last Updated",
         "Item Family Group",
+        "Custody",
     ]
 
     SUPPLIER_HISTORY_COLUMNS = [
@@ -56,7 +57,7 @@ class Exporter:
         "To Address", "GLN", "GTIN", "Drug Name", "Generic Item Number",
         "Trade Description", "BN", "Expiry Date", "PackageSize",
         "Dispatch Quantity Each", "Dispatch Quantity Pack",
-        "First Dispatch Date", "Last Dispatch Date",
+        "First Dispatch Date", "Last Dispatch Date", "Custody",
     ]
 
     FULL_ACCEPT_RECONCILIATION_COLUMNS = [
@@ -86,6 +87,7 @@ class Exporter:
         "Expiry Date",
         "Expiry Month Key",
         "Generic Item Number",
+        "Custody",
         "PackageSize",
         "Historical Dispatch Quantity Each",
         "Historical Dispatch Quantity Pack",
