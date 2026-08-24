@@ -2469,6 +2469,67 @@ def _expire_stale_historical_build_jobs(
     return expired
 
 
+def claim_historical_build_job(job_id: str) -> bool:
+    """Atomically claim one queued Historical Build for a single worker.
+
+    Queue delivery is at-least-once and a recovered message can coexist with the
+    original message after a host recycle. Only the worker that changes the row
+    from Queued -> Running is allowed to execute the heavy build.
+    """
+    initialize_database()
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE dbo.HistoricalBuildJobs
+            SET Status = 'Running',
+                Progress = CASE WHEN Progress < 1 THEN 1 ELSE Progress END,
+                CurrentStage = 'Historical worker claimed job',
+                StartedAt = COALESCE(StartedAt, SYSUTCDATETIME()),
+                UpdatedAt = SYSUTCDATETIME(),
+                ErrorMessage = ''
+            WHERE JobID = ?
+              AND Status = 'Queued'
+              AND StartedAt IS NULL;
+            """,
+            (str(job_id),),
+        )
+        claimed = int(cursor.rowcount or 0) > 0
+        connection.commit()
+    return claimed
+
+
+def acquire_historical_requeue_lease(
+    job_id: str,
+    min_age_seconds: int = 60,
+) -> bool:
+    """Throttle self-healing re-enqueue attempts for a ghost queued job.
+
+    The status endpoint may be polled by several browser requests. This atomic
+    update allows only one request per recovery window to send a replacement
+    queue message for the same JobID.
+    """
+    initialize_database()
+    safe_age = max(30, int(min_age_seconds or 60))
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE dbo.HistoricalBuildJobs
+            SET CurrentStage = 'Queued for processing - recovery enqueue',
+                UpdatedAt = SYSUTCDATETIME()
+            WHERE JobID = ?
+              AND Status = 'Queued'
+              AND StartedAt IS NULL
+              AND COALESCE(UpdatedAt, CreatedAt) < DATEADD(SECOND, -?, SYSUTCDATETIME());
+            """,
+            (str(job_id), safe_age),
+        )
+        acquired = int(cursor.rowcount or 0) > 0
+        connection.commit()
+    return acquired
+
+
 def heartbeat_historical_build_job(job_id: str) -> bool:
     """Refresh UpdatedAt only while the job is still Running.
 
@@ -2723,7 +2784,8 @@ def get_historical_build_job(job_id: str) -> Dict[str, Any]:
             CreatedAt,
             StartedAt,
             CompletedAt,
-            UpdatedAt
+            UpdatedAt,
+            WarehouseID
         FROM dbo.HistoricalBuildJobs
         WHERE JobID = ?;
     """
@@ -2757,6 +2819,7 @@ def get_historical_build_job(job_id: str) -> Dict[str, Any]:
         "started_at": row[10],
         "completed_at": row[11],
         "updated_at": row[12],
+        "warehouse_id": int(row[13] or 0),
     }
 
 
