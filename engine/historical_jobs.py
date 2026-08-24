@@ -4,6 +4,7 @@ import base64
 import io
 import logging
 import mimetypes
+import threading
 from time import perf_counter
 from typing import Any, Dict, List
 
@@ -17,6 +18,8 @@ from engine.database import (
     get_customer_history_df,
     get_event_summaries,
     get_history_summaries,
+    heartbeat_historical_build_job,
+    historical_build_job_is_active,
     get_supplier_history_df,
     get_sto_incoming_history_df,
     get_sto_return_history_df,
@@ -35,6 +38,33 @@ from engine.full_reconciliation import FullReconciliationEngine
 
 
 logger = logging.getLogger("SFDA-Reconciliation.HistoricalJobs")
+
+
+class HistoricalBuildCancelled(RuntimeError):
+    """Raised when a job is cancelled/failed while its worker is still alive."""
+
+
+def _start_job_heartbeat(job_id: str, stop_event: threading.Event, cancel_event: threading.Event) -> threading.Thread:
+    """Keep UpdatedAt fresh while the worker is alive and detect cancellation."""
+
+    def _run() -> None:
+        while not stop_event.wait(30):
+            try:
+                if not heartbeat_historical_build_job(job_id):
+                    cancel_event.set()
+                    return
+            except Exception:
+                # A transient heartbeat failure must not kill a healthy worker;
+                # the normal stage updates still provide recovery evidence.
+                logger.exception("Historical heartbeat failed. job_id=%s", job_id)
+
+    thread = threading.Thread(
+        target=_run,
+        name=f"historical-heartbeat-{job_id[-8:]}",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 def _read_excel_bytes(file_name: str, file_bytes: bytes) -> pd.DataFrame:
@@ -113,6 +143,10 @@ def process_historical_build_job(
     storage = BlobStorage()
     storage.initialize_containers()
 
+    heartbeat_stop = threading.Event()
+    cancel_event = threading.Event()
+    heartbeat_thread: threading.Thread | None = None
+
     job_started_at = perf_counter()
     stage_started_at = job_started_at
     timings: Dict[str, float] = {}
@@ -131,6 +165,12 @@ def process_historical_build_job(
             now - job_started_at,
         )
 
+    def ensure_active() -> None:
+        if cancel_event.is_set() or not historical_build_job_is_active(job_id):
+            raise HistoricalBuildCancelled(
+                f"Historical Build is no longer active: {job_id}"
+            )
+
     try:
         update_historical_build_job(
             job_id,
@@ -140,6 +180,10 @@ def process_historical_build_job(
             mark_started=True,
             error_message="",
         )
+        heartbeat_thread = _start_job_heartbeat(
+            job_id, heartbeat_stop, cancel_event
+        )
+        ensure_active()
 
         asn_df = _read_input_group(
             storage,
@@ -158,6 +202,7 @@ def process_historical_build_job(
         sfda_source_name = str(sfda_items[0].get("file_name", "") or "")
         replace_latest_sfda_snapshot(sfda_df, sfda_source_name)
         mark_stage("read_inputs_and_sfda_snapshot")
+        ensure_active()
 
         update_historical_build_job(
             job_id,
@@ -172,6 +217,7 @@ def process_historical_build_job(
         )
         prepared = engine.prepare_incremental()
         mark_stage("validate_normalize_prepare_events")
+        ensure_active()
 
         # Self-clean legacy out-of-scope data when an Append re-encounters it.
         # This prevents old LAB/Biochemicals rows from returning in Supplier/
@@ -195,6 +241,7 @@ def process_historical_build_job(
             )
             reset_history()
             mark_stage("reset_previous_history")
+            ensure_active()
 
         update_historical_build_job(
             job_id,
@@ -208,6 +255,7 @@ def process_historical_build_job(
         )
 
         mark_stage("save_receipt_dispatch_events")
+        ensure_active()
 
         has_new_events = (
             inserted.get("receipt_events", 0) > 0
@@ -269,29 +317,66 @@ def process_historical_build_job(
             sto_incoming_history = get_sto_incoming_history_df()
             sto_return_history = get_sto_return_history_df()
         else:
-            # Explicit rebuild remains the maintenance/recovery path.
+            # Explicit rebuild remains the maintenance/recovery path. Keep each
+            # expensive unit visible so CurrentStage identifies the real bottleneck.
             update_historical_build_job(
-                job_id, progress=68, current_stage="Building Batch Master",
+                job_id,
+                progress=55,
+                current_stage="Loading receipt and dispatch summaries",
             )
             receipt_summary, dispatch_summary = get_event_summaries()
+            mark_stage("load_event_summaries")
+            ensure_active()
+
+            update_historical_build_job(
+                job_id,
+                progress=64,
+                current_stage="Matching WMS batches with SFDA",
+            )
             master = engine.build_master_from_summaries(
                 receipt_summary, dispatch_summary, prepared["sfda_summary"],
             )
-            replace_batch_master(master)
-            mark_stage("build_and_save_batch_master")
+            logger.info(
+                "HISTORICAL_PERF job_id=%s matching_result receipt_groups=%s dispatch_groups=%s master_rows=%s",
+                job_id,
+                len(receipt_summary),
+                len(dispatch_summary),
+                len(master),
+            )
+            mark_stage("match_wms_sfda_build_master")
+            ensure_active()
 
             update_historical_build_job(
-                job_id, progress=80, current_stage="Building Supplier and Customer History",
+                job_id,
+                progress=74,
+                current_stage="Saving Batch Master to database",
+            )
+            replace_batch_master(master)
+            mark_stage("save_batch_master")
+            ensure_active()
+
+            update_historical_build_job(
+                job_id,
+                progress=80,
+                current_stage="Building Supplier and Customer History",
             )
             supplier_summary, customer_summary = get_history_summaries()
+            mark_stage("load_history_summaries")
+            ensure_active()
+
             supplier_history = engine.build_supplier_history(supplier_summary, master)
             customer_history = engine.build_customer_history(customer_summary, master)
+            mark_stage("build_histories_in_memory")
+            ensure_active()
+
             replace_supplier_history(supplier_history)
             replace_customer_history(customer_history)
             sto_incoming_history = get_sto_incoming_history_df()
             sto_return_history = get_sto_return_history_df()
-            mark_stage("build_and_save_histories")
+            mark_stage("save_histories_and_load_sto")
+            ensure_active()
 
+        ensure_active()
         update_historical_build_job(
             job_id,
             progress=90,
@@ -416,6 +501,7 @@ def process_historical_build_job(
             "total_seconds": round(perf_counter() - job_started_at, 3),
         }
 
+        ensure_active()
         update_historical_build_job(
             job_id,
             status="Completed",
@@ -427,17 +513,32 @@ def process_historical_build_job(
             mark_completed=True,
         )
 
+    except HistoricalBuildCancelled as exc:
+        logger.warning(
+            "Historical background build stopped cooperatively. job_id=%s reason=%s",
+            job_id,
+            exc,
+        )
+        # Do not overwrite the externally supplied Cancelled/Failed status.
+        return
     except Exception as exc:
         logger.exception(
             "Historical background build failed. job_id=%s",
             job_id,
         )
-        update_historical_build_job(
-            job_id,
-            status="Failed",
-            progress=100,
-            current_stage="Historical data build failed",
-            error_message=str(exc),
-            mark_completed=True,
-        )
+        # Only mark Failed if the job is still active. If an admin/user already
+        # cancelled it, preserve that terminal state.
+        if historical_build_job_is_active(job_id):
+            update_historical_build_job(
+                job_id,
+                status="Failed",
+                progress=100,
+                current_stage="Historical data build failed",
+                error_message=str(exc),
+                mark_completed=True,
+            )
         raise
+    finally:
+        heartbeat_stop.set()
+        if heartbeat_thread is not None and heartbeat_thread.is_alive():
+            heartbeat_thread.join(timeout=2.0)
