@@ -671,20 +671,22 @@ def append_events(
     *,
     assume_empty: bool = False,
 ) -> Dict[str, int]:
-    """Append new receipt and dispatch events with server-side de-duplication.
+    """Append receipt/dispatch events using bounded bulk inserts.
 
-    The previous implementation first downloaded every matching EventKey from
-    SQL in many IN queries. For large historical files that lookup dominated
-    the runtime. This version sends rows in fast_executemany batches and lets
-    SQL Server perform the EventKey existence check through the clustered
-    primary key.
+    Rebuild performance rule:
+      ``reset_history()`` has already removed this warehouse's events, so
+      ``assume_empty=True`` performs direct bulk inserts and returns the
+      prepared row counts.  It deliberately avoids the old COUNT_BIG scans
+      before/after insertion.
 
-    ``assume_empty`` is used immediately after ``reset_history()`` during a
-    rebuild, allowing direct bulk inserts without unnecessary NOT EXISTS
-    checks.
+    Append keeps server-side EventKey de-duplication and uses warehouse-scoped
+    counts only to report how many genuinely new events were inserted.
     """
 
     initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+
+    warehouse_id = int(current_warehouse_id())
     started_at = time.perf_counter()
 
     direct_receipt_sql = r"""
@@ -753,11 +755,6 @@ def append_events(
             != "LABORATORYSUPPLIES"
         )
     ]
-
-    prepared_receipts = _deduplicate_parameters(
-        receipt_rows,
-        _receipt_parameters,
-    )
     dispatch_rows = [
         row
         for row in (dispatch_rows or [])
@@ -771,91 +768,76 @@ def append_events(
         )
     ]
 
-    prepared_dispatches = _deduplicate_parameters(
-        dispatch_rows,
-        _dispatch_parameters,
-    )
+    prepared_receipts = _deduplicate_parameters(receipt_rows, _receipt_parameters)
+    prepared_dispatches = _deduplicate_parameters(dispatch_rows, _dispatch_parameters)
 
     logger.info(
-        "Optimized event save started. prepared_receipts=%s "
+        "Optimized event save started. WarehouseID=%s prepared_receipts=%s "
         "prepared_dispatches=%s assume_empty=%s",
+        warehouse_id,
         len(prepared_receipts),
         len(prepared_dispatches),
         assume_empty,
     )
 
+    inserted_receipts = 0
+    inserted_dispatches = 0
+
     with Database().connect() as connection:
         cursor = connection.cursor()
-
         try:
-            before_receipts = int(
-                cursor.execute(
-                    "SELECT COUNT_BIG(*) FROM dbo.ReceiptEvents;"
-                ).fetchone()[0]
-            )
-            before_dispatches = int(
-                cursor.execute(
-                    "SELECT COUNT_BIG(*) FROM dbo.DispatchEvents;"
-                ).fetchone()[0]
-            )
-
             if assume_empty:
-                _bulk_insert_rows(
-                    cursor,
-                    direct_receipt_sql,
-                    prepared_receipts,
+                inserted_receipts = _bulk_insert_rows(
+                    cursor, direct_receipt_sql, prepared_receipts
                 )
-                _bulk_insert_rows(
-                    cursor,
-                    direct_dispatch_sql,
-                    prepared_dispatches,
+                inserted_dispatches = _bulk_insert_rows(
+                    cursor, direct_dispatch_sql, prepared_dispatches
                 )
             else:
-                receipt_parameters = [
-                    tuple(row) + (row[0],)
-                    for row in prepared_receipts
-                ]
-                dispatch_parameters = [
-                    tuple(row) + (row[0],)
-                    for row in prepared_dispatches
-                ]
-
-                _bulk_insert_rows(
-                    cursor,
-                    missing_receipt_sql,
-                    receipt_parameters,
+                before_receipts = int(
+                    cursor.execute(
+                        "SELECT COUNT_BIG(*) FROM dbo.ReceiptEvents WHERE WarehouseID = ?;",
+                        (warehouse_id,),
+                    ).fetchone()[0]
                 )
-                _bulk_insert_rows(
-                    cursor,
-                    missing_dispatch_sql,
-                    dispatch_parameters,
+                before_dispatches = int(
+                    cursor.execute(
+                        "SELECT COUNT_BIG(*) FROM dbo.DispatchEvents WHERE WarehouseID = ?;",
+                        (warehouse_id,),
+                    ).fetchone()[0]
                 )
 
-            after_receipts = int(
-                cursor.execute(
-                    "SELECT COUNT_BIG(*) FROM dbo.ReceiptEvents;"
-                ).fetchone()[0]
-            )
-            after_dispatches = int(
-                cursor.execute(
-                    "SELECT COUNT_BIG(*) FROM dbo.DispatchEvents;"
-                ).fetchone()[0]
-            )
+                receipt_parameters = [tuple(row) + (row[0],) for row in prepared_receipts]
+                dispatch_parameters = [tuple(row) + (row[0],) for row in prepared_dispatches]
+
+                _bulk_insert_rows(cursor, missing_receipt_sql, receipt_parameters)
+                _bulk_insert_rows(cursor, missing_dispatch_sql, dispatch_parameters)
+
+                after_receipts = int(
+                    cursor.execute(
+                        "SELECT COUNT_BIG(*) FROM dbo.ReceiptEvents WHERE WarehouseID = ?;",
+                        (warehouse_id,),
+                    ).fetchone()[0]
+                )
+                after_dispatches = int(
+                    cursor.execute(
+                        "SELECT COUNT_BIG(*) FROM dbo.DispatchEvents WHERE WarehouseID = ?;",
+                        (warehouse_id,),
+                    ).fetchone()[0]
+                )
+                inserted_receipts = max(0, after_receipts - before_receipts)
+                inserted_dispatches = max(0, after_dispatches - before_dispatches)
 
             connection.commit()
-
         except Exception:
             connection.rollback()
             raise
 
-    inserted_receipts = max(0, after_receipts - before_receipts)
-    inserted_dispatches = max(0, after_dispatches - before_dispatches)
-
     logger.info(
-        "Optimized event save completed in %.2f seconds. "
-        "new_receipts=%s duplicate_receipts=%s "
-        "new_dispatches=%s duplicate_dispatches=%s",
+        "Optimized event save completed in %.2f seconds. WarehouseID=%s "
+        "new_receipts=%s duplicate_receipts=%s new_dispatches=%s duplicate_dispatches=%s",
         time.perf_counter() - started_at,
+        warehouse_id,
         inserted_receipts,
         max(0, len(prepared_receipts) - inserted_receipts),
         inserted_dispatches,
@@ -869,91 +851,88 @@ def append_events(
 
 
 def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Return cumulative receipt and dispatch summaries for Batch Master.
+    """Return warehouse-scoped cumulative summaries for Batch Master.
 
-    Batch Master receipt totals include only the three physical WMS receipt
-    classes relevant to warehouse stock history:
-      * TRK5060 - Supplier
-      * TRK800  - STO incoming
-      * TRK49   - STO return
-
-    TRK30 Customer Return, TRK43 Reservation and TRK74 Principal are retained
-    in ReceiptEvents for audit only and never enter Batch Master quantities.
-    Unknown TRK prefixes are also excluded until classified explicitly.
+    This version keeps the same business rules but avoids the expensive
+    EligibleReceipt + OUTER APPLY pattern.  One windowed pass calculates both
+    receipt totals and the preferred descriptive row for every
+    BN + ExpiryMonth + Generic group.
     """
 
     initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+
+    warehouse_id = int(current_warehouse_id())
     started_at = time.perf_counter()
 
     receipt_sql = r"""
-        WITH EligibleReceipt AS
-        (
-            SELECT *
-            FROM dbo.ReceiptEvents
-            WHERE
-                (
-                    UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK5060%'
-                    OR UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK800%'
-                    OR UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK49%'
-                )
-                AND REPLACE(REPLACE(REPLACE(
-                        UPPER(LTRIM(RTRIM(ISNULL(ItemFamilyGroup, '')))),
-                        ' ', ''), '-', ''), '_', '') <> 'LABORATORYSUPPLIES'
-        ),
-        ReceiptAggregate AS
+        WITH RankedReceipt AS
         (
             SELECT
                 BN,
                 ExpiryMonthKey,
+                ExpiryDate,
                 GenericItemNumber,
-                MAX(ExpiryDate) AS ReceiptExpiryDate,
-                COUNT_BIG(*) AS ReceiveRuns,
-                SUM(ReceivedQuantity) AS TotalReceiveQty,
-                MIN(ReceivedDate) AS FirstReceivedDate,
-                MAX(ReceivedDate) AS LastReceivedDate
-            FROM EligibleReceipt
-            GROUP BY BN, ExpiryMonthKey, GenericItemNumber
+                TradeItemNumber,
+                TradeName,
+                Description,
+                SupplierName,
+                SupplierCode,
+                ItemFamilyGroup,
+                ReceivedQuantity,
+                ReceivedDate,
+                EventKey,
+                InboundShipment,
+                ROW_NUMBER() OVER
+                (
+                    PARTITION BY BN, ExpiryMonthKey, GenericItemNumber
+                    ORDER BY
+                        CASE
+                            WHEN InboundShipment LIKE 'TRK5060%' THEN 0
+                            WHEN InboundShipment LIKE 'TRK800%' THEN 1
+                            ELSE 2
+                        END,
+                        ReceivedDate ASC,
+                        EventKey ASC
+                ) AS rn,
+                MAX(ExpiryDate) OVER
+                    (PARTITION BY BN, ExpiryMonthKey, GenericItemNumber) AS ReceiptExpiryDate,
+                COUNT_BIG(*) OVER
+                    (PARTITION BY BN, ExpiryMonthKey, GenericItemNumber) AS ReceiveRuns,
+                SUM(ReceivedQuantity) OVER
+                    (PARTITION BY BN, ExpiryMonthKey, GenericItemNumber) AS TotalReceiveQty,
+                MIN(ReceivedDate) OVER
+                    (PARTITION BY BN, ExpiryMonthKey, GenericItemNumber) AS FirstReceivedDate,
+                MAX(ReceivedDate) OVER
+                    (PARTITION BY BN, ExpiryMonthKey, GenericItemNumber) AS LastReceivedDate
+            FROM dbo.ReceiptEvents
+            WHERE WarehouseID = ?
+              AND (
+                    InboundShipment LIKE 'TRK5060%'
+                    OR InboundShipment LIKE 'TRK800%'
+                    OR InboundShipment LIKE 'TRK49%'
+                  )
+              AND REPLACE(REPLACE(REPLACE(
+                    UPPER(LTRIM(RTRIM(ISNULL(ItemFamilyGroup, '')))),
+                    ' ', ''), '-', ''), '_', '') <> 'LABORATORYSUPPLIES'
         )
         SELECT
-            a.BN,
-            a.ExpiryMonthKey AS [Expiry Month Key],
-            a.ReceiptExpiryDate AS [Receipt Expiry Date],
-            a.GenericItemNumber AS [Generic Item Number],
-            s.TradeItemNumber AS [Trade Item Number],
-            s.TradeName AS [Trade Name],
-            s.Description AS [Description],
-            s.SupplierName AS [Supplier Name],
-            s.SupplierCode AS [Supplier Code],
-            s.ItemFamilyGroup AS [Item Family Group],
-            a.ReceiveRuns AS [Receive Runs],
-            a.TotalReceiveQty AS [Total Receive Qty],
-            a.FirstReceivedDate AS [First Received Date],
-            a.LastReceivedDate AS [Last Received Date]
-        FROM ReceiptAggregate a
-        OUTER APPLY
-        (
-            SELECT TOP (1)
-                r.TradeItemNumber,
-                r.TradeName,
-                r.Description,
-                r.SupplierName,
-                r.SupplierCode,
-                r.ItemFamilyGroup
-            FROM EligibleReceipt r
-            WHERE r.BN = a.BN
-              AND r.ExpiryMonthKey = a.ExpiryMonthKey
-              AND r.GenericItemNumber = a.GenericItemNumber
-            ORDER BY
-                CASE
-                    WHEN UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, '')))) LIKE 'TRK5060%'
-                    THEN 0
-                    WHEN UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, '')))) LIKE 'TRK800%'
-                    THEN 1
-                    ELSE 2
-                END,
-                r.ReceivedDate ASC,
-                r.EventKey ASC
-        ) s;
+            BN,
+            ExpiryMonthKey AS [Expiry Month Key],
+            ReceiptExpiryDate AS [Receipt Expiry Date],
+            GenericItemNumber AS [Generic Item Number],
+            TradeItemNumber AS [Trade Item Number],
+            TradeName AS [Trade Name],
+            Description,
+            SupplierName AS [Supplier Name],
+            SupplierCode AS [Supplier Code],
+            ItemFamilyGroup AS [Item Family Group],
+            ReceiveRuns AS [Receive Runs],
+            TotalReceiveQty AS [Total Receive Qty],
+            FirstReceivedDate AS [First Received Date],
+            LastReceivedDate AS [Last Received Date]
+        FROM RankedReceipt
+        WHERE rn = 1;
     """
 
     dispatch_sql = r"""
@@ -970,19 +949,21 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             MIN(DispatchDate) AS [First Dispatch Date],
             MAX(DispatchDate) AS [Last Dispatch Date]
         FROM dbo.DispatchEvents
-        WHERE REPLACE(REPLACE(REPLACE(
-            UPPER(LTRIM(RTRIM(ISNULL(Custody, '')))),
-            ' ', ''), '-', ''), '_', '') <> 'BIOCHEMICALS'
+        WHERE WarehouseID = ?
+          AND REPLACE(REPLACE(REPLACE(
+                UPPER(LTRIM(RTRIM(ISNULL(Custody, '')))),
+                ' ', ''), '-', ''), '_', '') <> 'BIOCHEMICALS'
         GROUP BY BN, ExpiryMonthKey, GenericItemNumber;
     """
 
     with Database().connect() as connection:
-        receipt = pd.read_sql(receipt_sql, connection)
-        dispatch = pd.read_sql(dispatch_sql, connection)
+        receipt = pd.read_sql(receipt_sql, connection, params=(warehouse_id,))
+        dispatch = pd.read_sql(dispatch_sql, connection, params=(warehouse_id,))
 
     logger.info(
-        "Historical event summaries loaded in %.2f seconds. receipt_groups=%s dispatch_groups=%s",
+        "Historical event summaries loaded in %.2f seconds. WarehouseID=%s receipt_groups=%s dispatch_groups=%s",
         time.perf_counter() - started_at,
+        warehouse_id,
         len(receipt),
         len(dispatch),
     )
@@ -990,14 +971,14 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Return Supplier History and Customer History at their operational grains.
-
-    Supplier History is intentionally TRK5060-only. This guarantees that
-    Supplier Variance can never be inflated by STO, returns, reservations or
-    principal movements.
-    """
+    """Return warehouse-scoped Supplier and Customer History summaries."""
 
     initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+
+    warehouse_id = int(current_warehouse_id())
+    started_at = time.perf_counter()
+
     supplier_sql = r"""
         SELECT
             SupplierName AS [Supplier Name],
@@ -1014,7 +995,8 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             MIN(ReceivedDate) AS [First Received Date],
             MAX(ReceivedDate) AS [Last Received Date]
         FROM dbo.ReceiptEvents
-        WHERE UPPER(LTRIM(RTRIM(ISNULL(InboundShipment, '')))) LIKE 'TRK5060%'
+        WHERE WarehouseID = ?
+          AND InboundShipment LIKE 'TRK5060%'
           AND REPLACE(REPLACE(REPLACE(
                 UPPER(LTRIM(RTRIM(ISNULL(ItemFamilyGroup, '')))),
                 ' ', ''), '-', ''), '_', '') <> 'LABORATORYSUPPLIES'
@@ -1035,15 +1017,24 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             MIN(DispatchDate) AS [First Dispatch Date],
             MAX(DispatchDate) AS [Last Dispatch Date]
         FROM dbo.DispatchEvents
-        WHERE REPLACE(REPLACE(REPLACE(
-            UPPER(LTRIM(RTRIM(ISNULL(Custody, '')))),
-            ' ', ''), '-', ''), '_', '') <> 'BIOCHEMICALS'
+        WHERE WarehouseID = ?
+          AND REPLACE(REPLACE(REPLACE(
+                UPPER(LTRIM(RTRIM(ISNULL(Custody, '')))),
+                ' ', ''), '-', ''), '_', '') <> 'BIOCHEMICALS'
         GROUP BY ToAddress, BN, ExpiryMonthKey, GenericItemNumber;
     """
 
     with Database().connect() as connection:
-        supplier = pd.read_sql(supplier_sql, connection)
-        customer = pd.read_sql(customer_sql, connection)
+        supplier = pd.read_sql(supplier_sql, connection, params=(warehouse_id,))
+        customer = pd.read_sql(customer_sql, connection, params=(warehouse_id,))
+
+    logger.info(
+        "Historical history summaries loaded in %.2f seconds. WarehouseID=%s supplier_rows=%s customer_rows=%s",
+        time.perf_counter() - started_at,
+        warehouse_id,
+        len(supplier),
+        len(customer),
+    )
     return supplier, customer
 
 
@@ -2420,11 +2411,11 @@ def _expire_stale_historical_build_jobs(
     queued_stale_minutes = max(2, int(
         os.getenv("HISTORICAL_QUEUED_STALE_MINUTES", "10") or 10
     ))
-    running_stale_minutes = max(30, int(
+    running_stale_minutes = max(5, int(
         os.getenv(
             "HISTORICAL_RUNNING_STALE_MINUTES",
-            os.getenv("HISTORICAL_JOB_STALE_MINUTES", "360") or 360,
-        ) or 360
+            os.getenv("HISTORICAL_JOB_STALE_MINUTES", "15") or 15,
+        ) or 15
     ))
 
     cursor = connection.cursor()
@@ -2476,6 +2467,67 @@ def _expire_stale_historical_build_jobs(
             expired_running,
         )
     return expired
+
+
+def heartbeat_historical_build_job(job_id: str) -> bool:
+    """Refresh UpdatedAt only while the job is still Running.
+
+    Returns False when another actor has cancelled/failed/completed the job.
+    The worker uses this as both a heartbeat and a cooperative cancellation
+    signal so a manually stopped job cannot later overwrite itself as Completed.
+    """
+    initialize_database()
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE dbo.HistoricalBuildJobs
+            SET UpdatedAt = SYSUTCDATETIME()
+            WHERE JobID = ? AND Status = 'Running';
+            """,
+            (str(job_id),),
+        )
+        active = int(cursor.rowcount or 0) > 0
+        connection.commit()
+    return active
+
+
+def historical_build_job_is_active(job_id: str) -> bool:
+    """Return True only while a Historical Build remains Queued/Running."""
+    initialize_database()
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        row = cursor.execute(
+            """
+            SELECT Status
+            FROM dbo.HistoricalBuildJobs
+            WHERE JobID = ?;
+            """,
+            (str(job_id),),
+        ).fetchone()
+    return bool(row and str(row[0] or '').strip() in {'Queued', 'Running'})
+
+
+def cancel_historical_build_job(job_id: str, reason: str = 'Cancelled by user.') -> bool:
+    """Cooperatively cancel a queued/running Historical Build."""
+    initialize_database()
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE dbo.HistoricalBuildJobs
+            SET Status = 'Cancelled',
+                CurrentStage = 'Historical Build cancelled',
+                ErrorMessage = ?,
+                CompletedAt = COALESCE(CompletedAt, SYSUTCDATETIME()),
+                UpdatedAt = SYSUTCDATETIME()
+            WHERE JobID = ? AND Status IN ('Queued', 'Running');
+            """,
+            (str(reason or 'Cancelled by user.'), str(job_id)),
+        )
+        changed = int(cursor.rowcount or 0) > 0
+        connection.commit()
+    return changed
 
 
 def get_active_historical_build_job(warehouse_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
