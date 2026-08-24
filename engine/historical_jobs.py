@@ -342,13 +342,19 @@ def process_historical_build_job(
                 ),
             )
             export_started = perf_counter()
-            exported = Exporter.build_formatted_excel_file(
-                df=export_df,
-                file_name=export_file_name,
-                sheet_name=export_sheet_name,
-                title=export_title,
-                sort_columns=export_sort_columns,
-            )
+            if export_file_name == "Batch_Master.xlsx":
+                exported = Exporter.build_batch_master_two_sheet_file(
+                    df=export_df,
+                    file_name=export_file_name,
+                )
+            else:
+                exported = Exporter.build_formatted_excel_file(
+                    df=export_df,
+                    file_name=export_file_name,
+                    sheet_name=export_sheet_name,
+                    title=export_title,
+                    sort_columns=export_sort_columns,
+                )
             file_name, file_bytes, mime_type = _decode_exported_file(exported)
             saved = storage.upload_job_output(
                 job_id,
