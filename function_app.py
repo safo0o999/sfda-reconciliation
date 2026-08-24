@@ -1678,10 +1678,9 @@ def historical_export_current(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         outputs = {}
-        outputs.update(Exporter.build_formatted_excel_file(
-            df=batch_master, file_name="Batch_Master.xlsx",
-            sheet_name="Batch Master", title="SFDA Historical Batch Master",
-            sort_columns=["Generic Item Number", "BN", "Expiry Date"],
+        outputs.update(Exporter.build_batch_master_two_sheet_file(
+            df=batch_master,
+            file_name="Batch_Master.xlsx",
         ))
         outputs.update(Exporter.build_formatted_excel_file(
             df=supplier_history, file_name="Supplier_History.xlsx",
@@ -2175,17 +2174,9 @@ def _run_full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
         sto_return_cancel = result["sto_return_cancel_dispatch"]
         accept_upload = result["accept_upload"]
         outputs = {
-            "batch_master": Exporter.build_formatted_excel_file(
+            "batch_master": Exporter.build_batch_master_two_sheet_file(
                 df=batch_master,
                 file_name="Batch_Master.xlsx",
-                sheet_name="Batch Master",
-                title="SFDA Historical Batch Master",
-                columns=[
-                    column
-                    for column in Exporter.BATCH_MASTER_COLUMNS
-                    if column in batch_master.columns
-                ],
-                sort_columns=["Generic Item Number", "BN", "Expiry Date"],
             ),
             "accept_details": Exporter.build_formatted_excel_file(
                 df=accept_details,
@@ -2501,17 +2492,9 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
         replace_full_dispatch_sfda_baseline(sfda_df, sfda_name)
 
         outputs = {
-            "batch_master": Exporter.build_formatted_excel_file(
+            "batch_master": Exporter.build_batch_master_two_sheet_file(
                 df=batch_master,
                 file_name="Batch_Master.xlsx",
-                sheet_name="Batch Master",
-                title="SFDA Historical Batch Master",
-                columns=[
-                    column
-                    for column in Exporter.BATCH_MASTER_COLUMNS
-                    if column in batch_master.columns
-                ],
-                sort_columns=["Generic Item Number", "BN", "Expiry Date"],
             ),
             "dispatch_details": Exporter.build_formatted_excel_file(
                 df=dispatch_details,
