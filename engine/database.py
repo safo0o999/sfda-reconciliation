@@ -2616,32 +2616,57 @@ def list_historical_build_jobs(limit: int = 500) -> List[Dict[str, Any]]:
 def sync_batch_master_sfda_snapshot(
     sfda_df: pd.DataFrame,
 ) -> Dict[str, int]:
-    """Synchronize SFDA-controlled BatchMaster fields safely and in bulk.
+    """Synchronize BatchMaster from the current SFDA snapshot by BN + expiry month.
 
-    BN + expiry month is only the operational candidate key.  A BatchMaster
-    row is updated only when its already-resolved GTIN agrees with the SFDA
-    GTIN for that candidate.  The exact SFDA expiry date is persisted so every
-    SFDA-facing export uses the regulatory date, even when the WMS expiry day
-    differs within the same month.
+    The regulatory candidate key is BN + ExpiryMonthKey.  The existing GTIN in
+    BatchMaster is never used as a prerequisite for an exact batch match because
+    it may have been inherited earlier from another batch of the same Generic.
+
+    Safety rule: only unambiguous SFDA BN + expiry-month keys (exactly one GTIN)
+    are eligible.  When a key matches, GTIN, Drug Name, exact SFDA expiry date and
+    all SFDA quantities are overwritten from that exact SFDA row and the batch is
+    marked GenericExistsInSFDA = Yes.
     """
 
     initialize_database()
     if sfda_df is None or sfda_df.empty:
-        return {"sfda_rows": 0, "updated_rows": 0}
+        return {"sfda_rows": 0, "unambiguous_sfda_keys": 0, "updated_rows": 0}
 
     from engine.full_reconciliation import FullReconciliationEngine
     from engine.normalizer import Normalizer
 
     frame = Normalizer.normalize_sfda(sfda_df.copy())
     frame["Expiry Month Key"] = FullReconciliationEngine._month_key(frame["Expiry Date"])
+    frame["GTIN"] = Normalizer.text(frame["GTIN"])
+    frame["Drug Name"] = Normalizer.text(frame["Drug Name"])
+    frame["BN"] = Normalizer.text(frame["BN"])
     for column in ["Quantity", "Active", "Quantity sent pending", "Quantity Receive Pending"]:
         frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0)
-    frame["GTIN"] = frame["GTIN"].fillna("").astype(str).str.strip()
 
-    # Keep GTIN in the grain. Different products may legitimately share BN/month.
+    frame = frame.loc[
+        frame["BN"].ne("")
+        & frame["Expiry Month Key"].astype(str).str.strip().ne("")
+        & frame["GTIN"].ne("")
+    ].copy()
+
+    identity_counts = (
+        frame.groupby(["BN", "Expiry Month Key"], dropna=False)["GTIN"]
+        .nunique()
+        .rename("_GTINCount")
+        .reset_index()
+    )
+    frame = frame.merge(
+        identity_counts,
+        on=["BN", "Expiry Month Key"],
+        how="left",
+        validate="many_to_one",
+    )
+    frame = frame.loc[frame["_GTINCount"].eq(1)].copy()
+
     grouped = (
-        frame.groupby(["GTIN", "BN", "Expiry Month Key"], dropna=False)
+        frame.groupby(["BN", "Expiry Month Key"], dropna=False)
         .agg(**{
+            "GTIN": ("GTIN", "first"),
             "Expiry Date": ("Expiry Date", "first"),
             "Drug Name": ("Drug Name", "first"),
             "Quantity": ("Quantity", "sum"),
@@ -2654,16 +2679,25 @@ def sync_batch_master_sfda_snapshot(
 
     rows = [
         (
-            _text(row, "GTIN"), _text(row, "BN"), _text(row, "Expiry Month Key"),
-            _value(row, "Expiry Date"), _text(row, "Drug Name"),
-            _number(row, "Quantity"), _number(row, "Active"),
-            _number(row, "Quantity sent pending"), _number(row, "Quantity Receive Pending"),
+            _text(row, "BN"),
+            _text(row, "Expiry Month Key"),
+            _text(row, "GTIN"),
+            _value(row, "Expiry Date"),
+            _text(row, "Drug Name"),
+            _number(row, "Quantity"),
+            _number(row, "Active"),
+            _number(row, "Quantity sent pending"),
+            _number(row, "Quantity Receive Pending"),
         )
         for row in grouped.to_dict(orient="records")
-        if _text(row, "GTIN") and _text(row, "BN") and _text(row, "Expiry Month Key")
+        if _text(row, "BN") and _text(row, "Expiry Month Key") and _text(row, "GTIN")
     ]
     if not rows:
-        return {"sfda_rows": int(len(grouped)), "updated_rows": 0}
+        return {
+            "sfda_rows": int(len(sfda_df)),
+            "unambiguous_sfda_keys": 0,
+            "updated_rows": 0,
+        }
 
     from engine.warehouse_context import current_warehouse_id
     warehouse_id = int(current_warehouse_id())
@@ -2673,40 +2707,42 @@ def sync_batch_master_sfda_snapshot(
         try:
             cursor.execute(r"""
                 CREATE TABLE #SFDABatchState (
-                    GTIN nvarchar(100) NOT NULL,
                     BN nvarchar(255) NOT NULL,
                     ExpiryMonthKey nvarchar(20) NOT NULL,
+                    GTIN nvarchar(100) NOT NULL,
                     ExpiryDate date NULL,
                     DrugName nvarchar(1000) NULL,
                     SFDAQuantity decimal(38,6) NOT NULL,
                     Active decimal(38,6) NOT NULL,
                     QuantitySentPending decimal(38,6) NOT NULL,
                     QuantityReceivePending decimal(38,6) NOT NULL,
-                    PRIMARY KEY (GTIN, BN, ExpiryMonthKey)
+                    PRIMARY KEY (BN, ExpiryMonthKey)
                 );
             """)
             cursor.fast_executemany = True
             cursor.executemany(r"""
                 INSERT INTO #SFDABatchState
-                (GTIN, BN, ExpiryMonthKey, ExpiryDate, DrugName, SFDAQuantity, Active,
+                (BN, ExpiryMonthKey, GTIN, ExpiryDate, DrugName, SFDAQuantity, Active,
                  QuantitySentPending, QuantityReceivePending)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
             """, rows)
             cursor.fast_executemany = False
+
             cursor.execute(r"""
                 UPDATE bm
-                SET bm.ExpiryDate = s.ExpiryDate,
+                SET bm.GTIN = s.GTIN,
+                    bm.ExpiryDate = s.ExpiryDate,
                     bm.DrugName = s.DrugName,
                     bm.SFDAQuantity = s.SFDAQuantity,
                     bm.Active = s.Active,
                     bm.QuantitySentPending = s.QuantitySentPending,
                     bm.QuantityReceivePending = s.QuantityReceivePending,
+                    bm.GenericExistsInSFDA = N'Yes',
                     bm.LastUpdated = SYSUTCDATETIME()
                 FROM dbo.BatchMaster AS bm
                 INNER JOIN #SFDABatchState AS s
                     ON s.BN = bm.BN
                    AND s.ExpiryMonthKey = bm.ExpiryMonthKey
-                   AND s.GTIN = bm.GTIN
                 WHERE bm.WarehouseID = ?;
             """, (warehouse_id,))
             updated = max(0, int(cursor.rowcount or 0))
@@ -2715,8 +2751,11 @@ def sync_batch_master_sfda_snapshot(
             connection.rollback()
             raise
 
-    return {"sfda_rows": int(len(grouped)), "updated_rows": updated}
-
+    return {
+        "sfda_rows": int(len(sfda_df)),
+        "unambiguous_sfda_keys": int(len(grouped)),
+        "updated_rows": updated,
+    }
 
 def test_database_connection() -> Dict[str, Optional[Any]]:
     initialize_database()
@@ -4678,9 +4717,7 @@ def refresh_accept_history_incremental(
                     FROM #CurrentAcceptSFDA s
                     WHERE s.BN = bm.BN
                       AND s.ExpiryMonthKey = bm.ExpiryMonthKey
-                      AND NULLIF(bm.GTIN, N'') IS NOT NULL
-                      AND s.GTIN = bm.GTIN
-                    ORDER BY CASE WHEN s.GTIN = bm.GTIN THEN 0 ELSE 1 END, s.GTIN
+                    ORDER BY s.GTIN
                 ) sf;
             """)
             batch_updated = max(0, int(cursor.rowcount or 0))
@@ -4737,20 +4774,6 @@ def refresh_accept_history_incremental(
                         WHERE a.GenericItemNumber = bm.GenericItemNumber
                     )
                 ),
-                TrustedGeneric AS
-                (
-                    SELECT GenericItemNumber
-                    FROM ExactIdentityRows
-                    GROUP BY GenericItemNumber
-                    HAVING COUNT(DISTINCT GTIN) = 1
-                ),
-                TrustedGTIN AS
-                (
-                    SELECT GTIN
-                    FROM ExactIdentityRows
-                    GROUP BY GTIN
-                    HAVING COUNT(DISTINCT GenericItemNumber) = 1
-                ),
                 GenericReference AS
                 (
                     SELECT *
@@ -4766,13 +4789,9 @@ def refresh_accept_history_incremental(
                             ROW_NUMBER() OVER
                             (
                                 PARTITION BY e.GenericItemNumber
-                                ORDER BY e.LastUpdated DESC
+                                ORDER BY e.LastUpdated DESC, e.GTIN
                             ) AS rn
                         FROM ExactIdentityRows e
-                        INNER JOIN TrustedGeneric tg
-                            ON tg.GenericItemNumber = e.GenericItemNumber
-                        INNER JOIN TrustedGTIN tgi
-                            ON tgi.GTIN = e.GTIN
                     ) x
                     WHERE rn = 1
                 ),
@@ -4832,7 +4851,7 @@ def refresh_accept_history_incremental(
                     CASE WHEN sf.BN IS NOT NULL THEN N'Yes' ELSE N'Missing Batch in SFDA' END,
                     SYSUTCDATETIME()
                 FROM ReceiptAggregate ra
-                INNER JOIN GenericReference gr
+                LEFT JOIN GenericReference gr
                     ON gr.GenericItemNumber = ra.GenericItemNumber
                 LEFT JOIN DispatchAggregate da
                     ON da.BN = ra.BN
@@ -4846,10 +4865,10 @@ def refresh_accept_history_incremental(
                     FROM #CurrentAcceptSFDA s
                     WHERE s.BN = ra.BN
                       AND s.ExpiryMonthKey = ra.ExpiryMonthKey
-                      AND s.GTIN = gr.GTIN
                     ORDER BY s.GTIN
                 ) sf
-                WHERE NOT EXISTS
+                WHERE (sf.BN IS NOT NULL OR gr.GenericItemNumber IS NOT NULL)
+                  AND NOT EXISTS
                 (
                     SELECT 1
                     FROM dbo.BatchMaster bm
@@ -4952,7 +4971,6 @@ def refresh_accept_history_incremental(
         "supplier_history_rows": int(counts[1] or 0),
         "customer_history_rows": int(counts[2] or 0),
     }
-
 
 def refresh_dispatch_history_incremental(
     confirmed_history_rows: List[Dict[str, Any]],
