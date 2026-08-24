@@ -473,6 +473,7 @@ def _dispatch_parameters(row: Dict[str, Any]) -> Tuple[Any, ...]:
         _text(row, "Sales Order Number"),
         _text(row, "Order Line"),
         _value(row, "Dispatch Date"),
+        _text(row, "Custody"),
     )
 
 
@@ -702,9 +703,9 @@ def append_events(
         (
             EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
             TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
-            SalesOrderNumber, OrderLine, DispatchDate
+            SalesOrderNumber, OrderLine, DispatchDate, Custody
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     """
 
     missing_receipt_sql = r"""
@@ -729,9 +730,9 @@ def append_events(
         (
             EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
             TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
-            SalesOrderNumber, OrderLine, DispatchDate
+            SalesOrderNumber, OrderLine, DispatchDate, Custody
         )
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         WHERE NOT EXISTS
         (
             SELECT 1
@@ -757,8 +758,21 @@ def append_events(
         receipt_rows,
         _receipt_parameters,
     )
+    dispatch_rows = [
+        row
+        for row in (dispatch_rows or [])
+        if (
+            "".join(
+                ch
+                for ch in str(row.get("Custody") or "").upper()
+                if ch.isalnum()
+            )
+            != "BIOCHEMICALS"
+        )
+    ]
+
     prepared_dispatches = _deduplicate_parameters(
-        dispatch_rows or [],
+        dispatch_rows,
         _dispatch_parameters,
     )
 
@@ -950,11 +964,15 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             GenericItemNumber AS [Generic Item Number],
             MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
             MAX(NULLIF(TradeName, '')) AS [Trade Name],
+            MAX(NULLIF(Custody, '')) AS [Custody],
             COUNT_BIG(*) AS [Dispatch Runs],
             SUM(DispatchedQuantity) AS [Total Dispatched Qty],
             MIN(DispatchDate) AS [First Dispatch Date],
             MAX(DispatchDate) AS [Last Dispatch Date]
         FROM dbo.DispatchEvents
+        WHERE REPLACE(REPLACE(REPLACE(
+            UPPER(LTRIM(RTRIM(ISNULL(Custody, '')))),
+            ' ', ''), '-', ''), '_', '') <> 'BIOCHEMICALS'
         GROUP BY BN, ExpiryMonthKey, GenericItemNumber;
     """
 
@@ -1012,10 +1030,14 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             GenericItemNumber AS [Generic Item Number],
             MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
             MAX(NULLIF(TradeName, '')) AS [Trade Name],
+            MAX(NULLIF(Custody, '')) AS [Custody],
             SUM(DispatchedQuantity) AS [Dispatch Quantity Each],
             MIN(DispatchDate) AS [First Dispatch Date],
             MAX(DispatchDate) AS [Last Dispatch Date]
         FROM dbo.DispatchEvents
+        WHERE REPLACE(REPLACE(REPLACE(
+            UPPER(LTRIM(RTRIM(ISNULL(Custody, '')))),
+            ' ', ''), '-', ''), '_', '') <> 'BIOCHEMICALS'
         GROUP BY ToAddress, BN, ExpiryMonthKey, GenericItemNumber;
     """
 
@@ -1254,8 +1276,8 @@ def replace_customer_history(history: pd.DataFrame) -> Dict[str, Any]:
         (ToAddress, GLN, GTIN, DrugName, GenericItemNumber, TradeDescription,
          BN, ExpiryMonthKey, ExpiryDate, PackageSize, DispatchQuantityEach,
          DispatchQuantityPack, FirstDispatchDate, LastDispatchDate,
-         TradeItemNumber, LastUpdated)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
+         Custody, TradeItemNumber, LastUpdated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
     """
     rows = [(
         _text(r, "To Address"), _text(r, "GLN"), _text(r, "GTIN"),
@@ -1264,7 +1286,7 @@ def replace_customer_history(history: pd.DataFrame) -> Dict[str, Any]:
         _value(r, "Expiry Date"), _number(r, "PackageSize"),
         _number(r, "Dispatch Quantity Each"), _number(r, "Dispatch Quantity Pack"),
         _value(r, "First Dispatch Date"), _value(r, "Last Dispatch Date"),
-        _text(r, "Trade Item Number")
+        _text(r, "Custody"), _text(r, "Trade Item Number")
     ) for r in history.to_dict(orient="records")]
     inserted = _replace_history_table("CustomerHistory", insert_sql, rows)
     return {"status": "Completed", "rows_inserted": inserted}
@@ -1317,6 +1339,7 @@ def get_customer_history_df() -> pd.DataFrame:
                 DispatchQuantityPack AS [Dispatch Quantity Pack],
                 FirstDispatchDate AS [First Dispatch Date],
                 LastDispatchDate AS [Last Dispatch Date],
+                Custody,
                 TradeItemNumber AS [Trade Item Number],
                 LastUpdated AS [Last Updated]
             FROM dbo.CustomerHistory
@@ -1372,6 +1395,7 @@ def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
             QuantityReceivePending,
             Description,
             ItemFamilyGroup,
+            Custody,
             SupplierName,
             SupplierCode,
             TotalReceiveQty,
@@ -1388,7 +1412,7 @@ def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
         VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?
         );
     """
 
@@ -1421,6 +1445,7 @@ def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
             _number(row, "Quantity Receive Pending"),
             _text(row, "Description"),
             _text(row, "Item Family Group"),
+            _text(row, "Custody"),
             _text(row, "Supplier Name"),
             _text(row, "Supplier Code"),
             _number_with_fallback(
@@ -1519,6 +1544,7 @@ def get_batch_master_df() -> pd.DataFrame:
             GenericExistsInSFDA AS [Generic Exists in SFDA],
             LastUpdated AS [Last Updated],
             ItemFamilyGroup AS [Item Family Group],
+            Custody,
             ExpiryMonthKey AS [Expiry Month Key],
             TradeItemNumber AS [Trade Item Number]
         FROM dbo.BatchMaster
@@ -1551,7 +1577,8 @@ def get_dispatch_events_df() -> pd.DataFrame:
             ToAddress AS [To Address],
             SalesOrderNumber AS [Sales Order Number],
             OrderLine AS [Order Line],
-            DispatchDate AS [Dispatch Date]
+            DispatchDate AS [Dispatch Date],
+            Custody
         FROM dbo.DispatchEvents
         ORDER BY
             DispatchDate,
@@ -4016,6 +4043,7 @@ def save_dispatch_pending_transactions(
                 "Reference Number": _text(row, "Reference Number"),
                 "Reference Line": _text(row, "Reference Line"),
                 "To Address": _text(row, "To Address"),
+                "Custody": _text(row, "Custody"),
                 "Transaction Date": _value(row, "Transaction Date"),
                 "Each": 0.0,
                 "Pack": 0.0,
@@ -4034,7 +4062,7 @@ def save_dispatch_pending_transactions(
             SELECT
                 ? AS TransactionKey, ? AS BN, ? AS ExpiryDate,
                 ? AS GenericItemNumber, ? AS ReferenceNumber,
-                ? AS ReferenceLine, ? AS ToAddress, ? AS TransactionDate,
+                ? AS ReferenceLine, ? AS ToAddress, ? AS Custody, ? AS TransactionDate,
                 ? AS NewQuantityEach, ? AS NewQuantityPack, ? AS RunNumber
         ) AS source
         ON target.TransactionKey = source.TransactionKey
@@ -4046,6 +4074,7 @@ def save_dispatch_pending_transactions(
                 ReferenceNumber = source.ReferenceNumber,
                 ReferenceLine = source.ReferenceLine,
                 ToAddress = source.ToAddress,
+                Custody = source.Custody,
                 TransactionDate = source.TransactionDate,
                 SubmittedQuantityEach = CASE
                     WHEN target.SubmittedQuantityEach >=
@@ -4065,7 +4094,7 @@ def save_dispatch_pending_transactions(
             INSERT
             (
                 TransactionKey, BN, ExpiryDate, GenericItemNumber,
-                ReferenceNumber, ReferenceLine, ToAddress, TransactionDate,
+                ReferenceNumber, ReferenceLine, ToAddress, Custody, TransactionDate,
                 SubmittedQuantityEach, SubmittedQuantityPack,
                 ConfirmedQuantityEach, ConfirmedQuantityPack,
                 FirstSubmittedRun, LastSubmittedRun
@@ -4074,7 +4103,7 @@ def save_dispatch_pending_transactions(
             (
                 source.TransactionKey, source.BN, source.ExpiryDate,
                 source.GenericItemNumber, source.ReferenceNumber,
-                source.ReferenceLine, source.ToAddress, source.TransactionDate,
+                source.ReferenceLine, source.ToAddress, source.Custody, source.TransactionDate,
                 source.NewQuantityEach, source.NewQuantityPack,
                 0, 0, source.RunNumber, source.RunNumber
             );
@@ -4090,7 +4119,7 @@ def save_dispatch_pending_transactions(
                     (
                         row["Transaction Key"], row["BN"], row["Expiry Date"],
                         row["Generic Item Number"], row["Reference Number"],
-                        row["Reference Line"], row["To Address"],
+                        row["Reference Line"], row["To Address"], row["Custody"],
                         row["Transaction Date"], row["Each"], row["Pack"],
                         str(run_number),
                     ),
@@ -4349,7 +4378,7 @@ def get_dispatch_confirmed_history_records() -> List[Dict[str, Any]]:
         SELECT
             c.ConfirmationKey,
             t.BN, t.ExpiryDate, t.GenericItemNumber,
-            t.ReferenceNumber, t.ReferenceLine, t.ToAddress,
+            t.ReferenceNumber, t.ReferenceLine, t.ToAddress, t.Custody,
             t.TransactionDate, c.ConfirmedQuantityEach
         FROM dbo.DailyDispatchConfirmations AS c
         INNER JOIN dbo.DailyDispatchTransactions AS t
@@ -4380,11 +4409,12 @@ def get_dispatch_confirmed_history_records() -> List[Dict[str, Any]]:
                 "Generic Item Number": str(row[3] or "").strip(),
                 "Trade Item Number": "",
                 "Trade Name": "",
-                "Dispatched Quantity": float(row[8] or 0),
+                "Dispatched Quantity": float(row[9] or 0),
                 "To Address": str(row[6] or "").strip(),
                 "Sales Order Number": str(row[4] or "").strip(),
                 "Order Line": str(row[5] or "").strip(),
-                "Dispatch Date": row[7],
+                "Custody": str(row[7] or "").strip(),
+                "Dispatch Date": row[8],
             }
         )
     return records
@@ -4600,7 +4630,8 @@ def reconcile_batch_master_event_totals() -> Dict[str, int]:
                         SUM(COALESCE(d.DispatchedQuantity, 0)) AS TotalDispatchedQty,
                         COUNT_BIG(*) AS DispatchRuns,
                         MIN(d.DispatchDate) AS FirstDispatchDate,
-                        MAX(d.DispatchDate) AS LastDispatchDate
+                        MAX(d.DispatchDate) AS LastDispatchDate,
+                        MAX(NULLIF(d.Custody, N'')) AS Custody
                     FROM dbo.DispatchEvents d
                     GROUP BY d.BN, d.ExpiryMonthKey, d.GenericItemNumber
                 )
@@ -5180,7 +5211,8 @@ def refresh_dispatch_history_incremental(
                         COUNT_BIG(*) AS DispatchRuns,
                         SUM(COALESCE(d.DispatchedQuantity, 0)) AS TotalDispatchedQty,
                         MIN(d.DispatchDate) AS FirstDispatchDate,
-                        MAX(d.DispatchDate) AS LastDispatchDate
+                        MAX(d.DispatchDate) AS LastDispatchDate,
+                        MAX(NULLIF(d.Custody, N'')) AS Custody
                     FROM dbo.DispatchEvents d
                     INNER JOIN #AffectedDispatchKeys a
                         ON a.BN = d.BN
@@ -5194,6 +5226,7 @@ def refresh_dispatch_history_incremental(
                     bm.DispatchRuns = COALESCE(a.DispatchRuns, 0),
                     bm.FirstDispatchDate = a.FirstDispatchDate,
                     bm.LastDispatchDate = a.LastDispatchDate,
+                    bm.Custody = COALESCE(NULLIF(a.Custody, N''), bm.Custody),
                     bm.LastUpdated = SYSUTCDATETIME()
                 FROM dbo.BatchMaster bm
                 INNER JOIN DispatchAggregate a
@@ -5220,7 +5253,7 @@ def refresh_dispatch_history_incremental(
                     ToAddress, GLN, GTIN, DrugName, GenericItemNumber,
                     TradeDescription, BN, ExpiryMonthKey, ExpiryDate,
                     PackageSize, DispatchQuantityEach, DispatchQuantityPack,
-                    FirstDispatchDate, LastDispatchDate, TradeItemNumber,
+                    FirstDispatchDate, LastDispatchDate, Custody, TradeItemNumber,
                     LastUpdated
                 )
                 SELECT
@@ -5242,6 +5275,7 @@ def refresh_dispatch_history_incremental(
                     END,
                     MIN(d.DispatchDate),
                     MAX(d.DispatchDate),
+                    COALESCE(NULLIF(MAX(d.Custody), N''), bm.Custody, N''),
                     COALESCE(NULLIF(MAX(d.TradeItemNumber), N''), bm.TradeItemNumber, N''),
                     SYSUTCDATETIME()
                 FROM dbo.DispatchEvents d
