@@ -12,6 +12,7 @@ import pandas as pd
 from engine.blob_storage import BlobStorage, INPUTS_CONTAINER
 from engine.database import (
     append_events,
+    remove_excluded_historical_keys,
     get_batch_master_df,
     get_customer_history_df,
     get_event_summaries,
@@ -171,6 +172,20 @@ def process_historical_build_job(
         )
         prepared = engine.prepare_incremental()
         mark_stage("validate_normalize_prepare_events")
+
+        # Self-clean legacy out-of-scope data when an Append re-encounters it.
+        # This prevents old LAB/Biochemicals rows from returning in Supplier/
+        # Customer History after they were introduced by earlier versions.
+        if operation == "append":
+            scope_cleanup = remove_excluded_historical_keys(
+                prepared.get("excluded_receipt_keys") or [],
+                prepared.get("excluded_dispatch_keys") or [],
+            )
+            logger.info(
+                "Historical append scope cleanup: %s",
+                scope_cleanup,
+            )
+            mark_stage("remove_excluded_historical_scope")
 
         if operation == "rebuild":
             update_historical_build_job(
