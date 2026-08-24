@@ -220,6 +220,16 @@ class ReconciliationEngine:
         return result.drop(columns=["_Proven GTIN", "_Proven Drug Name"], errors="ignore")
 
     @staticmethod
+    def _excluded_dispatch_custody_mask(series: pd.Series) -> pd.Series:
+        normalized = (
+            series.fillna("")
+            .astype(str)
+            .str.upper()
+            .str.replace(r"[^A-Z0-9]+", "", regex=True)
+        )
+        return normalized.eq("BIOCHEMICALS")
+
+    @staticmethod
     def _safe_int(value: Any) -> int:
         number = pd.to_numeric(
             pd.Series([value]),
@@ -413,6 +423,7 @@ class ReconciliationEngine:
             "Reference Number": reference_number,
             "Reference Line": reference_line,
             "To Address": frame.get("To Address", ""),
+            "Custody": frame.get("Custody", ""),
             "Transaction Date": transaction_date,
             "Processed Quantity Each": frame["Current Quantity Each"],
             "Processed Quantity Pack": frame.get(pack_column, 0),
@@ -1396,6 +1407,16 @@ class ReconciliationEngine:
         self.dispatch = Normalizer.normalize_dispatch(
             self.dispatch
         )
+
+        # Same scope rule as Historical Full Dispatch.
+        biochemical_mask = self._excluded_dispatch_custody_mask(
+            self.dispatch.get(
+                "Custody",
+                pd.Series("", index=self.dispatch.index, dtype=object),
+            )
+        )
+        self.dispatch = self.dispatch.loc[~biochemical_mask].copy()
+
         self.dispatch = self._ensure_expiry_month_key(self.dispatch)
         Validator.validate(
             self.dispatch,
@@ -1566,6 +1587,7 @@ class ReconciliationEngine:
             "Quantity Receive Pending",
             "PackageSize",
             "Generic Item Number",
+            "Custody",
             "Trade Name",
             "Sales Order Number",
             "Order Line",
