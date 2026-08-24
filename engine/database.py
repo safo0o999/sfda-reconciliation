@@ -2488,13 +2488,16 @@ def claim_historical_build_job(job_id: str) -> bool:
                 StartedAt = COALESCE(StartedAt, SYSUTCDATETIME()),
                 UpdatedAt = SYSUTCDATETIME(),
                 ErrorMessage = ''
+            OUTPUT INSERTED.JobID
             WHERE JobID = ?
               AND Status = 'Queued'
               AND StartedAt IS NULL;
             """,
             (str(job_id),),
         )
-        claimed = int(cursor.rowcount or 0) > 0
+        # pyodbc cursor.rowcount is not reliable for SQL Server DML (it can be -1
+        # even when the UPDATE succeeds). OUTPUT gives an authoritative atomic claim.
+        claimed = cursor.fetchone() is not None
         connection.commit()
     return claimed
 
@@ -2518,6 +2521,7 @@ def acquire_historical_requeue_lease(
             UPDATE dbo.HistoricalBuildJobs
             SET CurrentStage = 'Queued for processing - recovery enqueue',
                 UpdatedAt = SYSUTCDATETIME()
+            OUTPUT INSERTED.JobID
             WHERE JobID = ?
               AND Status = 'Queued'
               AND StartedAt IS NULL
@@ -2525,7 +2529,7 @@ def acquire_historical_requeue_lease(
             """,
             (str(job_id), safe_age),
         )
-        acquired = int(cursor.rowcount or 0) > 0
+        acquired = cursor.fetchone() is not None
         connection.commit()
     return acquired
 
@@ -2544,11 +2548,15 @@ def heartbeat_historical_build_job(job_id: str) -> bool:
             """
             UPDATE dbo.HistoricalBuildJobs
             SET UpdatedAt = SYSUTCDATETIME()
+            OUTPUT INSERTED.JobID
             WHERE JobID = ? AND Status = 'Running';
             """,
             (str(job_id),),
         )
-        active = int(cursor.rowcount or 0) > 0
+        # Never use cursor.rowcount as the cancellation signal here. SQL Server
+        # drivers may report -1 for successful DML. OUTPUT proves the row was
+        # actually still Running and refreshed by this heartbeat.
+        active = cursor.fetchone() is not None
         connection.commit()
     return active
 
