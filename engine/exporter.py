@@ -587,6 +587,166 @@ class Exporter:
         )
 
     @staticmethod
+    def build_batch_master_two_sheet_file(
+        df,
+        file_name="Batch_Master.xlsx",
+    ):
+        """Build Batch Master workbook with two explicit business stages.
+
+        Sheet 1 - Matched SFDA Batches:
+            direct BN + Expiry Month matches only (Generic Exists in SFDA = Yes).
+
+        Sheet 2 - Missing From SFDA:
+            WMS batches belonging to a Generic proven in Sheet 1, excluding all
+            batches already present in Sheet 1.
+        """
+        source = df.copy() if df is not None else pd.DataFrame()
+        source = source.reindex(columns=Exporter.BATCH_MASTER_COLUMNS)
+        status = source.get(
+            "Generic Exists in SFDA",
+            pd.Series("", index=source.index, dtype=object),
+        ).fillna("").astype(str).str.strip().str.upper()
+
+        matched = source.loc[status.eq("YES")].copy()
+        missing = source.loc[status.eq("MISSING BATCH IN SFDA")].copy()
+
+        sort_columns = [
+            column for column in ["Generic Item Number", "BN", "Expiry Date"]
+            if column in source.columns
+        ]
+        if sort_columns:
+            matched = matched.sort_values(sort_columns, kind="stable")
+            missing = missing.sort_values(sort_columns, kind="stable")
+
+        workbook = Workbook()
+        workbook.remove(workbook.active)
+
+        border = Border(
+            left=Side(style="thin", color="B8C4CE"),
+            right=Side(style="thin", color="B8C4CE"),
+            top=Side(style="thin", color="B8C4CE"),
+            bottom=Side(style="thin", color="B8C4CE"),
+        )
+
+        def add_sheet(frame, sheet_name, title):
+            ws = workbook.create_sheet(title=sheet_name[:31])
+            frame = frame.dropna(how="all").reset_index(drop=True)
+            columns = list(frame.columns)
+            last_column = get_column_letter(max(1, len(columns)))
+
+            ws.merge_cells(f"A1:{last_column}1")
+            ws["A1"] = title
+            ws["A1"].font = Font(bold=True, color="FFFFFF", size=14)
+            ws["A1"].fill = PatternFill(fill_type="solid", fgColor="0F6CBD")
+            ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+
+            # Same SFDA/WMS visual split used by the normal Batch Master report.
+            group_definitions = [
+                (1, 9, "SFDA Report", "5B9BD5"),
+                (10, len(columns), "WMS Report", "4472C4"),
+            ]
+            for start_col, end_col, label, fill_color in group_definitions:
+                if start_col > len(columns) or end_col < start_col:
+                    continue
+                end_col = min(end_col, len(columns))
+                ws.merge_cells(
+                    f"{get_column_letter(start_col)}2:{get_column_letter(end_col)}2"
+                )
+                cell = ws.cell(row=2, column=start_col, value=label)
+                cell.font = Font(bold=True, color="FFFFFF", size=11)
+                cell.fill = PatternFill(fill_type="solid", fgColor=fill_color)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                for col in range(start_col, end_col + 1):
+                    ws.cell(row=2, column=col).fill = PatternFill(
+                        fill_type="solid", fgColor=fill_color
+                    )
+
+            header_row = 3
+            identifier_flags = []
+            date_flags = []
+            max_lengths = []
+            for col_idx, name in enumerate(columns, start=1):
+                cell = ws.cell(row=header_row, column=col_idx, value=str(name))
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill(
+                    fill_type="solid",
+                    fgColor="17365D" if col_idx <= 9 else "2F5597",
+                )
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border = border
+                lower = str(name).lower()
+                identifier_flags.append(any(x in lower for x in [
+                    "gtin", "generic item", "trade item", "gln", "bn"
+                ]))
+                date_flags.append("date" in lower or "expiry" in lower)
+                max_lengths.append(len(str(name)))
+
+            stripe_fill = PatternFill(fill_type="solid", fgColor="EAF2F8")
+            for row_offset, values in enumerate(frame.itertuples(index=False, name=None), start=1):
+                excel_row = header_row + row_offset
+                for idx, value in enumerate(values):
+                    col_idx = idx + 1
+                    if pd.isna(value):
+                        value = None
+                    elif date_flags[idx]:
+                        parsed = pd.to_datetime(value, errors="coerce")
+                        if not pd.isna(parsed):
+                            value = parsed.to_pydatetime()
+                    elif identifier_flags[idx]:
+                        value = Exporter._normalize_identifier(value)
+                    elif hasattr(value, "item"):
+                        try:
+                            value = value.item()
+                        except Exception:
+                            pass
+                    if value is not None:
+                        max_lengths[idx] = max(max_lengths[idx], len(str(value)))
+                    cell = ws.cell(row=excel_row, column=col_idx, value=value)
+                    cell.border = border
+                    if identifier_flags[idx]:
+                        cell.number_format = "@"
+                    elif date_flags[idx]:
+                        cell.number_format = "dd-mm-yyyy"
+                    elif isinstance(value, (int, float)):
+                        cell.number_format = "#,##0.##"
+                    if row_offset % 2 == 0:
+                        cell.fill = stripe_fill
+
+            if len(frame) > 0:
+                ws.auto_filter.ref = f"A{header_row}:{last_column}{header_row + len(frame)}"
+            ws.freeze_panes = f"A{header_row + 1}"
+            ws.sheet_view.showGridLines = False
+            for idx, max_length in enumerate(max_lengths, start=1):
+                ws.column_dimensions[get_column_letter(idx)].width = min(
+                    max(max_length + 2, 12), 45
+                )
+
+        add_sheet(
+            matched,
+            "Matched SFDA Batches",
+            "Stage 1 - Direct BN + Expiry Month Matches",
+        )
+        add_sheet(
+            missing,
+            "Missing From SFDA",
+            "Stage 2 - Trusted Generic Batches Missing From SFDA",
+        )
+
+        output = io.BytesIO()
+        workbook.save(output)
+        output.seek(0)
+        content = base64.b64encode(output.read()).decode("ascii")
+        return {
+            file_name: {
+                "content": content,
+                "encoding": "base64",
+                "mime_type": (
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                ),
+            }
+        }
+
+    @staticmethod
     def build_formatted_excel_file(
         df,
         file_name,
