@@ -88,6 +88,7 @@ class FullReconciliationEngine:
         "Sales Order Number",
         "Order Line",
         "Dispatch Date",
+        "Custody",
     ]
 
     MASTER_COLUMNS = [
@@ -116,6 +117,7 @@ class FullReconciliationEngine:
         "Generic Exists in SFDA",
         "Last Updated",
         "Item Family Group",
+        "Custody",
         # Internal key retained for SQL and matching, but excluded by Batch Master exporter.
         "Expiry Month Key",
         "Trade Item Number",
@@ -155,6 +157,7 @@ class FullReconciliationEngine:
         "Dispatch Quantity Pack",
         "First Dispatch Date",
         "Last Dispatch Date",
+        "Custody",
         "Expiry Month Key",
         "Trade Item Number",
     ]
@@ -203,6 +206,7 @@ class FullReconciliationEngine:
         "Expiry Date",
         "Expiry Month Key",
         "Generic Item Number",
+        "Custody",
         "PackageSize",
         "Historical Dispatch Quantity Each",
         "Historical Dispatch Quantity Pack",
@@ -749,6 +753,7 @@ class FullReconciliationEngine:
                 "Trade Item Number",
                 "Trade Name",
                 "Dispatch Expiry Date",
+                "Custody",
                 "Total Dispatched Qty",
                 "First Dispatch Date",
                 "Last Dispatch Date",
@@ -780,12 +785,19 @@ class FullReconciliationEngine:
         historical_lab_mask = self._excluded_item_family_mask(
             master["Item Family Group"]
         )
-        if historical_lab_mask.any():
-            logger.info(
-                "Batch Master builder excluded %s Laboratory Supplies historical group(s).",
-                int(historical_lab_mask.sum()),
+        historical_biochemical_mask = self._excluded_dispatch_custody_mask(
+            master.get(
+                "Custody",
+                pd.Series("", index=master.index, dtype=object),
             )
-            master = master.loc[~historical_lab_mask].copy()
+        )
+        excluded_scope_mask = historical_lab_mask | historical_biochemical_mask
+        if excluded_scope_mask.any():
+            logger.info(
+                "Batch Master builder excluded %s out-of-scope historical group(s) (Laboratory Supplies/Biochemicals).",
+                int(excluded_scope_mask.sum()),
+            )
+            master = master.loc[~excluded_scope_mask].copy()
 
         sfda = self._sfda_keys() if sfda_summary is None else sfda_summary.copy()
         sfda_columns = self.SFDA_KEYS + [
@@ -1226,6 +1238,7 @@ class FullReconciliationEngine:
             "Expiry Date",
             "Trade Item Number",
             "Trade Name",
+            "Custody",
             "Dispatch Quantity Each",
             "First Dispatch Date",
             "Last Dispatch Date",
