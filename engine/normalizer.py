@@ -438,6 +438,9 @@ class Normalizer:
                 ["Generic Item Number", "Item Number"],
             )
         )
+        df["Custody"] = Normalizer.text(
+            Normalizer._optional_series(df, ["Custody"])
+        )
 
         return df
 
