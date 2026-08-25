@@ -29,8 +29,6 @@ class Exporter:
         "Generic Item Number",
         "Description",
         "Trade Description",
-        "Supplier Name",
-        "Supplier Code",
         "Received Quantity Each",
         "Received Quantity Pack",
         "First Received Date",
@@ -748,6 +746,166 @@ class Exporter:
             }
         }
 
+
+    @staticmethod
+    def build_historical_database_workbook(
+        batch_master,
+        supplier_history,
+        sto_incoming_history,
+        customer_history,
+        sto_return_history,
+        file_name="Historical_Database.xlsx",
+    ):
+        """Build the complete Historical Database as one seven-sheet workbook.
+
+        Business contract:
+        - Batch Master is batch movement history only; Supplier Name/Code are not exported.
+        - Batch Master contains direct SFDA matches (BN + Expiry Month).
+        - Missing From SFDA contains received WMS batches for Generics proven by Stage 1.
+        - Supplier/STO/Customer histories remain separate audit views in their own sheets.
+        """
+        master = batch_master.copy() if batch_master is not None else pd.DataFrame()
+        master = master.reindex(columns=Exporter.BATCH_MASTER_COLUMNS)
+        status = master.get(
+            "Generic Exists in SFDA",
+            pd.Series("", index=master.index, dtype=object),
+        ).fillna("").astype(str).str.strip().str.upper()
+        matched = master.loc[status.eq("YES")].copy()
+        missing = master.loc[status.eq("MISSING BATCH IN SFDA")].copy()
+
+        def prepared(frame, columns=None, sort_columns=None):
+            out = frame.copy() if frame is not None else pd.DataFrame()
+            if columns is not None:
+                out = out.reindex(columns=columns)
+            if sort_columns:
+                valid = [c for c in sort_columns if c in out.columns]
+                if valid:
+                    out = out.sort_values(valid, kind="stable")
+            return out.dropna(how="all").reset_index(drop=True)
+
+        matched = prepared(matched, sort_columns=["Generic Item Number", "BN", "Expiry Date"])
+        missing = prepared(missing, sort_columns=["Generic Item Number", "BN", "Expiry Date"])
+        supplier = prepared(
+            supplier_history,
+            Exporter.SUPPLIER_HISTORY_COLUMNS,
+            ["Supplier Name", "Generic Item Number", "BN", "Expiry Date"],
+        )
+        sto_in = prepared(
+            sto_incoming_history,
+            sort_columns=["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
+        )
+        customer = prepared(
+            customer_history,
+            Exporter.CUSTOMER_HISTORY_COLUMNS,
+            ["To Address", "Generic Item Number", "BN", "Expiry Date"],
+        )
+        sto_return = prepared(
+            sto_return_history,
+            sort_columns=["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
+        )
+
+        workbook = Workbook()
+        workbook.remove(workbook.active)
+        thin = Side(style="thin", color="D9E2F3")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        title_fill = PatternFill(fill_type="solid", fgColor="0F6CBD")
+        header_fill = PatternFill(fill_type="solid", fgColor="17365D")
+        alt_fill = PatternFill(fill_type="solid", fgColor="F4F8FC")
+
+        def add_data_sheet(frame, sheet_name, title):
+            ws = workbook.create_sheet(title=sheet_name[:31])
+            cols = list(frame.columns)
+            last_col = get_column_letter(max(1, len(cols)))
+            ws.merge_cells(f"A1:{last_col}1")
+            ws["A1"] = title
+            ws["A1"].font = Font(bold=True, color="FFFFFF", size=14)
+            ws["A1"].fill = title_fill
+            ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+            header_row = 3
+            max_lengths = [len(str(c)) for c in cols]
+            for idx, col in enumerate(cols, start=1):
+                cell = ws.cell(header_row, idx, str(col))
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.border = border
+            for r_idx, values in enumerate(frame.itertuples(index=False, name=None), start=header_row + 1):
+                for c_idx, value in enumerate(values, start=1):
+                    if pd.isna(value):
+                        value = ""
+                    cell = ws.cell(r_idx, c_idx, value)
+                    cell.border = border
+                    if r_idx % 2 == 0:
+                        cell.fill = alt_fill
+                    if c_idx <= len(max_lengths):
+                        max_lengths[c_idx - 1] = min(45, max(max_lengths[c_idx - 1], len(str(value))))
+            if cols:
+                ws.auto_filter.ref = f"A{header_row}:{last_col}{header_row + len(frame)}"
+                ws.freeze_panes = f"A{header_row + 1}"
+                for idx, width in enumerate(max_lengths, start=1):
+                    ws.column_dimensions[get_column_letter(idx)].width = min(max(width + 2, 12), 45)
+            ws.sheet_view.showGridLines = False
+
+        # Summary is intentionally first so users can understand the workbook immediately.
+        summary_ws = workbook.create_sheet(title="Summary")
+        summary_ws.merge_cells("A1:C1")
+        summary_ws["A1"] = "Historical Database Summary"
+        summary_ws["A1"].font = Font(bold=True, color="FFFFFF", size=16)
+        summary_ws["A1"].fill = title_fill
+        summary_ws["A1"].alignment = Alignment(horizontal="center")
+        summary_ws.append([])
+        summary_ws.append(["Metric", "Value", "Description"])
+        for cell in summary_ws[3]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.border = border
+
+        def qty_sum(frame, column):
+            if column not in frame.columns:
+                return 0
+            return float(pd.to_numeric(frame[column], errors="coerce").fillna(0).sum())
+
+        metrics = [
+            ("Matched SFDA Batches", len(matched), "Direct BN + Expiry Month matches"),
+            ("Missing From SFDA", len(missing), "Received batches for trusted Generics not present in SFDA"),
+            ("Total Historical Batches", len(matched) + len(missing), "Matched + Missing batch records"),
+            ("Supplier History Rows", len(supplier), "Supplier receipt history"),
+            ("STO Incoming Rows", len(sto_in), "Incoming inter-warehouse transfer history"),
+            ("Customer History Rows", len(customer), "Customer dispatch history"),
+            ("STO Return/Cancel Rows", len(sto_return), "STO return / cancel-dispatch history"),
+            ("Total Received Qty Each", qty_sum(master, "Received Quantity Each"), "Historical receipts across eligible receipt types"),
+            ("Total Dispatched Qty Each", qty_sum(master, "Total Dispatched Qty"), "Historical dispatch quantity"),
+        ]
+        for metric, value, desc in metrics:
+            summary_ws.append([metric, value, desc])
+        for row in summary_ws.iter_rows(min_row=4, max_row=3 + len(metrics), min_col=1, max_col=3):
+            for cell in row:
+                cell.border = border
+        summary_ws.column_dimensions["A"].width = 30
+        summary_ws.column_dimensions["B"].width = 20
+        summary_ws.column_dimensions["C"].width = 58
+        summary_ws.freeze_panes = "A4"
+        summary_ws.sheet_view.showGridLines = False
+
+        add_data_sheet(matched, "Batch Master", "Historical Batch Master - Matched SFDA Batches")
+        add_data_sheet(missing, "Missing From SFDA", "Trusted Generic Batches Missing From SFDA")
+        add_data_sheet(supplier, "Supplier History", "Historical Supplier Receipt History")
+        add_data_sheet(sto_in, "STO Incoming History", "Historical STO Incoming Receipt History")
+        add_data_sheet(customer, "Customer History", "Historical Customer Dispatch History")
+        add_data_sheet(sto_return, "STO Return Cancel", "STO Returns - Cancel Previous RSD Dispatch")
+
+        output = io.BytesIO()
+        workbook.save(output)
+        output.seek(0)
+        content = base64.b64encode(output.read()).decode("ascii")
+        return {
+            file_name: {
+                "content": content,
+                "encoding": "base64",
+                "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            }
+        }
+
     @staticmethod
     def build_formatted_excel_file(
         df,
@@ -888,7 +1046,7 @@ class Exporter:
             if is_batch_master:
                 group_definitions = [
                     (1, 9, "SFDA Report", "5B9BD5"),
-                    (10, 25, "WMS Report", "4472C4"),
+                    (10, 24, "WMS Report", "4472C4"),
                 ]
             elif is_full_accept_reconciliation:
                 group_definitions = [
