@@ -415,105 +415,60 @@ def process_historical_build_job(
             current_stage="Generating downloadable audit files",
         )
 
-        # Generate and upload one workbook at a time.  The old code built
-        # all five base64-encoded workbooks in memory before uploading any of
-        # them.  Customer History can be very large, so that caused avoidable
-        # memory pressure and garbage-collection pauses.
-        export_specs = [
-            (
-                master,
-                "Batch_Master.xlsx",
-                "Batch Master",
-                "SFDA Historical Batch Master",
-                ["Generic Item Number", "BN", "Expiry Date"],
-            ),
-            (
-                supplier_history,
-                "Supplier_History.xlsx",
-                "Supplier History",
-                "Historical Supplier Receipt History",
-                ["Supplier Name", "Generic Item Number", "BN", "Expiry Date"],
-            ),
-            (
-                customer_history,
-                "Customer_History.xlsx",
-                "Customer History",
-                "Historical Customer Dispatch History",
-                ["To Address", "Generic Item Number", "BN", "Expiry Date"],
-            ),
-            (
-                sto_incoming_history,
-                "STO_Incoming_History.xlsx",
-                "STO Incoming",
-                "Historical STO Incoming Receipt History",
-                ["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
-            ),
-            (
-                sto_return_history,
-                "STO_Return_Cancel_Dispatch.xlsx",
-                "STO Return",
-                "STO Returns - Cancel Previous RSD Dispatch",
-                ["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
-            ),
-        ]
-
-        output_files: List[Dict[str, Any]] = []
-        for export_index, (
-            export_df,
-            export_file_name,
-            export_sheet_name,
-            export_title,
-            export_sort_columns,
-        ) in enumerate(export_specs, start=1):
-            update_historical_build_job(
-                job_id,
-                progress=min(98, 90 + export_index),
-                current_stage=(
-                    f"Generating audit file {export_index}/{len(export_specs)}: "
-                    f"{export_file_name}"
+        # Historical Build now produces one consolidated workbook instead of
+        # five separate files. This is an export/presentation change only;
+        # all historical tables remain persisted separately in SQL.
+        update_historical_build_job(
+            job_id,
+            progress=94,
+            current_stage="Generating Historical Database workbook",
+        )
+        export_started = perf_counter()
+        exported = Exporter.build_historical_database_workbook(
+            batch_master=master,
+            supplier_history=supplier_history,
+            sto_incoming_history=sto_incoming_history,
+            customer_history=customer_history,
+            sto_return_history=sto_return_history,
+            file_name="Historical_Database.xlsx",
+        )
+        file_name, file_bytes, mime_type = _decode_exported_file(exported)
+        update_historical_build_job(
+            job_id,
+            progress=97,
+            current_stage="Uploading Historical Database workbook",
+        )
+        saved = storage.upload_job_output(
+            job_id,
+            file_name,
+            file_bytes,
+            mime_type,
+        )
+        output_files: List[Dict[str, Any]] = [
+            {
+                "file_name": file_name,
+                "content_type": mime_type,
+                "size_bytes": saved.get("size_bytes", len(file_bytes)),
+                "blob_name": saved.get("blob_name", ""),
+                "download_url": (
+                    f"/api/history/{job_id}/download"
+                    f"?category=output&file_name={file_name}"
                 ),
-            )
-            export_started = perf_counter()
-            if export_file_name == "Batch_Master.xlsx":
-                exported = Exporter.build_batch_master_two_sheet_file(
-                    df=export_df,
-                    file_name=export_file_name,
-                )
-            else:
-                exported = Exporter.build_formatted_excel_file(
-                    df=export_df,
-                    file_name=export_file_name,
-                    sheet_name=export_sheet_name,
-                    title=export_title,
-                    sort_columns=export_sort_columns,
-                )
-            file_name, file_bytes, mime_type = _decode_exported_file(exported)
-            saved = storage.upload_job_output(
-                job_id,
-                file_name,
-                file_bytes,
-                mime_type,
-            )
-            output_files.append(
-                {
-                    "file_name": file_name,
-                    "content_type": mime_type,
-                    "size_bytes": saved.get("size_bytes", len(file_bytes)),
-                    "blob_name": saved.get("blob_name", ""),
-                    "download_url": (
-                        f"/api/history/{job_id}/download"
-                        f"?category=output&file_name={file_name}"
-                    ),
-                }
-            )
-            logger.info(
-                "HISTORICAL_PERF job_id=%s export=%s rows=%s seconds=%.3f",
-                job_id,
-                file_name,
-                len(export_df),
-                perf_counter() - export_started,
-            )
-            del exported, file_bytes
+            }
+        ]
+        logger.info(
+            "HISTORICAL_PERF job_id=%s export=%s sheets=7 batch_rows=%s "
+            "supplier_rows=%s sto_in_rows=%s customer_rows=%s sto_return_rows=%s seconds=%.3f",
+            job_id,
+            file_name,
+            len(master),
+            len(supplier_history),
+            len(sto_incoming_history),
+            len(customer_history),
+            len(sto_return_history),
+            perf_counter() - export_started,
+        )
+        del exported, file_bytes
 
         mark_stage("generate_and_upload_audit_files")
 
