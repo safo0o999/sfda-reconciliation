@@ -2070,6 +2070,8 @@ def historical_build_worker(
             job_id,
             input_manifest,
             operation,
+            warehouse_id=warehouse_id,
+            warehouse_name=warehouse_name or f"Warehouse {warehouse_id}",
         )
         _refresh_dashboard_summary_safe()
 
