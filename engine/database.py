@@ -5412,7 +5412,7 @@ def refresh_dispatch_history_incremental(
                     END,
                     MIN(d.DispatchDate),
                     MAX(d.DispatchDate),
-                    COALESCE(NULLIF(MAX(d.Custody), N''), bm.Custody, N''),
+                    COALESCE(NULLIF(MAX(d.Custody), N''), NULLIF(MAX(bm.Custody), N''), N''),
                     COALESCE(NULLIF(MAX(d.TradeItemNumber), N''), bm.TradeItemNumber, N''),
                     SYSUTCDATETIME()
                 FROM dbo.DispatchEvents d
