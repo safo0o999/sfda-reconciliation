@@ -501,15 +501,21 @@ class FullReconciliationEngine:
     def _pack_lookup(self) -> pd.DataFrame:
         lookup = self.packsize[["Trade Name", "PackageSize"]].copy()
         lookup["Drug Name"] = Normalizer.text(lookup["Trade Name"])
+        lookup["_Drug Name Key"] = Normalizer.drug_name_key(lookup["Trade Name"])
         lookup["PackageSize"] = pd.to_numeric(lookup["PackageSize"], errors="coerce")
         lookup = lookup[
-            lookup["Drug Name"].ne("")
+            lookup["_Drug Name Key"].ne("")
             & lookup["PackageSize"].notna()
             & lookup["PackageSize"].gt(0)
         ].copy()
+        # If a normalized key is duplicated with different pack sizes, do not
+        # guess. Only unambiguous normalized drug names are eligible.
+        counts = lookup.groupby("_Drug Name Key")["PackageSize"].nunique()
+        safe = set(counts[counts.eq(1)].index)
+        lookup = lookup.loc[lookup["_Drug Name Key"].isin(safe)].copy()
         return (
-            lookup[["Drug Name", "PackageSize"]]
-            .drop_duplicates(subset=["Drug Name"], keep="first")
+            lookup[["Drug Name", "_Drug Name Key", "PackageSize"]]
+            .drop_duplicates(subset=["_Drug Name Key"], keep="first")
             .reset_index(drop=True)
         )
 
@@ -600,13 +606,70 @@ class FullReconciliationEngine:
                 .eq(1)
             ].drop(columns=["_GTIN Count"], errors="ignore")
 
+        sfda["_Drug Name Key"] = Normalizer.drug_name_key(sfda["Drug Name"])
         sfda = sfda.merge(
-            self._pack_lookup(),
-            on="Drug Name",
+            self._pack_lookup()[["_Drug Name Key", "PackageSize"]],
+            on="_Drug Name Key",
             how="left",
             validate="many_to_one",
-        )
+        ).drop(columns=["_Drug Name Key"], errors="ignore")
         return sfda
+
+    def _resolve_exact_sfda_generic_candidates(
+        self, candidates: pd.DataFrame, sfda: pd.DataFrame
+    ) -> pd.DataFrame:
+        """Validate exact BN+expiry matches with normalized drug identity.
+
+        Business rule:
+        1. BN + Expiry Month is ALWAYS the primary SFDA matching key.
+        2. Generic Item Number always comes from the WMS row.
+        3. After the exact batch match is found, SFDA Drug Name is normalized
+           and compared with that WMS row's Trade Description.
+        4. A clearly unrelated name rejects that WMS Generic/Bn/Expiry match.
+
+        Important: validation is applied to EVERY WMS Generic candidate, even
+        when only one candidate exists in the current build. This protects
+        Append runs where a conflicting Generic for the same BN+expiry appears
+        months after the original correct Generic. The name check validates; it
+        never selects a Generic by fuzzy search.
+        """
+        if candidates.empty or sfda.empty:
+            return pd.DataFrame()
+
+        c = candidates.copy()
+        c["_WMS Trade Description"] = (
+            c.get("Trade Description", pd.Series("", index=c.index, dtype=object))
+            .fillna("").astype(str).str.strip()
+        )
+        edges = c.merge(sfda, on=self.SFDA_KEYS, how="inner", validate="many_to_one")
+        if edges.empty:
+            return edges
+
+        edges["_Drug Identity Score"] = [
+            Normalizer.drug_name_match_score(drug, trade)
+            for drug, trade in zip(edges["Drug Name"], edges["_WMS Trade Description"])
+        ]
+        valid = edges["_Drug Identity Score"].ge(60.0)
+
+        rejected = edges.loc[~valid]
+        for _, row in rejected.iterrows():
+            logger.warning(
+                "Historical exact batch match rejected by drug-name validation. BN=%s expiry_month=%s generic=%s SFDA_drug=%s WMS_trade=%s score=%.2f",
+                str(row.get("BN", "")),
+                str(row.get("Expiry Month Key", "")),
+                str(row.get("Generic Item Number", "")),
+                str(row.get("Drug Name", "")),
+                str(row.get("_WMS Trade Description", "")),
+                float(row.get("_Drug Identity Score", 0) or 0),
+            )
+
+        accepted = edges.loc[valid].copy()
+        if not accepted.empty:
+            logger.info(
+                "Historical drug-name validation completed. exact_candidates=%s accepted=%s rejected=%s",
+                len(edges), len(accepted), len(rejected),
+            )
+        return accepted
 
     def _receipt_events(self) -> pd.DataFrame:
         started_at = time.perf_counter()
@@ -846,6 +909,8 @@ class FullReconciliationEngine:
         candidate_columns = self.SFDA_KEYS + [
             "Generic Item Number",
             "Item Family Group",
+            "Receipt Trade Name",
+            "Dispatch Trade Name",
         ]
         candidates = self._ensure_columns(master, candidate_columns)[candidate_columns].copy()
         candidates["Generic Item Number"] = (
@@ -857,18 +922,24 @@ class FullReconciliationEngine:
         )
         candidates = candidates.loc[~candidates["_Excluded Family"]].copy()
         candidates = candidates.drop(columns=["_Excluded Family"], errors="ignore")
+        candidates["Trade Description"] = (
+            candidates["Receipt Trade Name"].fillna("").astype(str).str.strip()
+        )
+        missing_candidate_trade = candidates["Trade Description"].eq("")
+        candidates.loc[missing_candidate_trade, "Trade Description"] = (
+            candidates.loc[missing_candidate_trade, "Dispatch Trade Name"]
+            .fillna("").astype(str).str.strip()
+        )
         candidates = candidates.drop_duplicates(
             subset=self.SFDA_KEYS + ["Generic Item Number"],
             keep="first",
         )
 
-        # Direct SFDA anchor: BN + Expiry Month only. SFDA itself was already
-        # reduced to unambiguous BN/month -> one GTIN rows by _sfda_keys().
-        exact_edges = candidates.merge(
-            sfda[sfda_columns],
-            on=self.SFDA_KEYS,
-            how="inner",
-            validate="many_to_one",
+        # Direct SFDA anchor: BN + Expiry Month is the matching key. Drug Name
+        # vs WMS Trade Description is only a post-match validation gate; it does
+        # not choose or invent the Generic Item Number.
+        exact_edges = self._resolve_exact_sfda_generic_candidates(
+            candidates, sfda[sfda_columns]
         )
 
         resolved_columns = self.SFDA_KEYS + ["Generic Item Number"] + [
@@ -2047,15 +2118,16 @@ class FullReconciliationEngine:
             validate="one_to_one",
         )
 
-        configured_pack_lookup = self._pack_lookup().rename(
+        configured_pack_lookup = self._pack_lookup()[["_Drug Name Key", "PackageSize"]].rename(
             columns={"PackageSize": "_Configured PackageSize"}
         )
+        target["_Drug Name Key"] = Normalizer.drug_name_key(target["Drug Name"])
         target = target.merge(
             configured_pack_lookup,
-            on="Drug Name",
+            on="_Drug Name Key",
             how="left",
             validate="many_to_one",
-        )
+        ).drop(columns=["_Drug Name Key"], errors="ignore")
         target["PackageSize"] = pd.to_numeric(
             target.get("_Customer PackageSize", 0), errors="coerce"
         ).fillna(0)
