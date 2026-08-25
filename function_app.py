@@ -1677,31 +1677,14 @@ def historical_export_current(req: func.HttpRequest) -> func.HttpResponse:
                 "Historical Batch Master is empty. Complete Step 1 first.", 400
             )
 
-        outputs = {}
-        outputs.update(Exporter.build_batch_master_two_sheet_file(
-            df=batch_master,
-            file_name="Batch_Master.xlsx",
-        ))
-        outputs.update(Exporter.build_formatted_excel_file(
-            df=supplier_history, file_name="Supplier_History.xlsx",
-            sheet_name="Supplier History", title="Historical Supplier Receipt History",
-            sort_columns=["Supplier Name", "Generic Item Number", "BN", "Expiry Date"],
-        ))
-        outputs.update(Exporter.build_formatted_excel_file(
-            df=customer_history, file_name="Customer_History.xlsx",
-            sheet_name="Customer History", title="Historical Customer Dispatch History",
-            sort_columns=["To Address", "Generic Item Number", "BN", "Expiry Date"],
-        ))
-        outputs.update(Exporter.build_formatted_excel_file(
-            df=sto_incoming_history, file_name="STO_Incoming_History.xlsx",
-            sheet_name="STO Incoming", title="Historical STO Incoming Receipt History",
-            sort_columns=["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
-        ))
-        outputs.update(Exporter.build_formatted_excel_file(
-            df=sto_return_history, file_name="STO_Return_Cancel_Dispatch.xlsx",
-            sheet_name="STO Return", title="STO Returns - Cancel Previous RSD Dispatch",
-            sort_columns=["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
-        ))
+        outputs = Exporter.build_historical_database_workbook(
+            batch_master=batch_master,
+            supplier_history=supplier_history,
+            sto_incoming_history=sto_incoming_history,
+            customer_history=customer_history,
+            sto_return_history=sto_return_history,
+            file_name="Historical_Database.xlsx",
+        )
         return json_response({"status": "Completed", "outputs": outputs})
     except Exception as exc:
         logger.exception("Current historical export failed")
