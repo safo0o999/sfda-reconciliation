@@ -563,11 +563,11 @@ def remove_excluded_historical_keys(
 ) -> Dict[str, int]:
     """Remove legacy rows for keys explicitly excluded by the current upload.
 
-    Receipt exclusions are Laboratory Supplies from ASN.
-    Dispatch exclusions are Custody=Biochemicals from Full Dispatch.
-
-    Keys include BN + ExpiryMonthKey + GenericItemNumber so a drug row that
-    happens to share the same BN/month with a LAB row is not removed.
+    Performance note:
+    keys are staged once into temporary tables and all cleanup is executed with
+    set-based DELETE statements.  The business rule is unchanged:
+      * Receipt exclusions = Laboratory Supplies from ASN.
+      * Dispatch exclusions = Custody=Biochemicals from Full Dispatch.
     """
     initialize_database()
 
@@ -600,55 +600,97 @@ def remove_excluded_historical_keys(
     with Database().connect() as connection:
         cursor = connection.cursor()
         try:
+            cursor.execute(r"""
+                CREATE TABLE #ExcludedReceiptKeys
+                (
+                    BN nvarchar(255) NOT NULL,
+                    ExpiryMonthKey nvarchar(20) NOT NULL,
+                    GenericItemNumber nvarchar(255) NOT NULL,
+                    PRIMARY KEY (BN, ExpiryMonthKey, GenericItemNumber)
+                );
+                CREATE TABLE #ExcludedDispatchKeys
+                (
+                    BN nvarchar(255) NOT NULL,
+                    ExpiryMonthKey nvarchar(20) NOT NULL,
+                    GenericItemNumber nvarchar(255) NOT NULL,
+                    PRIMARY KEY (BN, ExpiryMonthKey, GenericItemNumber)
+                );
+            """)
+            cursor.fast_executemany = True
             if receipt:
-                for table, counter in [
-                    ("ReceiptEvents", "receipt_events"),
-                    ("SupplierHistory", "supplier_history"),
-                ]:
-                    for bn, month, generic in receipt:
-                        cursor.execute(
-                            f"""
-                            DELETE FROM dbo.{table}
-                            WHERE BN=?
-                              AND ExpiryMonthKey=?
-                              AND GenericItemNumber=?;
-                            """,
-                            (bn, month, generic),
-                        )
-                        deleted[counter] += max(0, int(cursor.rowcount or 0))
+                cursor.executemany(
+                    "INSERT INTO #ExcludedReceiptKeys (BN, ExpiryMonthKey, GenericItemNumber) VALUES (?, ?, ?);",
+                    receipt,
+                )
+            if dispatch:
+                cursor.executemany(
+                    "INSERT INTO #ExcludedDispatchKeys (BN, ExpiryMonthKey, GenericItemNumber) VALUES (?, ?, ?);",
+                    dispatch,
+                )
+
+            if receipt:
+                cursor.execute(r"""
+                    DELETE r
+                    FROM dbo.ReceiptEvents r
+                    INNER JOIN #ExcludedReceiptKeys k
+                        ON k.BN = r.BN
+                       AND k.ExpiryMonthKey = r.ExpiryMonthKey
+                       AND k.GenericItemNumber = r.GenericItemNumber;
+                """)
+                deleted["receipt_events"] = max(0, int(cursor.rowcount or 0))
+
+                cursor.execute(r"""
+                    DELETE sh
+                    FROM dbo.SupplierHistory sh
+                    INNER JOIN #ExcludedReceiptKeys k
+                        ON k.BN = sh.BN
+                       AND k.ExpiryMonthKey = sh.ExpiryMonthKey
+                       AND k.GenericItemNumber = sh.GenericItemNumber;
+                """)
+                deleted["supplier_history"] = max(0, int(cursor.rowcount or 0))
 
             if dispatch:
-                for table, counter in [
-                    ("DispatchEvents", "dispatch_events"),
-                    ("CustomerHistory", "customer_history"),
-                ]:
-                    for bn, month, generic in dispatch:
-                        cursor.execute(
-                            f"""
-                            DELETE FROM dbo.{table}
-                            WHERE BN=?
-                              AND ExpiryMonthKey=?
-                              AND GenericItemNumber=?;
-                            """,
-                            (bn, month, generic),
-                        )
-                        deleted[counter] += max(0, int(cursor.rowcount or 0))
+                cursor.execute(r"""
+                    DELETE d
+                    FROM dbo.DispatchEvents d
+                    INNER JOIN #ExcludedDispatchKeys k
+                        ON k.BN = d.BN
+                       AND k.ExpiryMonthKey = d.ExpiryMonthKey
+                       AND k.GenericItemNumber = d.GenericItemNumber;
+                """)
+                deleted["dispatch_events"] = max(0, int(cursor.rowcount or 0))
 
-            # BatchMaster is derived from both movement types. A key explicitly
-            # excluded on either side must be removed so it cannot remain as a
-            # stale Matched/Missing row.
-            all_keys = sorted(set(receipt) | set(dispatch))
-            for bn, month, generic in all_keys:
-                cursor.execute(
-                    """
-                    DELETE FROM dbo.BatchMaster
-                    WHERE BN=?
-                      AND ExpiryMonthKey=?
-                      AND GenericItemNumber=?;
-                    """,
-                    (bn, month, generic),
+                cursor.execute(r"""
+                    DELETE ch
+                    FROM dbo.CustomerHistory ch
+                    INNER JOIN #ExcludedDispatchKeys k
+                        ON k.BN = ch.BN
+                       AND k.ExpiryMonthKey = ch.ExpiryMonthKey
+                       AND k.GenericItemNumber = ch.GenericItemNumber;
+                """)
+                deleted["customer_history"] = max(0, int(cursor.rowcount or 0))
+
+            cursor.execute(r"""
+                DELETE bm
+                FROM dbo.BatchMaster bm
+                WHERE EXISTS
+                (
+                    SELECT 1
+                    FROM #ExcludedReceiptKeys r
+                    WHERE r.BN = bm.BN
+                      AND r.ExpiryMonthKey = bm.ExpiryMonthKey
+                      AND r.GenericItemNumber = bm.GenericItemNumber
                 )
-                deleted["batch_master"] += max(0, int(cursor.rowcount or 0))
+                OR EXISTS
+                (
+                    SELECT 1
+                    FROM #ExcludedDispatchKeys d
+                    WHERE d.BN = bm.BN
+                      AND d.ExpiryMonthKey = bm.ExpiryMonthKey
+                      AND d.GenericItemNumber = bm.GenericItemNumber
+                );
+            """)
+            deleted["batch_master"] = max(0, int(cursor.rowcount or 0))
 
             connection.commit()
         except Exception:
@@ -664,23 +706,20 @@ def remove_excluded_historical_keys(
     return deleted
 
 
-
 def append_events(
     receipt_rows: List[Dict[str, Any]],
     dispatch_rows: List[Dict[str, Any]],
     *,
     assume_empty: bool = False,
 ) -> Dict[str, int]:
-    """Append receipt/dispatch events using bounded bulk inserts.
+    """Append receipt/dispatch events with set-based SQL de-duplication.
 
-    Rebuild performance rule:
-      ``reset_history()`` has already removed this warehouse's events, so
-      ``assume_empty=True`` performs direct bulk inserts and returns the
-      prepared row counts.  It deliberately avoids the old COUNT_BIG scans
-      before/after insertion.
-
-    Append keeps server-side EventKey de-duplication and uses warehouse-scoped
-    counts only to report how many genuinely new events were inserted.
+    Python still prepares exactly the same EventKey and payload.  For Append,
+    prepared rows are bulk-loaded into temporary staging tables, then SQL Server
+    performs one anti-join per event table and inserts all missing rows in one
+    set-based statement.  This replaces tens of thousands of per-row
+    ``INSERT ... WHERE NOT EXISTS`` executions without changing de-duplication
+    semantics or historical business rules.
     """
 
     initialize_database()
@@ -708,39 +747,6 @@ def append_events(
             SalesOrderNumber, OrderLine, DispatchDate, Custody
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-    """
-
-    missing_receipt_sql = r"""
-        INSERT INTO dbo.ReceiptEvents
-        (
-            EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
-            TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
-            ASNLine, SupplierName, SupplierCode, Description, ItemFamilyGroup,
-            ReceivedDate
-        )
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        WHERE NOT EXISTS
-        (
-            SELECT 1
-            FROM dbo.ReceiptEvents WITH (UPDLOCK, HOLDLOCK)
-            WHERE EventKey = ?
-        );
-    """
-
-    missing_dispatch_sql = r"""
-        INSERT INTO dbo.DispatchEvents
-        (
-            EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
-            TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
-            SalesOrderNumber, OrderLine, DispatchDate, Custody
-        )
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        WHERE NOT EXISTS
-        (
-            SELECT 1
-            FROM dbo.DispatchEvents WITH (UPDLOCK, HOLDLOCK)
-            WHERE EventKey = ?
-        );
     """
 
     receipt_rows = [
@@ -772,7 +778,7 @@ def append_events(
     prepared_dispatches = _deduplicate_parameters(dispatch_rows, _dispatch_parameters)
 
     logger.info(
-        "Optimized event save started. WarehouseID=%s prepared_receipts=%s "
+        "Set-based event save started. WarehouseID=%s prepared_receipts=%s "
         "prepared_dispatches=%s assume_empty=%s",
         warehouse_id,
         len(prepared_receipts),
@@ -794,39 +800,114 @@ def append_events(
                     cursor, direct_dispatch_sql, prepared_dispatches
                 )
             else:
-                before_receipts = int(
-                    cursor.execute(
-                        "SELECT COUNT_BIG(*) FROM dbo.ReceiptEvents WHERE WarehouseID = ?;",
-                        (warehouse_id,),
-                    ).fetchone()[0]
+                # Clone target column definitions so staging always follows the
+                # deployed SQL schema and does not introduce type/length drift.
+                cursor.execute(r"""
+                    SELECT TOP (0)
+                        EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                        TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
+                        ASNLine, SupplierName, SupplierCode, Description, ItemFamilyGroup,
+                        ReceivedDate
+                    INTO #ReceiptEventStage
+                    FROM dbo.ReceiptEvents;
+
+                    SELECT TOP (0)
+                        EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                        TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
+                        SalesOrderNumber, OrderLine, DispatchDate, Custody
+                    INTO #DispatchEventStage
+                    FROM dbo.DispatchEvents;
+                """)
+                cursor.execute(
+                    "CREATE UNIQUE CLUSTERED INDEX IX_ReceiptEventStage_EventKey ON #ReceiptEventStage(EventKey);"
                 )
-                before_dispatches = int(
-                    cursor.execute(
-                        "SELECT COUNT_BIG(*) FROM dbo.DispatchEvents WHERE WarehouseID = ?;",
-                        (warehouse_id,),
-                    ).fetchone()[0]
+                cursor.execute(
+                    "CREATE UNIQUE CLUSTERED INDEX IX_DispatchEventStage_EventKey ON #DispatchEventStage(EventKey);"
                 )
 
-                receipt_parameters = [tuple(row) + (row[0],) for row in prepared_receipts]
-                dispatch_parameters = [tuple(row) + (row[0],) for row in prepared_dispatches]
+                cursor.fast_executemany = True
+                if prepared_receipts:
+                    cursor.executemany(
+                        r"""
+                        INSERT INTO #ReceiptEventStage
+                        (
+                            EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                            TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
+                            ASNLine, SupplierName, SupplierCode, Description, ItemFamilyGroup,
+                            ReceivedDate
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        """,
+                        prepared_receipts,
+                    )
 
-                _bulk_insert_rows(cursor, missing_receipt_sql, receipt_parameters)
-                _bulk_insert_rows(cursor, missing_dispatch_sql, dispatch_parameters)
+                if prepared_dispatches:
+                    cursor.executemany(
+                        r"""
+                        INSERT INTO #DispatchEventStage
+                        (
+                            EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                            TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
+                            SalesOrderNumber, OrderLine, DispatchDate, Custody
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        """,
+                        prepared_dispatches,
+                    )
 
-                after_receipts = int(
+                if prepared_receipts:
                     cursor.execute(
-                        "SELECT COUNT_BIG(*) FROM dbo.ReceiptEvents WHERE WarehouseID = ?;",
+                        r"""
+                        INSERT INTO dbo.ReceiptEvents
+                        (
+                            EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                            TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
+                            ASNLine, SupplierName, SupplierCode, Description, ItemFamilyGroup,
+                            ReceivedDate
+                        )
+                        SELECT
+                            s.EventKey, s.BN, s.ExpiryMonthKey, s.ExpiryDate, s.GenericItemNumber,
+                            s.TradeItemNumber, s.TradeName, s.ReceivedQuantity, s.InboundShipment,
+                            s.ASNLine, s.SupplierName, s.SupplierCode, s.Description, s.ItemFamilyGroup,
+                            s.ReceivedDate
+                        FROM #ReceiptEventStage s
+                        WHERE NOT EXISTS
+                        (
+                            SELECT 1
+                            FROM dbo.ReceiptEvents t WITH (UPDLOCK, HOLDLOCK)
+                            WHERE t.WarehouseID = ?
+                              AND t.EventKey = s.EventKey
+                        );
+                        """,
                         (warehouse_id,),
-                    ).fetchone()[0]
-                )
-                after_dispatches = int(
+                    )
+                    inserted_receipts = max(0, int(cursor.rowcount or 0))
+
+                if prepared_dispatches:
                     cursor.execute(
-                        "SELECT COUNT_BIG(*) FROM dbo.DispatchEvents WHERE WarehouseID = ?;",
+                        r"""
+                        INSERT INTO dbo.DispatchEvents
+                        (
+                            EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                            TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
+                            SalesOrderNumber, OrderLine, DispatchDate, Custody
+                        )
+                        SELECT
+                            s.EventKey, s.BN, s.ExpiryMonthKey, s.ExpiryDate, s.GenericItemNumber,
+                            s.TradeItemNumber, s.TradeName, s.DispatchedQuantity, s.ToAddress,
+                            s.SalesOrderNumber, s.OrderLine, s.DispatchDate, s.Custody
+                        FROM #DispatchEventStage s
+                        WHERE NOT EXISTS
+                        (
+                            SELECT 1
+                            FROM dbo.DispatchEvents t WITH (UPDLOCK, HOLDLOCK)
+                            WHERE t.WarehouseID = ?
+                              AND t.EventKey = s.EventKey
+                        );
+                        """,
                         (warehouse_id,),
-                    ).fetchone()[0]
-                )
-                inserted_receipts = max(0, after_receipts - before_receipts)
-                inserted_dispatches = max(0, after_dispatches - before_dispatches)
+                    )
+                    inserted_dispatches = max(0, int(cursor.rowcount or 0))
 
             connection.commit()
         except Exception:
@@ -834,7 +915,7 @@ def append_events(
             raise
 
     logger.info(
-        "Optimized event save completed in %.2f seconds. WarehouseID=%s "
+        "Set-based event save completed in %.2f seconds. WarehouseID=%s "
         "new_receipts=%s duplicate_receipts=%s new_dispatches=%s duplicate_dispatches=%s",
         time.perf_counter() - started_at,
         warehouse_id,
@@ -4949,6 +5030,9 @@ def refresh_accept_history_incremental(
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
                     sfda_rows,
+                )
+                cursor.execute(
+                    "CREATE INDEX IX_CurrentAcceptSFDA_Batch ON #CurrentAcceptSFDA (BN, ExpiryMonthKey, GTIN);"
                 )
 
             # Aggregate only the affected physical receipt keys.
