@@ -2534,14 +2534,20 @@ def acquire_historical_requeue_lease(
     return acquired
 
 
-def heartbeat_historical_build_job(job_id: str) -> bool:
-    """Refresh UpdatedAt only while the job is still Running.
+def heartbeat_historical_build_job(
+    job_id: str,
+    warehouse_id: Optional[int] = None,
+) -> bool:
+    """Refresh UpdatedAt only while the warehouse-scoped job is Running.
 
-    Returns False when another actor has cancelled/failed/completed the job.
-    The worker uses this as both a heartbeat and a cooperative cancellation
-    signal so a manually stopped job cannot later overwrite itself as Completed.
+    WarehouseID is included explicitly in addition to SQL RLS. This prevents a
+    background thread with a missing Python context from touching or misreading
+    another warehouse's job.
     """
     initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+
+    resolved_warehouse_id = int(warehouse_id or current_warehouse_id())
     with Database().connect() as connection:
         cursor = connection.cursor()
         cursor.execute(
@@ -2549,9 +2555,11 @@ def heartbeat_historical_build_job(job_id: str) -> bool:
             UPDATE dbo.HistoricalBuildJobs
             SET UpdatedAt = SYSUTCDATETIME()
             OUTPUT INSERTED.JobID
-            WHERE JobID = ? AND Status = 'Running';
+            WHERE WarehouseID = ?
+              AND JobID = ?
+              AND Status = 'Running';
             """,
-            (str(job_id),),
+            (resolved_warehouse_id, str(job_id)),
         )
         # Never use cursor.rowcount as the cancellation signal here. SQL Server
         # drivers may report -1 for successful DML. OUTPUT proves the row was
@@ -2561,18 +2569,24 @@ def heartbeat_historical_build_job(job_id: str) -> bool:
     return active
 
 
-def historical_build_job_is_active(job_id: str) -> bool:
-    """Return True only while a Historical Build remains Queued/Running."""
+def historical_build_job_is_active(
+    job_id: str,
+    warehouse_id: Optional[int] = None,
+) -> bool:
+    """Return True only while the warehouse-scoped Historical Build is active."""
     initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+
+    resolved_warehouse_id = int(warehouse_id or current_warehouse_id())
     with Database().connect() as connection:
         cursor = connection.cursor()
         row = cursor.execute(
             """
             SELECT Status
             FROM dbo.HistoricalBuildJobs
-            WHERE JobID = ?;
+            WHERE WarehouseID = ? AND JobID = ?;
             """,
-            (str(job_id),),
+            (resolved_warehouse_id, str(job_id)),
         ).fetchone()
     return bool(row and str(row[0] or '').strip() in {'Queued', 'Running'})
 
