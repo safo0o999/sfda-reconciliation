@@ -1,3 +1,7 @@
+import re
+from difflib import SequenceMatcher
+from functools import lru_cache
+
 import pandas as pd
 
 
@@ -61,6 +65,75 @@ class Normalizer:
             .str.strip()
             .str.upper()
         )
+
+    @staticmethod
+    def drug_name_key(series):
+        """Conservative drug-name normalization for identity/package matching.
+
+        Keeps strength/volume tokens (25 MG, 100 ML, etc.) while removing only
+        formatting noise. This is deliberately safer than aggressive fuzzy
+        normalization because different strengths must remain distinguishable.
+        """
+        result = Normalizer.text(series)
+        result = result.str.replace(r"(?<=\d)\s*(MG|MCG|UG|G|ML|L|IU|UNIT|UNITS)\b", r" \1", regex=True)
+        result = result.str.replace(r"[^A-Z0-9]+", " ", regex=True)
+        result = result.str.replace(r"\s+", " ", regex=True).str.strip()
+        return result
+
+    @staticmethod
+    @lru_cache(maxsize=20000)
+    def _drug_key_scalar(value):
+        # Scalar normalization is used repeatedly during Historical matching.
+        # Cache by input text so the same SFDA/WMS drug name is normalized once
+        # per worker process rather than once per historical row.
+        value = "" if value is None else str(value)
+        return str(Normalizer.drug_name_key(pd.Series([value], dtype=object)).iloc[0])
+
+    @staticmethod
+    def _strength_tokens(value):
+        key = Normalizer._drug_key_scalar(value)
+        return set(re.findall(r"\b\d+(?:\.\d+)?\s*(?:MG|MCG|UG|G|ML|L|IU|UNIT|UNITS)\b", key))
+
+    @staticmethod
+    def drug_name_match_score(sfda_name, wms_trade_description):
+        """Return a conservative 0..100 identity score for SFDA vs WMS names.
+
+        Exact/contained normalized drug names score highest. Conflicting explicit
+        strength/volume tokens are heavily penalized so RISPERDAL 25 MG cannot
+        silently select RISPERDAL 50 MG.
+        """
+        sfda = Normalizer._drug_key_scalar(sfda_name)
+        wms = Normalizer._drug_key_scalar(wms_trade_description)
+        if not sfda or not wms:
+            return 0.0
+
+        sfda_strength = Normalizer._strength_tokens(sfda)
+        wms_strength = Normalizer._strength_tokens(wms)
+        if sfda_strength and wms_strength and sfda_strength.isdisjoint(wms_strength):
+            return 0.0
+
+        if sfda == wms:
+            return 100.0
+        if sfda in wms:
+            return 98.0
+
+        sfda_tokens = sfda.split()
+        wms_tokens = set(wms.split())
+        token_coverage = (sum(1 for token in sfda_tokens if token in wms_tokens) / max(1, len(sfda_tokens)))
+        sequence = SequenceMatcher(None, sfda, wms).ratio()
+        return round(100.0 * (0.72 * token_coverage + 0.28 * sequence), 2)
+
+    @staticmethod
+    def drug_name_validation_pass(sfda_name, wms_trade_description, threshold=60.0):
+        """Validation gate AFTER BN+Expiry matching.
+
+        BN + Expiry remains the regulatory matching key. This check does not
+        discover or choose a Generic; it only rejects an exact batch match when
+        the SFDA Drug Name and the WMS Trade Description are clearly unrelated.
+        Explicit strength/volume conflicts already score zero in
+        drug_name_match_score().
+        """
+        return Normalizer.drug_name_match_score(sfda_name, wms_trade_description) >= float(threshold)
 
     @staticmethod
     def identifier(series, length=None):
