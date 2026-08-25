@@ -2297,28 +2297,36 @@ class FullReconciliationEngine:
             ["BN", "Expiry Month Key", "First Dispatch Date", "To Address"],
             kind="stable",
         ).reset_index(drop=True)
-        details["To Be Dispatch"] = 0
 
-        for _, indexes in details.groupby(
-            ["BN", "Expiry Month Key"], sort=False, dropna=False
-        ).groups.items():
-            index_list = list(indexes)
-            remaining = int(details.loc[index_list[0], "Required Dispatch Pack"])
-            for row_index in index_list:
-                if remaining <= 0:
-                    break
-                available = int(
-                    max(
-                        details.loc[
-                            row_index,
-                            "Available Historical Dispatch Quantity Pack",
-                        ],
-                        0,
-                    )
-                )
-                allocated = min(available, remaining)
-                details.loc[row_index, "To Be Dispatch"] = allocated
-                remaining -= allocated
+        # Allocate the required dispatch quantity in the exact same stable row
+        # order as the previous nested loop, but vectorized per batch. For each
+        # row, allocation = min(available, max(required - prior_available, 0)).
+        # This preserves output row-for-row while avoiding thousands of DataFrame
+        # .loc writes in Python.
+        group_keys = ["BN", "Expiry Month Key"]
+        available_pack = pd.to_numeric(
+            details["Available Historical Dispatch Quantity Pack"],
+            errors="coerce",
+        ).fillna(0).clip(lower=0)
+        required_pack = pd.to_numeric(
+            details["Required Dispatch Pack"],
+            errors="coerce",
+        ).fillna(0).clip(lower=0)
+        prior_available = (
+            available_pack.groupby(
+                [details[key] for key in group_keys],
+                sort=False,
+                dropna=False,
+            ).cumsum()
+            - available_pack
+        )
+        remaining_before_row = (required_pack - prior_available).clip(lower=0)
+        details["To Be Dispatch"] = pd.concat(
+            [available_pack, remaining_before_row], axis=1
+        ).min(axis=1)
+        details["To Be Dispatch"] = pd.to_numeric(
+            details["To Be Dispatch"], errors="coerce"
+        ).fillna(0).astype("int64")
 
         # Any required SFDA dispatch that cannot be explained by remaining
         # Customer History must still be used to align SFDA Active to Current
