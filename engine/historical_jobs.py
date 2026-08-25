@@ -35,6 +35,7 @@ from engine.database import (
 )
 from engine.exporter import Exporter
 from engine.full_reconciliation import FullReconciliationEngine
+from engine.warehouse_context import warehouse_scope
 
 
 logger = logging.getLogger("SFDA-Reconciliation.HistoricalJobs")
@@ -44,19 +45,41 @@ class HistoricalBuildCancelled(RuntimeError):
     """Raised when a job is cancelled/failed while its worker is still alive."""
 
 
-def _start_job_heartbeat(job_id: str, stop_event: threading.Event, cancel_event: threading.Event) -> threading.Thread:
-    """Keep UpdatedAt fresh while the worker is alive and detect cancellation."""
+def _start_job_heartbeat(
+    job_id: str,
+    stop_event: threading.Event,
+    cancel_event: threading.Event,
+    warehouse_id: int,
+    warehouse_name: str,
+) -> threading.Thread:
+    """Keep UpdatedAt fresh while the worker is alive and detect cancellation.
+
+    ``contextvars`` do not automatically propagate to a new ``threading.Thread``.
+    The heartbeat therefore establishes the same warehouse scope explicitly so
+    SQL SESSION_CONTEXT/RLS never falls back to Warehouse 1 while processing a
+    different warehouse.
+    """
 
     def _run() -> None:
-        while not stop_event.wait(30):
-            try:
-                if not heartbeat_historical_build_job(job_id):
-                    cancel_event.set()
-                    return
-            except Exception:
-                # A transient heartbeat failure must not kill a healthy worker;
-                # the normal stage updates still provide recovery evidence.
-                logger.exception("Historical heartbeat failed. job_id=%s", job_id)
+        with warehouse_scope(warehouse_id, warehouse_name):
+            while not stop_event.wait(30):
+                try:
+                    if not heartbeat_historical_build_job(job_id, warehouse_id=warehouse_id):
+                        logger.warning(
+                            "Historical heartbeat no longer sees an active job. job_id=%s warehouse_id=%s",
+                            job_id,
+                            warehouse_id,
+                        )
+                        cancel_event.set()
+                        return
+                except Exception:
+                    # A transient heartbeat failure must not kill a healthy worker;
+                    # the normal stage updates still provide recovery evidence.
+                    logger.exception(
+                        "Historical heartbeat failed. job_id=%s warehouse_id=%s",
+                        job_id,
+                        warehouse_id,
+                    )
 
     thread = threading.Thread(
         target=_run,
@@ -137,6 +160,9 @@ def process_historical_build_job(
     job_id: str,
     input_manifest: Dict[str, Any],
     operation: str,
+    *,
+    warehouse_id: int,
+    warehouse_name: str = "",
 ) -> None:
     """Execute a historical build outside the initiating HTTP request."""
 
@@ -166,7 +192,9 @@ def process_historical_build_job(
         )
 
     def ensure_active() -> None:
-        if cancel_event.is_set() or not historical_build_job_is_active(job_id):
+        if cancel_event.is_set() or not historical_build_job_is_active(
+            job_id, warehouse_id=warehouse_id
+        ):
             raise HistoricalBuildCancelled(
                 f"Historical Build is no longer active: {job_id}"
             )
@@ -181,7 +209,11 @@ def process_historical_build_job(
             error_message="",
         )
         heartbeat_thread = _start_job_heartbeat(
-            job_id, heartbeat_stop, cancel_event
+            job_id,
+            heartbeat_stop,
+            cancel_event,
+            warehouse_id,
+            warehouse_name or f"Warehouse {warehouse_id}",
         )
         ensure_active()
 
@@ -528,7 +560,7 @@ def process_historical_build_job(
         )
         # Only mark Failed if the job is still active. If an admin/user already
         # cancelled it, preserve that terminal state.
-        if historical_build_job_is_active(job_id):
+        if historical_build_job_is_active(job_id, warehouse_id=warehouse_id):
             update_historical_build_job(
                 job_id,
                 status="Failed",
