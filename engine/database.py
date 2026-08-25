@@ -4953,21 +4953,88 @@ def refresh_accept_history_incremental(
                 current_sfda[column], errors="coerce"
             ).fillna(0)
 
-    sfda_rows = [
-        (
-            _text(row, "GTIN"),
-            _text(row, "Drug Name"),
-            _text(row, "BN"),
-            _text(row, "Expiry Month Key"),
-            _value(row, "Expiry Date"),
-            _number(row, "Quantity"),
-            _number(row, "Active"),
-            _number(row, "Quantity sent pending"),
-            _number(row, "Quantity Receive Pending"),
-        )
-        for row in current_sfda.to_dict(orient="records")
-        if _text(row, "BN") and _text(row, "Expiry Month Key")
-    ]
+    # PackageSize authority: SFDA Drug Name -> config/pack_size.xlsx.
+    # Use conservative formatting normalization while preserving strength/volume.
+    pack_path = Path(__file__).resolve().parent.parent / "config" / "pack_size.xlsx"
+    pack_frame = Normalizer.normalize_packsize(pd.read_excel(pack_path, engine="openpyxl", dtype=object))
+    pack_frame["_PackKey"] = Normalizer.drug_name_key(pack_frame["Trade Name"])
+    pack_frame["PackageSize"] = pd.to_numeric(pack_frame["PackageSize"], errors="coerce").fillna(0)
+    pack_map = (
+        pack_frame.loc[pack_frame["_PackKey"].ne("") & pack_frame["PackageSize"].gt(0)]
+        .drop_duplicates(subset=["_PackKey"], keep="first")
+        .set_index("_PackKey")["PackageSize"]
+        .to_dict()
+    )
+
+    # Validate WMS Generics against exact SFDA BN+expiry keys. BN+Expiry is the
+    # primary match. Drug Name vs Trade Description is ONLY a validation gate
+    # applied to every candidate, including a single Generic appearing in a
+    # later Append run. It never fuzzy-selects a Generic.
+    candidate_rows = pd.DataFrame(receipt_history_rows or [])
+    resolved_generics = {}
+    if not candidate_rows.empty:
+        for col in ["BN", "Expiry Month Key", "Generic Item Number", "Trade Name"]:
+            if col not in candidate_rows.columns:
+                candidate_rows[col] = ""
+        candidate_rows["BN"] = Normalizer.text(candidate_rows["BN"])
+        candidate_rows["Expiry Month Key"] = candidate_rows["Expiry Month Key"].fillna("").astype(str).str.strip()
+        candidate_rows["Generic Item Number"] = candidate_rows["Generic Item Number"].fillna("").astype(str).str.strip()
+        candidate_rows["Trade Name"] = candidate_rows["Trade Name"].fillna("").astype(str).str.strip()
+
+    if not current_sfda.empty:
+        current_sfda["BN"] = Normalizer.text(current_sfda["BN"])
+        current_sfda["Drug Name"] = Normalizer.text(current_sfda["Drug Name"])
+        current_sfda["GTIN"] = Normalizer.text(current_sfda["GTIN"])
+        # Do not auto-resolve SFDA keys that themselves point to multiple GTINs.
+        gtin_counts = (current_sfda.loc[current_sfda["GTIN"].ne("")]
+                       .groupby(["BN", "Expiry Month Key"])["GTIN"].nunique())
+        safe_keys = set(gtin_counts[gtin_counts.eq(1)].index.tolist())
+        current_sfda = current_sfda.loc[
+            current_sfda.apply(lambda r: (r["BN"], r["Expiry Month Key"]) in safe_keys, axis=1)
+        ].copy()
+
+        if not candidate_rows.empty:
+            for (bn, month), sf_group in current_sfda.groupby(["BN", "Expiry Month Key"], sort=False):
+                c = candidate_rows.loc[(candidate_rows["BN"] == bn) & (candidate_rows["Expiry Month Key"] == month)].copy()
+                c = c.loc[c["Generic Item Number"].ne("")].copy()
+                if c.empty:
+                    continue
+                by_generic = c.groupby("Generic Item Number", sort=False)["Trade Name"].agg(
+                    lambda x: next((str(v) for v in x if str(v).strip()), "")
+                )
+                sfda_drug = str(sf_group.iloc[0]["Drug Name"])
+                accepted = []
+                for generic, trade in by_generic.items():
+                    score = Normalizer.drug_name_match_score(sfda_drug, trade)
+                    if score >= 60.0:
+                        accepted.append(str(generic))
+                    else:
+                        logger.warning(
+                            "Incremental exact batch match rejected by drug-name validation. BN=%s expiry_month=%s generic=%s SFDA_drug=%s WMS_trade=%s score=%.2f",
+                            bn, month, str(generic), sfda_drug, str(trade), score,
+                        )
+                if accepted:
+                    resolved_generics[(bn, month)] = accepted
+
+    sfda_rows = []
+    for row in current_sfda.to_dict(orient="records"):
+        bn = _text(row, "BN")
+        month = _text(row, "Expiry Month Key")
+        if not bn or not month:
+            continue
+        generics = resolved_generics.get((bn, month), [])
+        if not generics:
+            continue
+        drug_name = _text(row, "Drug Name")
+        pack_key = Normalizer._drug_key_scalar(drug_name)
+        for generic in generics:
+            sfda_rows.append((
+                _text(row, "GTIN"), drug_name, bn, month, generic,
+                float(pack_map.get(pack_key, 0) or 0),
+                _value(row, "Expiry Date"), _number(row, "Quantity"),
+                _number(row, "Active"), _number(row, "Quantity sent pending"),
+                _number(row, "Quantity Receive Pending"),
+            ))
 
     if not affected:
         with Database().connect() as connection:
@@ -5014,6 +5081,8 @@ def refresh_accept_history_incremental(
                     DrugName nvarchar(500) NULL,
                     BN nvarchar(255) NOT NULL,
                     ExpiryMonthKey nvarchar(20) NOT NULL,
+                    ResolvedGenericItemNumber nvarchar(255) NOT NULL,
+                    PackageSize decimal(38, 6) NULL,
                     ExpiryDate date NULL,
                     Quantity decimal(38, 6) NULL,
                     Active decimal(38, 6) NULL,
@@ -5025,14 +5094,14 @@ def refresh_accept_history_incremental(
                 cursor.executemany(
                     r"""
                     INSERT INTO #CurrentAcceptSFDA
-                    (GTIN, DrugName, BN, ExpiryMonthKey, ExpiryDate, Quantity,
+                    (GTIN, DrugName, BN, ExpiryMonthKey, ResolvedGenericItemNumber, PackageSize, ExpiryDate, Quantity,
                      Active, QuantitySentPending, QuantityReceivePending)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
                     sfda_rows,
                 )
                 cursor.execute(
-                    "CREATE INDEX IX_CurrentAcceptSFDA_Batch ON #CurrentAcceptSFDA (BN, ExpiryMonthKey, GTIN);"
+                    "CREATE INDEX IX_CurrentAcceptSFDA_Batch ON #CurrentAcceptSFDA (BN, ExpiryMonthKey, ResolvedGenericItemNumber, GTIN);"
                 )
 
             # Aggregate only the affected physical receipt keys.
@@ -5080,6 +5149,7 @@ def refresh_accept_history_incremental(
                     bm.LastReceivedDate = ra.LastReceivedDate,
                     bm.GTIN = COALESCE(NULLIF(sf.GTIN, N''), bm.GTIN),
                     bm.DrugName = COALESCE(NULLIF(sf.DrugName, N''), bm.DrugName),
+                    bm.PackageSize = CASE WHEN COALESCE(sf.PackageSize, 0) > 0 THEN sf.PackageSize ELSE bm.PackageSize END,
                     bm.SFDAQuantity = COALESCE(sf.Quantity, bm.SFDAQuantity),
                     bm.Active = COALESCE(sf.Active, bm.Active),
                     bm.QuantitySentPending = COALESCE(sf.QuantitySentPending, bm.QuantitySentPending),
@@ -5094,11 +5164,12 @@ def refresh_accept_history_incremental(
                 OUTER APPLY
                 (
                     SELECT TOP (1)
-                        s.BN, s.ExpiryDate, s.GTIN, s.DrugName, s.Quantity, s.Active,
+                        s.BN, s.ExpiryDate, s.GTIN, s.DrugName, s.PackageSize, s.Quantity, s.Active,
                         s.QuantitySentPending, s.QuantityReceivePending
                     FROM #CurrentAcceptSFDA s
                     WHERE s.BN = bm.BN
                       AND s.ExpiryMonthKey = bm.ExpiryMonthKey
+                      AND s.ResolvedGenericItemNumber = bm.GenericItemNumber
                     ORDER BY s.GTIN
                 ) sf;
             """)
@@ -5213,7 +5284,7 @@ def refresh_accept_history_incremental(
                     COALESCE(NULLIF(ra.TradeName, N''), gr.TradeName, N''),
                     COALESCE(NULLIF(sf.GTIN, N''), gr.GTIN, N''),
                     COALESCE(NULLIF(sf.DrugName, N''), gr.DrugName, N''),
-                    COALESCE(gr.PackageSize, 0),
+                    CASE WHEN COALESCE(sf.PackageSize, 0) > 0 THEN sf.PackageSize ELSE COALESCE(gr.PackageSize, 0) END,
                     COALESCE(sf.Quantity, 0),
                     COALESCE(sf.Active, 0),
                     COALESCE(sf.QuantitySentPending, 0),
@@ -5242,11 +5313,12 @@ def refresh_accept_history_incremental(
                 OUTER APPLY
                 (
                     SELECT TOP (1)
-                        s.BN, s.ExpiryDate, s.GTIN, s.DrugName, s.Quantity, s.Active,
+                        s.BN, s.ExpiryDate, s.GTIN, s.DrugName, s.PackageSize, s.Quantity, s.Active,
                         s.QuantitySentPending, s.QuantityReceivePending
                     FROM #CurrentAcceptSFDA s
                     WHERE s.BN = ra.BN
                       AND s.ExpiryMonthKey = ra.ExpiryMonthKey
+                      AND s.ResolvedGenericItemNumber = ra.GenericItemNumber
                     ORDER BY s.GTIN
                 ) sf
                 WHERE (sf.BN IS NOT NULL OR gr.GenericItemNumber IS NOT NULL)
