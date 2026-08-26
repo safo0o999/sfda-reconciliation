@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-
   workflow_dispatch:
 
 env:
@@ -26,7 +25,6 @@ jobs:
         working-directory: ${{ github.workspace }}
 
     steps:
-
       # ============================================================
       # 1. CLEAN CHECKOUT
       # ============================================================
@@ -60,7 +58,6 @@ jobs:
           echo "Git status:"
           git status --short
 
-
       # ============================================================
       # 2. PYTHON
       # ============================================================
@@ -74,7 +71,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
 
-
       # ============================================================
       # 3. VALIDATION DEPENDENCIES
       # ============================================================
@@ -82,9 +78,7 @@ jobs:
       - name: Install dependencies for validation
         run: |
           set -euo pipefail
-
           python -m pip install -r requirements.txt
-
 
       # ============================================================
       # 4. REQUIRED FILE VALIDATION
@@ -98,7 +92,6 @@ jobs:
             "function_app.py"
             "host.json"
             "requirements.txt"
-
             "engine/__init__.py"
             "engine/database.py"
             "engine/historical_jobs.py"
@@ -116,7 +109,6 @@ jobs:
           done
 
           echo "All required project files are present."
-
 
       # ============================================================
       # 5. SHOW ENGINE FILES
@@ -136,7 +128,6 @@ jobs:
             -printf "%f\n" \
             | sort
 
-
       # ============================================================
       # 6. PYTHON SYNTAX
       # ============================================================
@@ -149,7 +140,6 @@ jobs:
             function_app.py \
             engine \
             config
-
 
       # ============================================================
       # 7. VERIFY LOCAL ENGINE PACKAGE
@@ -204,9 +194,8 @@ jobs:
           print("Local engine package verified.")
           PY
 
-
       # ============================================================
-      # 8. IMPORT FUNCTION APP
+      # 8. VERIFY FUNCTION APP IMPORT
       # ============================================================
 
       - name: Verify function_app import
@@ -260,39 +249,118 @@ jobs:
           )
           PY
 
-
       # ============================================================
-      # 9. V8.1 CODE MARKERS
+      # 9. VERIFY VERSIONED BUILD V8 CODE
       # ============================================================
 
       - name: Verify Versioned Build V8 code
         run: |
           set -euo pipefail
 
-          echo "Checking V8 historical implementation..."
+          python - <<'PY'
+          import inspect
+          import pathlib
+          import sys
 
-          grep -n \
-            "VERSIONED_BUILD_V8_20260826" \
-            function_app.py
+          workspace = pathlib.Path.cwd().resolve()
 
-          grep -n \
-            "activate_historical_rebuild" \
-            engine/historical_jobs.py
+          if str(workspace) not in sys.path:
+              sys.path.insert(0, str(workspace))
 
-          grep -n \
-            "_enqueue_historical_cleanup" \
-            engine/historical_jobs.py
+          import function_app
+          import engine.database as database
+          import engine.historical_jobs as historical_jobs
 
-          grep -n \
-            "Saving and activating new historical build" \
-            engine/historical_jobs.py
+          expected_historical_engine = "VERSIONED_BUILD_V8_20260826"
+          expected_reset_engine = "WAREHOUSE_RESET_V8_VERSIONED"
 
-          echo ""
-          echo "V8 historical code markers verified."
+          actual_historical_engine = getattr(
+              function_app,
+              "_HISTORICAL_REBUILD_ENGINE_VERSION",
+              None,
+          )
 
+          actual_reset_engine = getattr(
+              function_app,
+              "_RESET_ENGINE_VERSION",
+              None,
+          )
+
+          print(
+              "Historical rebuild engine:",
+              actual_historical_engine,
+          )
+
+          print(
+              "Reset engine:",
+              actual_reset_engine,
+          )
+
+          if actual_historical_engine != expected_historical_engine:
+              raise RuntimeError(
+                  "Unexpected Historical Rebuild engine. "
+                  f"Expected {expected_historical_engine}, "
+                  f"got {actual_historical_engine}"
+              )
+
+          if actual_reset_engine != expected_reset_engine:
+              raise RuntimeError(
+                  "Unexpected Reset engine. "
+                  f"Expected {expected_reset_engine}, "
+                  f"got {actual_reset_engine}"
+              )
+
+          required_historical_functions = [
+              "process_historical_build_job",
+              "_enqueue_historical_cleanup",
+          ]
+
+          for function_name in required_historical_functions:
+              if not hasattr(historical_jobs, function_name):
+                  raise RuntimeError(
+                      f"engine.historical_jobs is missing "
+                      f"{function_name}()"
+                  )
+
+          required_database_functions = [
+              "activate_historical_rebuild",
+              "cleanup_inactive_historical_builds",
+          ]
+
+          for function_name in required_database_functions:
+              if not hasattr(database, function_name):
+                  raise RuntimeError(
+                      f"engine.database is missing "
+                      f"{function_name}()"
+                  )
+
+          historical_source = inspect.getsource(
+              historical_jobs.process_historical_build_job
+          )
+
+          if "activate_historical_rebuild(" not in historical_source:
+              raise RuntimeError(
+                  "Historical worker does not call "
+                  "activate_historical_rebuild()."
+              )
+
+          if "_enqueue_historical_cleanup(" not in historical_source:
+              raise RuntimeError(
+                  "Historical worker does not enqueue "
+                  "background cleanup."
+              )
+
+          if "Saving and activating new historical build" not in historical_source:
+              raise RuntimeError(
+                  "Expected V8 activation stage was not found."
+              )
+
+          print("")
+          print("VERSIONED BUILD V8 VALIDATION PASSED")
+          PY
 
       # ============================================================
-      # 10. VERIFY AZURE FUNCTION ROUTES
+      # 10. VERIFY REGISTERED AZURE FUNCTION ROUTES
       # ============================================================
 
       - name: Validate registered Azure Function routes
@@ -371,36 +439,23 @@ jobs:
           required = {
               "health": {"GET"},
               "version": {"GET"},
-
               "auth/status": {"GET"},
               "auth/register": {"POST"},
               "auth/login": {"POST"},
               "auth/logout": {"POST"},
               "auth/me": {"GET"},
-
               "user-management/users": {"GET"},
-              "user-management/users/{user_id}/status":
-                  {"POST"},
-
+              "user-management/users/{user_id}/status": {"POST"},
               "history": {"GET"},
               "historical/status": {"GET"},
-
               "batch-master/build": {"GET", "POST"},
-
-              "full-reconciliation/accept":
-                  {"GET", "POST"},
-
-              "full-reconciliation/dispatch":
-                  {"GET", "POST"},
-
+              "full-reconciliation/accept": {"GET", "POST"},
+              "full-reconciliation/dispatch": {"GET", "POST"},
               "variance-management": {"GET"},
               "product-intelligence": {"GET"},
-
               "process-accept": {"GET", "POST"},
               "process-dispatch": {"GET", "POST"},
-
               "reconcile": {"GET", "POST"},
-
               "ui": {"GET"},
           }
 
@@ -453,7 +508,6 @@ jobs:
           )
           PY
 
-
       # ============================================================
       # 11. CREATE COMPLETELY CLEAN DEPLOYMENT PACKAGE
       # ============================================================
@@ -478,7 +532,6 @@ jobs:
           echo ""
           echo "Git files copied into clean deployment directory."
 
-
       # ============================================================
       # 12. INSTALL DEPENDENCIES INSIDE DEPLOYMENT PACKAGE
       # ============================================================
@@ -494,7 +547,6 @@ jobs:
             --requirement requirements.txt \
             --target \
             deployment_package/.python_packages/lib/site-packages
-
 
       # ============================================================
       # 13. ADD DEPLOYMENT IDENTITY FILE
@@ -516,7 +568,6 @@ jobs:
 
           cat deployment_package/DEPLOYMENT_IDENTITY.txt
 
-
       # ============================================================
       # 14. VERIFY EXACT CODE THAT WILL BE DEPLOYED
       # ============================================================
@@ -525,41 +576,82 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "======================================"
-          echo "VERIFYING DEPLOYMENT PACKAGE"
-          echo "======================================"
+          DEPLOYMENT_PACKAGE="$GITHUB_WORKSPACE/deployment_package"
 
-          test -f \
-            deployment_package/function_app.py
+          python - <<'PY'
+          import inspect
+          import pathlib
+          import sys
 
-          test -f \
-            deployment_package/engine/database.py
+          package = pathlib.Path("deployment_package").resolve()
 
-          test -f \
-            deployment_package/engine/historical_jobs.py
+          if str(package) not in sys.path:
+              sys.path.insert(0, str(package))
 
-          test -f \
-            deployment_package/engine/warehouse_context.py
+          import function_app
+          import engine.database as database
+          import engine.historical_jobs as historical_jobs
 
-          grep -n \
-            "VERSIONED_BUILD_V8_20260826" \
-            deployment_package/function_app.py
+          expected_historical_engine = "VERSIONED_BUILD_V8_20260826"
+          expected_reset_engine = "WAREHOUSE_RESET_V8_VERSIONED"
 
-          grep -n \
-            "activate_historical_rebuild" \
-            deployment_package/engine/historical_jobs.py
+          if getattr(
+              function_app,
+              "_HISTORICAL_REBUILD_ENGINE_VERSION",
+              None
+          ) != expected_historical_engine:
+              raise RuntimeError(
+                  "Deployment package contains the wrong "
+                  "historical rebuild engine."
+              )
 
-          grep -n \
-            "_enqueue_historical_cleanup" \
-            deployment_package/engine/historical_jobs.py
+          if getattr(
+              function_app,
+              "_RESET_ENGINE_VERSION",
+              None
+          ) != expected_reset_engine:
+              raise RuntimeError(
+                  "Deployment package contains the wrong reset engine."
+              )
 
-          grep -n \
-            "Saving and activating new historical build" \
-            deployment_package/engine/historical_jobs.py
+          if not hasattr(
+              database,
+              "activate_historical_rebuild"
+          ):
+              raise RuntimeError(
+                  "Deployment package is missing "
+                  "activate_historical_rebuild()."
+              )
 
-          echo ""
-          echo "Exact deployment package verified."
+          if not hasattr(
+              database,
+              "cleanup_inactive_historical_builds"
+          ):
+              raise RuntimeError(
+                  "Deployment package is missing "
+                  "cleanup_inactive_historical_builds()."
+              )
 
+          source = inspect.getsource(
+              historical_jobs.process_historical_build_job
+          )
+
+          required_markers = [
+              "activate_historical_rebuild(",
+              "_enqueue_historical_cleanup(",
+              "Saving and activating new historical build",
+          ]
+
+          for marker in required_markers:
+              if marker not in source:
+                  raise RuntimeError(
+                      f"Deployment package is missing V8 marker: {marker}"
+                  )
+
+          print(
+              "Exact deployment package V8 code verified."
+          )
+          PY
 
       # ============================================================
       # 15. REMOVE PYTHON CACHE / DEVELOPMENT JUNK
@@ -585,7 +677,6 @@ jobs:
             -delete
 
           echo "Deployment package cleaned."
-
 
       # ============================================================
       # 16. CREATE ZIP
@@ -618,7 +709,6 @@ jobs:
             | grep -E \
               "function_app.py|engine/database.py|engine/historical_jobs.py|engine/warehouse_context.py|DEPLOYMENT_IDENTITY.txt"
 
-
       # ============================================================
       # 17. AZURE LOGIN
       # ============================================================
@@ -627,11 +717,8 @@ jobs:
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_A7F67E2D1CB7477A971E7B2AD479CD0F }}
-
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_D57BA3F0BD1F4199A96E44DA5E102117 }}
-
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_F7881D9CCEF9483F953C7F423CFACB41 }}
-
 
       # ============================================================
       # 18. DISCOVER RESOURCE GROUP
@@ -662,7 +749,6 @@ jobs:
             "resource_group=$RESOURCE_GROUP" \
             >> "$GITHUB_OUTPUT"
 
-
       # ============================================================
       # 19. SHOW CURRENT AZURE APP STATE
       # ============================================================
@@ -678,7 +764,6 @@ jobs:
               "{name:name,state:state,hostName:defaultHostName}" \
             --output table
 
-
       # ============================================================
       # 20. FULL ZIP DEPLOY
       # ============================================================
@@ -689,7 +774,6 @@ jobs:
         with:
           app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
           package: sfda-function-deploy.zip
-
 
       # ============================================================
       # 21. RESTART FUNCTION APP
@@ -707,47 +791,47 @@ jobs:
 
           echo "Restart requested successfully."
 
-
       # ============================================================
-      # 22. WAIT FOR HOST
-      # ============================================================
-
-      - name: Wait for Azure Function App restart
-        run: |
-          set -euo pipefail
-
-          echo "Waiting 30 seconds for Function host..."
-          sleep 30
-
-
-      # ============================================================
-      # 23. VERIFY AZURE APP STATE
+      # 22. VERIFY AZURE APP WITH RETRIES
       # ============================================================
 
       - name: Verify Azure Function App after deployment
         run: |
           set -euo pipefail
 
-          APP_STATE=$(
-            az functionapp show \
-              --name "${AZURE_FUNCTIONAPP_NAME}" \
-              --resource-group "${{ steps.azure-info.outputs.resource_group }}" \
-              --query "state" \
-              --output tsv
-          )
+          RESOURCE_GROUP="${{ steps.azure-info.outputs.resource_group }}"
 
-          echo "Azure Function App state:"
-          echo "$APP_STATE"
+          echo "Waiting for Azure Function App to become Running..."
 
-          if [ "$APP_STATE" != "Running" ]; then
-            echo "Function App is not Running."
-            exit 1
-          fi
+          for attempt in {1..30}; do
+
+            APP_STATE=$(
+              az functionapp show \
+                --name "${AZURE_FUNCTIONAPP_NAME}" \
+                --resource-group "$RESOURCE_GROUP" \
+                --query "state" \
+                --output tsv \
+                2>/dev/null || true
+            )
+
+            echo "Attempt $attempt/30 - State: ${APP_STATE:-Unknown}"
+
+            if [ "$APP_STATE" = "Running" ]; then
+              echo ""
+              echo "Azure Function App is Running."
+              echo "Commit deployed: $GITHUB_SHA"
+              exit 0
+            fi
+
+            sleep 10
+          done
 
           echo ""
-          echo "======================================"
-          echo "FULL CLEAN DEPLOY COMPLETED"
-          echo "======================================"
+          echo "Function App did not report Running within 5 minutes."
 
-          echo "Commit deployed:"
-          echo "$GITHUB_SHA"
+          az functionapp show \
+            --name "${AZURE_FUNCTIONAPP_NAME}" \
+            --resource-group "$RESOURCE_GROUP" \
+            --output table || true
+
+          exit 1
