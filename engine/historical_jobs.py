@@ -31,7 +31,6 @@ from engine.database import (
     refresh_accept_history_incremental,
     refresh_dispatch_history_incremental,
     reconcile_affected_batch_master_event_totals,
-    reset_history,
     update_historical_build_job,
 )
 from engine.exporter import Exporter
