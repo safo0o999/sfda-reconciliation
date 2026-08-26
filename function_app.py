@@ -1707,9 +1707,12 @@ def _enqueue_historical_build_message(
     if not connection_string:
         raise RuntimeError("AzureWebJobsStorage is missing.")
 
+    # Historical builds use the same proven background queue as the other
+    # reconciliation jobs. Keeping one queue listener avoids a second listener
+    # holding a message without dispatching it to the Python worker.
     queue = QueueClient.from_connection_string(
         connection_string,
-        "historical-build-jobs",
+        "reconciliation-jobs",
         message_encode_policy=TextBase64EncodePolicy(),
     )
     try:
@@ -1721,6 +1724,7 @@ def _enqueue_historical_build_message(
         json.dumps(
             {
                 "job_id": str(job_id),
+                "job_type": "historical_build",
                 "operation": str(operation or "append").strip().lower(),
                 "input_manifest": input_manifest or {},
                 "warehouse_id": int(warehouse_id),
@@ -2019,82 +2023,31 @@ def historical_build_status(req: func.HttpRequest) -> func.HttpResponse:
 def historical_build_worker(
     message: func.QueueMessage,
 ) -> None:
-    logger.info(
-        "Historical build queue message received. message_id=%s",
-        getattr(message, "id", ""),
-    )
+    """Compatibility bridge for Historical Build messages already in the legacy queue.
 
-    payload = json.loads(
-        message.get_body().decode("utf-8")
-    )
-
+    New Historical Build submissions use reconciliation-jobs. If an older
+    historical-build-jobs message becomes visible after deployment, forward it
+    to the canonical queue instead of running a second independent worker path.
+    """
+    payload = json.loads(message.get_body().decode("utf-8"))
     job_id = str(payload.get("job_id", "")).strip()
-    operation = str(
-        payload.get("operation", "append")
-    ).strip().lower()
+    if not job_id:
+        raise ValueError("Historical build queue message is missing job_id.")
+    operation = str(payload.get("operation", "append")).strip().lower()
     input_manifest = payload.get("input_manifest") or {}
     warehouse_id_raw = payload.get("warehouse_id")
-    warehouse_name = str(
-        payload.get("warehouse_name", "")
-    ).strip()
-
-    if not job_id:
-        raise ValueError(
-            "Historical build queue message is missing job_id."
-        )
-
     if warehouse_id_raw in (None, ""):
-        raise ValueError(
-            "Historical build queue message is missing warehouse_id. "
-            "The job was rejected to prevent cross-warehouse processing."
-        )
-
-    try:
-        warehouse_id = int(warehouse_id_raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "Historical build queue message has an invalid warehouse_id."
-        ) from exc
-
-    if warehouse_id < 1:
-        raise ValueError(
-            "Historical build queue message has an invalid warehouse_id."
-        )
-
-    from engine.historical_jobs import process_historical_build_job
-    from engine.database import claim_historical_build_job, get_historical_build_job
-    from engine.warehouse_context import warehouse_scope
-
-    with warehouse_scope(
-        warehouse_id,
-        warehouse_name or f"Warehouse {warehouse_id}",
-    ):
-        # Queue delivery is at-least-once. Recovery may enqueue the same JobID
-        # while an older invisible message later returns. Claim only after the
-        # warehouse scope is established so SQL RLS remains fully isolated.
-        if not claim_historical_build_job(job_id):
-            existing = get_historical_build_job(job_id)
-            logger.warning(
-                "Historical build queue delivery skipped because JobID was already claimed/finalized. "
-                "job_id=%s status=%s warehouse_id=%s",
-                job_id, existing.get("status"), warehouse_id,
-            )
-            return
-
-        logger.info(
-            "Historical build worker scoped to WarehouseID=%s (%s), job_id=%s",
-            warehouse_id,
-            warehouse_name or f"Warehouse {warehouse_id}",
-            job_id,
-        )
-        process_historical_build_job(
-            job_id,
-            input_manifest,
-            operation,
-            warehouse_id=warehouse_id,
-            warehouse_name=warehouse_name or f"Warehouse {warehouse_id}",
-        )
-        _refresh_dashboard_summary_safe()
+        raise ValueError("Historical build queue message is missing warehouse_id.")
+    warehouse_id = int(warehouse_id_raw)
+    warehouse_name = str(payload.get("warehouse_name") or f"Warehouse {warehouse_id}")
+    logger.warning(
+        "Legacy Historical Build queue message forwarded to canonical reconciliation queue. "
+        "job_id=%s warehouse_id=%s",
+        job_id, warehouse_id,
+    )
+    _enqueue_historical_build_message(
+        job_id, operation, input_manifest, warehouse_id, warehouse_name
+    )
 
 
 
@@ -3628,6 +3581,35 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
     from engine.warehouse_context import warehouse_scope
 
     with warehouse_scope(warehouse_id, warehouse_name or f"Warehouse {warehouse_id}"):
+        if job_type == "historical_build":
+            from engine.database import claim_historical_build_job, get_historical_build_job
+            from engine.historical_jobs import process_historical_build_job
+
+            operation = str(payload.get("operation", "append")).strip().lower()
+            logger.info(
+                "Canonical background worker received Historical Build. "
+                "job_id=%s operation=%s warehouse_id=%s",
+                job_id, operation, warehouse_id,
+            )
+            if not claim_historical_build_job(job_id):
+                existing = get_historical_build_job(job_id)
+                logger.warning(
+                    "Historical Build delivery skipped because JobID was already claimed/finalized. "
+                    "job_id=%s status=%s warehouse_id=%s",
+                    job_id, existing.get("status"), warehouse_id,
+                )
+                return
+
+            process_historical_build_job(
+                job_id,
+                input_manifest,
+                operation,
+                warehouse_id=warehouse_id,
+                warehouse_name=warehouse_name or f"Warehouse {warehouse_id}",
+            )
+            _refresh_dashboard_summary_safe()
+            return
+
         storage = BlobStorage()
         storage.initialize_containers()
         base_status = {
