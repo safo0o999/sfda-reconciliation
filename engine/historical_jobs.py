@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import logging
 import mimetypes
+import os
 import threading
 from time import perf_counter
 from typing import Any, Dict, List
+
+from azure.core.exceptions import ResourceExistsError
+from azure.storage.queue import QueueClient, TextBase64EncodePolicy
 
 import pandas as pd
 
@@ -35,7 +40,7 @@ from engine.database import (
 )
 from engine.exporter import Exporter
 from engine.full_reconciliation import FullReconciliationEngine
-from engine.warehouse_context import warehouse_scope
+from engine.warehouse_context import historical_build_scope, warehouse_scope
 
 
 logger = logging.getLogger("SFDA-Reconciliation.HistoricalJobs")
@@ -344,6 +349,34 @@ def _build_sto_history_from_prepared(
         rows.append(row)
     return pd.DataFrame(rows)
 
+def _enqueue_historical_cleanup(job_id: str, warehouse_id: int, warehouse_name: str) -> None:
+    """Queue old-generation cleanup after the new build is already active/completed."""
+    connection_string = os.getenv("AzureWebJobsStorage", "").strip()
+    if not connection_string:
+        raise RuntimeError("AzureWebJobsStorage is missing.")
+    queue = QueueClient.from_connection_string(
+        connection_string,
+        "reconciliation-jobs",
+        message_encode_policy=TextBase64EncodePolicy(),
+    )
+    try:
+        queue.create_queue()
+    except ResourceExistsError:
+        pass
+    queue.send_message(
+        json.dumps(
+            {
+                "job_id": f"{job_id}-cleanup",
+                "job_type": "historical_cleanup",
+                "source_job_id": job_id,
+                "warehouse_id": int(warehouse_id),
+                "warehouse_name": str(warehouse_name or f"Warehouse {warehouse_id}"),
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 def process_historical_build_job(
     job_id: str,
     input_manifest: Dict[str, Any],
@@ -646,7 +679,7 @@ def process_historical_build_job(
             update_historical_build_job(
                 job_id,
                 progress=98,
-                current_stage="Activating new historical database",
+                current_stage="Saving and activating new historical build",
             )
 
             def _activation_progress(_progress: int, stage: str, _extra: Dict[str, Any]) -> None:
@@ -660,6 +693,8 @@ def process_historical_build_job(
                 master,
                 supplier_history,
                 customer_history,
+                build_id=job_id,
+                source_job_id=job_id,
                 progress_callback=_activation_progress,
             )
             # Activate the SFDA snapshot only after the historical replacement
@@ -700,6 +735,24 @@ def process_historical_build_job(
             error_message="",
             mark_completed=True,
         )
+
+        # User-visible work is complete as soon as the new BuildID is active.
+        # Cleanup runs later on the same durable background queue and cannot
+        # delay the downloadable workbook or Append readiness.
+        if operation == "rebuild":
+            try:
+                _enqueue_historical_cleanup(job_id, warehouse_id, warehouse_name)
+                logger.info(
+                    "Historical background cleanup queued. source_job_id=%s warehouse_id=%s",
+                    job_id, warehouse_id,
+                )
+            except Exception:
+                # Old inactive generations are harmless; a cleanup enqueue
+                # failure must never turn a successful rebuild into Failed.
+                logger.exception(
+                    "Historical cleanup enqueue failed after successful activation. job_id=%s",
+                    job_id,
+                )
 
     except HistoricalBuildCancelled as exc:
         logger.warning(
