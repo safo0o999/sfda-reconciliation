@@ -2571,8 +2571,7 @@ def claim_historical_build_job(job_id: str) -> bool:
                 ErrorMessage = ''
             OUTPUT INSERTED.JobID
             WHERE JobID = ?
-              AND Status = 'Queued'
-              AND StartedAt IS NULL;
+              AND Status = 'Queued';
             """,
             (str(job_id),),
         )
@@ -2607,6 +2606,43 @@ def acquire_historical_requeue_lease(
               AND Status = 'Queued'
               AND StartedAt IS NULL
               AND COALESCE(UpdatedAt, CreatedAt) < DATEADD(SECOND, -?, SYSUTCDATETIME());
+            """,
+            (str(job_id), safe_age),
+        )
+        acquired = cursor.fetchone() is not None
+        connection.commit()
+    return acquired
+
+
+def acquire_historical_running_recovery_lease(
+    job_id: str,
+    min_age_seconds: int = 300,
+) -> bool:
+    """Move an abandoned Running Historical Build back to Queued exactly once.
+
+    A healthy worker refreshes UpdatedAt every 30 seconds. If the Azure Functions
+    host is recycled, that heartbeat stops while the durable SQL job row remains
+    Running. This atomic transition lets the status endpoint re-enqueue the SAME
+    JobID after a conservative inactivity window. The build then restarts from
+    the beginning: Rebuild safely resets warehouse history again, while Append is
+    protected by event-level deduplication.
+    """
+    initialize_database()
+    safe_age = max(180, int(min_age_seconds or 300))
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE dbo.HistoricalBuildJobs
+            SET Status = 'Queued',
+                CurrentStage = 'Recovering interrupted Historical Build',
+                UpdatedAt = SYSUTCDATETIME(),
+                ErrorMessage = 'Azure worker interruption detected; same JobID queued for recovery.'
+            OUTPUT INSERTED.JobID
+            WHERE JobID = ?
+              AND Status = 'Running'
+              AND COALESCE(UpdatedAt, StartedAt, CreatedAt)
+                    < DATEADD(SECOND, -?, SYSUTCDATETIME());
             """,
             (str(job_id), safe_age),
         )
