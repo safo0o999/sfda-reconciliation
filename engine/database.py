@@ -1769,37 +1769,151 @@ def get_reconciliation_history(limit: int = 100) -> List[Dict[str, Any]]:
     return history
 
 
-def reset_history() -> None:
+def reset_history() -> Dict[str, Any]:
     """Delete cumulative historical tables for the current warehouse only.
 
-    Database connections always carry WarehouseID session context and Version 6
-    RLS isolates these tables. This function is used only by Historical Build
-    operation=rebuild and does not touch users, warehouse configuration, GLN or
-    reference data.
+    Historical Rebuild can contain more than a million DispatchEvents rows for
+    one warehouse. Deleting all of them in one transaction causes very large
+    Azure SQL I/O/log pressure and makes the worker appear stuck at 32%.
+
+    HISTORICAL_BATCHED_RESET_V1 deletes the two large event tables in bounded
+    batches and commits every batch. Smaller derived/history tables are deleted
+    directly and committed per table. The result is identical to the previous
+    rebuild reset, but each transaction is bounded and restart-safe.
     """
 
     initialize_database()
 
+    from engine.warehouse_context import current_warehouse_id
+
+    warehouse_id = int(current_warehouse_id())
+    if warehouse_id < 1:
+        raise RuntimeError("A valid WarehouseID is required for historical reset.")
+
+    try:
+        batch_size = int(os.getenv("HISTORICAL_RESET_BATCH_SIZE", "10000") or 10000)
+    except (TypeError, ValueError):
+        batch_size = 10000
+    batch_size = max(1000, min(batch_size, 50000))
+
+    reset_started = time.perf_counter()
+    deleted: Dict[str, int] = {}
+
+    logger.info(
+        "HISTORICAL_BATCHED_RESET_V1 started. WarehouseID=%s batch_size=%s",
+        warehouse_id,
+        batch_size,
+    )
+
     with Database().connect() as connection:
         cursor = connection.cursor()
         try:
-            from engine.warehouse_context import current_warehouse_id
-            warehouse_id = int(current_warehouse_id())
+            # These tables are comparatively small. Commit each table so a
+            # failure never holds one warehouse's complete reset in one giant
+            # transaction.
+            for table_name in (
+                "CustomerHistory",
+                "SupplierHistory",
+                "BatchMaster",
+            ):
+                table_started = time.perf_counter()
+                cursor.execute(
+                    f"DELETE FROM dbo.[{table_name}] WHERE WarehouseID = ?;",
+                    warehouse_id,
+                )
+                rows = max(int(cursor.rowcount or 0), 0)
+                connection.commit()
+                deleted[table_name] = rows
+                logger.info(
+                    "HISTORICAL_BATCHED_RESET_V1 table complete. "
+                    "WarehouseID=%s table=%s deleted=%s seconds=%.3f",
+                    warehouse_id,
+                    table_name,
+                    rows,
+                    time.perf_counter() - table_started,
+                )
+
+            # Large event tables must never be deleted as one unbounded
+            # transaction. SQL Server TOP uses a validated integer literal here
+            # because TOP parameterisation is driver/version-sensitive.
+            for table_name in ("DispatchEvents", "ReceiptEvents"):
+                table_started = time.perf_counter()
+                table_deleted = 0
+                batch_number = 0
+
+                while True:
+                    batch_started = time.perf_counter()
+                    cursor.execute(
+                        f"DELETE TOP ({batch_size}) FROM dbo.[{table_name}] "
+                        "WHERE WarehouseID = ?;",
+                        warehouse_id,
+                    )
+                    rows = max(int(cursor.rowcount or 0), 0)
+                    connection.commit()
+
+                    batch_number += 1
+                    table_deleted += rows
+                    logger.info(
+                        "HISTORICAL_BATCHED_RESET_V1 batch complete. "
+                        "WarehouseID=%s table=%s batch=%s deleted=%s "
+                        "total_deleted=%s seconds=%.3f",
+                        warehouse_id,
+                        table_name,
+                        batch_number,
+                        rows,
+                        table_deleted,
+                        time.perf_counter() - batch_started,
+                    )
+
+                    if rows < batch_size:
+                        break
+
+                deleted[table_name] = table_deleted
+                logger.info(
+                    "HISTORICAL_BATCHED_RESET_V1 table complete. "
+                    "WarehouseID=%s table=%s deleted=%s seconds=%.3f",
+                    warehouse_id,
+                    table_name,
+                    table_deleted,
+                    time.perf_counter() - table_started,
+                )
+
+            # RunHistory is last to preserve the previous reset semantics.
+            table_started = time.perf_counter()
             cursor.execute(
-                """
-                DELETE FROM dbo.CustomerHistory WHERE WarehouseID = ?;
-                DELETE FROM dbo.SupplierHistory WHERE WarehouseID = ?;
-                DELETE FROM dbo.BatchMaster WHERE WarehouseID = ?;
-                DELETE FROM dbo.DispatchEvents WHERE WarehouseID = ?;
-                DELETE FROM dbo.ReceiptEvents WHERE WarehouseID = ?;
-                DELETE FROM dbo.RunHistory WHERE WarehouseID = ?;
-                """,
-                (warehouse_id, warehouse_id, warehouse_id, warehouse_id, warehouse_id, warehouse_id),
+                "DELETE FROM dbo.RunHistory WHERE WarehouseID = ?;",
+                warehouse_id,
             )
+            rows = max(int(cursor.rowcount or 0), 0)
             connection.commit()
+            deleted["RunHistory"] = rows
+            logger.info(
+                "HISTORICAL_BATCHED_RESET_V1 table complete. "
+                "WarehouseID=%s table=RunHistory deleted=%s seconds=%.3f",
+                warehouse_id,
+                rows,
+                time.perf_counter() - table_started,
+            )
+
         except Exception:
             connection.rollback()
+            logger.exception(
+                "HISTORICAL_BATCHED_RESET_V1 failed. WarehouseID=%s deleted_so_far=%s",
+                warehouse_id,
+                deleted,
+            )
             raise
+
+    result = {
+        "warehouse_id": warehouse_id,
+        "engine": "HISTORICAL_BATCHED_RESET_V1",
+        "batch_size": batch_size,
+        "deleted": deleted,
+        "total_deleted": int(sum(deleted.values())),
+        "seconds": round(time.perf_counter() - reset_started, 3),
+    }
+    logger.info("HISTORICAL_BATCHED_RESET_V1 completed. %s", result)
+    return result
 
 
 def get_historical_status() -> Dict[str, Any]:
