@@ -1906,9 +1906,47 @@ def historical_build_status(req: func.HttpRequest) -> func.HttpResponse:
         from engine.database import (
             get_historical_build_job,
             acquire_historical_requeue_lease,
+            acquire_historical_running_recovery_lease,
         )
 
         job = get_historical_build_job(job_id)
+
+        # Recover a worker that was interrupted after it had already claimed the
+        # job. A healthy worker heartbeats UpdatedAt every 30 seconds. If Azure
+        # recycles the host, the durable SQL row remains Running but stops moving.
+        # After a conservative inactivity window, atomically return that SAME
+        # JobID to Queued and send a replacement queue message.
+        if (
+            str(job.get("status") or "") == "Running"
+            and acquire_historical_running_recovery_lease(
+                job_id,
+                int(os.getenv("HISTORICAL_RUNNING_RECOVERY_SECONDS", "300") or 300),
+            )
+        ):
+            try:
+                warehouse_id = int(job.get("warehouse_id") or 0)
+                if warehouse_id < 1:
+                    raise RuntimeError("Historical recovery job has no WarehouseID.")
+                from engine.warehouse_context import current_warehouse_name
+                _enqueue_historical_build_message(
+                    job_id,
+                    str(job.get("operation") or "append"),
+                    job.get("input_manifest") or {},
+                    warehouse_id,
+                    str(current_warehouse_name() or f"Warehouse {warehouse_id}"),
+                )
+                logger.warning(
+                    "Recovered interrupted Running Historical Build by re-enqueueing same JobID. "
+                    "job_id=%s warehouse_id=%s",
+                    job_id, warehouse_id,
+                )
+                job = get_historical_build_job(job_id)
+            except Exception as recovery_exc:
+                logger.exception(
+                    "Historical running-job recovery enqueue failed. job_id=%s", job_id
+                )
+                job["current_stage"] = "Interrupted - recovery enqueue retry pending"
+                job["error"] = f"Running-job recovery retry pending: {recovery_exc}"
 
         # Self-heal a ghost queue submission. A host recycle can occur after the
         # HTTP producer commits the DB row / sends a queue message but before the
