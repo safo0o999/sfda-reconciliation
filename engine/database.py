@@ -28,7 +28,11 @@ class Database:
         self.connection_string = connection_string
 
     def connect(self):
-        from engine.warehouse_context import current_warehouse_id
+        from engine.warehouse_context import (
+            current_historical_build_id,
+            current_warehouse_id,
+            historical_maintenance_enabled,
+        )
 
         warehouse_id = int(current_warehouse_id())
         if warehouse_id < 1:
@@ -53,31 +57,62 @@ class Database:
                 "SQL warehouse session context could not be established safely."
             )
 
+        # Historical tables are versioned independently from warehouse RLS.
+        # A rebuild may bind to a not-yet-active BuildID while ordinary requests
+        # automatically resolve to the warehouse's currently active build.
+        build_id = str(current_historical_build_id() or '').strip()
+        maintenance = bool(historical_maintenance_enabled())
+        cursor.execute(
+            "EXEC sys.sp_set_session_context @key=N'HistoricalBuildMaintenance', @value=?;",
+            1 if maintenance else 0,
+        )
+        if build_id:
+            cursor.execute(
+                "EXEC sys.sp_set_session_context @key=N'HistoricalBuildID', @value=?;",
+                build_id,
+            )
+        else:
+            try:
+                row = cursor.execute(
+                    """
+                    SELECT TOP (1) BuildID
+                    FROM dbo.HistoricalBuildVersions
+                    WHERE WarehouseID = ? AND IsActive = 1
+                    ORDER BY ActivatedAt DESC, CreatedAt DESC;
+                    """,
+                    warehouse_id,
+                ).fetchone()
+                active_build_id = str(row[0] or '').strip() if row else ''
+                if active_build_id:
+                    cursor.execute(
+                        "EXEC sys.sp_set_session_context @key=N'HistoricalBuildID', @value=?;",
+                        active_build_id,
+                    )
+            except pyodbc.Error:
+                # Backward-compatible before migration 002 is applied.
+                pass
+
         return connection
 
 
 def _load_schema_sql() -> str:
-    """Load the idempotent Version 6 SQL schema from the project SQL folder."""
+    """Load all idempotent SQL migrations in filename order."""
 
-    schema_path = (
-        Path(__file__).resolve().parent.parent
-        / "sql"
-        / "001_initial_schema.sql"
-    )
+    sql_dir = Path(__file__).resolve().parent.parent / "sql"
+    paths = sorted(sql_dir.glob("*.sql"))
+    if not paths:
+        raise RuntimeError(f"Database schema folder contains no SQL migrations: {sql_dir}")
 
-    if not schema_path.exists():
-        raise RuntimeError(
-            f"Database schema file is missing: {schema_path}"
-        )
+    batches = []
+    for schema_path in paths:
+        text = schema_path.read_text(encoding="utf-8").strip()
+        if text:
+            batches.append(f"-- BEGIN {schema_path.name}\n{text}\n-- END {schema_path.name}")
 
-    schema_sql = schema_path.read_text(encoding="utf-8").strip()
+    if not batches:
+        raise RuntimeError(f"Database migration files are empty: {sql_dir}")
 
-    if not schema_sql:
-        raise RuntimeError(
-            f"Database schema file is empty: {schema_path}"
-        )
-
-    return schema_sql
+    return "\n\n".join(batches)
 
 
 def _consume_all_results(cursor: pyodbc.Cursor) -> None:
@@ -368,26 +403,32 @@ def _text_with_fallback(
 
 
 def _warehouse_scoped_key(value: str) -> str:
-    """Namespace deterministic keys without exceeding legacy SQL key widths.
+    """Namespace deterministic event keys by warehouse and historical build.
 
-    Warehouse 1 keeps the historical key format unchanged so existing Madinah
-    de-duplication remains stable. For other warehouses, the warehouse identity
-    and original key are re-hashed into a fixed 64-character SHA-256 hex key.
-    This prevents cross-warehouse PK collisions without lengthening varchar(64)
-    / nvarchar(64) key columns.
+    Legacy BuildIDs preserve the old key format so migration does not invalidate
+    existing de-duplication. New rebuild generations hash WarehouseID + BuildID +
+    EventKey into the existing 64-character EventKey column, allowing multiple
+    historical generations to coexist without PK collisions.
     """
     import hashlib
 
-    from engine.warehouse_context import current_warehouse_id
+    from engine.warehouse_context import current_historical_build_id, current_warehouse_id
 
     key = str(value or "").strip()
     warehouse_id = int(current_warehouse_id())
+    build_id = str(current_historical_build_id() or "").strip()
 
-    if not key or warehouse_id == 1:
+    if not key:
         return key
 
+    is_legacy = (not build_id) or build_id.upper().startswith("LEGACY-")
+    if is_legacy:
+        if warehouse_id == 1:
+            return key
+        return hashlib.sha256(f"W{warehouse_id}|{key}".encode("utf-8")).hexdigest()
+
     return hashlib.sha256(
-        f"W{warehouse_id}|{key}".encode("utf-8")
+        f"W{warehouse_id}|B{build_id}|{key}".encode("utf-8")
     ).hexdigest()
 
 
@@ -774,8 +815,13 @@ def append_events(
         )
     ]
 
-    prepared_receipts = _deduplicate_parameters(receipt_rows, _receipt_parameters)
-    prepared_dispatches = _deduplicate_parameters(dispatch_rows, _dispatch_parameters)
+    # EventKey must be namespaced by the ACTIVE BuildID so Append de-duplication
+    # continues exactly from the latest successful Rebuild generation.
+    from engine.warehouse_context import current_historical_build_id, historical_build_scope
+    active_build_id = str(current_historical_build_id() or '').strip() or get_active_historical_build_id(warehouse_id)
+    with historical_build_scope(active_build_id):
+        prepared_receipts = _deduplicate_parameters(receipt_rows, _receipt_parameters)
+        prepared_dispatches = _deduplicate_parameters(dispatch_rows, _dispatch_parameters)
 
     logger.info(
         "Set-based event save started. WarehouseID=%s prepared_receipts=%s "
@@ -1784,6 +1830,65 @@ def reset_history() -> None:
 
 
 
+def _upsert_historical_build_version(build_id: str, source_job_id: str = "", status: str = "Building") -> None:
+    """Create/update one warehouse-scoped historical generation metadata row."""
+    initialize_database()
+    from engine.warehouse_context import current_warehouse_id, historical_maintenance_scope
+
+    warehouse_id = int(current_warehouse_id())
+    build_id = str(build_id or "").strip()
+    if not build_id:
+        raise ValueError("Historical BuildID is required.")
+
+    with historical_maintenance_scope():
+        with Database().connect() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                r"""
+                IF EXISTS (
+                    SELECT 1 FROM dbo.HistoricalBuildVersions
+                    WHERE WarehouseID = ? AND BuildID = ?
+                )
+                BEGIN
+                    UPDATE dbo.HistoricalBuildVersions
+                    SET Status = ?, SourceJobID = NULLIF(?, N''), UpdatedAt = SYSUTCDATETIME()
+                    WHERE WarehouseID = ? AND BuildID = ?;
+                END
+                ELSE
+                BEGIN
+                    INSERT INTO dbo.HistoricalBuildVersions
+                    (WarehouseID, BuildID, Status, IsActive, SourceJobID, CreatedAt, UpdatedAt)
+                    VALUES (?, ?, ?, 0, NULLIF(?, N''), SYSUTCDATETIME(), SYSUTCDATETIME());
+                END;
+                """,
+                warehouse_id, build_id,
+                status, source_job_id,
+                warehouse_id, build_id,
+                warehouse_id, build_id, status, source_job_id,
+            )
+            connection.commit()
+
+
+def get_active_historical_build_id(warehouse_id: Optional[int] = None) -> str:
+    """Return the active historical generation for one warehouse."""
+    initialize_database()
+    from engine.warehouse_context import current_warehouse_id, historical_maintenance_scope
+
+    resolved = int(warehouse_id or current_warehouse_id())
+    with historical_maintenance_scope():
+        with Database().connect() as connection:
+            row = connection.cursor().execute(
+                r"""
+                SELECT TOP (1) BuildID
+                FROM dbo.HistoricalBuildVersions
+                WHERE WarehouseID = ? AND IsActive = 1
+                ORDER BY ActivatedAt DESC, CreatedAt DESC;
+                """,
+                resolved,
+            ).fetchone()
+    return str(row[0] or "").strip() if row else ""
+
+
 def activate_historical_rebuild(
     receipt_rows: List[Dict[str, Any]],
     dispatch_rows: List[Dict[str, Any]],
@@ -1791,134 +1896,32 @@ def activate_historical_rebuild(
     supplier_history: pd.DataFrame,
     customer_history: pd.DataFrame,
     *,
+    build_id: str,
+    source_job_id: str = "",
     progress_callback: Optional[Callable[[int, str, Dict[str, Any]], None]] = None,
-    delete_batch_size: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Atomically activate a fully-built Historical Rebuild dataset.
+    """Persist and activate a new Historical Build without deleting the old one.
 
-    Rebuild preparation/export is completed before this function is called.  The
-    current warehouse's live historical rows remain untouched until activation.
-    Activation then replaces raw events + derived history in ONE SQL transaction.
-    If any delete or insert fails, rollback restores the previous historical
-    database exactly as it was before activation.
-
-    DELETE TOP batches bound individual statements while intentionally avoiding
-    commits between batches; atomic rollback safety is more important here than
-    transaction-log minimization.  The warehouse heartbeat runs independently in
-    the Historical worker while this transaction is active.
+    HISTORICAL_VERSIONED_ACTIVATION_V2 writes the complete new generation under
+    its BuildID while the current generation remains active. After cardinality
+    verification, activation is a tiny metadata switch in HistoricalBuildVersions.
+    The user-visible rebuild can therefore finish immediately; old generations
+    are removed later by a background cleanup message.
     """
     initialize_database()
-    from engine.warehouse_context import current_warehouse_id
+    from engine.warehouse_context import (
+        current_warehouse_id,
+        historical_build_scope,
+        historical_maintenance_scope,
+    )
 
     warehouse_id = int(current_warehouse_id())
-    batch_size = int(
-        delete_batch_size
-        or os.getenv("HISTORICAL_ACTIVATION_DELETE_BATCH_SIZE", "10000")
-        or 10000
-    )
-    batch_size = max(1000, min(batch_size, 50000))
+    build_id = str(build_id or "").strip()
+    if not build_id:
+        raise ValueError("Historical BuildID is required for versioned activation.")
 
-    prepared_receipts = _deduplicate_parameters(receipt_rows or [], _receipt_parameters)
-    prepared_dispatches = _deduplicate_parameters(dispatch_rows or [], _dispatch_parameters)
-
-    batch_master_rows = [
-        (
-            _text(row, "BN"),
-            _text(row, "Expiry Month Key"),
-            _value(row, "Expiry Date"),
-            _text(row, "Generic Item Number"),
-            _text_with_fallback(row, "Trade Item Number", "Trade Item"),
-            _text_with_fallback(row, "Trade Description", "Trade Name"),
-            _text(row, "GTIN"),
-            _text(row, "Drug Name"),
-            _number(row, "PackageSize"),
-            _number_with_fallback(row, "Quantity", "SFDA Quantity"),
-            _number(row, "Active"),
-            _number(row, "Quantity sent pending"),
-            _number(row, "Quantity Receive Pending"),
-            _text(row, "Description"),
-            _text(row, "Item Family Group"),
-            _text(row, "Custody"),
-            _text(row, "Supplier Name"),
-            _text(row, "Supplier Code"),
-            _number_with_fallback(row, "Received Quantity Each", "Total Receive Qty"),
-            _number(row, "Total Dispatched Qty"),
-            _integer(row, "Receive Runs"),
-            _integer(row, "Dispatch Runs"),
-            _value(row, "First Received Date"),
-            _value(row, "Last Received Date"),
-            _value(row, "First Dispatch Date"),
-            _value(row, "Last Dispatch Date"),
-            _text(row, "Generic Exists in SFDA", "Yes") or "Yes",
-            _value(row, "Last Updated", pd.Timestamp.utcnow().tz_localize(None)),
-        )
-        for row in (master if master is not None else pd.DataFrame()).to_dict(orient="records")
-    ]
-
-    supplier_rows = [(
-        _text(r, "Supplier Name"), _text(r, "Supplier Code"), _text(r, "GTIN"),
-        _text(r, "Drug Name"), _text(r, "Generic Item Number"), _text(r, "Description"),
-        _text(r, "Trade Description"), _text(r, "BN"), _text(r, "Expiry Month Key"),
-        _value(r, "Expiry Date"), _number(r, "PackageSize"),
-        _number(r, "Received Quantity Each"), _number(r, "Received Quantity Pack"),
-        _value(r, "First Received Date"), _value(r, "Last Received Date"),
-        _text(r, "Item Family Group"), _text(r, "Trade Item Number")
-    ) for r in (supplier_history if supplier_history is not None else pd.DataFrame()).to_dict(orient="records")]
-
-    customer_rows = [(
-        _text(r, "To Address"), _text(r, "GLN"), _text(r, "GTIN"),
-        _text(r, "Drug Name"), _text(r, "Generic Item Number"),
-        _text(r, "Trade Description"), _text(r, "BN"), _text(r, "Expiry Month Key"),
-        _value(r, "Expiry Date"), _number(r, "PackageSize"),
-        _number(r, "Dispatch Quantity Each"), _number(r, "Dispatch Quantity Pack"),
-        _value(r, "First Dispatch Date"), _value(r, "Last Dispatch Date"),
-        _text(r, "Custody"), _text(r, "Trade Item Number")
-    ) for r in (customer_history if customer_history is not None else pd.DataFrame()).to_dict(orient="records")]
-
-    receipt_insert_sql = r"""
-        INSERT INTO dbo.ReceiptEvents
-        (EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
-         TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
-         ASNLine, SupplierName, SupplierCode, Description, ItemFamilyGroup,
-         ReceivedDate)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-    """
-    dispatch_insert_sql = r"""
-        INSERT INTO dbo.DispatchEvents
-        (EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
-         TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
-         SalesOrderNumber, OrderLine, DispatchDate, Custody)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-    """
-    master_insert_sql = r"""
-        INSERT INTO dbo.BatchMaster
-        (BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber, TradeItemNumber,
-         TradeName, GTIN, DrugName, PackageSize, SFDAQuantity, Active,
-         QuantitySentPending, QuantityReceivePending, Description, ItemFamilyGroup,
-         Custody, SupplierName, SupplierCode, TotalReceiveQty, TotalDispatchedQty,
-         ReceiveRuns, DispatchRuns, FirstReceivedDate, LastReceivedDate,
-         FirstDispatchDate, LastDispatchDate, GenericExistsInSFDA, LastUpdated)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-    """
-    supplier_insert_sql = r"""
-        INSERT INTO dbo.SupplierHistory
-        (SupplierName, SupplierCode, GTIN, DrugName, GenericItemNumber, Description,
-         TradeDescription, BN, ExpiryMonthKey, ExpiryDate, PackageSize,
-         ReceivedQuantityEach, ReceivedQuantityPack, FirstReceivedDate,
-         LastReceivedDate, ItemFamilyGroup, TradeItemNumber, LastUpdated)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
-    """
-    customer_insert_sql = r"""
-        INSERT INTO dbo.CustomerHistory
-        (ToAddress, GLN, GTIN, DrugName, GenericItemNumber, TradeDescription,
-         BN, ExpiryMonthKey, ExpiryDate, PackageSize, DispatchQuantityEach,
-         DispatchQuantityPack, FirstDispatchDate, LastDispatchDate,
-         Custody, TradeItemNumber, LastUpdated)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
-    """
-
-    deleted: Dict[str, int] = {}
     started_at = time.perf_counter()
+    _upsert_historical_build_version(build_id, source_job_id, "Building")
 
     def emit(stage: str, extra: Optional[Dict[str, Any]] = None) -> None:
         if progress_callback is None:
@@ -1926,93 +1929,254 @@ def activate_historical_rebuild(
         try:
             progress_callback(98, stage, dict(extra or {}))
         except Exception:
-            logger.exception("HISTORICAL_SAFE_ACTIVATION progress callback failed.")
+            logger.exception("HISTORICAL_VERSIONED_ACTIVATION progress callback failed.")
 
-    with Database().connect() as connection:
-        cursor = connection.cursor()
-        try:
-            # No small statement-level timeout during the final atomic switch.
-            # The independent job heartbeat keeps the run alive/observable.
-            cursor.timeout = int(os.getenv("HISTORICAL_ACTIVATION_SQL_TIMEOUT_SECONDS", "0") or 0)
-        except Exception:
-            pass
+    try:
+        # Bind every SQL connection in this block to the NEW, still-inactive build.
+        # Historical Build RLS makes the generation visible to this worker only.
+        with historical_build_scope(build_id):
+            prepared_receipts = _deduplicate_parameters(receipt_rows or [], _receipt_parameters)
+            prepared_dispatches = _deduplicate_parameters(dispatch_rows or [], _dispatch_parameters)
 
-        try:
-            logger.info(
-                "HISTORICAL_SAFE_ACTIVATION_V1 started. WarehouseID=%s delete_batch_size=%s "
-                "new_receipts=%s new_dispatches=%s new_master=%s",
-                warehouse_id, batch_size, len(prepared_receipts), len(prepared_dispatches), len(batch_master_rows),
-            )
-
-            # Derived tables first, raw events last. No commit until every new row
-            # has been inserted successfully.
-            for table in ("CustomerHistory", "SupplierHistory", "BatchMaster", "DispatchEvents", "ReceiptEvents"):
-                table_deleted = 0
-                batch_no = 0
-                while True:
-                    cursor.execute(
-                        f"DELETE TOP ({batch_size}) FROM dbo.[{table}] WHERE WarehouseID = ?;",
-                        warehouse_id,
-                    )
-                    affected = max(0, int(cursor.rowcount or 0))
-                    table_deleted += affected
-                    batch_no += 1
-                    if affected:
-                        logger.info(
-                            "HISTORICAL_SAFE_ACTIVATION_V1 delete batch. WarehouseID=%s table=%s batch=%s deleted=%s total_deleted=%s",
-                            warehouse_id, table, batch_no, affected, table_deleted,
-                        )
-                        emit(
-                            f"Activating new historical data: clearing previous {table}",
-                            {"table": table, "batch": batch_no, "deleted": affected, "total_deleted": table_deleted},
-                        )
-                    if affected < batch_size:
-                        break
-                deleted[table] = table_deleted
-
-            inserted_receipts = _bulk_insert_rows(cursor, receipt_insert_sql, prepared_receipts)
-            inserted_dispatches = _bulk_insert_rows(cursor, dispatch_insert_sql, prepared_dispatches)
-            inserted_master = _bulk_insert_rows(cursor, master_insert_sql, batch_master_rows)
-            inserted_supplier = _bulk_insert_rows(cursor, supplier_insert_sql, supplier_rows)
-            inserted_customer = _bulk_insert_rows(cursor, customer_insert_sql, customer_rows)
-
-            # Verify the exact new raw-event cardinality before making the switch permanent.
-            live_receipts = int(cursor.execute(
-                "SELECT COUNT_BIG(*) FROM dbo.ReceiptEvents WHERE WarehouseID = ?;", warehouse_id
-            ).fetchone()[0] or 0)
-            live_dispatches = int(cursor.execute(
-                "SELECT COUNT_BIG(*) FROM dbo.DispatchEvents WHERE WarehouseID = ?;", warehouse_id
-            ).fetchone()[0] or 0)
-            if live_receipts != inserted_receipts or live_dispatches != inserted_dispatches:
-                raise RuntimeError(
-                    "Historical activation verification failed before commit: "
-                    f"ReceiptEvents expected={inserted_receipts} actual={live_receipts}; "
-                    f"DispatchEvents expected={inserted_dispatches} actual={live_dispatches}."
+            batch_master_rows = [
+                (
+                    _text(row, "BN"), _text(row, "Expiry Month Key"), _value(row, "Expiry Date"),
+                    _text(row, "Generic Item Number"), _text_with_fallback(row, "Trade Item Number", "Trade Item"),
+                    _text_with_fallback(row, "Trade Description", "Trade Name"), _text(row, "GTIN"),
+                    _text(row, "Drug Name"), _number(row, "PackageSize"),
+                    _number_with_fallback(row, "Quantity", "SFDA Quantity"), _number(row, "Active"),
+                    _number(row, "Quantity sent pending"), _number(row, "Quantity Receive Pending"),
+                    _text(row, "Description"), _text(row, "Item Family Group"), _text(row, "Custody"),
+                    _text(row, "Supplier Name"), _text(row, "Supplier Code"),
+                    _number_with_fallback(row, "Received Quantity Each", "Total Receive Qty"),
+                    _number(row, "Total Dispatched Qty"), _integer(row, "Receive Runs"),
+                    _integer(row, "Dispatch Runs"), _value(row, "First Received Date"),
+                    _value(row, "Last Received Date"), _value(row, "First Dispatch Date"),
+                    _value(row, "Last Dispatch Date"), _text(row, "Generic Exists in SFDA", "Yes") or "Yes",
+                    _value(row, "Last Updated", pd.Timestamp.utcnow().tz_localize(None)),
                 )
+                for row in (master if master is not None else pd.DataFrame()).to_dict(orient="records")
+            ]
+            supplier_rows = [(
+                _text(r, "Supplier Name"), _text(r, "Supplier Code"), _text(r, "GTIN"),
+                _text(r, "Drug Name"), _text(r, "Generic Item Number"), _text(r, "Description"),
+                _text(r, "Trade Description"), _text(r, "BN"), _text(r, "Expiry Month Key"),
+                _value(r, "Expiry Date"), _number(r, "PackageSize"), _number(r, "Received Quantity Each"),
+                _number(r, "Received Quantity Pack"), _value(r, "First Received Date"),
+                _value(r, "Last Received Date"), _text(r, "Item Family Group"), _text(r, "Trade Item Number")
+            ) for r in (supplier_history if supplier_history is not None else pd.DataFrame()).to_dict(orient="records")]
+            customer_rows = [(
+                _text(r, "To Address"), _text(r, "GLN"), _text(r, "GTIN"), _text(r, "Drug Name"),
+                _text(r, "Generic Item Number"), _text(r, "Trade Description"), _text(r, "BN"),
+                _text(r, "Expiry Month Key"), _value(r, "Expiry Date"), _number(r, "PackageSize"),
+                _number(r, "Dispatch Quantity Each"), _number(r, "Dispatch Quantity Pack"),
+                _value(r, "First Dispatch Date"), _value(r, "Last Dispatch Date"), _text(r, "Custody"),
+                _text(r, "Trade Item Number")
+            ) for r in (customer_history if customer_history is not None else pd.DataFrame()).to_dict(orient="records")]
 
-            connection.commit()
+            receipt_insert_sql = r"""
+                INSERT INTO dbo.ReceiptEvents
+                (EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                 TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
+                 ASNLine, SupplierName, SupplierCode, Description, ItemFamilyGroup, ReceivedDate)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """
+            dispatch_insert_sql = r"""
+                INSERT INTO dbo.DispatchEvents
+                (EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                 TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
+                 SalesOrderNumber, OrderLine, DispatchDate, Custody)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """
+            master_insert_sql = r"""
+                INSERT INTO dbo.BatchMaster
+                (BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber, TradeItemNumber,
+                 TradeName, GTIN, DrugName, PackageSize, SFDAQuantity, Active,
+                 QuantitySentPending, QuantityReceivePending, Description, ItemFamilyGroup,
+                 Custody, SupplierName, SupplierCode, TotalReceiveQty, TotalDispatchedQty,
+                 ReceiveRuns, DispatchRuns, FirstReceivedDate, LastReceivedDate,
+                 FirstDispatchDate, LastDispatchDate, GenericExistsInSFDA, LastUpdated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """
+            supplier_insert_sql = r"""
+                INSERT INTO dbo.SupplierHistory
+                (SupplierName, SupplierCode, GTIN, DrugName, GenericItemNumber, Description,
+                 TradeDescription, BN, ExpiryMonthKey, ExpiryDate, PackageSize,
+                 ReceivedQuantityEach, ReceivedQuantityPack, FirstReceivedDate,
+                 LastReceivedDate, ItemFamilyGroup, TradeItemNumber, LastUpdated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
+            """
+            customer_insert_sql = r"""
+                INSERT INTO dbo.CustomerHistory
+                (ToAddress, GLN, GTIN, DrugName, GenericItemNumber, TradeDescription,
+                 BN, ExpiryMonthKey, ExpiryDate, PackageSize, DispatchQuantityEach,
+                 DispatchQuantityPack, FirstDispatchDate, LastDispatchDate,
+                 Custody, TradeItemNumber, LastUpdated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
+            """
+
+            emit("Saving new historical generation", {"build_id": build_id})
+            with Database().connect() as connection:
+                cursor = connection.cursor()
+                try:
+                    cursor.timeout = int(os.getenv("HISTORICAL_ACTIVATION_SQL_TIMEOUT_SECONDS", "0") or 0)
+                except Exception:
+                    pass
+                try:
+                    inserted_receipts = _bulk_insert_rows(cursor, receipt_insert_sql, prepared_receipts)
+                    inserted_dispatches = _bulk_insert_rows(cursor, dispatch_insert_sql, prepared_dispatches)
+                    inserted_master = _bulk_insert_rows(cursor, master_insert_sql, batch_master_rows)
+                    inserted_supplier = _bulk_insert_rows(cursor, supplier_insert_sql, supplier_rows)
+                    inserted_customer = _bulk_insert_rows(cursor, customer_insert_sql, customer_rows)
+
+                    live_receipts = int(cursor.execute("SELECT COUNT_BIG(*) FROM dbo.ReceiptEvents;").fetchone()[0] or 0)
+                    live_dispatches = int(cursor.execute("SELECT COUNT_BIG(*) FROM dbo.DispatchEvents;").fetchone()[0] or 0)
+                    live_master = int(cursor.execute("SELECT COUNT_BIG(*) FROM dbo.BatchMaster;").fetchone()[0] or 0)
+                    if live_receipts != inserted_receipts or live_dispatches != inserted_dispatches or live_master != inserted_master:
+                        raise RuntimeError(
+                            "Historical generation verification failed before activation: "
+                            f"ReceiptEvents expected={inserted_receipts} actual={live_receipts}; "
+                            f"DispatchEvents expected={inserted_dispatches} actual={live_dispatches}; "
+                            f"BatchMaster expected={inserted_master} actual={live_master}."
+                        )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+        # Tiny atomic metadata switch: no old historical rows are deleted here.
+        emit("Activating new historical generation", {"build_id": build_id})
+        with historical_maintenance_scope():
+            with Database().connect() as connection:
+                cursor = connection.cursor()
+                try:
+                    cursor.execute(
+                        r"""
+                        UPDATE dbo.HistoricalBuildVersions
+                        SET IsActive = 0,
+                            Status = CASE WHEN Status = N'Active' THEN N'Previous' ELSE Status END,
+                            UpdatedAt = SYSUTCDATETIME()
+                        WHERE WarehouseID = ? AND IsActive = 1 AND BuildID <> ?;
+
+                        UPDATE dbo.HistoricalBuildVersions
+                        SET IsActive = 1,
+                            Status = N'Active',
+                            ActivatedAt = SYSUTCDATETIME(),
+                            CompletedAt = SYSUTCDATETIME(),
+                            UpdatedAt = SYSUTCDATETIME(),
+                            LastError = NULL
+                        WHERE WarehouseID = ? AND BuildID = ?;
+                        """,
+                        warehouse_id, build_id, warehouse_id, build_id,
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+
+    except Exception as exc:
+        try:
+            with historical_maintenance_scope():
+                with Database().connect() as connection:
+                    connection.cursor().execute(
+                        """
+                        UPDATE dbo.HistoricalBuildVersions
+                        SET Status = N'Failed', LastError = ?, UpdatedAt = SYSUTCDATETIME()
+                        WHERE WarehouseID = ? AND BuildID = ? AND IsActive = 0;
+                        """,
+                        str(exc)[:2000], warehouse_id, build_id,
+                    )
+                    connection.commit()
         except Exception:
-            connection.rollback()
-            logger.exception(
-                "HISTORICAL_SAFE_ACTIVATION_V1 failed; previous historical data was restored by rollback. WarehouseID=%s",
-                warehouse_id,
-            )
-            raise
+            logger.exception("Failed to record Historical Build generation failure.")
+        raise
 
     result = {
         "status": "Completed",
-        "version": "HISTORICAL_SAFE_ACTIVATION_V1",
+        "version": "HISTORICAL_VERSIONED_ACTIVATION_V2",
         "warehouse_id": warehouse_id,
-        "deleted_old_rows": deleted,
+        "build_id": build_id,
         "inserted_receipt_events": inserted_receipts,
         "inserted_dispatch_events": inserted_dispatches,
         "inserted_batch_master_rows": inserted_master,
         "inserted_supplier_history_rows": inserted_supplier,
         "inserted_customer_history_rows": inserted_customer,
         "seconds": round(time.perf_counter() - started_at, 3),
+        "cleanup_pending": True,
     }
-    logger.info("HISTORICAL_SAFE_ACTIVATION_V1 completed. %s", result)
+    logger.info("HISTORICAL_VERSIONED_ACTIVATION_V2 completed. %s", result)
     return result
+
+
+def cleanup_inactive_historical_builds(
+    *,
+    warehouse_id: Optional[int] = None,
+    keep_inactive: int = 0,
+    batch_size: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Delete inactive Historical Build generations in background.
+
+    The active BuildID is never touched. Cleanup is intentionally independent of
+    user-visible Historical Build completion and commits each bounded batch.
+    """
+    initialize_database()
+    from engine.warehouse_context import current_warehouse_id, historical_maintenance_scope
+
+    resolved_warehouse_id = int(warehouse_id or current_warehouse_id())
+    effective_batch_size = max(1000, min(int(batch_size or os.getenv("HISTORICAL_CLEANUP_BATCH_SIZE", "10000") or 10000), 50000))
+    deleted: Dict[str, int] = {}
+    removed_builds: List[str] = []
+
+    with historical_maintenance_scope():
+        with Database().connect() as connection:
+            rows = connection.cursor().execute(
+                r"""
+                SELECT BuildID
+                FROM dbo.HistoricalBuildVersions
+                WHERE WarehouseID = ? AND IsActive = 0 AND Status <> N'Building'
+                ORDER BY COALESCE(ActivatedAt, CreatedAt) DESC;
+                """,
+                resolved_warehouse_id,
+            ).fetchall()
+
+        candidates = [str(r[0] or '').strip() for r in rows if str(r[0] or '').strip()]
+        candidates = candidates[max(0, int(keep_inactive)):]
+
+        for old_build_id in candidates:
+            for table in ("CustomerHistory", "SupplierHistory", "BatchMaster", "DispatchEvents", "ReceiptEvents"):
+                table_total = 0
+                while True:
+                    with Database().connect() as connection:
+                        cursor = connection.cursor()
+                        cursor.execute(
+                            f"DELETE TOP ({effective_batch_size}) FROM dbo.[{table}] WHERE WarehouseID = ? AND BuildID = ?;",
+                            resolved_warehouse_id, old_build_id,
+                        )
+                        affected = max(0, int(cursor.rowcount or 0))
+                        connection.commit()
+                    table_total += affected
+                    if affected < effective_batch_size:
+                        break
+                deleted[f"{old_build_id}:{table}"] = table_total
+
+            with Database().connect() as connection:
+                connection.cursor().execute(
+                    "DELETE FROM dbo.HistoricalBuildVersions WHERE WarehouseID = ? AND BuildID = ? AND IsActive = 0;",
+                    resolved_warehouse_id, old_build_id,
+                )
+                connection.commit()
+            removed_builds.append(old_build_id)
+
+    result = {
+        "status": "Completed",
+        "version": "HISTORICAL_BACKGROUND_CLEANUP_V1",
+        "warehouse_id": resolved_warehouse_id,
+        "removed_builds": removed_builds,
+        "deleted_rows": deleted,
+    }
+    logger.info("HISTORICAL_BACKGROUND_CLEANUP_V1 completed. %s", result)
+    return result
+
 
 def get_historical_status() -> Dict[str, Any]:
     """Return lightweight warehouse-scoped historical readiness/dashboard coverage.
@@ -2412,7 +2576,7 @@ def reset_current_warehouse_data(
 ) -> Dict[str, Any]:
     """Verified batched reset of operational data for exactly one warehouse.
 
-    WAREHOUSE_RESET_V7_BATCHED uses a fixed WarehouseID-scoped delete plan for
+    WAREHOUSE_RESET_V8_VERSIONED uses a fixed WarehouseID-scoped delete plan for
     operational tables. Before deleting FullReconciliationRuns it also discovers
     only its direct FK children, because legacy child tables may not carry a
     WarehouseID column and must be scoped safely through the parent FullRunID.
@@ -2484,10 +2648,18 @@ def reset_current_warehouse_data(
             progress_callback(int(progress), str(stage), dict(extra or {}))
         except Exception:
             # Progress reporting must never make destructive work fail.
-            logger.exception("WAREHOUSE_RESET_V7_BATCHED progress callback failed.")
+            logger.exception("WAREHOUSE_RESET_V8_VERSIONED progress callback failed.")
 
     with Database().connect() as connection:
         cursor = connection.cursor()
+        # Reset must clear ALL historical generations for this warehouse, not
+        # only the currently active BuildID exposed by Historical Build RLS.
+        try:
+            cursor.execute(
+                "EXEC sys.sp_set_session_context @key=N'HistoricalBuildMaintenance', @value=1;"
+            )
+        except Exception:
+            pass
         # Give a single direct DELETE enough room to finish on a large table,
         # while avoiding an unbounded database call.
         try:
@@ -2497,7 +2669,7 @@ def reset_current_warehouse_data(
 
         try:
             logger.info(
-                "WAREHOUSE_RESET_V7_BATCHED started. WarehouseID=%s tables=%s",
+                "WAREHOUSE_RESET_V8_VERSIONED started. WarehouseID=%s tables=%s",
                 resolved_warehouse_id,
                 len(reset_tables),
             )
@@ -2554,7 +2726,7 @@ def reset_current_warehouse_data(
                 connection.commit()
                 deleted[child_table] = deleted.get(child_table, 0) + affected
                 logger.info(
-                    "WAREHOUSE_RESET_V7_BATCHED cleared %s FK child row(s) from %s.%s for WarehouseID=%s.",
+                    "WAREHOUSE_RESET_V8_VERSIONED cleared %s FK child row(s) from %s.%s for WarehouseID=%s.",
                     affected,
                     child_schema,
                     child_table,
@@ -2578,7 +2750,7 @@ def reset_current_warehouse_data(
                 elif exists:
                     skipped.append(table)
                     logger.warning(
-                        "WAREHOUSE_RESET_V7_BATCHED skipped %s because it has no WarehouseID column.",
+                        "WAREHOUSE_RESET_V8_VERSIONED skipped %s because it has no WarehouseID column.",
                         table,
                     )
 
@@ -2636,7 +2808,7 @@ def reset_current_warehouse_data(
                             },
                         )
                         logger.info(
-                            "WAREHOUSE_RESET_V7_BATCHED batch. WarehouseID=%s table=%s batch=%s deleted=%s table_deleted=%s.",
+                            "WAREHOUSE_RESET_V8_VERSIONED batch. WarehouseID=%s table=%s batch=%s deleted=%s table_deleted=%s.",
                             resolved_warehouse_id, table, batch_no, affected, table_deleted,
                         )
                     if affected < effective_batch_size:
@@ -2644,9 +2816,36 @@ def reset_current_warehouse_data(
 
                 deleted[table] = deleted.get(table, 0) + table_deleted
                 logger.info(
-                    "WAREHOUSE_RESET_V7_BATCHED table complete. WarehouseID=%s table=%s deleted=%s batches=%s.",
+                    "WAREHOUSE_RESET_V8_VERSIONED table complete. WarehouseID=%s table=%s deleted=%s batches=%s.",
                     resolved_warehouse_id, table, table_deleted, batch_no,
                 )
+
+            # Reinitialize Historical Build version metadata after every full
+            # account/warehouse reset. This guarantees the next Append always
+            # has one valid active generation even when no historical rows exist.
+            try:
+                reset_build_id = f"RESET-W{resolved_warehouse_id}-{int(time.time())}"
+                cursor.execute(
+                    "DELETE FROM dbo.HistoricalBuildVersions WHERE WarehouseID = ?;",
+                    resolved_warehouse_id,
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO dbo.HistoricalBuildVersions
+                    (WarehouseID, BuildID, Status, IsActive, SourceJobID, CreatedAt, ActivatedAt, CompletedAt, UpdatedAt)
+                    VALUES (?, ?, N'Active', 1, N'Warehouse Reset', SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME(), SYSUTCDATETIME());
+                    """,
+                    resolved_warehouse_id, reset_build_id,
+                )
+                connection.commit()
+                deleted["HistoricalBuildVersions"] = deleted.get("HistoricalBuildVersions", 0)
+                logger.info(
+                    "WAREHOUSE_RESET_V8_VERSIONED created fresh active BuildID=%s WarehouseID=%s.",
+                    reset_build_id, resolved_warehouse_id,
+                )
+            except pyodbc.Error as exc:
+                if "HistoricalBuildVersions" not in str(exc) and "Invalid object name" not in str(exc):
+                    raise
 
             # Quick verification only across the core operational tables.  No
             # expensive joins/aggregations are needed after a reset.
@@ -2677,7 +2876,7 @@ def reset_current_warehouse_data(
 
             result = {
                 "status": "Completed",
-                "version": "WAREHOUSE_RESET_V7_BATCHED",
+                "version": "WAREHOUSE_RESET_V8_VERSIONED",
                 "warehouse_id": resolved_warehouse_id,
                 "deleted_rows": deleted,
                 "deleted_rows_total": int(sum(deleted.values())),
@@ -2694,7 +2893,7 @@ def reset_current_warehouse_data(
                 ],
             }
             logger.info(
-                "WAREHOUSE_RESET_V7_BATCHED completed. WarehouseID=%s deleted_rows_total=%s tables=%s",
+                "WAREHOUSE_RESET_V8_VERSIONED completed. WarehouseID=%s deleted_rows_total=%s tables=%s",
                 resolved_warehouse_id,
                 result["deleted_rows_total"],
                 result["tables_cleared"],
@@ -2707,7 +2906,7 @@ def reset_current_warehouse_data(
             except Exception:
                 pass
             logger.exception(
-                "WAREHOUSE_RESET_V7_BATCHED failed for WarehouseID=%s. Already committed table clears remain deleted; retry is safe.",
+                "WAREHOUSE_RESET_V8_VERSIONED failed for WarehouseID=%s. Already committed table clears remain deleted; retry is safe.",
                 resolved_warehouse_id,
             )
             raise
