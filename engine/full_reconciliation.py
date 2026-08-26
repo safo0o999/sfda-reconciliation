@@ -1025,6 +1025,32 @@ class FullReconciliationEngine:
         )
         master = master.loc[keep_stage1 | keep_stage2].copy()
 
+        # Resolve PackageSize using the WMS Trade Description as the
+        # disambiguation source.  The configured Trade Name remains primary,
+        # while PharmaceuticalForm / explicit pack count / size in WMS text
+        # resolve Trade Names that legitimately have multiple package sizes.
+        master["Trade Description"] = (
+            master["Receipt Trade Name"].fillna("").astype(str).str.strip()
+        )
+        _missing_pack_trade = master["Trade Description"].eq("")
+        master.loc[_missing_pack_trade, "Trade Description"] = (
+            master.loc[_missing_pack_trade, "Dispatch Trade Name"]
+            .fillna("").astype(str).str.strip()
+        )
+        from engine.pack_size_resolver import PackSizeResolver
+        _pack_resolver = PackSizeResolver(self.packsize)
+        _resolved_pack = _pack_resolver.resolve_frame(
+            master[["Drug Name", "Trade Description"]].copy(),
+            drug_col="Drug Name",
+            wms_col="Trade Description",
+        )
+        _resolved_values = pd.to_numeric(
+            _resolved_pack["PackageSize"], errors="coerce"
+        ).fillna(0)
+        _use_resolved = _resolved_values.gt(0)
+        master.loc[_use_resolved, "PackageSize"] = _resolved_values.loc[_use_resolved]
+        master["Package Size Status"] = _resolved_pack["Package Size Status"].values
+
         # Build a Generic-to-SFDA reference from exact matches. This allows a
         # missing batch to show the correct drug and package size while its
         # batch-level SFDA quantities remain zero.
