@@ -184,8 +184,9 @@ def process_historical_build_job(
         timings[name] = round(elapsed, 3)
         stage_started_at = now
         logger.info(
-            "HISTORICAL_PERF job_id=%s stage=%s seconds=%.3f total_seconds=%.3f",
+            "HISTORICAL_PERF job_id=%s warehouse_id=%s stage=%s seconds=%.3f total_seconds=%.3f",
             job_id,
+            warehouse_id,
             name,
             elapsed,
             now - job_started_at,
@@ -433,6 +434,7 @@ def process_historical_build_job(
             file_name="Historical_Database.xlsx",
         )
         file_name, file_bytes, mime_type = _decode_exported_file(exported)
+        mark_stage("generate_historical_database_workbook")
         update_historical_build_job(
             job_id,
             progress=97,
@@ -456,6 +458,7 @@ def process_historical_build_job(
                 ),
             }
         ]
+        mark_stage("upload_historical_database_workbook")
         logger.info(
             "HISTORICAL_PERF job_id=%s export=%s sheets=7 batch_rows=%s "
             "supplier_rows=%s sto_in_rows=%s customer_rows=%s sto_return_rows=%s seconds=%.3f",
@@ -469,8 +472,6 @@ def process_historical_build_job(
             perf_counter() - export_started,
         )
         del exported, file_bytes
-
-        mark_stage("generate_and_upload_audit_files")
 
         summary = {
             "asn_files": len(input_manifest.get("asn_files", [])),
