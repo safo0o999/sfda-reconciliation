@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import contextvars
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Iterator, Optional
 
 _DEFAULT_WAREHOUSE_ID = 1
 _WAREHOUSE_ID = contextvars.ContextVar('sfda_warehouse_id', default=_DEFAULT_WAREHOUSE_ID)
 _WAREHOUSE_NAME = contextvars.ContextVar('sfda_warehouse_name', default='Madinah Warehouse')
+_HISTORICAL_BUILD_ID = contextvars.ContextVar('sfda_historical_build_id', default='')
+_HISTORICAL_MAINTENANCE = contextvars.ContextVar('sfda_historical_maintenance', default=False)
 
 
 def current_warehouse_id() -> int:
@@ -18,6 +20,14 @@ def current_warehouse_id() -> int:
 
 def current_warehouse_name() -> str:
     return str(_WAREHOUSE_NAME.get() or 'Madinah Warehouse')
+
+
+def current_historical_build_id() -> str:
+    return str(_HISTORICAL_BUILD_ID.get() or '').strip()
+
+
+def historical_maintenance_enabled() -> bool:
+    return bool(_HISTORICAL_MAINTENANCE.get())
 
 
 def set_current_warehouse(warehouse_id: int, warehouse_name: str = '') -> None:
@@ -35,3 +45,23 @@ def warehouse_scope(warehouse_id: int, warehouse_name: str = '') -> Iterator[Non
     finally:
         _WAREHOUSE_ID.reset(id_token)
         _WAREHOUSE_NAME.reset(name_token)
+
+
+@contextmanager
+def historical_build_scope(build_id: Optional[str]) -> Iterator[None]:
+    """Temporarily bind SQL reads/writes to one historical build generation."""
+    token = _HISTORICAL_BUILD_ID.set(str(build_id or '').strip())
+    try:
+        yield
+    finally:
+        _HISTORICAL_BUILD_ID.reset(token)
+
+
+@contextmanager
+def historical_maintenance_scope(enabled: bool = True) -> Iterator[None]:
+    """Bypass Historical Build RLS only for controlled cleanup/reset work."""
+    token = _HISTORICAL_MAINTENANCE.set(bool(enabled))
+    try:
+        yield
+    finally:
+        _HISTORICAL_MAINTENANCE.reset(token)
