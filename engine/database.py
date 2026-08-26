@@ -1770,36 +1770,17 @@ def get_reconciliation_history(limit: int = 100) -> List[Dict[str, Any]]:
 
 
 def reset_history() -> None:
-    """Delete cumulative historical tables for the current warehouse only.
+    """Deprecated destructive Historical Rebuild reset.
 
-    Database connections always carry WarehouseID session context and Version 6
-    RLS isolates these tables. This function is used only by Historical Build
-    operation=rebuild and does not touch users, warehouse configuration, GLN or
-    reference data.
+    Historical rebuilds must use the two-phase safe flow in
+    ``activate_historical_rebuild``.  This guard intentionally fails closed so
+    no legacy or accidentally restored call site can erase live history before
+    a replacement dataset has been fully built and validated.
     """
-
-    initialize_database()
-
-    with Database().connect() as connection:
-        cursor = connection.cursor()
-        try:
-            from engine.warehouse_context import current_warehouse_id
-            warehouse_id = int(current_warehouse_id())
-            cursor.execute(
-                """
-                DELETE FROM dbo.CustomerHistory WHERE WarehouseID = ?;
-                DELETE FROM dbo.SupplierHistory WHERE WarehouseID = ?;
-                DELETE FROM dbo.BatchMaster WHERE WarehouseID = ?;
-                DELETE FROM dbo.DispatchEvents WHERE WarehouseID = ?;
-                DELETE FROM dbo.ReceiptEvents WHERE WarehouseID = ?;
-                DELETE FROM dbo.RunHistory WHERE WarehouseID = ?;
-                """,
-                (warehouse_id, warehouse_id, warehouse_id, warehouse_id, warehouse_id, warehouse_id),
-            )
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+    raise RuntimeError(
+        "Legacy reset_history() is disabled. Historical rebuild must use "
+        "Build -> Validate -> activate_historical_rebuild()."
+    )
 
 
 
@@ -2573,7 +2554,7 @@ def reset_current_warehouse_data(
                 connection.commit()
                 deleted[child_table] = deleted.get(child_table, 0) + affected
                 logger.info(
-                    "WAREHOUSE_RESET_V6_FAST cleared %s FK child row(s) from %s.%s for WarehouseID=%s.",
+                    "WAREHOUSE_RESET_V7_BATCHED cleared %s FK child row(s) from %s.%s for WarehouseID=%s.",
                     affected,
                     child_schema,
                     child_table,
@@ -2597,7 +2578,7 @@ def reset_current_warehouse_data(
                 elif exists:
                     skipped.append(table)
                     logger.warning(
-                        "WAREHOUSE_RESET_V6_FAST skipped %s because it has no WarehouseID column.",
+                        "WAREHOUSE_RESET_V7_BATCHED skipped %s because it has no WarehouseID column.",
                         table,
                     )
 
@@ -2726,7 +2707,7 @@ def reset_current_warehouse_data(
             except Exception:
                 pass
             logger.exception(
-                "WAREHOUSE_RESET_V6_FAST failed for WarehouseID=%s. Already committed table clears remain deleted; retry is safe.",
+                "WAREHOUSE_RESET_V7_BATCHED failed for WarehouseID=%s. Already committed table clears remain deleted; retry is safe.",
                 resolved_warehouse_id,
             )
             raise
