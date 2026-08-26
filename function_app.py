@@ -24,8 +24,7 @@ APPLICATION_NAME = "SFDA Reconciliation"
 APPLICATION_VERSION = "6.0.0"
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 _PROCESS_STARTED_AT = datetime.now(timezone.utc)
-_RESET_ENGINE_VERSION = "WAREHOUSE_RESET_V8_VERSIONED"
-_HISTORICAL_REBUILD_ENGINE_VERSION = "VERSIONED_BUILD_V8_20260826"
+_RESET_ENGINE_VERSION = "WAREHOUSE_RESET_V6_FAST"
 
 
 _VARIANCE_CACHE: Dict[int, Dict[str, Any]] = {}
@@ -3582,34 +3581,6 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
     from engine.warehouse_context import warehouse_scope
 
     with warehouse_scope(warehouse_id, warehouse_name or f"Warehouse {warehouse_id}"):
-        if job_type == "historical_cleanup":
-            from engine.database import cleanup_inactive_historical_builds
-
-            source_job_id = str(payload.get("source_job_id") or job_id).strip()
-            logger.info(
-                "Canonical background worker received Historical cleanup. source_job_id=%s warehouse_id=%s",
-                source_job_id, warehouse_id,
-            )
-            try:
-                result = cleanup_inactive_historical_builds(
-                    warehouse_id=warehouse_id,
-                    keep_inactive=int(os.getenv("HISTORICAL_CLEANUP_KEEP_INACTIVE", "0") or 0),
-                )
-                logger.info(
-                    "Historical cleanup completed in background. source_job_id=%s result=%s",
-                    source_job_id, result,
-                )
-                _refresh_dashboard_summary_safe()
-            except Exception:
-                # Cleanup is maintenance-only and must never affect the already
-                # activated Historical Build. A later cleanup message/rebuild can
-                # retry old generations safely.
-                logger.exception(
-                    "Historical cleanup failed in background. source_job_id=%s warehouse_id=%s",
-                    source_job_id, warehouse_id,
-                )
-            return
-
         if job_type == "historical_build":
             from engine.database import claim_historical_build_job, get_historical_build_job
             from engine.historical_jobs import process_historical_build_job
@@ -3617,8 +3588,8 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
             operation = str(payload.get("operation", "append")).strip().lower()
             logger.info(
                 "Canonical background worker received Historical Build. "
-                "job_id=%s operation=%s warehouse_id=%s engine=%s",
-                job_id, operation, warehouse_id, _HISTORICAL_REBUILD_ENGINE_VERSION,
+                "job_id=%s operation=%s warehouse_id=%s",
+                job_id, operation, warehouse_id,
             )
             if not claim_historical_build_job(job_id):
                 existing = get_historical_build_job(job_id)
