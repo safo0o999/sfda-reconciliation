@@ -1,19 +1,19 @@
-name: Build and deploy Python project to Azure Function App - sfda-reconciliation-app
+name: Full Clean Deploy - SFDA Reconciliation
 
 on:
   push:
     branches:
       - main
+
   workflow_dispatch:
 
 env:
   AZURE_FUNCTIONAPP_NAME: sfda-reconciliation-app
-  AZURE_FUNCTIONAPP_PACKAGE_PATH: .
   PYTHON_VERSION: "3.12"
   PYTHONPATH: ${{ github.workspace }}
 
 jobs:
-  validate-and-deploy:
+  full-clean-deploy:
     runs-on: ubuntu-latest
 
     permissions:
@@ -26,29 +26,71 @@ jobs:
         working-directory: ${{ github.workspace }}
 
     steps:
-      - name: Checkout repository
+
+      # ============================================================
+      # 1. CLEAN CHECKOUT
+      # ============================================================
+
+      - name: Checkout repository cleanly
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          clean: true
+
+      - name: Show checked-out revision
+        run: |
+          set -euo pipefail
+
+          echo "======================================"
+          echo "SFDA FULL CLEAN DEPLOY"
+          echo "======================================"
+
+          echo "Workspace:"
+          echo "$GITHUB_WORKSPACE"
+
+          echo ""
+          echo "Commit SHA:"
+          echo "$GITHUB_SHA"
+
+          echo ""
+          echo "Git revision:"
+          git log -1 --oneline
+
+          echo ""
+          echo "Git status:"
+          git status --short
+
+
+      # ============================================================
+      # 2. PYTHON
+      # ============================================================
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Show checked-out revision
-        run: |
-          set -euo pipefail
-          echo "Workspace: $GITHUB_WORKSPACE"
-          echo "Commit: $GITHUB_SHA"
-          git status --short
-          git log -1 --oneline
-
       - name: Upgrade pip
-        run: python -m pip install --upgrade pip
+        run: |
+          python -m pip install --upgrade pip
+
+
+      # ============================================================
+      # 3. VALIDATION DEPENDENCIES
+      # ============================================================
 
       - name: Install dependencies for validation
-        run: python -m pip install -r requirements.txt
+        run: |
+          set -euo pipefail
 
-      - name: Validate required Azure Functions files
+          python -m pip install -r requirements.txt
+
+
+      # ============================================================
+      # 4. REQUIRED FILE VALIDATION
+      # ============================================================
+
+      - name: Validate required project files
         run: |
           set -euo pipefail
 
@@ -56,31 +98,62 @@ jobs:
             "function_app.py"
             "host.json"
             "requirements.txt"
+
             "engine/__init__.py"
-            "engine/batch_history.py"
             "engine/database.py"
+            "engine/historical_jobs.py"
+            "engine/warehouse_context.py"
+            "engine/batch_history.py"
             "engine/normalizer.py"
           )
 
           for file in "${required_files[@]}"; do
             if [ ! -f "$file" ]; then
-              echo "Required file is missing: $file"
+              echo "ERROR: Required file is missing:"
+              echo "$file"
               exit 1
             fi
           done
 
-          echo "Required project files are present."
+          echo "All required project files are present."
+
+
+      # ============================================================
+      # 5. SHOW ENGINE FILES
+      # ============================================================
 
       - name: Show engine package contents
         run: |
           set -euo pipefail
-          echo "Engine package contents:"
-          find engine -maxdepth 1 -type f -printf "%f\n" | sort
+
+          echo "======================================"
+          echo "ENGINE PACKAGE"
+          echo "======================================"
+
+          find engine \
+            -maxdepth 1 \
+            -type f \
+            -printf "%f\n" \
+            | sort
+
+
+      # ============================================================
+      # 6. PYTHON SYNTAX
+      # ============================================================
 
       - name: Validate Python syntax
         run: |
           set -euo pipefail
-          python -m compileall             function_app.py             engine             config
+
+          python -m compileall \
+            function_app.py \
+            engine \
+            config
+
+
+      # ============================================================
+      # 7. VERIFY LOCAL ENGINE PACKAGE
+      # ============================================================
 
       - name: Verify local engine package
         run: |
@@ -93,39 +166,26 @@ jobs:
 
           workspace = pathlib.Path.cwd().resolve()
           engine_directory = workspace / "engine"
-          batch_history_file = engine_directory / "batch_history.py"
 
           if str(workspace) not in sys.path:
               sys.path.insert(0, str(workspace))
 
-          print("Current working directory:", workspace)
-          print("Python executable:", sys.executable)
-          print("Python path:")
-          for entry in sys.path:
-              print(" -", entry)
+          print("Workspace:", workspace)
+          print("Python:", sys.executable)
 
           if not engine_directory.is_dir():
               raise RuntimeError(
-                  f"Engine directory was not found: {engine_directory}"
-              )
-
-          if not batch_history_file.is_file():
-              raise RuntimeError(
-                  f"batch_history.py was not found: {batch_history_file}"
+                  f"Engine directory not found: {engine_directory}"
               )
 
           engine_spec = importlib.util.find_spec("engine")
 
           if engine_spec is None:
               raise RuntimeError(
-                  "Python could not resolve the local engine package."
+                  "Python could not resolve local engine package."
               )
 
-          print("Resolved engine origin:", engine_spec.origin)
-          print(
-              "Resolved engine search locations:",
-              list(engine_spec.submodule_search_locations or [])
-          )
+          print("Engine origin:", engine_spec.origin)
 
           resolved_locations = [
               pathlib.Path(location).resolve()
@@ -137,20 +197,17 @@ jobs:
 
           if engine_directory.resolve() not in resolved_locations:
               raise RuntimeError(
-                  "Python resolved a different 'engine' package instead "
-                  f"of the repository package. Expected: {engine_directory}"
+                  "Python resolved another engine package. "
+                  f"Expected: {engine_directory}"
               )
 
-          from engine.batch_history import BatchHistoryEngine
-
-          if not hasattr(BatchHistoryEngine, "build"):
-              raise RuntimeError(
-                  "BatchHistoryEngine imported, but build() was not found."
-              )
-
-          print("Local engine.batch_history imported successfully.")
-          print("BatchHistoryEngine.build found.")
+          print("Local engine package verified.")
           PY
+
+
+      # ============================================================
+      # 8. IMPORT FUNCTION APP
+      # ============================================================
 
       - name: Verify function_app import
         run: |
@@ -169,12 +226,12 @@ jobs:
 
           if not hasattr(function_app, "app"):
               raise RuntimeError(
-                  "function_app.py was imported, but no variable named "
-                  "'app' was found."
+                  "function_app.py imported but Azure "
+                  "Functions app object was not found."
               )
 
           print("function_app.py imported successfully.")
-          print("Azure Functions app object found.")
+
           print(
               "Application version:",
               getattr(
@@ -183,7 +240,60 @@ jobs:
                   "Unknown"
               )
           )
+
+          print(
+              "Historical rebuild engine:",
+              getattr(
+                  function_app,
+                  "_HISTORICAL_REBUILD_ENGINE_VERSION",
+                  "Unknown"
+              )
+          )
+
+          print(
+              "Reset engine:",
+              getattr(
+                  function_app,
+                  "_RESET_ENGINE_VERSION",
+                  "Unknown"
+              )
+          )
           PY
+
+
+      # ============================================================
+      # 9. V8.1 CODE MARKERS
+      # ============================================================
+
+      - name: Verify Versioned Build V8 code
+        run: |
+          set -euo pipefail
+
+          echo "Checking V8 historical implementation..."
+
+          grep -n \
+            "VERSIONED_BUILD_V8_20260826" \
+            function_app.py
+
+          grep -n \
+            "activate_historical_rebuild" \
+            engine/historical_jobs.py
+
+          grep -n \
+            "_enqueue_historical_cleanup" \
+            engine/historical_jobs.py
+
+          grep -n \
+            "Saving and activating new historical build" \
+            engine/historical_jobs.py
+
+          echo ""
+          echo "V8 historical code markers verified."
+
+
+      # ============================================================
+      # 10. VERIFY AZURE FUNCTION ROUTES
+      # ============================================================
 
       - name: Validate registered Azure Function routes
         run: |
@@ -194,6 +304,7 @@ jobs:
           import sys
 
           workspace = pathlib.Path.cwd().resolve()
+
           if str(workspace) not in sys.path:
               sys.path.insert(0, str(workspace))
 
@@ -203,21 +314,33 @@ jobs:
           functions = app.get_functions()
 
           discovered = {}
+
           for fn in functions:
               name = fn.get_function_name()
+
               binding = next(
                   (
                       b
                       for b in fn.get_bindings()
-                      if getattr(b, "type", None) == "httpTrigger"
+                      if getattr(b, "type", None)
+                      == "httpTrigger"
                   ),
                   None,
               )
+
               if binding is None:
                   continue
 
-              route = getattr(binding, "route", None) or ""
-              raw_methods = getattr(binding, "methods", None) or []
+              route = (
+                  getattr(binding, "route", None)
+                  or ""
+              )
+
+              raw_methods = (
+                  getattr(binding, "methods", None)
+                  or []
+              )
+
               methods = tuple(
                   sorted(
                       (
@@ -228,14 +351,17 @@ jobs:
                       for method in raw_methods
                   )
               )
+
               discovered[route] = {
                   "name": name,
                   "methods": methods,
               }
 
           print("Discovered HTTP routes:")
+
           for route in sorted(discovered):
               item = discovered[route]
+
               print(
                   f" - {route or '<root>'} "
                   f"[{', '.join(item['methods'])}] "
@@ -245,23 +371,36 @@ jobs:
           required = {
               "health": {"GET"},
               "version": {"GET"},
+
               "auth/status": {"GET"},
               "auth/register": {"POST"},
               "auth/login": {"POST"},
               "auth/logout": {"POST"},
               "auth/me": {"GET"},
+
               "user-management/users": {"GET"},
-              "user-management/users/{user_id}/status": {"POST"},
+              "user-management/users/{user_id}/status":
+                  {"POST"},
+
               "history": {"GET"},
               "historical/status": {"GET"},
+
               "batch-master/build": {"GET", "POST"},
-              "full-reconciliation/accept": {"GET", "POST"},
-              "full-reconciliation/dispatch": {"GET", "POST"},
+
+              "full-reconciliation/accept":
+                  {"GET", "POST"},
+
+              "full-reconciliation/dispatch":
+                  {"GET", "POST"},
+
               "variance-management": {"GET"},
               "product-intelligence": {"GET"},
+
               "process-accept": {"GET", "POST"},
               "process-dispatch": {"GET", "POST"},
+
               "reconcile": {"GET", "POST"},
+
               "ui": {"GET"},
           }
 
@@ -269,41 +408,346 @@ jobs:
 
           for route, expected_methods in required.items():
               item = discovered.get(route)
+
               if item is None:
-                  problems.append(f"MISSING route: {route}")
+                  problems.append(
+                      f"MISSING route: {route}"
+                  )
                   continue
 
-              actual_methods = set(item["methods"])
-              missing_methods = expected_methods - actual_methods
+              actual_methods = set(
+                  item["methods"]
+              )
+
+              missing_methods = (
+                  expected_methods
+                  - actual_methods
+              )
+
               if missing_methods:
                   problems.append(
-                      f"Route {route} is missing methods: "
-                      + ", ".join(sorted(missing_methods))
+                      f"Route {route} missing methods: "
+                      + ", ".join(
+                          sorted(missing_methods)
+                      )
                   )
 
           if problems:
-              print("\nCRITICAL ROUTE VALIDATION FAILED:")
+              print(
+                  "\nCRITICAL ROUTE VALIDATION FAILED:"
+              )
+
               for problem in problems:
                   print(" -", problem)
+
               raise SystemExit(1)
 
+          print("")
           print(
-              f"\nCritical route validation PASSED. "
-              f"{len(functions)} Azure Functions discovered."
+              "Critical route validation PASSED."
+          )
+
+          print(
+              f"{len(functions)} Azure Functions "
+              "discovered."
           )
           PY
+
+
+      # ============================================================
+      # 11. CREATE COMPLETELY CLEAN DEPLOYMENT PACKAGE
+      # ============================================================
+
+      - name: Create clean deployment directory
+        run: |
+          set -euo pipefail
+
+          echo "Creating deployment package from Git HEAD..."
+
+          rm -rf deployment_package
+          rm -f sfda-function-deploy.zip
+
+          mkdir -p deployment_package
+
+          git archive \
+            --format=tar \
+            HEAD \
+            | tar -x \
+              -C deployment_package
+
+          echo ""
+          echo "Git files copied into clean deployment directory."
+
+
+      # ============================================================
+      # 12. INSTALL DEPENDENCIES INSIDE DEPLOYMENT PACKAGE
+      # ============================================================
+
+      - name: Install Python dependencies into deployment package
+        run: |
+          set -euo pipefail
+
+          mkdir -p \
+            deployment_package/.python_packages/lib/site-packages
+
+          python -m pip install \
+            --requirement requirements.txt \
+            --target \
+            deployment_package/.python_packages/lib/site-packages
+
+
+      # ============================================================
+      # 13. ADD DEPLOYMENT IDENTITY FILE
+      # ============================================================
+
+      - name: Add deployment identity
+        run: |
+          set -euo pipefail
+
+          {
+            echo "SFDA Reconciliation"
+            echo "DeploymentType=FULL_CLEAN_DEPLOY"
+            echo "Commit=$GITHUB_SHA"
+            echo "RunID=$GITHUB_RUN_ID"
+            echo "RunNumber=$GITHUB_RUN_NUMBER"
+            echo "Branch=$GITHUB_REF_NAME"
+            echo "UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          } > deployment_package/DEPLOYMENT_IDENTITY.txt
+
+          cat deployment_package/DEPLOYMENT_IDENTITY.txt
+
+
+      # ============================================================
+      # 14. VERIFY EXACT CODE THAT WILL BE DEPLOYED
+      # ============================================================
+
+      - name: Verify deployment package V8 code
+        run: |
+          set -euo pipefail
+
+          echo "======================================"
+          echo "VERIFYING DEPLOYMENT PACKAGE"
+          echo "======================================"
+
+          test -f \
+            deployment_package/function_app.py
+
+          test -f \
+            deployment_package/engine/database.py
+
+          test -f \
+            deployment_package/engine/historical_jobs.py
+
+          test -f \
+            deployment_package/engine/warehouse_context.py
+
+          grep -n \
+            "VERSIONED_BUILD_V8_20260826" \
+            deployment_package/function_app.py
+
+          grep -n \
+            "activate_historical_rebuild" \
+            deployment_package/engine/historical_jobs.py
+
+          grep -n \
+            "_enqueue_historical_cleanup" \
+            deployment_package/engine/historical_jobs.py
+
+          grep -n \
+            "Saving and activating new historical build" \
+            deployment_package/engine/historical_jobs.py
+
+          echo ""
+          echo "Exact deployment package verified."
+
+
+      # ============================================================
+      # 15. REMOVE PYTHON CACHE / DEVELOPMENT JUNK
+      # ============================================================
+
+      - name: Clean deployment package
+        run: |
+          set -euo pipefail
+
+          find deployment_package \
+            -type d \
+            -name "__pycache__" \
+            -prune \
+            -exec rm -rf {} +
+
+          find deployment_package \
+            -type f \
+            \( \
+              -name "*.pyc" \
+              -o \
+              -name "*.pyo" \
+            \) \
+            -delete
+
+          echo "Deployment package cleaned."
+
+
+      # ============================================================
+      # 16. CREATE ZIP
+      # ============================================================
+
+      - name: Create full deployment ZIP
+        run: |
+          set -euo pipefail
+
+          cd deployment_package
+
+          zip \
+            -r \
+            -q \
+            ../sfda-function-deploy.zip \
+            .
+
+          cd ..
+
+          echo "======================================"
+          echo "DEPLOYMENT ZIP"
+          echo "======================================"
+
+          ls -lh sfda-function-deploy.zip
+
+          echo ""
+          echo "Critical files inside ZIP:"
+
+          unzip -l sfda-function-deploy.zip \
+            | grep -E \
+              "function_app.py|engine/database.py|engine/historical_jobs.py|engine/warehouse_context.py|DEPLOYMENT_IDENTITY.txt"
+
+
+      # ============================================================
+      # 17. AZURE LOGIN
+      # ============================================================
 
       - name: Login to Azure
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_A7F67E2D1CB7477A971E7B2AD479CD0F }}
+
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_D57BA3F0BD1F4199A96E44DA5E102117 }}
+
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_F7881D9CCEF9483F953C7F423CFACB41 }}
 
-      - name: Deploy to Azure Functions
+
+      # ============================================================
+      # 18. DISCOVER RESOURCE GROUP
+      # ============================================================
+
+      - name: Discover Azure resource group
+        id: azure-info
+        run: |
+          set -euo pipefail
+
+          RESOURCE_GROUP=$(
+            az resource list \
+              --name "${AZURE_FUNCTIONAPP_NAME}" \
+              --resource-type "Microsoft.Web/sites" \
+              --query "[0].resourceGroup" \
+              --output tsv
+          )
+
+          if [ -z "$RESOURCE_GROUP" ]; then
+            echo "Could not determine Azure resource group."
+            exit 1
+          fi
+
+          echo "Azure Resource Group:"
+          echo "$RESOURCE_GROUP"
+
+          echo \
+            "resource_group=$RESOURCE_GROUP" \
+            >> "$GITHUB_OUTPUT"
+
+
+      # ============================================================
+      # 19. SHOW CURRENT AZURE APP STATE
+      # ============================================================
+
+      - name: Show Azure Function App before deployment
+        run: |
+          set -euo pipefail
+
+          az functionapp show \
+            --name "${AZURE_FUNCTIONAPP_NAME}" \
+            --resource-group "${{ steps.azure-info.outputs.resource_group }}" \
+            --query \
+              "{name:name,state:state,hostName:defaultHostName}" \
+            --output table
+
+
+      # ============================================================
+      # 20. FULL ZIP DEPLOY
+      # ============================================================
+
+      - name: Deploy full clean package to Azure Functions
         id: deploy-to-function
         uses: Azure/functions-action@v1
         with:
           app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
-          package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
-          remote-build: true
+          package: sfda-function-deploy.zip
+
+
+      # ============================================================
+      # 21. RESTART FUNCTION APP
+      # ============================================================
+
+      - name: Restart Azure Function App
+        run: |
+          set -euo pipefail
+
+          echo "Restarting Azure Function App..."
+
+          az functionapp restart \
+            --name "${AZURE_FUNCTIONAPP_NAME}" \
+            --resource-group "${{ steps.azure-info.outputs.resource_group }}"
+
+          echo "Restart requested successfully."
+
+
+      # ============================================================
+      # 22. WAIT FOR HOST
+      # ============================================================
+
+      - name: Wait for Azure Function App restart
+        run: |
+          set -euo pipefail
+
+          echo "Waiting 30 seconds for Function host..."
+          sleep 30
+
+
+      # ============================================================
+      # 23. VERIFY AZURE APP STATE
+      # ============================================================
+
+      - name: Verify Azure Function App after deployment
+        run: |
+          set -euo pipefail
+
+          APP_STATE=$(
+            az functionapp show \
+              --name "${AZURE_FUNCTIONAPP_NAME}" \
+              --resource-group "${{ steps.azure-info.outputs.resource_group }}" \
+              --query "state" \
+              --output tsv
+          )
+
+          echo "Azure Function App state:"
+          echo "$APP_STATE"
+
+          if [ "$APP_STATE" != "Running" ]; then
+            echo "Function App is not Running."
+            exit 1
+          fi
+
+          echo ""
+          echo "======================================"
+          echo "FULL CLEAN DEPLOY COMPLETED"
+          echo "======================================"
+
+          echo "Commit deployed:"
+          echo "$GITHUB_SHA"
