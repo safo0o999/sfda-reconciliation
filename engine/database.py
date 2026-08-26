@@ -922,10 +922,11 @@ def append_events(
                             SELECT 1
                             FROM dbo.ReceiptEvents t WITH (UPDLOCK, HOLDLOCK)
                             WHERE t.WarehouseID = ?
+                              AND t.BuildID = ?
                               AND t.EventKey = s.EventKey
                         );
                         """,
-                        (warehouse_id,),
+                        (warehouse_id, active_build_id),
                     )
                     inserted_receipts = max(0, int(cursor.rowcount or 0))
 
@@ -948,10 +949,11 @@ def append_events(
                             SELECT 1
                             FROM dbo.DispatchEvents t WITH (UPDLOCK, HOLDLOCK)
                             WHERE t.WarehouseID = ?
+                              AND t.BuildID = ?
                               AND t.EventKey = s.EventKey
                         );
                         """,
-                        (warehouse_id,),
+                        (warehouse_id, active_build_id),
                     )
                     inserted_dispatches = max(0, int(cursor.rowcount or 0))
 
@@ -5422,18 +5424,11 @@ def refresh_accept_history_incremental(
                 current_sfda[column], errors="coerce"
             ).fillna(0)
 
-    # PackageSize authority: SFDA Drug Name -> config/pack_size.xlsx.
-    # Use conservative formatting normalization while preserving strength/volume.
-    pack_path = Path(__file__).resolve().parent.parent / "config" / "pack_size.xlsx"
-    pack_frame = Normalizer.normalize_packsize(pd.read_excel(pack_path, engine="openpyxl", dtype=object))
-    pack_frame["_PackKey"] = Normalizer.drug_name_key(pack_frame["Trade Name"])
-    pack_frame["PackageSize"] = pd.to_numeric(pack_frame["PackageSize"], errors="coerce").fillna(0)
-    pack_map = (
-        pack_frame.loc[pack_frame["_PackKey"].ne("") & pack_frame["PackageSize"].gt(0)]
-        .drop_duplicates(subset=["_PackKey"], keep="first")
-        .set_index("_PackKey")["PackageSize"]
-        .to_dict()
-    )
+    # Central PackageSize authority.  Ambiguous Trade Names are resolved with
+    # PharmaceuticalForm / explicit pack count / size found in WMS Trade text.
+    # Never pick the first/largest package size as a silent fallback.
+    from engine.pack_size_resolver import PackSizeResolver
+    pack_resolver = PackSizeResolver.from_config()
 
     # Validate WMS Generics against exact SFDA BN+expiry keys. BN+Expiry is the
     # primary match. Drug Name vs Trade Description is ONLY a validation gate
@@ -5495,11 +5490,23 @@ def refresh_accept_history_incremental(
         if not generics:
             continue
         drug_name = _text(row, "Drug Name")
-        pack_key = Normalizer._drug_key_scalar(drug_name)
         for generic in generics:
+            trade_text = ""
+            if not candidate_rows.empty:
+                _trade_match = candidate_rows.loc[
+                    (candidate_rows["BN"] == bn)
+                    & (candidate_rows["Expiry Month Key"] == month)
+                    & (candidate_rows["Generic Item Number"] == str(generic))
+                ]
+                if not _trade_match.empty:
+                    trade_text = next(
+                        (str(v).strip() for v in _trade_match["Trade Name"] if str(v).strip()),
+                        "",
+                    )
+            resolved_pack, _pack_status = pack_resolver.resolve(drug_name, trade_text)
             sfda_rows.append((
                 _text(row, "GTIN"), drug_name, bn, month, generic,
-                float(pack_map.get(pack_key, 0) or 0),
+                float(resolved_pack or 0),
                 _value(row, "Expiry Date"), _number(row, "Quantity"),
                 _number(row, "Active"), _number(row, "Quantity sent pending"),
                 _number(row, "Quantity Receive Pending"),
