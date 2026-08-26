@@ -13,6 +13,7 @@ import pandas as pd
 from engine.blob_storage import BlobStorage, INPUTS_CONTAINER
 from engine.database import (
     append_events,
+    activate_historical_rebuild,
     remove_excluded_historical_keys,
     get_batch_master_df,
     get_customer_history_df,
@@ -156,6 +157,194 @@ def _decode_exported_file(
     return file_name, base64.b64decode(content), mime_type
 
 
+
+def _nonblank_max(series: pd.Series) -> str:
+    values = [str(v).strip() for v in series.tolist() if pd.notna(v) and str(v).strip()]
+    return max(values) if values else ""
+
+
+def _build_rebuild_summaries_from_prepared(
+    prepared: Dict[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Build the four SQL-style cumulative summaries from the NEW upload only.
+
+    This is the key two-phase rebuild boundary: no live historical table is read
+    or deleted while the new Batch Master / histories are being prepared.
+    """
+    receipt = prepared.get("receipt_events")
+    dispatch = prepared.get("dispatch_events")
+    receipt = receipt.copy() if isinstance(receipt, pd.DataFrame) else pd.DataFrame(receipt or [])
+    dispatch = dispatch.copy() if isinstance(dispatch, pd.DataFrame) else pd.DataFrame(dispatch or [])
+
+    keys = ["BN", "Expiry Month Key", "Generic Item Number"]
+
+    if receipt.empty:
+        receipt_summary = pd.DataFrame()
+        supplier_summary = pd.DataFrame()
+    else:
+        receipt["Received Quantity"] = pd.to_numeric(receipt["Received Quantity"], errors="coerce").fillna(0)
+        receipt["Received Date"] = pd.to_datetime(receipt["Received Date"], errors="coerce")
+        receipt["Expiry Date"] = pd.to_datetime(receipt["Expiry Date"], errors="coerce")
+        shipment = receipt["Inbound Shipment"].fillna("").astype(str).str.strip().str.upper()
+        eligible = receipt.loc[
+            shipment.str.startswith(("TRK5060", "TRK800", "TRK49"))
+        ].copy()
+        eligible["_priority"] = 2
+        eship = eligible["Inbound Shipment"].fillna("").astype(str).str.strip().str.upper()
+        eligible.loc[eship.str.startswith("TRK5060"), "_priority"] = 0
+        eligible.loc[eship.str.startswith("TRK800"), "_priority"] = 1
+        eligible = eligible.sort_values(keys + ["_priority", "Received Date", "Event Key"], kind="stable")
+        preferred = eligible.drop_duplicates(subset=keys, keep="first").copy()
+        agg = eligible.groupby(keys, dropna=False).agg(
+            **{
+                "Receipt Expiry Date": ("Expiry Date", "max"),
+                "Receive Runs": ("Event Key", "size"),
+                "Total Receive Qty": ("Received Quantity", "sum"),
+                "First Received Date": ("Received Date", "min"),
+                "Last Received Date": ("Received Date", "max"),
+            }
+        ).reset_index()
+        preferred = preferred.rename(columns={"Trade Item": "Trade Item Number"})
+        keep = keys + ["Trade Item Number", "Trade Name", "Description", "Supplier Name", "Supplier Code", "Item Family Group"]
+        receipt_summary = preferred[keep].merge(agg, on=keys, how="inner", validate="one_to_one")
+
+        supplier_source = receipt.loc[shipment.str.startswith("TRK5060")].copy()
+        if supplier_source.empty:
+            supplier_summary = pd.DataFrame()
+        else:
+            skeys = ["Supplier Name", "Supplier Code", *keys]
+            supplier_summary = supplier_source.groupby(skeys, dropna=False).agg(
+                **{
+                    "Expiry Date": ("Expiry Date", "max"),
+                    "Trade Item Number": ("Trade Item", _nonblank_max),
+                    "Trade Name": ("Trade Name", _nonblank_max),
+                    "Description": ("Description", _nonblank_max),
+                    "Item Family Group": ("Item Family Group", _nonblank_max),
+                    "Received Quantity Each": ("Received Quantity", "sum"),
+                    "First Received Date": ("Received Date", "min"),
+                    "Last Received Date": ("Received Date", "max"),
+                }
+            ).reset_index()
+
+    if dispatch.empty:
+        dispatch_summary = pd.DataFrame()
+        customer_summary = pd.DataFrame()
+    else:
+        dispatch["Dispatched Quantity"] = pd.to_numeric(dispatch["Dispatched Quantity"], errors="coerce").fillna(0)
+        dispatch["Dispatch Date"] = pd.to_datetime(dispatch["Dispatch Date"], errors="coerce")
+        dispatch["Expiry Date"] = pd.to_datetime(dispatch["Expiry Date"], errors="coerce")
+        dispatch_summary = dispatch.groupby(keys, dropna=False).agg(
+            **{
+                "Dispatch Expiry Date": ("Expiry Date", "max"),
+                "Trade Item Number": ("Trade Item Number", _nonblank_max),
+                "Trade Name": ("Trade Name", _nonblank_max),
+                "Custody": ("Custody", _nonblank_max),
+                "Dispatch Runs": ("Event Key", "size"),
+                "Total Dispatched Qty": ("Dispatched Quantity", "sum"),
+                "First Dispatch Date": ("Dispatch Date", "min"),
+                "Last Dispatch Date": ("Dispatch Date", "max"),
+            }
+        ).reset_index()
+
+        ckeys = ["To Address", *keys]
+        customer_summary = dispatch.groupby(ckeys, dropna=False).agg(
+            **{
+                "Expiry Date": ("Expiry Date", "max"),
+                "Trade Item Number": ("Trade Item Number", _nonblank_max),
+                "Trade Name": ("Trade Name", _nonblank_max),
+                "Custody": ("Custody", _nonblank_max),
+                "Dispatch Quantity Each": ("Dispatched Quantity", "sum"),
+                "First Dispatch Date": ("Dispatch Date", "min"),
+                "Last Dispatch Date": ("Dispatch Date", "max"),
+            }
+        ).reset_index()
+
+    return receipt_summary, dispatch_summary, supplier_summary, customer_summary
+
+
+def _build_sto_history_from_prepared(
+    prepared: Dict[str, Any],
+    master: pd.DataFrame,
+    prefix: str,
+    *,
+    required_action: str = "",
+) -> pd.DataFrame:
+    receipt = prepared.get("receipt_events")
+    receipt = receipt.copy() if isinstance(receipt, pd.DataFrame) else pd.DataFrame(receipt or [])
+    if receipt.empty:
+        return pd.DataFrame()
+
+    shipment = receipt["Inbound Shipment"].fillna("").astype(str).str.strip().str.upper()
+    source = receipt.loc[shipment.str.startswith(prefix.upper())].copy()
+    if source.empty:
+        return pd.DataFrame()
+
+    source["Received Quantity"] = pd.to_numeric(source["Received Quantity"], errors="coerce").fillna(0)
+    source["Received Date"] = pd.to_datetime(source["Received Date"], errors="coerce")
+    source["Expiry Date"] = pd.to_datetime(source["Expiry Date"], errors="coerce")
+    keys = ["Inbound Shipment", "Supplier Name", "Supplier Code", "BN", "Expiry Month Key", "Generic Item Number"]
+    agg = source.groupby(keys, dropna=False).agg(
+        **{
+            "Receipt Expiry Date": ("Expiry Date", "max"),
+            "Trade Item Number": ("Trade Item", _nonblank_max),
+            "Receipt Trade Name": ("Trade Name", _nonblank_max),
+            "Description": ("Description", _nonblank_max),
+            "Item Family Group": ("Item Family Group", _nonblank_max),
+            "Received Quantity Each": ("Received Quantity", "sum"),
+            "First Received Date": ("Received Date", "min"),
+            "Last Received Date": ("Received Date", "max"),
+        }
+    ).reset_index()
+
+    m = master.copy() if master is not None else pd.DataFrame()
+    if m.empty:
+        return pd.DataFrame()
+    m["Generic Item Number"] = m["Generic Item Number"].fillna("").astype(str).str.strip()
+    exact_map = {}
+    generic_map = {}
+    for row in m.to_dict(orient="records"):
+        exact_map.setdefault((str(row.get("BN", "")).strip(), str(row.get("Expiry Month Key", "")).strip()), row)
+        generic = str(row.get("Generic Item Number", "")).strip()
+        if generic:
+            generic_map.setdefault(generic, row)
+
+    rows = []
+    for r in agg.to_dict(orient="records"):
+        exact_key = (str(r.get("BN", "")).strip(), str(r.get("Expiry Month Key", "")).strip())
+        generic = str(r.get("Generic Item Number", "")).strip()
+        ref = exact_map.get(exact_key) or generic_map.get(generic)
+        if not ref:
+            continue
+        package_size = pd.to_numeric(pd.Series([ref.get("PackageSize", 0)]), errors="coerce").fillna(0).iloc[0]
+        qty_each = float(r.get("Received Quantity Each", 0) or 0)
+        row = {
+            "Inbound Shipment": r.get("Inbound Shipment", ""),
+            "Source Warehouse": r.get("Supplier Name", ""),
+            "Source Warehouse Code": r.get("Supplier Code", ""),
+            "BN": r.get("BN", ""),
+            "Expiry Month Key": r.get("Expiry Month Key", ""),
+            "Expiry Date": ref.get("Expiry Date") if pd.notna(ref.get("Expiry Date")) else r.get("Receipt Expiry Date"),
+            "Generic Item Number": generic,
+            "GTIN": ref.get("GTIN", ""),
+            "Drug Name": ref.get("Drug Name", ""),
+            "Trade Description": ref.get("Trade Description", "") or r.get("Receipt Trade Name", ""),
+            "Description": r.get("Description", ""),
+            "Item Family Group": r.get("Item Family Group", ""),
+            "PackageSize": float(package_size or 0),
+            "Received Quantity Each": qty_each,
+            "Received Quantity Pack": (qty_each / float(package_size)) if float(package_size or 0) > 0 else 0.0,
+            "First Received Date": r.get("First Received Date"),
+            "Last Received Date": r.get("Last Received Date"),
+            "SFDA Match Status": (
+                "Exact Batch in SFDA-Relevant Master" if exact_key in exact_map
+                else "Generic Exists - STO Batch Missing from SFDA"
+            ),
+        }
+        if required_action:
+            row["Required Action"] = required_action
+        rows.append(row)
+    return pd.DataFrame(rows)
+
 def process_historical_build_job(
     job_id: str,
     input_manifest: Dict[str, Any],
@@ -233,7 +422,11 @@ def process_historical_build_job(
 
         sfda_df = _read_input_group(storage, sfda_items)
         sfda_source_name = str(sfda_items[0].get("file_name", "") or "")
-        replace_latest_sfda_snapshot(sfda_df, sfda_source_name)
+        # Rebuild is two-phase: do not mutate live historical state before the
+        # new dataset and workbook are fully prepared. Append keeps the existing
+        # immediate snapshot behavior.
+        if operation == "append":
+            replace_latest_sfda_snapshot(sfda_df, sfda_source_name)
         mark_stage("read_inputs_and_sfda_snapshot")
         ensure_active()
 
@@ -266,29 +459,20 @@ def process_historical_build_job(
             )
             mark_stage("remove_excluded_historical_scope")
 
-        if operation == "rebuild":
+        inserted = {"receipt_events": 0, "dispatch_events": 0}
+        if operation == "append":
             update_historical_build_job(
                 job_id,
-                progress=32,
-                current_stage="Resetting previous historical data",
+                progress=40,
+                current_stage="Saving receipt and dispatch events",
             )
-            reset_history()
-            mark_stage("reset_previous_history")
+            inserted = append_events(
+                prepared["receipt_records"],
+                prepared["dispatch_records"],
+                assume_empty=False,
+            )
+            mark_stage("save_receipt_dispatch_events")
             ensure_active()
-
-        update_historical_build_job(
-            job_id,
-            progress=40,
-            current_stage="Saving receipt and dispatch events",
-        )
-        inserted = append_events(
-            prepared["receipt_records"],
-            prepared["dispatch_records"],
-            assume_empty=(operation == "rebuild"),
-        )
-
-        mark_stage("save_receipt_dispatch_events")
-        ensure_active()
 
         has_new_events = (
             inserted.get("receipt_events", 0) > 0
@@ -350,63 +534,47 @@ def process_historical_build_job(
             sto_incoming_history = get_sto_incoming_history_df()
             sto_return_history = get_sto_return_history_df()
         else:
-            # Explicit rebuild remains the maintenance/recovery path. Keep each
-            # expensive unit visible so CurrentStage identifies the real bottleneck.
+            # SAFE REBUILD: build the complete replacement dataset from the new
+            # uploads in memory. The currently active historical SQL data remains
+            # available and untouched throughout preparation and export.
             update_historical_build_job(
                 job_id,
-                progress=55,
-                current_stage="Loading receipt and dispatch summaries",
+                progress=35,
+                current_stage="Building new historical summaries",
             )
-            receipt_summary, dispatch_summary = get_event_summaries()
-            mark_stage("load_event_summaries")
+            receipt_summary, dispatch_summary, supplier_summary, customer_summary = (
+                _build_rebuild_summaries_from_prepared(prepared)
+            )
+            mark_stage("build_new_summaries_in_memory")
             ensure_active()
 
             update_historical_build_job(
                 job_id,
-                progress=64,
-                current_stage="Matching WMS batches with SFDA",
+                progress=55,
+                current_stage="Matching new WMS history with SFDA",
             )
             master = engine.build_master_from_summaries(
                 receipt_summary, dispatch_summary, prepared["sfda_summary"],
             )
             logger.info(
-                "HISTORICAL_PERF job_id=%s matching_result receipt_groups=%s dispatch_groups=%s master_rows=%s",
-                job_id,
-                len(receipt_summary),
-                len(dispatch_summary),
-                len(master),
+                "HISTORICAL_PERF job_id=%s safe_rebuild receipt_groups=%s dispatch_groups=%s master_rows=%s",
+                job_id, len(receipt_summary), len(dispatch_summary), len(master),
             )
-            mark_stage("match_wms_sfda_build_master")
+            mark_stage("build_new_batch_master_in_memory")
             ensure_active()
 
             update_historical_build_job(
                 job_id,
-                progress=74,
-                current_stage="Saving Batch Master to database",
+                progress=70,
+                current_stage="Building new Supplier, Customer and STO History",
             )
-            replace_batch_master(master)
-            mark_stage("save_batch_master")
-            ensure_active()
-
-            update_historical_build_job(
-                job_id,
-                progress=80,
-                current_stage="Building Supplier and Customer History",
-            )
-            supplier_summary, customer_summary = get_history_summaries()
-            mark_stage("load_history_summaries")
-            ensure_active()
-
             supplier_history = engine.build_supplier_history(supplier_summary, master)
             customer_history = engine.build_customer_history(customer_summary, master)
-            mark_stage("build_histories_in_memory")
-            ensure_active()
-
-            replace_supplier_history(supplier_history)
-            replace_customer_history(customer_history)
-            sto_incoming_history = get_sto_incoming_history_df()
-            sto_return_history = get_sto_return_history_df()
-            mark_stage("save_histories_and_load_sto")
+            sto_incoming_history = _build_sto_history_from_prepared(prepared, master, "TRK800")
+            sto_return_history = _build_sto_history_from_prepared(
+                prepared, master, "TRK49", required_action="Cancel Previous RSD Dispatch"
+            )
+            mark_stage("build_new_histories_in_memory")
             ensure_active()
 
         ensure_active()
@@ -473,6 +641,38 @@ def process_historical_build_job(
         )
         del exported, file_bytes
 
+        activation_result: Dict[str, Any] = {}
+        if operation == "rebuild":
+            ensure_active()
+            update_historical_build_job(
+                job_id,
+                progress=98,
+                current_stage="Activating new historical database",
+            )
+
+            def _activation_progress(_progress: int, stage: str, _extra: Dict[str, Any]) -> None:
+                update_historical_build_job(
+                    job_id, progress=98, current_stage=stage
+                )
+
+            activation_result = activate_historical_rebuild(
+                prepared["receipt_records"],
+                prepared["dispatch_records"],
+                master,
+                supplier_history,
+                customer_history,
+                progress_callback=_activation_progress,
+            )
+            # Activate the SFDA snapshot only after the historical replacement
+            # transaction succeeds. A failed rebuild therefore leaves both the
+            # previous history and previous snapshot intact.
+            replace_latest_sfda_snapshot(sfda_df, sfda_source_name)
+            inserted = {
+                "receipt_events": int(activation_result.get("inserted_receipt_events", 0)),
+                "dispatch_events": int(activation_result.get("inserted_dispatch_events", 0)),
+            }
+            mark_stage("activate_new_historical_database")
+
         summary = {
             "asn_files": len(input_manifest.get("asn_files", [])),
             "dispatch_files": len(input_manifest.get("dispatch_files", [])),
@@ -487,6 +687,7 @@ def process_historical_build_job(
             "sto_return_rows": len(sto_return_history),
             "stage_timings_seconds": timings,
             "total_seconds": round(perf_counter() - job_started_at, 3),
+            "activation": activation_result,
         }
 
         ensure_active()
