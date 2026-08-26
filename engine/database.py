@@ -1769,152 +1769,269 @@ def get_reconciliation_history(limit: int = 100) -> List[Dict[str, Any]]:
     return history
 
 
-def reset_history() -> Dict[str, Any]:
+def reset_history() -> None:
     """Delete cumulative historical tables for the current warehouse only.
 
-    Historical Rebuild can contain more than a million DispatchEvents rows for
-    one warehouse. Deleting all of them in one transaction causes very large
-    Azure SQL I/O/log pressure and makes the worker appear stuck at 32%.
-
-    HISTORICAL_BATCHED_RESET_V1 deletes the two large event tables in bounded
-    batches and commits every batch. Smaller derived/history tables are deleted
-    directly and committed per table. The result is identical to the previous
-    rebuild reset, but each transaction is bounded and restart-safe.
+    Database connections always carry WarehouseID session context and Version 6
+    RLS isolates these tables. This function is used only by Historical Build
+    operation=rebuild and does not touch users, warehouse configuration, GLN or
+    reference data.
     """
 
     initialize_database()
 
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            from engine.warehouse_context import current_warehouse_id
+            warehouse_id = int(current_warehouse_id())
+            cursor.execute(
+                """
+                DELETE FROM dbo.CustomerHistory WHERE WarehouseID = ?;
+                DELETE FROM dbo.SupplierHistory WHERE WarehouseID = ?;
+                DELETE FROM dbo.BatchMaster WHERE WarehouseID = ?;
+                DELETE FROM dbo.DispatchEvents WHERE WarehouseID = ?;
+                DELETE FROM dbo.ReceiptEvents WHERE WarehouseID = ?;
+                DELETE FROM dbo.RunHistory WHERE WarehouseID = ?;
+                """,
+                (warehouse_id, warehouse_id, warehouse_id, warehouse_id, warehouse_id, warehouse_id),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+
+
+def activate_historical_rebuild(
+    receipt_rows: List[Dict[str, Any]],
+    dispatch_rows: List[Dict[str, Any]],
+    master: pd.DataFrame,
+    supplier_history: pd.DataFrame,
+    customer_history: pd.DataFrame,
+    *,
+    progress_callback: Optional[Callable[[int, str, Dict[str, Any]], None]] = None,
+    delete_batch_size: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Atomically activate a fully-built Historical Rebuild dataset.
+
+    Rebuild preparation/export is completed before this function is called.  The
+    current warehouse's live historical rows remain untouched until activation.
+    Activation then replaces raw events + derived history in ONE SQL transaction.
+    If any delete or insert fails, rollback restores the previous historical
+    database exactly as it was before activation.
+
+    DELETE TOP batches bound individual statements while intentionally avoiding
+    commits between batches; atomic rollback safety is more important here than
+    transaction-log minimization.  The warehouse heartbeat runs independently in
+    the Historical worker while this transaction is active.
+    """
+    initialize_database()
     from engine.warehouse_context import current_warehouse_id
 
     warehouse_id = int(current_warehouse_id())
-    if warehouse_id < 1:
-        raise RuntimeError("A valid WarehouseID is required for historical reset.")
-
-    try:
-        batch_size = int(os.getenv("HISTORICAL_RESET_BATCH_SIZE", "10000") or 10000)
-    except (TypeError, ValueError):
-        batch_size = 10000
+    batch_size = int(
+        delete_batch_size
+        or os.getenv("HISTORICAL_ACTIVATION_DELETE_BATCH_SIZE", "10000")
+        or 10000
+    )
     batch_size = max(1000, min(batch_size, 50000))
 
-    reset_started = time.perf_counter()
-    deleted: Dict[str, int] = {}
+    prepared_receipts = _deduplicate_parameters(receipt_rows or [], _receipt_parameters)
+    prepared_dispatches = _deduplicate_parameters(dispatch_rows or [], _dispatch_parameters)
 
-    logger.info(
-        "HISTORICAL_BATCHED_RESET_V1 started. WarehouseID=%s batch_size=%s",
-        warehouse_id,
-        batch_size,
-    )
+    batch_master_rows = [
+        (
+            _text(row, "BN"),
+            _text(row, "Expiry Month Key"),
+            _value(row, "Expiry Date"),
+            _text(row, "Generic Item Number"),
+            _text_with_fallback(row, "Trade Item Number", "Trade Item"),
+            _text_with_fallback(row, "Trade Description", "Trade Name"),
+            _text(row, "GTIN"),
+            _text(row, "Drug Name"),
+            _number(row, "PackageSize"),
+            _number_with_fallback(row, "Quantity", "SFDA Quantity"),
+            _number(row, "Active"),
+            _number(row, "Quantity sent pending"),
+            _number(row, "Quantity Receive Pending"),
+            _text(row, "Description"),
+            _text(row, "Item Family Group"),
+            _text(row, "Custody"),
+            _text(row, "Supplier Name"),
+            _text(row, "Supplier Code"),
+            _number_with_fallback(row, "Received Quantity Each", "Total Receive Qty"),
+            _number(row, "Total Dispatched Qty"),
+            _integer(row, "Receive Runs"),
+            _integer(row, "Dispatch Runs"),
+            _value(row, "First Received Date"),
+            _value(row, "Last Received Date"),
+            _value(row, "First Dispatch Date"),
+            _value(row, "Last Dispatch Date"),
+            _text(row, "Generic Exists in SFDA", "Yes") or "Yes",
+            _value(row, "Last Updated", pd.Timestamp.utcnow().tz_localize(None)),
+        )
+        for row in (master if master is not None else pd.DataFrame()).to_dict(orient="records")
+    ]
+
+    supplier_rows = [(
+        _text(r, "Supplier Name"), _text(r, "Supplier Code"), _text(r, "GTIN"),
+        _text(r, "Drug Name"), _text(r, "Generic Item Number"), _text(r, "Description"),
+        _text(r, "Trade Description"), _text(r, "BN"), _text(r, "Expiry Month Key"),
+        _value(r, "Expiry Date"), _number(r, "PackageSize"),
+        _number(r, "Received Quantity Each"), _number(r, "Received Quantity Pack"),
+        _value(r, "First Received Date"), _value(r, "Last Received Date"),
+        _text(r, "Item Family Group"), _text(r, "Trade Item Number")
+    ) for r in (supplier_history if supplier_history is not None else pd.DataFrame()).to_dict(orient="records")]
+
+    customer_rows = [(
+        _text(r, "To Address"), _text(r, "GLN"), _text(r, "GTIN"),
+        _text(r, "Drug Name"), _text(r, "Generic Item Number"),
+        _text(r, "Trade Description"), _text(r, "BN"), _text(r, "Expiry Month Key"),
+        _value(r, "Expiry Date"), _number(r, "PackageSize"),
+        _number(r, "Dispatch Quantity Each"), _number(r, "Dispatch Quantity Pack"),
+        _value(r, "First Dispatch Date"), _value(r, "Last Dispatch Date"),
+        _text(r, "Custody"), _text(r, "Trade Item Number")
+    ) for r in (customer_history if customer_history is not None else pd.DataFrame()).to_dict(orient="records")]
+
+    receipt_insert_sql = r"""
+        INSERT INTO dbo.ReceiptEvents
+        (EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+         TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
+         ASNLine, SupplierName, SupplierCode, Description, ItemFamilyGroup,
+         ReceivedDate)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """
+    dispatch_insert_sql = r"""
+        INSERT INTO dbo.DispatchEvents
+        (EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+         TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
+         SalesOrderNumber, OrderLine, DispatchDate, Custody)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """
+    master_insert_sql = r"""
+        INSERT INTO dbo.BatchMaster
+        (BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber, TradeItemNumber,
+         TradeName, GTIN, DrugName, PackageSize, SFDAQuantity, Active,
+         QuantitySentPending, QuantityReceivePending, Description, ItemFamilyGroup,
+         Custody, SupplierName, SupplierCode, TotalReceiveQty, TotalDispatchedQty,
+         ReceiveRuns, DispatchRuns, FirstReceivedDate, LastReceivedDate,
+         FirstDispatchDate, LastDispatchDate, GenericExistsInSFDA, LastUpdated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """
+    supplier_insert_sql = r"""
+        INSERT INTO dbo.SupplierHistory
+        (SupplierName, SupplierCode, GTIN, DrugName, GenericItemNumber, Description,
+         TradeDescription, BN, ExpiryMonthKey, ExpiryDate, PackageSize,
+         ReceivedQuantityEach, ReceivedQuantityPack, FirstReceivedDate,
+         LastReceivedDate, ItemFamilyGroup, TradeItemNumber, LastUpdated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
+    """
+    customer_insert_sql = r"""
+        INSERT INTO dbo.CustomerHistory
+        (ToAddress, GLN, GTIN, DrugName, GenericItemNumber, TradeDescription,
+         BN, ExpiryMonthKey, ExpiryDate, PackageSize, DispatchQuantityEach,
+         DispatchQuantityPack, FirstDispatchDate, LastDispatchDate,
+         Custody, TradeItemNumber, LastUpdated)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
+    """
+
+    deleted: Dict[str, int] = {}
+    started_at = time.perf_counter()
+
+    def emit(stage: str, extra: Optional[Dict[str, Any]] = None) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(98, stage, dict(extra or {}))
+        except Exception:
+            logger.exception("HISTORICAL_SAFE_ACTIVATION progress callback failed.")
 
     with Database().connect() as connection:
         cursor = connection.cursor()
         try:
-            # These tables are comparatively small. Commit each table so a
-            # failure never holds one warehouse's complete reset in one giant
-            # transaction.
-            for table_name in (
-                "CustomerHistory",
-                "SupplierHistory",
-                "BatchMaster",
-            ):
-                table_started = time.perf_counter()
-                cursor.execute(
-                    f"DELETE FROM dbo.[{table_name}] WHERE WarehouseID = ?;",
-                    warehouse_id,
-                )
-                rows = max(int(cursor.rowcount or 0), 0)
-                connection.commit()
-                deleted[table_name] = rows
-                logger.info(
-                    "HISTORICAL_BATCHED_RESET_V1 table complete. "
-                    "WarehouseID=%s table=%s deleted=%s seconds=%.3f",
-                    warehouse_id,
-                    table_name,
-                    rows,
-                    time.perf_counter() - table_started,
-                )
+            # No small statement-level timeout during the final atomic switch.
+            # The independent job heartbeat keeps the run alive/observable.
+            cursor.timeout = int(os.getenv("HISTORICAL_ACTIVATION_SQL_TIMEOUT_SECONDS", "0") or 0)
+        except Exception:
+            pass
 
-            # Large event tables must never be deleted as one unbounded
-            # transaction. SQL Server TOP uses a validated integer literal here
-            # because TOP parameterisation is driver/version-sensitive.
-            for table_name in ("DispatchEvents", "ReceiptEvents"):
-                table_started = time.perf_counter()
-                table_deleted = 0
-                batch_number = 0
-
-                while True:
-                    batch_started = time.perf_counter()
-                    cursor.execute(
-                        f"DELETE TOP ({batch_size}) FROM dbo.[{table_name}] "
-                        "WHERE WarehouseID = ?;",
-                        warehouse_id,
-                    )
-                    rows = max(int(cursor.rowcount or 0), 0)
-                    connection.commit()
-
-                    batch_number += 1
-                    table_deleted += rows
-                    logger.info(
-                        "HISTORICAL_BATCHED_RESET_V1 batch complete. "
-                        "WarehouseID=%s table=%s batch=%s deleted=%s "
-                        "total_deleted=%s seconds=%.3f",
-                        warehouse_id,
-                        table_name,
-                        batch_number,
-                        rows,
-                        table_deleted,
-                        time.perf_counter() - batch_started,
-                    )
-
-                    if rows < batch_size:
-                        break
-
-                deleted[table_name] = table_deleted
-                logger.info(
-                    "HISTORICAL_BATCHED_RESET_V1 table complete. "
-                    "WarehouseID=%s table=%s deleted=%s seconds=%.3f",
-                    warehouse_id,
-                    table_name,
-                    table_deleted,
-                    time.perf_counter() - table_started,
-                )
-
-            # RunHistory is last to preserve the previous reset semantics.
-            table_started = time.perf_counter()
-            cursor.execute(
-                "DELETE FROM dbo.RunHistory WHERE WarehouseID = ?;",
-                warehouse_id,
-            )
-            rows = max(int(cursor.rowcount or 0), 0)
-            connection.commit()
-            deleted["RunHistory"] = rows
+        try:
             logger.info(
-                "HISTORICAL_BATCHED_RESET_V1 table complete. "
-                "WarehouseID=%s table=RunHistory deleted=%s seconds=%.3f",
-                warehouse_id,
-                rows,
-                time.perf_counter() - table_started,
+                "HISTORICAL_SAFE_ACTIVATION_V1 started. WarehouseID=%s delete_batch_size=%s "
+                "new_receipts=%s new_dispatches=%s new_master=%s",
+                warehouse_id, batch_size, len(prepared_receipts), len(prepared_dispatches), len(batch_master_rows),
             )
 
+            # Derived tables first, raw events last. No commit until every new row
+            # has been inserted successfully.
+            for table in ("CustomerHistory", "SupplierHistory", "BatchMaster", "DispatchEvents", "ReceiptEvents"):
+                table_deleted = 0
+                batch_no = 0
+                while True:
+                    cursor.execute(
+                        f"DELETE TOP ({batch_size}) FROM dbo.[{table}] WHERE WarehouseID = ?;",
+                        warehouse_id,
+                    )
+                    affected = max(0, int(cursor.rowcount or 0))
+                    table_deleted += affected
+                    batch_no += 1
+                    if affected:
+                        logger.info(
+                            "HISTORICAL_SAFE_ACTIVATION_V1 delete batch. WarehouseID=%s table=%s batch=%s deleted=%s total_deleted=%s",
+                            warehouse_id, table, batch_no, affected, table_deleted,
+                        )
+                        emit(
+                            f"Activating new historical data: clearing previous {table}",
+                            {"table": table, "batch": batch_no, "deleted": affected, "total_deleted": table_deleted},
+                        )
+                    if affected < batch_size:
+                        break
+                deleted[table] = table_deleted
+
+            inserted_receipts = _bulk_insert_rows(cursor, receipt_insert_sql, prepared_receipts)
+            inserted_dispatches = _bulk_insert_rows(cursor, dispatch_insert_sql, prepared_dispatches)
+            inserted_master = _bulk_insert_rows(cursor, master_insert_sql, batch_master_rows)
+            inserted_supplier = _bulk_insert_rows(cursor, supplier_insert_sql, supplier_rows)
+            inserted_customer = _bulk_insert_rows(cursor, customer_insert_sql, customer_rows)
+
+            # Verify the exact new raw-event cardinality before making the switch permanent.
+            live_receipts = int(cursor.execute(
+                "SELECT COUNT_BIG(*) FROM dbo.ReceiptEvents WHERE WarehouseID = ?;", warehouse_id
+            ).fetchone()[0] or 0)
+            live_dispatches = int(cursor.execute(
+                "SELECT COUNT_BIG(*) FROM dbo.DispatchEvents WHERE WarehouseID = ?;", warehouse_id
+            ).fetchone()[0] or 0)
+            if live_receipts != inserted_receipts or live_dispatches != inserted_dispatches:
+                raise RuntimeError(
+                    "Historical activation verification failed before commit: "
+                    f"ReceiptEvents expected={inserted_receipts} actual={live_receipts}; "
+                    f"DispatchEvents expected={inserted_dispatches} actual={live_dispatches}."
+                )
+
+            connection.commit()
         except Exception:
             connection.rollback()
             logger.exception(
-                "HISTORICAL_BATCHED_RESET_V1 failed. WarehouseID=%s deleted_so_far=%s",
+                "HISTORICAL_SAFE_ACTIVATION_V1 failed; previous historical data was restored by rollback. WarehouseID=%s",
                 warehouse_id,
-                deleted,
             )
             raise
 
     result = {
+        "status": "Completed",
+        "version": "HISTORICAL_SAFE_ACTIVATION_V1",
         "warehouse_id": warehouse_id,
-        "engine": "HISTORICAL_BATCHED_RESET_V1",
-        "batch_size": batch_size,
-        "deleted": deleted,
-        "total_deleted": int(sum(deleted.values())),
-        "seconds": round(time.perf_counter() - reset_started, 3),
+        "deleted_old_rows": deleted,
+        "inserted_receipt_events": inserted_receipts,
+        "inserted_dispatch_events": inserted_dispatches,
+        "inserted_batch_master_rows": inserted_master,
+        "inserted_supplier_history_rows": inserted_supplier,
+        "inserted_customer_history_rows": inserted_customer,
+        "seconds": round(time.perf_counter() - started_at, 3),
     }
-    logger.info("HISTORICAL_BATCHED_RESET_V1 completed. %s", result)
+    logger.info("HISTORICAL_SAFE_ACTIVATION_V1 completed. %s", result)
     return result
-
 
 def get_historical_status() -> Dict[str, Any]:
     """Return lightweight warehouse-scoped historical readiness/dashboard coverage.
@@ -2312,17 +2429,17 @@ def reset_current_warehouse_data(
     progress_callback: Optional[Callable[[int, str, Dict[str, Any]], None]] = None,
     batch_size: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Fast, explicit reset of operational data for exactly one warehouse.
+    """Verified batched reset of operational data for exactly one warehouse.
 
-    WAREHOUSE_RESET_V6_FAST uses a fixed WarehouseID-scoped delete plan for
+    WAREHOUSE_RESET_V7_BATCHED uses a fixed WarehouseID-scoped delete plan for
     operational tables. Before deleting FullReconciliationRuns it also discovers
     only its direct FK children, because legacy child tables may not carry a
     WarehouseID column and must be scoped safely through the parent FullRunID.
 
-    Each table is committed immediately after deletion.  This keeps locks and
-    transaction-log pressure bounded without turning a reset into thousands of
-    small DELETE TOP batches.  The operation remains idempotent: running it
-    again simply finds zero rows in tables that were already cleared.
+    Large tables are drained with committed DELETE TOP batches. This prevents a
+    single 180-second timeout from leaving DispatchEvents/ReceiptEvents behind
+    after earlier tables were already committed. The operation remains
+    idempotent and performs a final zero-row verification before Success.
 
     Warehouse configuration and reference data are preserved: Warehouses,
     ApplicationUsers, AuthSessions, GLN mapping, Pack Size and business rules.
@@ -2386,7 +2503,7 @@ def reset_current_warehouse_data(
             progress_callback(int(progress), str(stage), dict(extra or {}))
         except Exception:
             # Progress reporting must never make destructive work fail.
-            logger.exception("WAREHOUSE_RESET_V6_FAST progress callback failed.")
+            logger.exception("WAREHOUSE_RESET_V7_BATCHED progress callback failed.")
 
     with Database().connect() as connection:
         cursor = connection.cursor()
@@ -2399,7 +2516,7 @@ def reset_current_warehouse_data(
 
         try:
             logger.info(
-                "WAREHOUSE_RESET_V6_FAST started. WarehouseID=%s tables=%s",
+                "WAREHOUSE_RESET_V7_BATCHED started. WarehouseID=%s tables=%s",
                 resolved_warehouse_id,
                 len(reset_tables),
             )
@@ -2501,40 +2618,62 @@ def reset_current_warehouse_data(
                     },
                 )
 
-                # One direct warehouse-scoped DELETE per known table.  This is
-                # intentionally not DELETE TOP(...) batching: reset should be a
-                # fast clear operation, not a long-running row-draining loop.
-                cursor.execute(
-                    f"DELETE FROM dbo.{q(table)} WHERE WarehouseID = ?;",
-                    resolved_warehouse_id,
+                # Delete in committed batches.  The previous implementation used
+                # one large DELETE with a 180-second statement timeout.  Because
+                # earlier tables were committed first, a timeout on DispatchEvents
+                # or ReceiptEvents could leave the warehouse only partially reset.
+                # Bounded batches make progress durable and observable instead.
+                effective_batch_size = int(
+                    batch_size
+                    or os.getenv("WAREHOUSE_RESET_BATCH_SIZE", "10000")
+                    or 10000
                 )
-                affected = max(0, int(cursor.rowcount or 0))
-                connection.commit()
-                deleted[table] = deleted.get(table, 0) + affected
+                effective_batch_size = max(1000, min(effective_batch_size, 50000))
+                table_deleted = 0
+                batch_no = 0
+                while True:
+                    cursor.execute(
+                        f"DELETE TOP ({effective_batch_size}) FROM dbo.{q(table)} WHERE WarehouseID = ?;",
+                        resolved_warehouse_id,
+                    )
+                    affected = max(0, int(cursor.rowcount or 0))
+                    connection.commit()
+                    table_deleted += affected
+                    batch_no += 1
+                    if affected:
+                        emit(
+                            progress,
+                            f"Clearing {table}",
+                            {
+                                "current_table": table,
+                                "table_index": index,
+                                "table_total": total,
+                                "batch": batch_no,
+                                "batch_deleted": affected,
+                                "table_deleted": table_deleted,
+                                "deleted_rows_total": int(sum(deleted.values())) + table_deleted,
+                            },
+                        )
+                        logger.info(
+                            "WAREHOUSE_RESET_V7_BATCHED batch. WarehouseID=%s table=%s batch=%s deleted=%s table_deleted=%s.",
+                            resolved_warehouse_id, table, batch_no, affected, table_deleted,
+                        )
+                    if affected < effective_batch_size:
+                        break
 
+                deleted[table] = deleted.get(table, 0) + table_deleted
                 logger.info(
-                    "WAREHOUSE_RESET_V6_FAST cleared %s row(s) from %s for WarehouseID=%s.",
-                    affected,
-                    table,
-                    resolved_warehouse_id,
+                    "WAREHOUSE_RESET_V7_BATCHED table complete. WarehouseID=%s table=%s deleted=%s batches=%s.",
+                    resolved_warehouse_id, table, table_deleted, batch_no,
                 )
 
             # Quick verification only across the core operational tables.  No
             # expensive joins/aggregations are needed after a reset.
             emit(70, "Verifying warehouse database is empty", {"deleted_rows_total": int(sum(deleted.values()))})
-            verification_tables = (
-                "ReceiptEvents",
-                "DispatchEvents",
-                "BatchMaster",
-                "SupplierHistory",
-                "CustomerHistory",
-                "LatestSFDASnapshot",
-                "LatestInventorySnapshot",
-                "DailyAcceptTransactions",
-                "DailyDispatchTransactions",
-                "FullDispatchTransactions",
-                "DailyProcessedTransactions",
-            )
+            # Verify every WarehouseID-scoped table that participated in the
+            # reset, not only a small core subset. Success is impossible while
+            # any warehouse-owned row remains.
+            verification_tables = tuple(existing_tables)
             remaining: Dict[str, int] = {}
             for table in verification_tables:
                 if table not in existing_tables:
@@ -2557,7 +2696,7 @@ def reset_current_warehouse_data(
 
             result = {
                 "status": "Completed",
-                "version": "WAREHOUSE_RESET_V6_FAST",
+                "version": "WAREHOUSE_RESET_V7_BATCHED",
                 "warehouse_id": resolved_warehouse_id,
                 "deleted_rows": deleted,
                 "deleted_rows_total": int(sum(deleted.values())),
@@ -2574,7 +2713,7 @@ def reset_current_warehouse_data(
                 ],
             }
             logger.info(
-                "WAREHOUSE_RESET_V6_FAST completed. WarehouseID=%s deleted_rows_total=%s tables=%s",
+                "WAREHOUSE_RESET_V7_BATCHED completed. WarehouseID=%s deleted_rows_total=%s tables=%s",
                 resolved_warehouse_id,
                 result["deleted_rows_total"],
                 result["tables_cleared"],
