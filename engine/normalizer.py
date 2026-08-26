@@ -589,6 +589,21 @@ class Normalizer:
                 ["PackageSize", "Package Size"],
             )
         )
+        # Keep the disambiguation fields from config/pack_size.xlsx.
+        # Historical Pack Size resolution uses PharmaceuticalForm and, when
+        # available, Size/SizeUnit/PackageTypes against the WMS Trade text.
+        df["PharmaceuticalForm"] = Normalizer.text(
+            Normalizer._optional_series(df, ["PharmaceuticalForm", "Pharmaceutical Form"])
+        )
+        df["Size"] = Normalizer.number(
+            Normalizer._optional_series(df, ["Size"], default="")
+        )
+        df["SizeUnit"] = Normalizer.text(
+            Normalizer._optional_series(df, ["SizeUnit", "Size Unit"])
+        )
+        df["PackageTypes"] = Normalizer.text(
+            Normalizer._optional_series(df, ["PackageTypes", "Package Types"])
+        )
 
         return df
 
