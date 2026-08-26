@@ -24,7 +24,8 @@ APPLICATION_NAME = "SFDA Reconciliation"
 APPLICATION_VERSION = "6.0.0"
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 _PROCESS_STARTED_AT = datetime.now(timezone.utc)
-_RESET_ENGINE_VERSION = "WAREHOUSE_RESET_V6_FAST"
+_RESET_ENGINE_VERSION = "WAREHOUSE_RESET_V7_BATCHED"
+_HISTORICAL_REBUILD_ENGINE_VERSION = "SAFE_REBUILD_V7_20260826"
 
 
 _VARIANCE_CACHE: Dict[int, Dict[str, Any]] = {}
@@ -3588,8 +3589,8 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
             operation = str(payload.get("operation", "append")).strip().lower()
             logger.info(
                 "Canonical background worker received Historical Build. "
-                "job_id=%s operation=%s warehouse_id=%s",
-                job_id, operation, warehouse_id,
+                "job_id=%s operation=%s warehouse_id=%s engine=%s",
+                job_id, operation, warehouse_id, _HISTORICAL_REBUILD_ENGINE_VERSION,
             )
             if not claim_historical_build_job(job_id):
                 existing = get_historical_build_job(job_id)
