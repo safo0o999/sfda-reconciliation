@@ -360,6 +360,19 @@ def _number(
     return float(value)
 
 
+def _package_size(
+    row: Dict[str, Any],
+    name: str = "PackageSize",
+) -> float:
+    """Return a strictly positive operational PackageSize.
+
+    Business rule: Pack Size must never be stored as zero. Any missing,
+    invalid, null, or non-positive value falls back to 1.
+    """
+    value = _number(row, name, 1.0)
+    return float(value) if float(value) > 0 else 1.0
+
+
 def _number_with_fallback(
     row: Dict[str, Any],
     primary_name: str,
@@ -1380,7 +1393,7 @@ def replace_supplier_history(history: pd.DataFrame) -> Dict[str, Any]:
         _text(r, "Supplier Name"), _text(r, "Supplier Code"), _text(r, "GTIN"),
         _text(r, "Drug Name"), _text(r, "Generic Item Number"), _text(r, "Description"),
         _text(r, "Trade Description"), _text(r, "BN"), _text(r, "Expiry Month Key"),
-        _value(r, "Expiry Date"), _number(r, "PackageSize"),
+        _value(r, "Expiry Date"), _package_size(r, "PackageSize"),
         _number(r, "Received Quantity Each"), _number(r, "Received Quantity Pack"),
         _value(r, "First Received Date"), _value(r, "Last Received Date"),
         _text(r, "Item Family Group"), _text(r, "Trade Item Number")
@@ -1403,7 +1416,7 @@ def replace_customer_history(history: pd.DataFrame) -> Dict[str, Any]:
         _text(r, "To Address"), _text(r, "GLN"), _text(r, "GTIN"),
         _text(r, "Drug Name"), _text(r, "Generic Item Number"),
         _text(r, "Trade Description"), _text(r, "BN"), _text(r, "Expiry Month Key"),
-        _value(r, "Expiry Date"), _number(r, "PackageSize"),
+        _value(r, "Expiry Date"), _package_size(r, "PackageSize"),
         _number(r, "Dispatch Quantity Each"), _number(r, "Dispatch Quantity Pack"),
         _value(r, "First Dispatch Date"), _value(r, "Last Dispatch Date"),
         _text(r, "Custody"), _text(r, "Trade Item Number")
@@ -1554,7 +1567,7 @@ def replace_batch_master(master: pd.DataFrame) -> Dict[str, Any]:
             ),
             _text(row, "GTIN"),
             _text(row, "Drug Name"),
-            _number(row, "PackageSize"),
+            _package_size(row, "PackageSize"),
             _number_with_fallback(
                 row,
                 "Quantity",
@@ -1945,7 +1958,7 @@ def activate_historical_rebuild(
                     _text(row, "BN"), _text(row, "Expiry Month Key"), _value(row, "Expiry Date"),
                     _text(row, "Generic Item Number"), _text_with_fallback(row, "Trade Item Number", "Trade Item"),
                     _text_with_fallback(row, "Trade Description", "Trade Name"), _text(row, "GTIN"),
-                    _text(row, "Drug Name"), _number(row, "PackageSize"),
+                    _text(row, "Drug Name"), _package_size(row, "PackageSize"),
                     _number_with_fallback(row, "Quantity", "SFDA Quantity"), _number(row, "Active"),
                     _number(row, "Quantity sent pending"), _number(row, "Quantity Receive Pending"),
                     _text(row, "Description"), _text(row, "Item Family Group"), _text(row, "Custody"),
@@ -1963,14 +1976,14 @@ def activate_historical_rebuild(
                 _text(r, "Supplier Name"), _text(r, "Supplier Code"), _text(r, "GTIN"),
                 _text(r, "Drug Name"), _text(r, "Generic Item Number"), _text(r, "Description"),
                 _text(r, "Trade Description"), _text(r, "BN"), _text(r, "Expiry Month Key"),
-                _value(r, "Expiry Date"), _number(r, "PackageSize"), _number(r, "Received Quantity Each"),
+                _value(r, "Expiry Date"), _package_size(r, "PackageSize"), _number(r, "Received Quantity Each"),
                 _number(r, "Received Quantity Pack"), _value(r, "First Received Date"),
                 _value(r, "Last Received Date"), _text(r, "Item Family Group"), _text(r, "Trade Item Number")
             ) for r in (supplier_history if supplier_history is not None else pd.DataFrame()).to_dict(orient="records")]
             customer_rows = [(
                 _text(r, "To Address"), _text(r, "GLN"), _text(r, "GTIN"), _text(r, "Drug Name"),
                 _text(r, "Generic Item Number"), _text(r, "Trade Description"), _text(r, "BN"),
-                _text(r, "Expiry Month Key"), _value(r, "Expiry Date"), _number(r, "PackageSize"),
+                _text(r, "Expiry Month Key"), _value(r, "Expiry Date"), _package_size(r, "PackageSize"),
                 _number(r, "Dispatch Quantity Each"), _number(r, "Dispatch Quantity Pack"),
                 _value(r, "First Dispatch Date"), _value(r, "Last Dispatch Date"), _text(r, "Custody"),
                 _text(r, "Trade Item Number")
@@ -6185,7 +6198,7 @@ def save_full_dispatch_pending_transactions(
                 "To Be Dispatch",
             ),
         )
-        package_size = max(0.0, _number(row, "PackageSize"))
+        package_size = max(0.0, _package_size(row, "PackageSize"))
         each_qty = pack_qty * package_size
 
         if not bn or expiry is None or pack_qty <= 0:
