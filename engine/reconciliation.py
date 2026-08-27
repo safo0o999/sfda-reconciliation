@@ -557,7 +557,11 @@ class ReconciliationEngine:
         )
         valid_package = sfda_summary["PackageSize"].notna() & sfda_summary["PackageSize"].gt(0)
         sfda_summary["Package Size Status"] = valid_package.map(
-            {True: "Mapped", False: "Missing"}
+            {True: "Mapped", False: "Default 1 - Missing from Pack Size Master"}
+        )
+        sfda_summary["PackageSize"] = (
+            sfda_summary["PackageSize"].fillna(1.0)
+            .where(sfda_summary["PackageSize"].fillna(0).gt(0), 1.0)
         )
         return sfda_summary
 
@@ -734,8 +738,13 @@ class ReconciliationEngine:
             result.get("PackageSize", 0), errors="coerce"
         ).fillna(0)
         result["PackageSize"] = current_pack.where(current_pack.gt(0), mapped_pack)
-        result["Package Size Status"] = result["PackageSize"].gt(0).map(
-            {True: "Mapped", False: "Missing from Pack Size Master"}
+        resolved_positive = result["PackageSize"].gt(0)
+        result["Package Size Status"] = resolved_positive.map(
+            {True: "Mapped", False: "Default 1 - Missing from Pack Size Master"}
+        )
+        result["PackageSize"] = result["PackageSize"].where(
+            resolved_positive,
+            1.0,
         )
         return result.drop(columns=["_Mapped PackageSize"], errors="ignore")
 
