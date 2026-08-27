@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import inspect
 import json
 import logging
 import mimetypes
@@ -44,6 +45,24 @@ from engine.warehouse_context import historical_build_scope, warehouse_scope
 
 
 logger = logging.getLogger("SFDA-Reconciliation.HistoricalJobs")
+
+
+def _supports_keyword_argument(func: Any, keyword: str) -> bool:
+    """Return True when the imported callable accepts the requested keyword.
+
+    Azure can briefly execute mixed worker code during a deployment/recycle.
+    Historical Append must stay compatible with both the pre-optimization
+    database helper signature and the optimized signature that accepts
+    ``include_counts``.
+    """
+    try:
+        parameters = inspect.signature(func).parameters.values()
+        return any(
+            p.name == keyword or p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in parameters
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 class HistoricalBuildCancelled(RuntimeError):
@@ -539,10 +558,23 @@ def process_historical_build_job(
             accept_refresh: Dict[str, Any] = {}
             if receipt_records:
                 refresh_started = perf_counter()
+                accept_kwargs = (
+                    {"include_counts": False}
+                    if _supports_keyword_argument(
+                        refresh_accept_history_incremental, "include_counts"
+                    )
+                    else {}
+                )
+                if not accept_kwargs:
+                    logger.warning(
+                        "Historical Append compatibility mode: "
+                        "refresh_accept_history_incremental does not expose "
+                        "include_counts yet; continuing without the optimization flag."
+                    )
                 accept_refresh = refresh_accept_history_incremental(
                     receipt_records,
                     sfda_df,
-                    include_counts=False,
+                    **accept_kwargs,
                 )
                 timings["append_accept_refresh"] = round(
                     perf_counter() - refresh_started, 3
@@ -561,9 +593,22 @@ def process_historical_build_job(
             dispatch_refresh: Dict[str, Any] = {}
             if dispatch_records:
                 refresh_started = perf_counter()
+                dispatch_kwargs = (
+                    {"include_counts": False}
+                    if _supports_keyword_argument(
+                        refresh_dispatch_history_incremental, "include_counts"
+                    )
+                    else {}
+                )
+                if not dispatch_kwargs:
+                    logger.warning(
+                        "Historical Append compatibility mode: "
+                        "refresh_dispatch_history_incremental does not expose "
+                        "include_counts yet; continuing without the optimization flag."
+                    )
                 dispatch_refresh = refresh_dispatch_history_incremental(
                     dispatch_records,
-                    include_counts=False,
+                    **dispatch_kwargs,
                 )
                 timings["append_dispatch_refresh"] = round(
                     perf_counter() - refresh_started, 3
