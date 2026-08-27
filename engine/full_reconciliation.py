@@ -508,11 +508,10 @@ class FullReconciliationEngine:
             & lookup["PackageSize"].notna()
             & lookup["PackageSize"].gt(0)
         ].copy()
-        # If a normalized key is duplicated with different pack sizes, do not
-        # guess. Only unambiguous normalized drug names are eligible.
-        counts = lookup.groupby("_Drug Name Key")["PackageSize"].nunique()
-        safe = set(counts[counts.eq(1)].index)
-        lookup = lookup.loc[lookup["_Drug Name Key"].isin(safe)].copy()
+        # Business rule: when the same product key has more than one positive
+        # PackageSize in the Pack Size master, keep the FIRST value in config
+        # file order. Final WMS-aware resolution is applied again immediately
+        # before BatchMaster quantities are calculated and persisted.
         return (
             lookup[["Drug Name", "_Drug Name Key", "PackageSize"]]
             .drop_duplicates(subset=["_Drug Name Key"], keep="first")
@@ -1118,12 +1117,36 @@ class FullReconciliationEngine:
             .str.strip()
         )
 
+        # FINAL PackageSize authority.
+        # This must run AFTER Generic-level Drug Name inheritance because the
+        # earlier Generic reference step may replace product identity/package
+        # data for batches missing from SFDA. The resolver now guarantees:
+        #   - first config PackageSize when multiple candidates remain;
+        #   - PackageSize = 1 when no Pack Size master match exists;
+        #   - PackageSize is never zero in BatchMaster.
+        _final_pack = _pack_resolver.resolve_frame(
+            master[["Drug Name", "Trade Description"]].copy(),
+            drug_col="Drug Name",
+            wms_col="Trade Description",
+        )
+        master["PackageSize"] = (
+            pd.to_numeric(_final_pack["PackageSize"], errors="coerce")
+            .fillna(1.0)
+            .where(lambda s: s.gt(0), 1.0)
+        )
+        master["Package Size Status"] = _final_pack["Package Size Status"].values
+
         for column in [
             "Total Receive Qty",
             "Total Dispatched Qty",
             "PackageSize",
         ]:
             master[column] = pd.to_numeric(master[column], errors="coerce").fillna(0)
+
+        master["PackageSize"] = master["PackageSize"].where(
+            master["PackageSize"].gt(0),
+            1.0,
+        )
 
         master["Received Quantity Each"] = master["Total Receive Qty"]
         valid_package = master["PackageSize"].gt(0)
