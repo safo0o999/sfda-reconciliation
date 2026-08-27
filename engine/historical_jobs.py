@@ -535,25 +535,58 @@ def process_historical_build_job(
             receipt_records = prepared.get("receipt_records") or []
             if hasattr(receipt_records, "to_dict"):
                 receipt_records = receipt_records.to_dict(orient="records")
+
+            accept_refresh: Dict[str, Any] = {}
             if receipt_records:
-                refresh_accept_history_incremental(receipt_records, sfda_df)
+                refresh_started = perf_counter()
+                accept_refresh = refresh_accept_history_incremental(
+                    receipt_records,
+                    sfda_df,
+                    include_counts=False,
+                )
+                timings["append_accept_refresh"] = round(
+                    perf_counter() - refresh_started, 3
+                )
+                timings["append_accept_scope_prepare"] = round(
+                    float(accept_refresh.get("scope_prepare_seconds", 0) or 0), 3
+                )
+                timings["append_accept_sql_refresh"] = round(
+                    float(accept_refresh.get("sql_refresh_seconds", 0) or 0), 3
+                )
 
             dispatch_records = prepared.get("dispatch_records") or []
             if hasattr(dispatch_records, "to_dict"):
                 dispatch_records = dispatch_records.to_dict(orient="records")
-            if dispatch_records:
-                refresh_dispatch_history_incremental(dispatch_records)
 
-            # Final production self-healing guard:
-            # reconcile ONLY keys represented by this upload directly from the
-            # durable SQL event tables. Duplicate events remain deduplicated, but
-            # their Batch Master rows are still recalculated.
+            dispatch_refresh: Dict[str, Any] = {}
+            if dispatch_records:
+                refresh_started = perf_counter()
+                dispatch_refresh = refresh_dispatch_history_incremental(
+                    dispatch_records,
+                    include_counts=False,
+                )
+                timings["append_dispatch_refresh"] = round(
+                    perf_counter() - refresh_started, 3
+                )
+
+            # Keep the final durable-event self-healing guard for now.  The
+            # expensive Python SFDA/ASN matching above has been optimized without
+            # weakening recovery semantics.  We time this final pass separately so
+            # a later optimization can remove/merge it only if production evidence
+            # proves it is a material bottleneck.
+            reconcile_started = perf_counter()
             reconcile_result = reconcile_affected_batch_master_event_totals(
                 receipt_records,
                 dispatch_records,
             )
+            timings["append_affected_reconcile"] = round(
+                perf_counter() - reconcile_started, 3
+            )
             logger.info(
-                "Historical append affected-key reconciliation completed. affected_keys=%s reconciled_rows=%s",
+                "Historical append affected-key refresh completed. "
+                "receipt_keys=%s dispatch_keys=%s reconciled_keys=%s reconciled_rows=%s",
+                int(accept_refresh.get("affected_batch_keys", 0)),
+                int(dispatch_refresh.get("affected_batch_keys", 0)),
                 int(reconcile_result.get("affected_batch_keys", 0)),
                 int(reconcile_result.get("batch_master_rows_reconciled", 0)),
             )
@@ -565,6 +598,7 @@ def process_historical_build_job(
             customer_history = get_customer_history_df()
             sto_incoming_history = get_sto_incoming_history_df()
             sto_return_history = get_sto_return_history_df()
+            mark_stage("load_historical_export_data")
         else:
             # SAFE REBUILD: build the complete replacement dataset from the new
             # uploads in memory. The currently active historical SQL data remains
