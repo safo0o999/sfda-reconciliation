@@ -13,10 +13,12 @@ from engine.normalizer import Normalizer
 class PackSizeResolver:
     """Resolve PackageSize from the configured product master plus WMS text.
 
-    Trade Name is the primary product identity.  When one Trade Name has more
+    Trade Name is the primary product identity. When one Trade Name has more
     than one package configuration, PharmaceuticalForm and explicit WMS pack
-    count/size tokens are used only as disambiguators.  The resolver never
-    guesses by taking the first/largest package size.
+    count/size tokens are used as disambiguators. If more than one positive
+    PackageSize still remains, the FIRST positive PackageSize in config file
+    order is used. If no Pack Size master match exists, PackageSize defaults
+    to 1. This guarantees operational outputs never use zero as PackageSize.
     """
 
     _FORM_ALIASES = {
@@ -120,7 +122,7 @@ class PackSizeResolver:
         drug_key = Normalizer._drug_key_scalar(drug_name)
         wms_key = Normalizer._drug_key_scalar(wms_trade_description)
         if not drug_key and not wms_key:
-            return 0.0, "Missing"
+            return 1.0, "Default 1 - Missing Drug Identity"
 
         candidate_keys = []
         if drug_key in self.by_trade:
@@ -130,7 +132,7 @@ class PackSizeResolver:
                 if key in wms_key and key not in candidate_keys:
                     candidate_keys.append(key)
         if not candidate_keys:
-            return 0.0, "Trade Name Not Matched"
+            return 1.0, "Default 1 - Trade Name Not Matched"
 
         # Prefer the longest matching trade name to avoid short-brand collisions.
         trade_key = max(candidate_keys, key=len)
@@ -172,7 +174,15 @@ class PackSizeResolver:
                 if len(packs) == 1:
                     return packs[0], "Mapped by Trade Name + Form + Size"
 
-        return 0.0, "Ambiguous"
+        first_pack = next(
+            (
+                float(value)
+                for value in candidates["PackageSize"].tolist()
+                if pd.notna(value) and float(value) > 0
+            ),
+            1.0,
+        )
+        return first_pack, "Mapped by First Pack Size"
 
     def resolve_frame(self, frame: pd.DataFrame, *, drug_col: str = "Drug Name", wms_col: str = "Trade Description") -> pd.DataFrame:
         result = frame.copy()
