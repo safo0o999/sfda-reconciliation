@@ -5381,21 +5381,25 @@ def reconcile_batch_master_event_totals() -> Dict[str, int]:
     return {"batch_master_rows_repaired": repaired}
 
 
-def refresh_accept_history_incremental(
+
+def _prepare_incremental_accept_refresh_scope(
     receipt_history_rows: List[Dict[str, Any]],
     sfda_df: pd.DataFrame,
-) -> Dict[str, Any]:
-    """Refresh only historical rows affected by one successful Daily Accept.
+) -> tuple[list[tuple[str, str, str]], list[tuple[Any, ...]], Dict[str, Any]]:
+    """Prepare the affected Accept keys and exact SFDA identity rows efficiently.
 
-    Daily Accept must not rebuild the complete historical database. ReceiptEvents
-    remain the durable source of truth; only BN + expiry-month + Generic keys
-    represented by the uploaded ASN are recalculated here.
+    Historical Append can contain thousands of ASN rows while the SFDA report can
+    contain many thousands of batch rows.  The previous implementation iterated
+    every SFDA BN+expiry group and, for each group, scanned the complete ASN
+    candidate DataFrame again.  Runtime therefore grew roughly with
+    ``SFDA groups x ASN rows`` even though only a small intersection of keys can
+    ever affect this Append.
 
-    Batch Master includes physical receipt classes TRK5060, TRK800 and TRK49.
-    SupplierHistory remains TRK5060-only. CustomerHistory is intentionally
-    untouched because an Accept run cannot change customer dispatch history.
+    This implementation keeps the same matching/business rules, but indexes the
+    uploaded ASN candidates once and restricts SFDA work to the exact intersecting
+    BN + ExpiryMonthKey keys.  Drug-name validation and PackageSize resolution are
+    unchanged.
     """
-    initialize_database()
     started_at = time.perf_counter()
 
     def _eligible_physical_receipt(row: Dict[str, Any]) -> bool:
@@ -5421,6 +5425,7 @@ def refresh_accept_history_incremental(
 
     from engine.full_reconciliation import FullReconciliationEngine
     from engine.normalizer import Normalizer
+    from engine.pack_size_resolver import PackSizeResolver
 
     current_sfda = Normalizer.normalize_sfda(
         sfda_df.copy() if sfda_df is not None else pd.DataFrame()
@@ -5437,104 +5442,181 @@ def refresh_accept_history_incremental(
                 current_sfda[column], errors="coerce"
             ).fillna(0)
 
-    # Central PackageSize authority.  Ambiguous Trade Names are resolved with
-    # PharmaceuticalForm / explicit pack count / size found in WMS Trade text.
-    # Never pick the first/largest package size as a silent fallback.
-    from engine.pack_size_resolver import PackSizeResolver
     pack_resolver = PackSizeResolver.from_config()
 
-    # Validate WMS Generics against exact SFDA BN+expiry keys. BN+Expiry is the
-    # primary match. Drug Name vs Trade Description is ONLY a validation gate
-    # applied to every candidate, including a single Generic appearing in a
-    # later Append run. It never fuzzy-selects a Generic.
     candidate_rows = pd.DataFrame(receipt_history_rows or [])
-    resolved_generics = {}
     if not candidate_rows.empty:
         for col in ["BN", "Expiry Month Key", "Generic Item Number", "Trade Name"]:
             if col not in candidate_rows.columns:
                 candidate_rows[col] = ""
         candidate_rows["BN"] = Normalizer.text(candidate_rows["BN"])
-        candidate_rows["Expiry Month Key"] = candidate_rows["Expiry Month Key"].fillna("").astype(str).str.strip()
-        candidate_rows["Generic Item Number"] = candidate_rows["Generic Item Number"].fillna("").astype(str).str.strip()
-        candidate_rows["Trade Name"] = candidate_rows["Trade Name"].fillna("").astype(str).str.strip()
+        candidate_rows["Expiry Month Key"] = (
+            candidate_rows["Expiry Month Key"].fillna("").astype(str).str.strip()
+        )
+        candidate_rows["Generic Item Number"] = (
+            candidate_rows["Generic Item Number"].fillna("").astype(str).str.strip()
+        )
+        candidate_rows["Trade Name"] = (
+            candidate_rows["Trade Name"].fillna("").astype(str).str.strip()
+        )
+        candidate_rows = candidate_rows.loc[
+            candidate_rows["BN"].ne("")
+            & candidate_rows["Expiry Month Key"].ne("")
+            & candidate_rows["Generic Item Number"].ne("")
+        ].copy()
 
-    if not current_sfda.empty:
+    resolved_generics: Dict[tuple[str, str], list[str]] = {}
+    trade_by_identity: Dict[tuple[str, str, str], str] = {}
+    candidate_keys: Set[tuple[str, str]] = set()
+
+    if not candidate_rows.empty:
+        candidate_keys = set(
+            zip(
+                candidate_rows["BN"].astype(str),
+                candidate_rows["Expiry Month Key"].astype(str),
+            )
+        )
+
+        # Build the WMS trade reference once.  This replaces repeated DataFrame
+        # scans inside the SFDA group loop.
+        for (bn, month, generic), group in candidate_rows.groupby(
+            ["BN", "Expiry Month Key", "Generic Item Number"],
+            sort=False,
+            dropna=False,
+        ):
+            trade_by_identity[(str(bn), str(month), str(generic))] = next(
+                (str(v).strip() for v in group["Trade Name"] if str(v).strip()),
+                "",
+            )
+
+    if not current_sfda.empty and candidate_keys:
         current_sfda["BN"] = Normalizer.text(current_sfda["BN"])
         current_sfda["Drug Name"] = Normalizer.text(current_sfda["Drug Name"])
         current_sfda["GTIN"] = Normalizer.text(current_sfda["GTIN"])
-        # Do not auto-resolve SFDA keys that themselves point to multiple GTINs.
-        gtin_counts = (current_sfda.loc[current_sfda["GTIN"].ne("")]
-                       .groupby(["BN", "Expiry Month Key"])["GTIN"].nunique())
+
+        # Same safety rule as before: one BN+expiry key may resolve only when it
+        # points to exactly one non-empty GTIN in the current SFDA report.
+        gtin_counts = (
+            current_sfda.loc[current_sfda["GTIN"].ne("")]
+            .groupby(["BN", "Expiry Month Key"])["GTIN"]
+            .nunique()
+        )
         safe_keys = set(gtin_counts[gtin_counts.eq(1)].index.tolist())
-        current_sfda = current_sfda.loc[
-            current_sfda.apply(lambda r: (r["BN"], r["Expiry Month Key"]) in safe_keys, axis=1)
-        ].copy()
+        relevant_keys = safe_keys.intersection(candidate_keys)
 
-        if not candidate_rows.empty:
-            for (bn, month), sf_group in current_sfda.groupby(["BN", "Expiry Month Key"], sort=False):
-                c = candidate_rows.loc[(candidate_rows["BN"] == bn) & (candidate_rows["Expiry Month Key"] == month)].copy()
-                c = c.loc[c["Generic Item Number"].ne("")].copy()
-                if c.empty:
-                    continue
-                by_generic = c.groupby("Generic Item Number", sort=False)["Trade Name"].agg(
-                    lambda x: next((str(v) for v in x if str(v).strip()), "")
-                )
-                sfda_drug = str(sf_group.iloc[0]["Drug Name"])
-                accepted = []
-                for generic, trade in by_generic.items():
-                    score = Normalizer.drug_name_match_score(sfda_drug, trade)
-                    if score >= 60.0:
-                        accepted.append(str(generic))
-                    else:
-                        logger.warning(
-                            "Incremental exact batch match rejected by drug-name validation. BN=%s expiry_month=%s generic=%s SFDA_drug=%s WMS_trade=%s score=%.2f",
-                            bn, month, str(generic), sfda_drug, str(trade), score,
-                        )
-                if accepted:
-                    resolved_generics[(bn, month)] = accepted
+        if relevant_keys:
+            sfda_index = pd.MultiIndex.from_frame(
+                current_sfda[["BN", "Expiry Month Key"]]
+            )
+            current_sfda = current_sfda.loc[
+                sfda_index.isin(relevant_keys)
+            ].copy()
+        else:
+            current_sfda = current_sfda.iloc[0:0].copy()
 
-    sfda_rows = []
-    for row in current_sfda.to_dict(orient="records"):
-        bn = _text(row, "BN")
-        month = _text(row, "Expiry Month Key")
-        if not bn or not month:
-            continue
-        generics = resolved_generics.get((bn, month), [])
-        if not generics:
-            continue
-        drug_name = _text(row, "Drug Name")
-        for generic in generics:
-            trade_text = ""
-            if not candidate_rows.empty:
-                _trade_match = candidate_rows.loc[
-                    (candidate_rows["BN"] == bn)
-                    & (candidate_rows["Expiry Month Key"] == month)
-                    & (candidate_rows["Generic Item Number"] == str(generic))
-                ]
-                if not _trade_match.empty:
-                    trade_text = next(
-                        (str(v).strip() for v in _trade_match["Trade Name"] if str(v).strip()),
-                        "",
+        # Candidate Generics are already grouped once by exact batch key, so each
+        # SFDA key performs O(1) dictionary lookups instead of rescanning all ASN
+        # rows.
+        candidates_by_batch: Dict[tuple[str, str], list[tuple[str, str]]] = {}
+        for (bn, month, generic), trade in trade_by_identity.items():
+            candidates_by_batch.setdefault((bn, month), []).append((generic, trade))
+
+        for (bn, month), sf_group in current_sfda.groupby(
+            ["BN", "Expiry Month Key"], sort=False
+        ):
+            candidates = candidates_by_batch.get((str(bn), str(month)), [])
+            if not candidates:
+                continue
+
+            sfda_drug = str(sf_group.iloc[0]["Drug Name"])
+            accepted: list[str] = []
+            for generic, trade in candidates:
+                score = Normalizer.drug_name_match_score(sfda_drug, trade)
+                if score >= 60.0:
+                    accepted.append(str(generic))
+                else:
+                    logger.warning(
+                        "Incremental exact batch match rejected by drug-name validation. "
+                        "BN=%s expiry_month=%s generic=%s SFDA_drug=%s WMS_trade=%s score=%.2f",
+                        bn, month, str(generic), sfda_drug, str(trade), score,
                     )
-            resolved_pack, _pack_status = pack_resolver.resolve(drug_name, trade_text)
-            sfda_rows.append((
-                _text(row, "GTIN"), drug_name, bn, month, generic,
-                float(resolved_pack or 0),
-                _value(row, "Expiry Date"), _number(row, "Quantity"),
-                _number(row, "Active"), _number(row, "Quantity sent pending"),
-                _number(row, "Quantity Receive Pending"),
-            ))
+            if accepted:
+                resolved_generics[(str(bn), str(month))] = accepted
+
+    sfda_rows: list[tuple[Any, ...]] = []
+    if not current_sfda.empty and resolved_generics:
+        for row in current_sfda.to_dict(orient="records"):
+            bn = _text(row, "BN")
+            month = _text(row, "Expiry Month Key")
+            if not bn or not month:
+                continue
+            generics = resolved_generics.get((bn, month), [])
+            if not generics:
+                continue
+
+            drug_name = _text(row, "Drug Name")
+            for generic in generics:
+                trade_text = trade_by_identity.get((bn, month, str(generic)), "")
+                resolved_pack, _pack_status = pack_resolver.resolve(
+                    drug_name, trade_text
+                )
+                package_size = float(resolved_pack or 1.0)
+                if package_size <= 0:
+                    package_size = 1.0
+                sfda_rows.append((
+                    _text(row, "GTIN"), drug_name, bn, month, generic,
+                    package_size,
+                    _value(row, "Expiry Date"), _number(row, "Quantity"),
+                    _number(row, "Active"), _number(row, "Quantity sent pending"),
+                    _number(row, "Quantity Receive Pending"),
+                ))
+
+    metrics = {
+        "candidate_rows": int(len(candidate_rows)),
+        "affected_receipt_keys": int(len(affected)),
+        "candidate_batch_keys": int(len(candidate_keys)),
+        "relevant_sfda_batch_keys": int(len(resolved_generics)),
+        "prepared_sfda_identity_rows": int(len(sfda_rows)),
+        "seconds": round(time.perf_counter() - started_at, 3),
+    }
+    logger.info("Incremental Accept scope prepared. %s", metrics)
+    return affected, sfda_rows, metrics
+
+def refresh_accept_history_incremental(
+    receipt_history_rows: List[Dict[str, Any]],
+    sfda_df: pd.DataFrame,
+    *,
+    include_counts: bool = True,
+) -> Dict[str, Any]:
+    """Refresh only historical rows affected by one successful Daily Accept.
+
+    Daily Accept must not rebuild the complete historical database. ReceiptEvents
+    remain the durable source of truth; only BN + expiry-month + Generic keys
+    represented by the uploaded ASN are recalculated here.
+
+    Batch Master includes physical receipt classes TRK5060, TRK800 and TRK49.
+    SupplierHistory remains TRK5060-only. CustomerHistory is intentionally
+    untouched because an Accept run cannot change customer dispatch history.
+    """
+    initialize_database()
+    started_at = time.perf_counter()
+    affected, sfda_rows, scope_metrics = _prepare_incremental_accept_refresh_scope(
+        receipt_history_rows,
+        sfda_df,
+    )
 
     if not affected:
-        with Database().connect() as connection:
-            counts = connection.cursor().execute(
-                r"""
-                SELECT
-                    (SELECT COUNT_BIG(*) FROM dbo.BatchMaster),
-                    (SELECT COUNT_BIG(*) FROM dbo.SupplierHistory),
-                    (SELECT COUNT_BIG(*) FROM dbo.CustomerHistory);
-                """
-            ).fetchone()
+        counts = (0, 0, 0)
+        if include_counts:
+            with Database().connect() as connection:
+                counts = connection.cursor().execute(
+                    r"""
+                    SELECT
+                        (SELECT COUNT_BIG(*) FROM dbo.BatchMaster),
+                        (SELECT COUNT_BIG(*) FROM dbo.SupplierHistory),
+                        (SELECT COUNT_BIG(*) FROM dbo.CustomerHistory);
+                    """
+                ).fetchone()
         return {
             "affected_batch_keys": 0,
             "batch_master_rows_updated": 0,
@@ -5543,8 +5625,10 @@ def refresh_accept_history_incremental(
             "batch_master_rows": int(counts[0] or 0),
             "supplier_history_rows": int(counts[1] or 0),
             "customer_history_rows": int(counts[2] or 0),
+            "scope_prepare_seconds": float(scope_metrics.get("seconds", 0) or 0),
         }
 
+    sql_started_at = time.perf_counter()
     with Database().connect() as connection:
         cursor = connection.cursor()
         try:
@@ -5773,7 +5857,7 @@ def refresh_accept_history_incremental(
                     COALESCE(NULLIF(ra.TradeName, N''), gr.TradeName, N''),
                     COALESCE(NULLIF(sf.GTIN, N''), gr.GTIN, N''),
                     COALESCE(NULLIF(sf.DrugName, N''), gr.DrugName, N''),
-                    CASE WHEN COALESCE(sf.PackageSize, 0) > 0 THEN sf.PackageSize ELSE COALESCE(gr.PackageSize, 0) END,
+                    CASE WHEN COALESCE(sf.PackageSize, 0) > 0 THEN sf.PackageSize WHEN COALESCE(gr.PackageSize, 0) > 0 THEN gr.PackageSize ELSE 1 END,
                     COALESCE(sf.Quantity, 0),
                     COALESCE(sf.Active, 0),
                     COALESCE(sf.QuantitySentPending, 0),
@@ -5886,23 +5970,30 @@ def refresh_accept_history_incremental(
             """)
             supplier_rebuilt = max(0, int(cursor.rowcount or 0))
 
-            counts = cursor.execute(
-                r"""
-                SELECT
-                    (SELECT COUNT_BIG(*) FROM dbo.BatchMaster),
-                    (SELECT COUNT_BIG(*) FROM dbo.SupplierHistory),
-                    (SELECT COUNT_BIG(*) FROM dbo.CustomerHistory);
-                """
-            ).fetchone()
+            counts = (0, 0, 0)
+            if include_counts:
+                counts = cursor.execute(
+                    r"""
+                    SELECT
+                        (SELECT COUNT_BIG(*) FROM dbo.BatchMaster),
+                        (SELECT COUNT_BIG(*) FROM dbo.SupplierHistory),
+                        (SELECT COUNT_BIG(*) FROM dbo.CustomerHistory);
+                    """
+                ).fetchone()
 
             connection.commit()
         except Exception:
             connection.rollback()
             raise
 
+    sql_seconds = time.perf_counter() - sql_started_at
     logger.info(
-        "Incremental Daily Accept history refresh completed in %.2f seconds. affected_keys=%s batch_updated=%s batch_inserted=%s supplier_rows=%s",
+        "Incremental Daily Accept history refresh completed in %.2f seconds. "
+        "scope_prepare_seconds=%.3f sql_seconds=%.3f affected_keys=%s "
+        "batch_updated=%s batch_inserted=%s supplier_rows=%s",
         time.perf_counter() - started_at,
+        float(scope_metrics.get("seconds", 0) or 0),
+        sql_seconds,
         len(affected),
         batch_updated,
         batch_inserted,
@@ -5916,10 +6007,14 @@ def refresh_accept_history_incremental(
         "batch_master_rows": int(counts[0] or 0),
         "supplier_history_rows": int(counts[1] or 0),
         "customer_history_rows": int(counts[2] or 0),
+        "scope_prepare_seconds": float(scope_metrics.get("seconds", 0) or 0),
+        "sql_refresh_seconds": round(sql_seconds, 3),
     }
 
 def refresh_dispatch_history_incremental(
     confirmed_history_rows: List[Dict[str, Any]],
+    *,
+    include_counts: bool = True,
 ) -> Dict[str, Any]:
     """Refresh only historical rows affected by newly confirmed Daily Dispatch.
 
@@ -5946,15 +6041,17 @@ def refresh_dispatch_history_incremental(
     })
 
     if not affected:
-        with Database().connect() as connection:
-            counts = connection.cursor().execute(
-                r"""
-                SELECT
-                    (SELECT COUNT_BIG(*) FROM dbo.BatchMaster),
-                    (SELECT COUNT_BIG(*) FROM dbo.SupplierHistory),
-                    (SELECT COUNT_BIG(*) FROM dbo.CustomerHistory);
-                """
-            ).fetchone()
+        counts = (0, 0, 0)
+        if include_counts:
+            with Database().connect() as connection:
+                counts = connection.cursor().execute(
+                    r"""
+                    SELECT
+                        (SELECT COUNT_BIG(*) FROM dbo.BatchMaster),
+                        (SELECT COUNT_BIG(*) FROM dbo.SupplierHistory),
+                        (SELECT COUNT_BIG(*) FROM dbo.CustomerHistory);
+                    """
+                ).fetchone()
         return {
             "affected_batch_keys": 0,
             "batch_master_rows_updated": 0,
@@ -6082,14 +6179,16 @@ def refresh_dispatch_history_incremental(
             """)
             customer_rebuilt = max(0, int(cursor.rowcount or 0))
 
-            counts = cursor.execute(
-                r"""
-                SELECT
-                    (SELECT COUNT_BIG(*) FROM dbo.BatchMaster),
-                    (SELECT COUNT_BIG(*) FROM dbo.SupplierHistory),
-                    (SELECT COUNT_BIG(*) FROM dbo.CustomerHistory);
-                """
-            ).fetchone()
+            counts = (0, 0, 0)
+            if include_counts:
+                counts = cursor.execute(
+                    r"""
+                    SELECT
+                        (SELECT COUNT_BIG(*) FROM dbo.BatchMaster),
+                        (SELECT COUNT_BIG(*) FROM dbo.SupplierHistory),
+                        (SELECT COUNT_BIG(*) FROM dbo.CustomerHistory);
+                    """
+                ).fetchone()
 
             connection.commit()
         except Exception:
