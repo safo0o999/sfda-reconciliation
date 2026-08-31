@@ -37,6 +37,7 @@ from engine.database import (
     refresh_accept_history_incremental,
     refresh_dispatch_history_incremental,
     reconcile_affected_batch_master_event_totals,
+    refresh_historical_append_incremental,
     update_historical_build_job,
 )
 from engine.exporter import Exporter
@@ -530,22 +531,25 @@ def process_historical_build_job(
             or inserted.get("dispatch_events", 0) > 0
         )
 
+        # Surface the event-save sub-phases in SummaryJson. These timings remain
+        # numeric so existing reporting on stage_timings_seconds stays compatible.
+        for phase_name, seconds in (inserted.get("timings_seconds") or {}).items():
+            try:
+                timings[f"save_events_{phase_name}"] = round(float(seconds or 0), 3)
+            except (TypeError, ValueError):
+                pass
+
         if operation == "append":
-            # Append remains deduplicated at the event level, but Batch Master
-            # refresh must be self-healing. A previous job may have successfully
-            # saved ReceiptEvents / DispatchEvents and then failed before the
-            # derived Batch Master was refreshed. In that case, re-uploading the
-            # same historical file produces duplicate events (correctly skipped)
-            # but MUST still recalculate every BN + Expiry Month + Generic key
-            # represented by the uploaded file from the durable SQL event tables.
-            #
-            # Therefore refresh is driven by PREPARED INPUT KEYS, not only by
-            # newly inserted-event counts.
+            # Historical Append is still self-healing, but it no longer performs
+            # Accept + Dispatch + final reconciliation as three independent SQL
+            # scans. The unified refresh derives its scope from PREPARED INPUT KEYS
+            # (not inserted counts), materializes durable events once, and repairs
+            # BatchMaster plus Supplier/Customer history in one transaction.
             update_historical_build_job(
                 job_id,
                 progress=68,
                 current_stage=(
-                    "Reconciling affected historical batches"
+                    "Refreshing affected historical batches"
                     if has_new_events
                     else "Rechecking existing historical batches"
                 ),
@@ -555,85 +559,48 @@ def process_historical_build_job(
             if hasattr(receipt_records, "to_dict"):
                 receipt_records = receipt_records.to_dict(orient="records")
 
-            accept_refresh: Dict[str, Any] = {}
-            if receipt_records:
-                refresh_started = perf_counter()
-                accept_kwargs = (
-                    {"include_counts": False}
-                    if _supports_keyword_argument(
-                        refresh_accept_history_incremental, "include_counts"
-                    )
-                    else {}
-                )
-                if not accept_kwargs:
-                    logger.warning(
-                        "Historical Append compatibility mode: "
-                        "refresh_accept_history_incremental does not expose "
-                        "include_counts yet; continuing without the optimization flag."
-                    )
-                accept_refresh = refresh_accept_history_incremental(
-                    receipt_records,
-                    sfda_df,
-                    **accept_kwargs,
-                )
-                timings["append_accept_refresh"] = round(
-                    perf_counter() - refresh_started, 3
-                )
-                timings["append_accept_scope_prepare"] = round(
-                    float(accept_refresh.get("scope_prepare_seconds", 0) or 0), 3
-                )
-                timings["append_accept_sql_refresh"] = round(
-                    float(accept_refresh.get("sql_refresh_seconds", 0) or 0), 3
-                )
-
             dispatch_records = prepared.get("dispatch_records") or []
             if hasattr(dispatch_records, "to_dict"):
                 dispatch_records = dispatch_records.to_dict(orient="records")
 
-            dispatch_refresh: Dict[str, Any] = {}
-            if dispatch_records:
-                refresh_started = perf_counter()
-                dispatch_kwargs = (
-                    {"include_counts": False}
-                    if _supports_keyword_argument(
-                        refresh_dispatch_history_incremental, "include_counts"
-                    )
-                    else {}
-                )
-                if not dispatch_kwargs:
-                    logger.warning(
-                        "Historical Append compatibility mode: "
-                        "refresh_dispatch_history_incremental does not expose "
-                        "include_counts yet; continuing without the optimization flag."
-                    )
-                dispatch_refresh = refresh_dispatch_history_incremental(
-                    dispatch_records,
-                    **dispatch_kwargs,
-                )
-                timings["append_dispatch_refresh"] = round(
-                    perf_counter() - refresh_started, 3
-                )
-
-            # Keep the final durable-event self-healing guard for now.  The
-            # expensive Python SFDA/ASN matching above has been optimized without
-            # weakening recovery semantics.  We time this final pass separately so
-            # a later optimization can remove/merge it only if production evidence
-            # proves it is a material bottleneck.
-            reconcile_started = perf_counter()
-            reconcile_result = reconcile_affected_batch_master_event_totals(
+            refresh_started = perf_counter()
+            unified_refresh = refresh_historical_append_incremental(
                 receipt_records,
                 dispatch_records,
+                sfda_df,
             )
-            timings["append_affected_reconcile"] = round(
-                perf_counter() - reconcile_started, 3
+            unified_seconds = round(perf_counter() - refresh_started, 3)
+
+            timings["append_unified_refresh"] = unified_seconds
+            timings["append_accept_scope_prepare"] = round(
+                float(unified_refresh.get("scope_prepare_seconds", 0) or 0), 3
             )
+            timings["append_accept_sql_refresh"] = round(
+                float(unified_refresh.get("sql_refresh_seconds", 0) or 0), 3
+            )
+            # Legacy timing fields are retained for dashboards/queries that already
+            # select them. The old third pass is intentionally gone.
+            timings["append_accept_refresh"] = unified_seconds
+            timings["append_dispatch_refresh"] = 0.0
+            timings["append_affected_reconcile"] = 0.0
+
+            for phase_name, seconds in (unified_refresh.get("timings_seconds") or {}).items():
+                try:
+                    timings[f"append_unified_{phase_name}"] = round(float(seconds or 0), 3)
+                except (TypeError, ValueError):
+                    pass
+
             logger.info(
-                "Historical append affected-key refresh completed. "
-                "receipt_keys=%s dispatch_keys=%s reconciled_keys=%s reconciled_rows=%s",
-                int(accept_refresh.get("affected_batch_keys", 0)),
-                int(dispatch_refresh.get("affected_batch_keys", 0)),
-                int(reconcile_result.get("affected_batch_keys", 0)),
-                int(reconcile_result.get("batch_master_rows_reconciled", 0)),
+                "Historical append unified refresh completed. movement_keys=%s "
+                "accept_keys=%s dispatch_keys=%s batch_updated=%s batch_inserted=%s "
+                "supplier_rows=%s customer_rows=%s",
+                int(unified_refresh.get("affected_batch_keys", 0)),
+                int(unified_refresh.get("accept_affected_batch_keys", 0)),
+                int(unified_refresh.get("dispatch_affected_batch_keys", 0)),
+                int(unified_refresh.get("batch_master_rows_updated", 0)),
+                int(unified_refresh.get("batch_master_rows_inserted", 0)),
+                int(unified_refresh.get("supplier_history_rows_rebuilt", 0)),
+                int(unified_refresh.get("customer_history_rows_rebuilt", 0)),
             )
 
             mark_stage("incremental_historical_refresh")
