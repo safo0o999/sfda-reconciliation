@@ -760,20 +760,65 @@ def remove_excluded_historical_keys(
     return deleted
 
 
+def _json_safe_event_value(value: Any) -> Any:
+    """Convert prepared SQL parameter values into compact JSON-safe scalars."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+
+    # datetime/date and numpy scalar values expose one of these helpers.
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat) and not isinstance(value, (str, bytes)):
+        try:
+            return isoformat()
+        except Exception:
+            pass
+
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            value = item()
+        except Exception:
+            pass
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _event_json_payload(rows: Sequence[Tuple[Any, ...]]) -> str:
+    return json.dumps(
+        [[_json_safe_event_value(value) for value in row] for row in rows],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 def append_events(
     receipt_rows: List[Dict[str, Any]],
     dispatch_rows: List[Dict[str, Any]],
     *,
     assume_empty: bool = False,
-) -> Dict[str, int]:
-    """Append receipt/dispatch events with set-based SQL de-duplication.
+) -> Dict[str, Any]:
+    """Append receipt/dispatch events with idempotent bulk SQL de-duplication.
 
-    Python still prepares exactly the same EventKey and payload.  For Append,
-    prepared rows are bulk-loaded into temporary staging tables, then SQL Server
-    performs one anti-join per event table and inserts all missing rows in one
-    set-based statement.  This replaces tens of thousands of per-row
-    ``INSERT ... WHERE NOT EXISTS`` executions without changing de-duplication
-    semantics or historical business rules.
+    Historical Append now prefers a chunked ``OPENJSON`` bulk path.  One JSON
+    payload represents thousands of rows, so the Function worker no longer needs
+    to send tens of thousands of ODBC parameter rows through a temporary staging
+    table before SQL can perform the de-duplication check.  The target EventKey
+    semantics, WarehouseID/BuildID scope, and durable event tables are unchanged.
+
+    If OPENJSON is unavailable or a deployment temporarily runs against an older
+    SQL compatibility level, the function automatically rolls back and retries
+    with the previous temp-table/fast_executemany path.  Re-running the same file
+    remains safe because both paths use the same EventKey anti-join.
     """
 
     initialize_database()
@@ -781,6 +826,7 @@ def append_events(
 
     warehouse_id = int(current_warehouse_id())
     started_at = time.perf_counter()
+    phase_timings: Dict[str, float] = {}
 
     direct_receipt_sql = r"""
         INSERT INTO dbo.ReceiptEvents
@@ -828,18 +874,23 @@ def append_events(
         )
     ]
 
-    # EventKey must be namespaced by the ACTIVE BuildID so Append de-duplication
-    # continues exactly from the latest successful Rebuild generation.
     from engine.warehouse_context import current_historical_build_id, historical_build_scope
-    active_build_id = str(current_historical_build_id() or '').strip() or get_active_historical_build_id(warehouse_id)
+    active_build_id = (
+        str(current_historical_build_id() or "").strip()
+        or get_active_historical_build_id(warehouse_id)
+    )
+
+    prep_started = time.perf_counter()
     with historical_build_scope(active_build_id):
         prepared_receipts = _deduplicate_parameters(receipt_rows, _receipt_parameters)
         prepared_dispatches = _deduplicate_parameters(dispatch_rows, _dispatch_parameters)
+    phase_timings["prepare_parameters"] = round(time.perf_counter() - prep_started, 3)
 
     logger.info(
-        "Set-based event save started. WarehouseID=%s prepared_receipts=%s "
+        "Bulk event save started. WarehouseID=%s BuildID=%s prepared_receipts=%s "
         "prepared_dispatches=%s assume_empty=%s",
         warehouse_id,
+        active_build_id,
         len(prepared_receipts),
         len(prepared_dispatches),
         assume_empty,
@@ -847,20 +898,132 @@ def append_events(
 
     inserted_receipts = 0
     inserted_dispatches = 0
+    save_mode = "direct" if assume_empty else "openjson"
 
-    with Database().connect() as connection:
-        cursor = connection.cursor()
-        try:
-            if assume_empty:
-                inserted_receipts = _bulk_insert_rows(
-                    cursor, direct_receipt_sql, prepared_receipts
-                )
-                inserted_dispatches = _bulk_insert_rows(
-                    cursor, direct_dispatch_sql, prepared_dispatches
-                )
-            else:
-                # Clone target column definitions so staging always follows the
-                # deployed SQL schema and does not introduce type/length drift.
+    receipt_json_sql = r"""
+        ;WITH Parsed AS
+        (
+            SELECT
+                CONVERT(varchar(64), JSON_VALUE(j.value, '$[0]')) AS EventKey,
+                CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[1]')) AS BN,
+                CONVERT(char(7), JSON_VALUE(j.value, '$[2]')) AS ExpiryMonthKey,
+                TRY_CONVERT(date, JSON_VALUE(j.value, '$[3]')) AS ExpiryDate,
+                CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[4]')) AS GenericItemNumber,
+                JSON_VALUE(j.value, '$[5]') AS TradeItemNumber,
+                JSON_VALUE(j.value, '$[6]') AS TradeName,
+                TRY_CONVERT(decimal(38, 6), JSON_VALUE(j.value, '$[7]')) AS ReceivedQuantity,
+                JSON_VALUE(j.value, '$[8]') AS InboundShipment,
+                JSON_VALUE(j.value, '$[9]') AS ASNLine,
+                JSON_VALUE(j.value, '$[10]') AS SupplierName,
+                JSON_VALUE(j.value, '$[11]') AS SupplierCode,
+                JSON_VALUE(j.value, '$[12]') AS Description,
+                JSON_VALUE(j.value, '$[13]') AS ItemFamilyGroup,
+                TRY_CONVERT(datetime2(7), JSON_VALUE(j.value, '$[14]')) AS ReceivedDate
+            FROM OPENJSON(CAST(? AS nvarchar(max))) AS j
+        )
+        INSERT INTO dbo.ReceiptEvents
+        (
+            EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+            TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
+            ASNLine, SupplierName, SupplierCode, Description, ItemFamilyGroup,
+            ReceivedDate
+        )
+        SELECT
+            s.EventKey, s.BN, s.ExpiryMonthKey, s.ExpiryDate, s.GenericItemNumber,
+            s.TradeItemNumber, s.TradeName, s.ReceivedQuantity, s.InboundShipment,
+            s.ASNLine, s.SupplierName, s.SupplierCode, s.Description, s.ItemFamilyGroup,
+            s.ReceivedDate
+        FROM Parsed AS s
+        WHERE s.EventKey IS NOT NULL
+          AND NOT EXISTS
+          (
+              SELECT 1
+              FROM dbo.ReceiptEvents AS t WITH (UPDLOCK)
+              WHERE t.WarehouseID = ?
+                AND t.BuildID = ?
+                AND t.EventKey = s.EventKey
+          );
+    """
+
+    dispatch_json_sql = r"""
+        ;WITH Parsed AS
+        (
+            SELECT
+                CONVERT(varchar(64), JSON_VALUE(j.value, '$[0]')) AS EventKey,
+                CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[1]')) AS BN,
+                CONVERT(char(7), JSON_VALUE(j.value, '$[2]')) AS ExpiryMonthKey,
+                TRY_CONVERT(date, JSON_VALUE(j.value, '$[3]')) AS ExpiryDate,
+                CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[4]')) AS GenericItemNumber,
+                JSON_VALUE(j.value, '$[5]') AS TradeItemNumber,
+                JSON_VALUE(j.value, '$[6]') AS TradeName,
+                TRY_CONVERT(decimal(38, 6), JSON_VALUE(j.value, '$[7]')) AS DispatchedQuantity,
+                JSON_VALUE(j.value, '$[8]') AS ToAddress,
+                JSON_VALUE(j.value, '$[9]') AS SalesOrderNumber,
+                JSON_VALUE(j.value, '$[10]') AS OrderLine,
+                TRY_CONVERT(datetime2(7), JSON_VALUE(j.value, '$[11]')) AS DispatchDate,
+                JSON_VALUE(j.value, '$[12]') AS Custody
+            FROM OPENJSON(CAST(? AS nvarchar(max))) AS j
+        )
+        INSERT INTO dbo.DispatchEvents
+        (
+            EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+            TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
+            SalesOrderNumber, OrderLine, DispatchDate, Custody
+        )
+        SELECT
+            s.EventKey, s.BN, s.ExpiryMonthKey, s.ExpiryDate, s.GenericItemNumber,
+            s.TradeItemNumber, s.TradeName, s.DispatchedQuantity, s.ToAddress,
+            s.SalesOrderNumber, s.OrderLine, s.DispatchDate, s.Custody
+        FROM Parsed AS s
+        WHERE s.EventKey IS NOT NULL
+          AND NOT EXISTS
+          (
+              SELECT 1
+              FROM dbo.DispatchEvents AS t WITH (UPDLOCK)
+              WHERE t.WarehouseID = ?
+                AND t.BuildID = ?
+                AND t.EventKey = s.EventKey
+          );
+    """
+
+    def _save_openjson() -> tuple[int, int]:
+        receipt_inserted = 0
+        dispatch_inserted = 0
+        # Keep each payload bounded so pyodbc sends a handful of nvarchar(max)
+        # values instead of tens of thousands of individual parameter rows.
+        json_batch_size = max(250, int(os.getenv("SFDA_APPEND_JSON_BATCH_SIZE", "2000") or 2000))
+        with Database().connect() as connection:
+            cursor = connection.cursor()
+            try:
+                receipt_started = time.perf_counter()
+                for row_batch in _chunks(prepared_receipts, json_batch_size):
+                    payload = _event_json_payload(row_batch)
+                    cursor.execute(receipt_json_sql, payload, warehouse_id, active_build_id)
+                    receipt_inserted += max(0, int(cursor.rowcount or 0))
+                phase_timings["openjson_receipts"] = round(time.perf_counter() - receipt_started, 3)
+
+                dispatch_started = time.perf_counter()
+                for row_batch in _chunks(prepared_dispatches, json_batch_size):
+                    payload = _event_json_payload(row_batch)
+                    cursor.execute(dispatch_json_sql, payload, warehouse_id, active_build_id)
+                    dispatch_inserted += max(0, int(cursor.rowcount or 0))
+                phase_timings["openjson_dispatches"] = round(time.perf_counter() - dispatch_started, 3)
+
+                commit_started = time.perf_counter()
+                connection.commit()
+                phase_timings["commit"] = round(time.perf_counter() - commit_started, 3)
+            except Exception:
+                connection.rollback()
+                raise
+        return receipt_inserted, dispatch_inserted
+
+    def _save_temp_stage() -> tuple[int, int]:
+        receipt_inserted = 0
+        dispatch_inserted = 0
+        with Database().connect() as connection:
+            cursor = connection.cursor()
+            try:
+                stage_create_started = time.perf_counter()
                 cursor.execute(r"""
                     SELECT TOP (0)
                         EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
@@ -883,8 +1046,10 @@ def append_events(
                 cursor.execute(
                     "CREATE UNIQUE CLUSTERED INDEX IX_DispatchEventStage_EventKey ON #DispatchEventStage(EventKey);"
                 )
+                phase_timings["temp_stage_create"] = round(time.perf_counter() - stage_create_started, 3)
 
                 cursor.fast_executemany = True
+                receipt_stage_started = time.perf_counter()
                 if prepared_receipts:
                     cursor.executemany(
                         r"""
@@ -899,7 +1064,9 @@ def append_events(
                         """,
                         prepared_receipts,
                     )
+                phase_timings["temp_stage_receipts"] = round(time.perf_counter() - receipt_stage_started, 3)
 
+                dispatch_stage_started = time.perf_counter()
                 if prepared_dispatches:
                     cursor.executemany(
                         r"""
@@ -913,7 +1080,9 @@ def append_events(
                         """,
                         prepared_dispatches,
                     )
+                phase_timings["temp_stage_dispatches"] = round(time.perf_counter() - dispatch_stage_started, 3)
 
+                receipt_insert_started = time.perf_counter()
                 if prepared_receipts:
                     cursor.execute(
                         r"""
@@ -933,7 +1102,7 @@ def append_events(
                         WHERE NOT EXISTS
                         (
                             SELECT 1
-                            FROM dbo.ReceiptEvents t WITH (UPDLOCK, HOLDLOCK)
+                            FROM dbo.ReceiptEvents t WITH (UPDLOCK)
                             WHERE t.WarehouseID = ?
                               AND t.BuildID = ?
                               AND t.EventKey = s.EventKey
@@ -941,8 +1110,10 @@ def append_events(
                         """,
                         (warehouse_id, active_build_id),
                     )
-                    inserted_receipts = max(0, int(cursor.rowcount or 0))
+                    receipt_inserted = max(0, int(cursor.rowcount or 0))
+                phase_timings["temp_insert_receipts"] = round(time.perf_counter() - receipt_insert_started, 3)
 
+                dispatch_insert_started = time.perf_counter()
                 if prepared_dispatches:
                     cursor.execute(
                         r"""
@@ -960,7 +1131,7 @@ def append_events(
                         WHERE NOT EXISTS
                         (
                             SELECT 1
-                            FROM dbo.DispatchEvents t WITH (UPDLOCK, HOLDLOCK)
+                            FROM dbo.DispatchEvents t WITH (UPDLOCK)
                             WHERE t.WarehouseID = ?
                               AND t.BuildID = ?
                               AND t.EventKey = s.EventKey
@@ -968,29 +1139,74 @@ def append_events(
                         """,
                         (warehouse_id, active_build_id),
                     )
-                    inserted_dispatches = max(0, int(cursor.rowcount or 0))
+                    dispatch_inserted = max(0, int(cursor.rowcount or 0))
+                phase_timings["temp_insert_dispatches"] = round(time.perf_counter() - dispatch_insert_started, 3)
 
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+                commit_started = time.perf_counter()
+                connection.commit()
+                phase_timings["commit"] = round(time.perf_counter() - commit_started, 3)
+            except Exception:
+                connection.rollback()
+                raise
+        return receipt_inserted, dispatch_inserted
 
+    if assume_empty:
+        with Database().connect() as connection:
+            cursor = connection.cursor()
+            try:
+                direct_started = time.perf_counter()
+                inserted_receipts = _bulk_insert_rows(cursor, direct_receipt_sql, prepared_receipts)
+                phase_timings["direct_receipts"] = round(time.perf_counter() - direct_started, 3)
+                direct_started = time.perf_counter()
+                inserted_dispatches = _bulk_insert_rows(cursor, direct_dispatch_sql, prepared_dispatches)
+                phase_timings["direct_dispatches"] = round(time.perf_counter() - direct_started, 3)
+                commit_started = time.perf_counter()
+                connection.commit()
+                phase_timings["commit"] = round(time.perf_counter() - commit_started, 3)
+            except Exception:
+                connection.rollback()
+                raise
+    else:
+        json_enabled = str(os.getenv("SFDA_APPEND_JSON_BULK", "1") or "1").strip().lower() not in {
+            "0", "false", "no", "off"
+        }
+        if json_enabled:
+            try:
+                inserted_receipts, inserted_dispatches = _save_openjson()
+            except Exception:
+                logger.exception(
+                    "OPENJSON historical event bulk save failed; retrying with temp-table fallback. "
+                    "WarehouseID=%s BuildID=%s",
+                    warehouse_id,
+                    active_build_id,
+                )
+                save_mode = "temp_fallback"
+                inserted_receipts, inserted_dispatches = _save_temp_stage()
+        else:
+            save_mode = "temp"
+            inserted_receipts, inserted_dispatches = _save_temp_stage()
+
+    total_seconds = time.perf_counter() - started_at
+    phase_timings["total"] = round(total_seconds, 3)
     logger.info(
-        "Set-based event save completed in %.2f seconds. WarehouseID=%s "
-        "new_receipts=%s duplicate_receipts=%s new_dispatches=%s duplicate_dispatches=%s",
-        time.perf_counter() - started_at,
+        "Bulk event save completed in %.2f seconds. mode=%s WarehouseID=%s "
+        "new_receipts=%s duplicate_receipts=%s new_dispatches=%s duplicate_dispatches=%s timings=%s",
+        total_seconds,
+        save_mode,
         warehouse_id,
         inserted_receipts,
         max(0, len(prepared_receipts) - inserted_receipts),
         inserted_dispatches,
         max(0, len(prepared_dispatches) - inserted_dispatches),
+        phase_timings,
     )
 
     return {
         "receipt_events": inserted_receipts,
         "dispatch_events": inserted_dispatches,
+        "save_mode": save_mode,
+        "timings_seconds": phase_timings,
     }
-
 
 def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Return warehouse-scoped cumulative summaries for Batch Master.
@@ -5582,6 +5798,631 @@ def _prepare_incremental_accept_refresh_scope(
     logger.info("Incremental Accept scope prepared. %s", metrics)
     return affected, sfda_rows, metrics
 
+
+def refresh_historical_append_incremental(
+    receipt_history_rows: List[Dict[str, Any]],
+    dispatch_history_rows: List[Dict[str, Any]],
+    sfda_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    """Unified, self-healing Historical Append refresh.
+
+    The previous Historical Append path performed three large SQL passes:
+    Accept refresh, Dispatch refresh, then a second durable-event reconciliation.
+    Each pass re-read ReceiptEvents/DispatchEvents for almost the same batch keys.
+
+    This function preserves the same business rules and crash-recovery semantics,
+    but materializes the affected durable event rows once, aggregates them once,
+    updates BatchMaster once, and rebuilds only the touched supplier/customer
+    history rows.  The affected scope is derived from the uploaded file rather
+    than inserted-event counts, so retrying a file after a post-save failure still
+    repairs BatchMaster even when every EventKey is already a duplicate.
+    """
+    initialize_database()
+    started_at = time.perf_counter()
+
+    from engine.warehouse_context import current_historical_build_id, current_warehouse_id
+
+    warehouse_id = int(current_warehouse_id())
+    build_id = (
+        str(current_historical_build_id() or "").strip()
+        or get_active_historical_build_id(warehouse_id)
+    )
+    if not build_id:
+        raise RuntimeError("Historical Append requires an active BuildID.")
+
+    accept_affected, sfda_rows, scope_metrics = _prepare_incremental_accept_refresh_scope(
+        receipt_history_rows,
+        sfda_df,
+    )
+
+    def _movement_key(row: Dict[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(row.get("BN") or "").strip(),
+            str(row.get("Expiry Month Key") or "").strip(),
+            str(row.get("Generic Item Number") or "").strip(),
+        )
+
+    receipt_keys = sorted({
+        key
+        for row in (receipt_history_rows or [])
+        for key in [_movement_key(row)]
+        if all(key)
+    })
+    dispatch_keys = sorted({
+        key
+        for row in (dispatch_history_rows or [])
+        for key in [_movement_key(row)]
+        if all(key)
+    })
+    movement_keys = sorted(set(receipt_keys).union(dispatch_keys))
+
+    if not movement_keys:
+        return {
+            "affected_batch_keys": 0,
+            "accept_affected_batch_keys": 0,
+            "dispatch_affected_batch_keys": 0,
+            "batch_master_rows_updated": 0,
+            "batch_master_rows_inserted": 0,
+            "supplier_history_rows_rebuilt": 0,
+            "customer_history_rows_rebuilt": 0,
+            "scope_prepare_seconds": float(scope_metrics.get("seconds", 0) or 0),
+            "sql_refresh_seconds": 0.0,
+            "timings_seconds": {},
+        }
+
+    timings: Dict[str, float] = {}
+    sql_started_at = time.perf_counter()
+
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            stage_started = time.perf_counter()
+            cursor.execute(r"""
+                CREATE TABLE #AffectedAcceptKeys
+                (
+                    BN nvarchar(255) NOT NULL,
+                    ExpiryMonthKey nvarchar(20) NOT NULL,
+                    GenericItemNumber nvarchar(255) NOT NULL,
+                    PRIMARY KEY (BN, ExpiryMonthKey, GenericItemNumber)
+                );
+
+                CREATE TABLE #AffectedDispatchKeys
+                (
+                    BN nvarchar(255) NOT NULL,
+                    ExpiryMonthKey nvarchar(20) NOT NULL,
+                    GenericItemNumber nvarchar(255) NOT NULL,
+                    PRIMARY KEY (BN, ExpiryMonthKey, GenericItemNumber)
+                );
+
+                CREATE TABLE #AffectedMovementKeys
+                (
+                    BN nvarchar(255) NOT NULL,
+                    ExpiryMonthKey nvarchar(20) NOT NULL,
+                    GenericItemNumber nvarchar(255) NOT NULL,
+                    PRIMARY KEY (BN, ExpiryMonthKey, GenericItemNumber)
+                );
+
+                CREATE TABLE #CurrentAcceptSFDA
+                (
+                    GTIN nvarchar(255) NULL,
+                    DrugName nvarchar(500) NULL,
+                    BN nvarchar(255) NOT NULL,
+                    ExpiryMonthKey nvarchar(20) NOT NULL,
+                    ResolvedGenericItemNumber nvarchar(255) NOT NULL,
+                    PackageSize decimal(38, 6) NULL,
+                    ExpiryDate date NULL,
+                    Quantity decimal(38, 6) NULL,
+                    Active decimal(38, 6) NULL,
+                    QuantitySentPending decimal(38, 6) NULL,
+                    QuantityReceivePending decimal(38, 6) NULL
+                );
+            """)
+            cursor.fast_executemany = True
+            if accept_affected:
+                cursor.executemany(
+                    "INSERT INTO #AffectedAcceptKeys (BN, ExpiryMonthKey, GenericItemNumber) VALUES (?, ?, ?);",
+                    accept_affected,
+                )
+            if dispatch_keys:
+                cursor.executemany(
+                    "INSERT INTO #AffectedDispatchKeys (BN, ExpiryMonthKey, GenericItemNumber) VALUES (?, ?, ?);",
+                    dispatch_keys,
+                )
+            cursor.executemany(
+                "INSERT INTO #AffectedMovementKeys (BN, ExpiryMonthKey, GenericItemNumber) VALUES (?, ?, ?);",
+                movement_keys,
+            )
+            if sfda_rows:
+                cursor.executemany(
+                    r"""
+                    INSERT INTO #CurrentAcceptSFDA
+                    (GTIN, DrugName, BN, ExpiryMonthKey, ResolvedGenericItemNumber, PackageSize,
+                     ExpiryDate, Quantity, Active, QuantitySentPending, QuantityReceivePending)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    sfda_rows,
+                )
+                cursor.execute(
+                    "CREATE INDEX IX_CurrentAcceptSFDA_Batch ON #CurrentAcceptSFDA "
+                    "(BN, ExpiryMonthKey, ResolvedGenericItemNumber, GTIN);"
+                )
+            timings["stage_affected_keys"] = round(time.perf_counter() - stage_started, 3)
+
+            # Materialize the durable event rows exactly once. Explicit WarehouseID
+            # + BuildID filters make the historical covering indexes directly usable
+            # instead of relying only on the security predicate to infer scope.
+            receipt_materialize_started = time.perf_counter()
+            cursor.execute(r"""
+                SELECT
+                    r.BN,
+                    r.ExpiryMonthKey,
+                    r.GenericItemNumber,
+                    r.ExpiryDate,
+                    r.TradeItemNumber,
+                    r.TradeName,
+                    r.ReceivedQuantity,
+                    r.InboundShipment,
+                    r.SupplierName,
+                    r.SupplierCode,
+                    r.Description,
+                    r.ItemFamilyGroup,
+                    r.ReceivedDate
+                INTO #ReceiptAffectedRows
+                FROM dbo.ReceiptEvents AS r
+                INNER JOIN #AffectedMovementKeys AS a
+                    ON a.BN = r.BN
+                   AND a.ExpiryMonthKey = r.ExpiryMonthKey
+                   AND a.GenericItemNumber = r.GenericItemNumber
+                WHERE r.WarehouseID = ?
+                  AND r.BuildID = ?
+                  AND (
+                        UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK5060%'
+                     OR UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK800%'
+                     OR UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK49%'
+                  );
+
+                CREATE CLUSTERED INDEX IX_ReceiptAffectedRows_Batch
+                    ON #ReceiptAffectedRows (BN, ExpiryMonthKey, GenericItemNumber);
+            """, warehouse_id, build_id)
+            timings["materialize_receipt_events"] = round(
+                time.perf_counter() - receipt_materialize_started, 3
+            )
+
+            dispatch_materialize_started = time.perf_counter()
+            cursor.execute(r"""
+                SELECT
+                    d.BN,
+                    d.ExpiryMonthKey,
+                    d.GenericItemNumber,
+                    d.ExpiryDate,
+                    d.TradeItemNumber,
+                    d.TradeName,
+                    d.DispatchedQuantity,
+                    d.ToAddress,
+                    d.DispatchDate,
+                    d.Custody
+                INTO #DispatchAffectedRows
+                FROM dbo.DispatchEvents AS d
+                INNER JOIN #AffectedMovementKeys AS a
+                    ON a.BN = d.BN
+                   AND a.ExpiryMonthKey = d.ExpiryMonthKey
+                   AND a.GenericItemNumber = d.GenericItemNumber
+                WHERE d.WarehouseID = ?
+                  AND d.BuildID = ?;
+
+                CREATE CLUSTERED INDEX IX_DispatchAffectedRows_Batch
+                    ON #DispatchAffectedRows (BN, ExpiryMonthKey, GenericItemNumber);
+            """, warehouse_id, build_id)
+            timings["materialize_dispatch_events"] = round(
+                time.perf_counter() - dispatch_materialize_started, 3
+            )
+
+            aggregate_started = time.perf_counter()
+            cursor.execute(r"""
+                SELECT
+                    r.BN,
+                    r.ExpiryMonthKey,
+                    r.GenericItemNumber,
+                    MAX(r.ExpiryDate) AS ExpiryDate,
+                    MAX(NULLIF(r.TradeItemNumber, N'')) AS TradeItemNumber,
+                    MAX(NULLIF(r.TradeName, N'')) AS TradeName,
+                    MAX(NULLIF(r.Description, N'')) AS Description,
+                    MAX(NULLIF(r.ItemFamilyGroup, N'')) AS ItemFamilyGroup,
+                    MAX(NULLIF(r.SupplierName, N'')) AS SupplierName,
+                    MAX(NULLIF(r.SupplierCode, N'')) AS SupplierCode,
+                    SUM(COALESCE(r.ReceivedQuantity, 0)) AS TotalReceiveQty,
+                    COUNT_BIG(*) AS ReceiveRuns,
+                    MIN(r.ReceivedDate) AS FirstReceivedDate,
+                    MAX(r.ReceivedDate) AS LastReceivedDate
+                INTO #ReceiptAggregate
+                FROM #ReceiptAffectedRows AS r
+                GROUP BY r.BN, r.ExpiryMonthKey, r.GenericItemNumber;
+
+                CREATE UNIQUE CLUSTERED INDEX IX_ReceiptAggregate_Batch
+                    ON #ReceiptAggregate (BN, ExpiryMonthKey, GenericItemNumber);
+
+                SELECT
+                    d.BN,
+                    d.ExpiryMonthKey,
+                    d.GenericItemNumber,
+                    MAX(d.ExpiryDate) AS ExpiryDate,
+                    MAX(NULLIF(d.TradeItemNumber, N'')) AS TradeItemNumber,
+                    MAX(NULLIF(d.TradeName, N'')) AS TradeName,
+                    SUM(COALESCE(d.DispatchedQuantity, 0)) AS TotalDispatchedQty,
+                    COUNT_BIG(*) AS DispatchRuns,
+                    MIN(d.DispatchDate) AS FirstDispatchDate,
+                    MAX(d.DispatchDate) AS LastDispatchDate,
+                    MAX(NULLIF(d.Custody, N'')) AS Custody
+                INTO #DispatchAggregate
+                FROM #DispatchAffectedRows AS d
+                GROUP BY d.BN, d.ExpiryMonthKey, d.GenericItemNumber;
+
+                CREATE UNIQUE CLUSTERED INDEX IX_DispatchAggregate_Batch
+                    ON #DispatchAggregate (BN, ExpiryMonthKey, GenericItemNumber);
+            """)
+            timings["aggregate_movement_events"] = round(time.perf_counter() - aggregate_started, 3)
+
+            batch_update_started = time.perf_counter()
+            cursor.execute(r"""
+                UPDATE bm
+                SET
+                    bm.ExpiryDate = COALESCE(sf.ExpiryDate, ra.ExpiryDate, da.ExpiryDate, bm.ExpiryDate),
+                    bm.TradeItemNumber = COALESCE(NULLIF(ra.TradeItemNumber, N''), NULLIF(da.TradeItemNumber, N''), bm.TradeItemNumber),
+                    bm.TradeName = COALESCE(NULLIF(ra.TradeName, N''), NULLIF(da.TradeName, N''), bm.TradeName),
+                    bm.Description = COALESCE(NULLIF(ra.Description, N''), bm.Description),
+                    bm.ItemFamilyGroup = COALESCE(NULLIF(ra.ItemFamilyGroup, N''), bm.ItemFamilyGroup),
+                    bm.SupplierName = COALESCE(NULLIF(ra.SupplierName, N''), bm.SupplierName),
+                    bm.SupplierCode = COALESCE(NULLIF(ra.SupplierCode, N''), bm.SupplierCode),
+                    bm.TotalReceiveQty = COALESCE(ra.TotalReceiveQty, 0),
+                    bm.ReceiveRuns = COALESCE(ra.ReceiveRuns, 0),
+                    bm.FirstReceivedDate = ra.FirstReceivedDate,
+                    bm.LastReceivedDate = ra.LastReceivedDate,
+                    bm.TotalDispatchedQty = COALESCE(da.TotalDispatchedQty, 0),
+                    bm.DispatchRuns = COALESCE(da.DispatchRuns, 0),
+                    bm.FirstDispatchDate = da.FirstDispatchDate,
+                    bm.LastDispatchDate = da.LastDispatchDate,
+                    bm.Custody = COALESCE(NULLIF(da.Custody, N''), bm.Custody),
+                    bm.GTIN = COALESCE(NULLIF(sf.GTIN, N''), bm.GTIN),
+                    bm.DrugName = COALESCE(NULLIF(sf.DrugName, N''), bm.DrugName),
+                    bm.PackageSize = CASE
+                        WHEN COALESCE(sf.PackageSize, 0) > 0 THEN sf.PackageSize
+                        WHEN COALESCE(bm.PackageSize, 0) > 0 THEN bm.PackageSize
+                        ELSE 1
+                    END,
+                    bm.SFDAQuantity = COALESCE(sf.Quantity, bm.SFDAQuantity),
+                    bm.Active = COALESCE(sf.Active, bm.Active),
+                    bm.QuantitySentPending = COALESCE(sf.QuantitySentPending, bm.QuantitySentPending),
+                    bm.QuantityReceivePending = COALESCE(sf.QuantityReceivePending, bm.QuantityReceivePending),
+                    bm.GenericExistsInSFDA = CASE WHEN sf.BN IS NOT NULL THEN N'Yes' ELSE bm.GenericExistsInSFDA END,
+                    bm.LastUpdated = SYSUTCDATETIME()
+                FROM dbo.BatchMaster AS bm
+                INNER JOIN #AffectedMovementKeys AS a
+                    ON a.BN = bm.BN
+                   AND a.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND a.GenericItemNumber = bm.GenericItemNumber
+                LEFT JOIN #ReceiptAggregate AS ra
+                    ON ra.BN = bm.BN
+                   AND ra.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND ra.GenericItemNumber = bm.GenericItemNumber
+                LEFT JOIN #DispatchAggregate AS da
+                    ON da.BN = bm.BN
+                   AND da.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND da.GenericItemNumber = bm.GenericItemNumber
+                OUTER APPLY
+                (
+                    SELECT TOP (1)
+                        s.BN, s.ExpiryDate, s.GTIN, s.DrugName, s.PackageSize,
+                        s.Quantity, s.Active, s.QuantitySentPending, s.QuantityReceivePending
+                    FROM #CurrentAcceptSFDA AS s
+                    WHERE s.BN = bm.BN
+                      AND s.ExpiryMonthKey = bm.ExpiryMonthKey
+                      AND s.ResolvedGenericItemNumber = bm.GenericItemNumber
+                    ORDER BY s.GTIN
+                ) AS sf
+                WHERE bm.WarehouseID = ?
+                  AND bm.BuildID = ?;
+            """, warehouse_id, build_id)
+            batch_updated = max(0, int(cursor.rowcount or 0))
+            timings["batch_master_update"] = round(time.perf_counter() - batch_update_started, 3)
+
+            batch_insert_started = time.perf_counter()
+            cursor.execute(r"""
+                ;WITH AffectedGenerics AS
+                (
+                    SELECT DISTINCT GenericItemNumber
+                    FROM #AffectedAcceptKeys
+                ),
+                ExactIdentityRows AS
+                (
+                    SELECT
+                        bm.GenericItemNumber,
+                        bm.GTIN,
+                        bm.DrugName,
+                        bm.PackageSize,
+                        bm.TradeItemNumber,
+                        bm.TradeName,
+                        bm.LastUpdated
+                    FROM dbo.BatchMaster AS bm
+                    INNER JOIN AffectedGenerics AS ag
+                        ON ag.GenericItemNumber = bm.GenericItemNumber
+                    WHERE bm.WarehouseID = ?
+                      AND bm.BuildID = ?
+                      AND NULLIF(bm.GTIN, N'') IS NOT NULL
+                      AND UPPER(LTRIM(RTRIM(ISNULL(bm.GenericExistsInSFDA, N'')))) = N'YES'
+                ),
+                GenericReference AS
+                (
+                    SELECT GenericItemNumber, GTIN, DrugName, PackageSize, TradeItemNumber, TradeName
+                    FROM
+                    (
+                        SELECT
+                            e.GenericItemNumber,
+                            e.GTIN,
+                            e.DrugName,
+                            e.PackageSize,
+                            e.TradeItemNumber,
+                            e.TradeName,
+                            ROW_NUMBER() OVER
+                            (
+                                PARTITION BY e.GenericItemNumber
+                                ORDER BY e.LastUpdated DESC, e.GTIN
+                            ) AS rn
+                        FROM ExactIdentityRows AS e
+                    ) AS x
+                    WHERE rn = 1
+                )
+                INSERT INTO dbo.BatchMaster
+                (
+                    BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                    TradeItemNumber, TradeName, GTIN, DrugName, PackageSize,
+                    SFDAQuantity, Active, QuantitySentPending, QuantityReceivePending,
+                    Description, ItemFamilyGroup, SupplierName, SupplierCode,
+                    TotalReceiveQty, TotalDispatchedQty, ReceiveRuns, DispatchRuns,
+                    FirstReceivedDate, LastReceivedDate, FirstDispatchDate, LastDispatchDate,
+                    Custody, GenericExistsInSFDA, LastUpdated
+                )
+                SELECT
+                    ra.BN,
+                    ra.ExpiryMonthKey,
+                    COALESCE(sf.ExpiryDate, ra.ExpiryDate),
+                    ra.GenericItemNumber,
+                    COALESCE(NULLIF(ra.TradeItemNumber, N''), gr.TradeItemNumber, N''),
+                    COALESCE(NULLIF(ra.TradeName, N''), gr.TradeName, N''),
+                    COALESCE(NULLIF(sf.GTIN, N''), gr.GTIN, N''),
+                    COALESCE(NULLIF(sf.DrugName, N''), gr.DrugName, N''),
+                    CASE
+                        WHEN COALESCE(sf.PackageSize, 0) > 0 THEN sf.PackageSize
+                        WHEN COALESCE(gr.PackageSize, 0) > 0 THEN gr.PackageSize
+                        ELSE 1
+                    END,
+                    COALESCE(sf.Quantity, 0),
+                    COALESCE(sf.Active, 0),
+                    COALESCE(sf.QuantitySentPending, 0),
+                    COALESCE(sf.QuantityReceivePending, 0),
+                    COALESCE(ra.Description, N''),
+                    COALESCE(ra.ItemFamilyGroup, N''),
+                    COALESCE(ra.SupplierName, N''),
+                    COALESCE(ra.SupplierCode, N''),
+                    COALESCE(ra.TotalReceiveQty, 0),
+                    COALESCE(da.TotalDispatchedQty, 0),
+                    COALESCE(ra.ReceiveRuns, 0),
+                    COALESCE(da.DispatchRuns, 0),
+                    ra.FirstReceivedDate,
+                    ra.LastReceivedDate,
+                    da.FirstDispatchDate,
+                    da.LastDispatchDate,
+                    COALESCE(NULLIF(da.Custody, N''), N''),
+                    CASE WHEN sf.BN IS NOT NULL THEN N'Yes' ELSE N'Missing Batch in SFDA' END,
+                    SYSUTCDATETIME()
+                FROM #ReceiptAggregate AS ra
+                INNER JOIN #AffectedAcceptKeys AS aa
+                    ON aa.BN = ra.BN
+                   AND aa.ExpiryMonthKey = ra.ExpiryMonthKey
+                   AND aa.GenericItemNumber = ra.GenericItemNumber
+                LEFT JOIN GenericReference AS gr
+                    ON gr.GenericItemNumber = ra.GenericItemNumber
+                LEFT JOIN #DispatchAggregate AS da
+                    ON da.BN = ra.BN
+                   AND da.ExpiryMonthKey = ra.ExpiryMonthKey
+                   AND da.GenericItemNumber = ra.GenericItemNumber
+                OUTER APPLY
+                (
+                    SELECT TOP (1)
+                        s.BN, s.ExpiryDate, s.GTIN, s.DrugName, s.PackageSize,
+                        s.Quantity, s.Active, s.QuantitySentPending, s.QuantityReceivePending
+                    FROM #CurrentAcceptSFDA AS s
+                    WHERE s.BN = ra.BN
+                      AND s.ExpiryMonthKey = ra.ExpiryMonthKey
+                      AND s.ResolvedGenericItemNumber = ra.GenericItemNumber
+                    ORDER BY s.GTIN
+                ) AS sf
+                WHERE (sf.BN IS NOT NULL OR gr.GenericItemNumber IS NOT NULL)
+                  AND NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM dbo.BatchMaster AS existing
+                      WHERE existing.WarehouseID = ?
+                        AND existing.BuildID = ?
+                        AND existing.BN = ra.BN
+                        AND existing.ExpiryMonthKey = ra.ExpiryMonthKey
+                        AND existing.GenericItemNumber = ra.GenericItemNumber
+                  );
+            """, warehouse_id, build_id, warehouse_id, build_id)
+            batch_inserted = max(0, int(cursor.rowcount or 0))
+            timings["batch_master_insert"] = round(time.perf_counter() - batch_insert_started, 3)
+
+            supplier_started = time.perf_counter()
+            cursor.execute(r"""
+                DELETE sh
+                FROM dbo.SupplierHistory AS sh
+                INNER JOIN #AffectedAcceptKeys AS a
+                    ON a.BN = sh.BN
+                   AND a.ExpiryMonthKey = sh.ExpiryMonthKey
+                   AND a.GenericItemNumber = sh.GenericItemNumber
+                WHERE sh.WarehouseID = ?
+                  AND sh.BuildID = ?;
+            """, warehouse_id, build_id)
+
+            cursor.execute(r"""
+                INSERT INTO dbo.SupplierHistory
+                (
+                    SupplierName, SupplierCode, GTIN, DrugName, GenericItemNumber,
+                    Description, TradeDescription, BN, ExpiryMonthKey, ExpiryDate,
+                    PackageSize, ReceivedQuantityEach, ReceivedQuantityPack,
+                    FirstReceivedDate, LastReceivedDate, ItemFamilyGroup,
+                    TradeItemNumber, LastUpdated
+                )
+                SELECT
+                    r.SupplierName,
+                    r.SupplierCode,
+                    bm.GTIN,
+                    bm.DrugName,
+                    r.GenericItemNumber,
+                    COALESCE(NULLIF(MAX(r.Description), N''), bm.Description, N''),
+                    COALESCE(NULLIF(MAX(r.TradeName), N''), bm.TradeName, N''),
+                    r.BN,
+                    r.ExpiryMonthKey,
+                    COALESCE(bm.ExpiryDate, MAX(r.ExpiryDate)),
+                    CASE WHEN COALESCE(bm.PackageSize, 0) > 0 THEN bm.PackageSize ELSE 1 END,
+                    SUM(COALESCE(r.ReceivedQuantity, 0)),
+                    SUM(COALESCE(r.ReceivedQuantity, 0)) /
+                        CASE WHEN COALESCE(bm.PackageSize, 0) > 0 THEN bm.PackageSize ELSE 1 END,
+                    MIN(r.ReceivedDate),
+                    MAX(r.ReceivedDate),
+                    COALESCE(NULLIF(MAX(r.ItemFamilyGroup), N''), bm.ItemFamilyGroup, N''),
+                    COALESCE(NULLIF(MAX(r.TradeItemNumber), N''), bm.TradeItemNumber, N''),
+                    SYSUTCDATETIME()
+                FROM #ReceiptAffectedRows AS r
+                INNER JOIN #AffectedAcceptKeys AS a
+                    ON a.BN = r.BN
+                   AND a.ExpiryMonthKey = r.ExpiryMonthKey
+                   AND a.GenericItemNumber = r.GenericItemNumber
+                INNER JOIN dbo.BatchMaster AS bm
+                    ON bm.WarehouseID = ?
+                   AND bm.BuildID = ?
+                   AND bm.BN = r.BN
+                   AND bm.ExpiryMonthKey = r.ExpiryMonthKey
+                   AND bm.GenericItemNumber = r.GenericItemNumber
+                WHERE UPPER(LTRIM(RTRIM(ISNULL(r.InboundShipment, N'')))) LIKE N'TRK5060%'
+                  AND REPLACE(REPLACE(REPLACE(
+                        UPPER(LTRIM(RTRIM(ISNULL(r.ItemFamilyGroup, N'')))),
+                        N' ', N''), N'-', N''), N'_', N'') <> N'LABORATORYSUPPLIES'
+                GROUP BY
+                    r.SupplierName, r.SupplierCode, r.BN, r.ExpiryMonthKey,
+                    r.GenericItemNumber, bm.GTIN, bm.DrugName, bm.Description,
+                    bm.TradeName, bm.ExpiryDate, bm.PackageSize,
+                    bm.ItemFamilyGroup, bm.TradeItemNumber;
+            """, warehouse_id, build_id)
+            supplier_rebuilt = max(0, int(cursor.rowcount or 0))
+            timings["supplier_history_refresh"] = round(time.perf_counter() - supplier_started, 3)
+
+            customer_started = time.perf_counter()
+            cursor.execute(r"""
+                DELETE ch
+                FROM dbo.CustomerHistory AS ch
+                INNER JOIN #AffectedDispatchKeys AS a
+                    ON a.BN = ch.BN
+                   AND a.ExpiryMonthKey = ch.ExpiryMonthKey
+                   AND a.GenericItemNumber = ch.GenericItemNumber
+                WHERE ch.WarehouseID = ?
+                  AND ch.BuildID = ?;
+            """, warehouse_id, build_id)
+
+            cursor.execute(r"""
+                INSERT INTO dbo.CustomerHistory
+                (
+                    ToAddress, GLN, GTIN, DrugName, GenericItemNumber,
+                    TradeDescription, BN, ExpiryMonthKey, ExpiryDate,
+                    PackageSize, DispatchQuantityEach, DispatchQuantityPack,
+                    FirstDispatchDate, LastDispatchDate, Custody, TradeItemNumber,
+                    LastUpdated
+                )
+                SELECT
+                    d.ToAddress,
+                    N'',
+                    bm.GTIN,
+                    bm.DrugName,
+                    d.GenericItemNumber,
+                    COALESCE(NULLIF(MAX(d.TradeName), N''), bm.TradeName, N''),
+                    d.BN,
+                    d.ExpiryMonthKey,
+                    COALESCE(bm.ExpiryDate, MAX(d.ExpiryDate)),
+                    CASE WHEN COALESCE(bm.PackageSize, 0) > 0 THEN bm.PackageSize ELSE 1 END,
+                    SUM(COALESCE(d.DispatchedQuantity, 0)),
+                    SUM(COALESCE(d.DispatchedQuantity, 0)) /
+                        CASE WHEN COALESCE(bm.PackageSize, 0) > 0 THEN bm.PackageSize ELSE 1 END,
+                    MIN(d.DispatchDate),
+                    MAX(d.DispatchDate),
+                    COALESCE(NULLIF(MAX(d.Custody), N''), NULLIF(MAX(bm.Custody), N''), N''),
+                    COALESCE(NULLIF(MAX(d.TradeItemNumber), N''), bm.TradeItemNumber, N''),
+                    SYSUTCDATETIME()
+                FROM #DispatchAffectedRows AS d
+                INNER JOIN #AffectedDispatchKeys AS a
+                    ON a.BN = d.BN
+                   AND a.ExpiryMonthKey = d.ExpiryMonthKey
+                   AND a.GenericItemNumber = d.GenericItemNumber
+                INNER JOIN dbo.BatchMaster AS bm
+                    ON bm.WarehouseID = ?
+                   AND bm.BuildID = ?
+                   AND bm.BN = d.BN
+                   AND bm.ExpiryMonthKey = d.ExpiryMonthKey
+                   AND bm.GenericItemNumber = d.GenericItemNumber
+                GROUP BY
+                    d.ToAddress,
+                    d.BN,
+                    d.ExpiryMonthKey,
+                    d.GenericItemNumber,
+                    bm.GTIN,
+                    bm.DrugName,
+                    bm.TradeName,
+                    bm.PackageSize,
+                    bm.TradeItemNumber;
+            """, warehouse_id, build_id)
+            customer_rebuilt = max(0, int(cursor.rowcount or 0))
+            timings["customer_history_refresh"] = round(time.perf_counter() - customer_started, 3)
+
+            commit_started = time.perf_counter()
+            connection.commit()
+            timings["commit"] = round(time.perf_counter() - commit_started, 3)
+        except Exception:
+            connection.rollback()
+            raise
+
+    sql_seconds = time.perf_counter() - sql_started_at
+    timings["sql_total"] = round(sql_seconds, 3)
+    total_seconds = time.perf_counter() - started_at
+    timings["total"] = round(total_seconds, 3)
+
+    logger.info(
+        "Unified Historical Append refresh completed in %.2f seconds. WarehouseID=%s BuildID=%s "
+        "movement_keys=%s accept_keys=%s dispatch_keys=%s batch_updated=%s batch_inserted=%s "
+        "supplier_rows=%s customer_rows=%s timings=%s",
+        total_seconds,
+        warehouse_id,
+        build_id,
+        len(movement_keys),
+        len(accept_affected),
+        len(dispatch_keys),
+        batch_updated,
+        batch_inserted,
+        supplier_rebuilt,
+        customer_rebuilt,
+        timings,
+    )
+
+    return {
+        "affected_batch_keys": int(len(movement_keys)),
+        "accept_affected_batch_keys": int(len(accept_affected)),
+        "dispatch_affected_batch_keys": int(len(dispatch_keys)),
+        "batch_master_rows_updated": int(batch_updated),
+        "batch_master_rows_inserted": int(batch_inserted),
+        "supplier_history_rows_rebuilt": int(supplier_rebuilt),
+        "customer_history_rows_rebuilt": int(customer_rebuilt),
+        "scope_prepare_seconds": float(scope_metrics.get("seconds", 0) or 0),
+        "sql_refresh_seconds": float(sql_seconds),
+        "timings_seconds": timings,
+    }
+
 def refresh_accept_history_incremental(
     receipt_history_rows: List[Dict[str, Any]],
     sfda_df: pd.DataFrame,
@@ -5749,7 +6590,7 @@ def refresh_accept_history_incremental(
             batch_updated = max(0, int(cursor.rowcount or 0))
 
             # Insert newly seen batches only when their Generic already has a
-            # proven identity in Batch Master. This preserves the Generic↔GTIN
+            # proven identity in Batch Master. This preserves the Genericâ†”GTIN
             # authority and prevents BN/expiry collisions from inventing a drug.
             cursor.execute(r"""
                 ;WITH ReceiptAggregate AS
