@@ -986,6 +986,85 @@ def append_events(
           );
     """
 
+    def _all_prepared_events_already_exist() -> bool:
+        """Fast retry probe for post-save Historical Append recovery.
+
+        A failed Append can be retried with every EventKey already durable in SQL.
+        Sending the full 28k-row payload through OPENJSON again is unnecessary and
+        can be much slower than an indexed key-only existence check.  This probe
+        stages only EventKey values and short-circuits the save when *all* prepared
+        rows are already present for the active WarehouseID + BuildID.
+        """
+        with Database().connect() as connection:
+            cursor = connection.cursor()
+            try:
+                cursor.execute(r"""
+                    CREATE TABLE #ReceiptEventKeyProbe
+                    (
+                        EventKey varchar(64) NOT NULL PRIMARY KEY
+                    );
+
+                    CREATE TABLE #DispatchEventKeyProbe
+                    (
+                        EventKey varchar(64) NOT NULL PRIMARY KEY
+                    );
+                """)
+                cursor.fast_executemany = True
+                if prepared_receipts:
+                    cursor.executemany(
+                        "INSERT INTO #ReceiptEventKeyProbe (EventKey) VALUES (?);",
+                        [(str(row[0]),) for row in prepared_receipts],
+                    )
+                if prepared_dispatches:
+                    cursor.executemany(
+                        "INSERT INTO #DispatchEventKeyProbe (EventKey) VALUES (?);",
+                        [(str(row[0]),) for row in prepared_dispatches],
+                    )
+                cursor.fast_executemany = False
+
+                cursor.execute(
+                    r"""
+                    SELECT
+                        (
+                            SELECT COUNT_BIG(*)
+                            FROM #ReceiptEventKeyProbe AS s
+                            WHERE EXISTS
+                            (
+                                SELECT 1
+                                FROM dbo.ReceiptEvents AS t
+                                WHERE t.WarehouseID = ?
+                                  AND t.BuildID = ?
+                                  AND t.EventKey = s.EventKey
+                            )
+                        ) AS ExistingReceiptKeys,
+                        (
+                            SELECT COUNT_BIG(*)
+                            FROM #DispatchEventKeyProbe AS s
+                            WHERE EXISTS
+                            (
+                                SELECT 1
+                                FROM dbo.DispatchEvents AS t
+                                WHERE t.WarehouseID = ?
+                                  AND t.BuildID = ?
+                                  AND t.EventKey = s.EventKey
+                            )
+                        ) AS ExistingDispatchKeys;
+                    """,
+                    warehouse_id,
+                    active_build_id,
+                    warehouse_id,
+                    active_build_id,
+                )
+                row = cursor.fetchone()
+                existing_receipts = int((row[0] if row else 0) or 0)
+                existing_dispatches = int((row[1] if row else 0) or 0)
+                return (
+                    existing_receipts == len(prepared_receipts)
+                    and existing_dispatches == len(prepared_dispatches)
+                )
+            finally:
+                cursor.close()
+
     def _save_openjson() -> tuple[int, int]:
         receipt_inserted = 0
         dispatch_inserted = 0
@@ -1171,17 +1250,37 @@ def append_events(
             "0", "false", "no", "off"
         }
         if json_enabled:
+            duplicate_probe_started = time.perf_counter()
+            all_already_present = False
             try:
-                inserted_receipts, inserted_dispatches = _save_openjson()
+                all_already_present = _all_prepared_events_already_exist()
             except Exception:
                 logger.exception(
-                    "OPENJSON historical event bulk save failed; retrying with temp-table fallback. "
+                    "Historical event duplicate fast-path probe failed; continuing with OPENJSON save. "
                     "WarehouseID=%s BuildID=%s",
                     warehouse_id,
                     active_build_id,
                 )
-                save_mode = "temp_fallback"
-                inserted_receipts, inserted_dispatches = _save_temp_stage()
+            phase_timings["duplicate_probe"] = round(
+                time.perf_counter() - duplicate_probe_started, 3
+            )
+
+            if all_already_present:
+                save_mode = "duplicate_fast_path"
+                inserted_receipts = 0
+                inserted_dispatches = 0
+            else:
+                try:
+                    inserted_receipts, inserted_dispatches = _save_openjson()
+                except Exception:
+                    logger.exception(
+                        "OPENJSON historical event bulk save failed; retrying with temp-table fallback. "
+                        "WarehouseID=%s BuildID=%s",
+                        warehouse_id,
+                        active_build_id,
+                    )
+                    save_mode = "temp_fallback"
+                    inserted_receipts, inserted_dispatches = _save_temp_stage()
         else:
             save_mode = "temp"
             inserted_receipts, inserted_dispatches = _save_temp_stage()
@@ -5916,6 +6015,26 @@ def refresh_historical_append_incremental(
                     QuantitySentPending decimal(38, 6) NULL,
                     QuantityReceivePending decimal(38, 6) NULL
                 );
+
+                -- IMPORTANT: create durable-event temp tables in this outer,
+                -- non-parameterized batch. With ODBC Driver 18 a temp table
+                -- created by SELECT...INTO inside a parameterized execute can
+                -- be scoped to the driver's prepared statement and disappear
+                -- before the next cursor.execute call. Creating the temp
+                -- tables here keeps them alive for the whole SQL session.
+                SELECT TOP (0)
+                    BN, ExpiryMonthKey, GenericItemNumber, ExpiryDate,
+                    TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
+                    SupplierName, SupplierCode, Description, ItemFamilyGroup, ReceivedDate
+                INTO #ReceiptAffectedRows
+                FROM dbo.ReceiptEvents;
+
+                SELECT TOP (0)
+                    BN, ExpiryMonthKey, GenericItemNumber, ExpiryDate,
+                    TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
+                    DispatchDate, Custody
+                INTO #DispatchAffectedRows
+                FROM dbo.DispatchEvents;
             """)
             cursor.fast_executemany = True
             if accept_affected:
@@ -5951,8 +6070,19 @@ def refresh_historical_append_incremental(
             # Materialize the durable event rows exactly once. Explicit WarehouseID
             # + BuildID filters make the historical covering indexes directly usable
             # instead of relying only on the security predicate to infer scope.
+            # fast_executemany is only needed for the small temp-key staging above;
+            # turn it off before normal SQL execution so subsequent statements use
+            # the regular cursor execution path.
+            cursor.fast_executemany = False
+
             receipt_materialize_started = time.perf_counter()
             cursor.execute(r"""
+                INSERT INTO #ReceiptAffectedRows
+                (
+                    BN, ExpiryMonthKey, GenericItemNumber, ExpiryDate,
+                    TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
+                    SupplierName, SupplierCode, Description, ItemFamilyGroup, ReceivedDate
+                )
                 SELECT
                     r.BN,
                     r.ExpiryMonthKey,
@@ -5967,7 +6097,6 @@ def refresh_historical_append_incremental(
                     r.Description,
                     r.ItemFamilyGroup,
                     r.ReceivedDate
-                INTO #ReceiptAffectedRows
                 FROM dbo.ReceiptEvents AS r
                 INNER JOIN #AffectedMovementKeys AS a
                     ON a.BN = r.BN
@@ -5990,6 +6119,12 @@ def refresh_historical_append_incremental(
 
             dispatch_materialize_started = time.perf_counter()
             cursor.execute(r"""
+                INSERT INTO #DispatchAffectedRows
+                (
+                    BN, ExpiryMonthKey, GenericItemNumber, ExpiryDate,
+                    TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
+                    DispatchDate, Custody
+                )
                 SELECT
                     d.BN,
                     d.ExpiryMonthKey,
@@ -6001,7 +6136,6 @@ def refresh_historical_append_incremental(
                     d.ToAddress,
                     d.DispatchDate,
                     d.Custody
-                INTO #DispatchAffectedRows
                 FROM dbo.DispatchEvents AS d
                 INNER JOIN #AffectedMovementKeys AS a
                     ON a.BN = d.BN
