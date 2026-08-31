@@ -6509,6 +6509,7 @@ def refresh_historical_append_incremental(
                     bm.GTIN,
                     bm.DrugName,
                     bm.TradeName,
+                    bm.ExpiryDate,
                     bm.PackageSize,
                     bm.TradeItemNumber;
             """, warehouse_id, build_id)
