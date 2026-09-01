@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -48,9 +49,10 @@ class PackSizeResolver:
 
     def __init__(self, pack_frame: pd.DataFrame):
         frame = pack_frame.copy()
-        for col in ["Trade Name", "PharmaceuticalForm", "Size", "SizeUnit", "PackageTypes", "PackageSize"]:
+        for col in ["Scientific Name", "Trade Name", "PharmaceuticalForm", "Size", "SizeUnit", "PackageTypes", "PackageSize"]:
             if col not in frame.columns:
                 frame[col] = ""
+        frame["Scientific Name"] = Normalizer.text(frame["Scientific Name"])
         frame["Trade Name"] = Normalizer.text(frame["Trade Name"])
         frame["PharmaceuticalForm"] = Normalizer.text(frame["PharmaceuticalForm"])
         frame["SizeUnit"] = Normalizer.text(frame["SizeUnit"])
@@ -64,6 +66,26 @@ class PackSizeResolver:
             key: group.reset_index(drop=True)
             for key, group in self.frame.groupby("_TradeKey", sort=False)
         }
+
+        # Separate identity index used only by Historical exact-batch validation.
+        # It never changes the PackageSize selection rule above.  The index links
+        # WMS/SFDA trade-name variants to the configured Scientific Name so known
+        # aliases such as NORMAL SALINE <-> SODIUM CHLORIDE can validate without
+        # lowering the fuzzy-match threshold globally.
+        identity = frame.copy()
+        identity["_ScientificKey"] = Normalizer.drug_name_key(identity["Scientific Name"])
+        identity = identity.loc[
+            identity["_TradeKey"].ne("") & identity["_ScientificKey"].ne("")
+        ].drop_duplicates(subset=["_TradeKey", "_ScientificKey"], keep="first")
+        self._identity_rows = identity[["_TradeKey", "_ScientificKey"]].reset_index(drop=True)
+        self._identity_tokens = {}
+        self._identity_prefix_index = {}
+        for idx, row in self._identity_rows.iterrows():
+            tokens = Normalizer.drug_identity_tokens(row["_TradeKey"])
+            self._identity_tokens[int(idx)] = tokens
+            for token in tokens:
+                self._identity_prefix_index.setdefault(token[:4], set()).add(int(idx))
+        self._scientific_identity_cache = {}
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -117,6 +139,85 @@ class PackSizeResolver:
         number = f"{float(size):g}"
         unit_alias = {"MICROGRAM": "MCG", "MILLIGRAM": "MG", "GRAM": "G", "MILLILITER": "ML"}.get(unit, unit)
         return bool(re.search(rf"\b{re.escape(number)}\s*{re.escape(unit_alias)}\b", wms_text, flags=re.IGNORECASE))
+
+    def scientific_identity_keys(self, value: Any) -> set[str]:
+        """Resolve a trade-name phrase to configured Scientific Name identities.
+
+        This is deliberately separate from ``resolve()`` so the long-standing
+        PackageSize rule is unchanged.  Matching uses only strong product tokens
+        and is cached for repeated SFDA/WMS names during Historical builds.
+        """
+        cache_key = Normalizer._drug_key_scalar(value)
+        if not cache_key:
+            return set()
+        cached = self._scientific_identity_cache.get(cache_key)
+        if cached is not None:
+            return set(cached)
+
+        input_tokens = Normalizer.drug_identity_tokens(cache_key)
+        candidate_ids = set()
+        for token in input_tokens:
+            candidate_ids.update(self._identity_prefix_index.get(token[:4], set()))
+
+        scored = []
+        for idx in candidate_ids:
+            trade_tokens = self._identity_tokens.get(idx, ())
+            if not trade_tokens:
+                continue
+
+            strong_pairs = []
+            for left in input_tokens:
+                for right in trade_tokens:
+                    ratio = SequenceMatcher(None, left, right).ratio()
+                    if ratio >= 0.86:
+                        strong_pairs.append((left, right, ratio))
+            if not strong_pairs:
+                continue
+
+            distinctive = any(
+                Normalizer._is_distinctive_identity_token(left)
+                or Normalizer._is_distinctive_identity_token(right)
+                for left, right, _ in strong_pairs
+            )
+            matched_left = {left for left, _, _ in strong_pairs}
+            matched_right = {right for _, right, _ in strong_pairs}
+            if not distinctive and min(len(matched_left), len(matched_right)) < 2:
+                continue
+
+            best = max(ratio for _, _, ratio in strong_pairs)
+            coverage = min(
+                1.0,
+                len(matched_left) / max(1, min(len(input_tokens), len(trade_tokens))),
+            )
+            score = (0.65 * coverage) + (0.35 * best)
+            scored.append((score, idx))
+
+        if not scored:
+            self._scientific_identity_cache[cache_key] = frozenset()
+            return set()
+
+        best_score = max(score for score, _ in scored)
+        selected = [idx for score, idx in scored if score >= best_score - 0.08]
+        identities = {
+            str(self._identity_rows.iloc[idx]["_ScientificKey"]).strip()
+            for idx in selected
+            if str(self._identity_rows.iloc[idx]["_ScientificKey"]).strip()
+        }
+        self._scientific_identity_cache[cache_key] = frozenset(identities)
+        return identities
+
+    def same_product_identity(self, sfda_name: Any, wms_trade_description: Any):
+        """Return True/False when the product master can compare both names.
+
+        ``None`` means the reference master cannot resolve one or both sides, so
+        callers should fall back to lexical identity validation rather than infer
+        a mismatch from missing reference data.
+        """
+        sfda_identities = self.scientific_identity_keys(sfda_name)
+        wms_identities = self.scientific_identity_keys(wms_trade_description)
+        if not sfda_identities or not wms_identities:
+            return None
+        return bool(sfda_identities.intersection(wms_identities))
 
     def resolve(self, drug_name: Any, wms_trade_description: Any = "") -> tuple[float, str]:
         drug_key = Normalizer._drug_key_scalar(drug_name)
