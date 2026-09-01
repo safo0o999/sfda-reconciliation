@@ -5973,7 +5973,11 @@ def _prepare_incremental_accept_refresh_scope(
     })
 
     from engine.full_reconciliation import FullReconciliationEngine
-    from engine.normalizer import Normalizer
+    from engine.normalizer import (
+        HISTORICAL_MATCH_LEGACY_THRESHOLD,
+        HISTORICAL_MATCH_LOGIC_VERSION,
+        Normalizer,
+    )
     from engine.pack_size_resolver import PackSizeResolver
 
     current_sfda = Normalizer.normalize_sfda(
@@ -6031,6 +6035,10 @@ def _prepare_incremental_accept_refresh_scope(
     resolved_generics: Dict[tuple[str, str], list[str]] = {}
     trade_by_identity: Dict[tuple[str, str, str], str] = {}
     candidate_keys: Set[tuple[str, str]] = set()
+    identity_exact_candidates = 0
+    identity_accepted = 0
+    identity_rejected = 0
+    identity_accepted_below_legacy_threshold = 0
 
     if not candidate_rows.empty:
         candidate_keys = set(
@@ -6096,14 +6104,20 @@ def _prepare_incremental_accept_refresh_scope(
             for generic, trade in candidates:
                 score = Normalizer.drug_name_match_score(sfda_drug, trade)
                 reference_match = pack_resolver.same_product_identity(sfda_drug, trade)
-                if Normalizer.drug_name_validation_pass(
+                identity_exact_candidates += 1
+                passed = Normalizer.drug_name_validation_pass(
                     sfda_drug,
                     trade,
-                    threshold=60.0,
+                    threshold=HISTORICAL_MATCH_LEGACY_THRESHOLD,
                     reference_match=reference_match,
-                ):
+                )
+                if passed:
+                    identity_accepted += 1
+                    if score < float(HISTORICAL_MATCH_LEGACY_THRESHOLD):
+                        identity_accepted_below_legacy_threshold += 1
                     accepted.append(str(generic))
                 else:
+                    identity_rejected += 1
                     logger.warning(
                         "Incremental exact batch match rejected by product-identity validation. "
                         "BN=%s expiry_month=%s generic=%s SFDA_drug=%s WMS_trade=%s "
@@ -6143,6 +6157,12 @@ def _prepare_incremental_accept_refresh_scope(
                 ))
 
     metrics = {
+        "logic_version": HISTORICAL_MATCH_LOGIC_VERSION,
+        "legacy_threshold": float(HISTORICAL_MATCH_LEGACY_THRESHOLD),
+        "identity_exact_candidates": int(identity_exact_candidates),
+        "identity_accepted": int(identity_accepted),
+        "identity_rejected": int(identity_rejected),
+        "identity_accepted_below_legacy_threshold": int(identity_accepted_below_legacy_threshold),
         "candidate_rows": int(len(candidate_rows)),
         "identity_receipt_rows": int(len(receipt_history_rows or [])),
         "identity_dispatch_rows": int(len(dispatch_history_rows or [])),
@@ -6225,6 +6245,7 @@ def refresh_historical_append_incremental(
             "customer_history_rows_rebuilt": 0,
             "scope_prepare_seconds": float(scope_metrics.get("seconds", 0) or 0),
             "sql_refresh_seconds": 0.0,
+            "match_diagnostics": scope_metrics,
             "timings_seconds": {},
         }
 
@@ -6841,6 +6862,7 @@ def refresh_historical_append_incremental(
         "customer_history_rows_rebuilt": int(customer_rebuilt),
         "scope_prepare_seconds": float(scope_metrics.get("seconds", 0) or 0),
         "sql_refresh_seconds": float(sql_seconds),
+        "match_diagnostics": scope_metrics,
         "timings_seconds": timings,
     }
 
