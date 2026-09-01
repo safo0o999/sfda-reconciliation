@@ -42,6 +42,7 @@ from engine.database import (
 )
 from engine.exporter import Exporter
 from engine.full_reconciliation import FullReconciliationEngine
+from engine.normalizer import HISTORICAL_MATCH_LOGIC_VERSION
 from engine.warehouse_context import historical_build_scope, warehouse_scope
 
 
@@ -442,6 +443,10 @@ def process_historical_build_job(
             )
 
     try:
+        logger.warning(
+            "HISTORICAL_MATCH_LOGIC_VERSION job_id=%s warehouse_id=%s operation=%s version=%s",
+            job_id, warehouse_id, operation, HISTORICAL_MATCH_LOGIC_VERSION,
+        )
         update_historical_build_job(
             job_id,
             status="Running",
@@ -492,6 +497,10 @@ def process_historical_build_job(
             asn_df,
             dispatch_df,
             sfda_df,
+        )
+        logger.warning(
+            "Historical matcher loaded. job_id=%s version=%s",
+            job_id, HISTORICAL_MATCH_LOGIC_VERSION,
         )
         prepared = engine.prepare_incremental()
         mark_stage("validate_normalize_prepare_events")
@@ -753,7 +762,17 @@ def process_historical_build_job(
             }
             mark_stage("activate_new_historical_database")
 
+        if operation == "rebuild":
+            match_diagnostics = engine.historical_match_diagnostics()
+        else:
+            match_diagnostics = dict(
+                (unified_refresh or {}).get("match_diagnostics") or {}
+            )
+        match_diagnostics.setdefault("logic_version", HISTORICAL_MATCH_LOGIC_VERSION)
+
         summary = {
+            "historical_match_logic_version": HISTORICAL_MATCH_LOGIC_VERSION,
+            "historical_match_diagnostics": match_diagnostics,
             "asn_files": len(input_manifest.get("asn_files", [])),
             "dispatch_files": len(input_manifest.get("dispatch_files", [])),
             "prepared_receipt_events": len(prepared["receipt_events"]),
