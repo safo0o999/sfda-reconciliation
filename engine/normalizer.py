@@ -5,6 +5,13 @@ from functools import lru_cache
 import pandas as pd
 
 
+# Historical matching deployment signature. This value is written into every
+# completed Historical Rebuild/Append SummaryJson so production SQL can prove
+# exactly which matching logic the Azure worker executed.
+HISTORICAL_MATCH_LOGIC_VERSION = "SFDA_IDENTITY_V3_20260901"
+HISTORICAL_MATCH_LEGACY_THRESHOLD = 60.0
+
+
 class Normalizer:
     @staticmethod
     def _find_column(df, candidates):
@@ -275,7 +282,7 @@ class Normalizer:
     def drug_name_validation_pass(
         sfda_name,
         wms_trade_description,
-        threshold=60.0,
+        threshold=HISTORICAL_MATCH_LEGACY_THRESHOLD,
         reference_match=None,
     ):
         """Safety validation AFTER an exact BN + Expiry Month match.
