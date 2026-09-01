@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Sequence
 import pandas as pd
 
 from engine.normalizer import Normalizer
+from engine.pack_size_resolver import PackSizeResolver
 from engine.validator import Validator
 from engine.reference_data import load_current_warehouse_gln
 
@@ -253,6 +254,9 @@ class FullReconciliationEngine:
             engine="openpyxl",
             dtype=object,
         )
+        # Build the PackageSize/product-identity reference once per engine run.
+        # Reused by exact SFDA validation and final PackageSize resolution.
+        self._pack_size_resolver = PackSizeResolver(self.packsize)
         # GLN is warehouse-scoped without changing any historical batch logic.
         # Madinah (WarehouseID=1) continues to use config/gln.xlsx exactly as
         # before. Other warehouses use only their own stored mapping.
@@ -624,7 +628,8 @@ class FullReconciliationEngine:
         2. Generic Item Number always comes from the WMS row.
         3. After the exact batch match is found, SFDA Drug Name is normalized
            and compared with that WMS row's Trade Description.
-        4. A clearly unrelated name rejects that WMS Generic/Bn/Expiry match.
+        4. Product identity is a safety check only: known aliases/abbreviations
+           remain valid, while a clear strength/product conflict rejects the match.
 
         Important: validation is applied to EVERY WMS Generic candidate, even
         when only one candidate exists in the current build. This protects
@@ -644,11 +649,26 @@ class FullReconciliationEngine:
         if edges.empty:
             return edges
 
-        edges["_Drug Identity Score"] = [
-            Normalizer.drug_name_match_score(drug, trade)
-            for drug, trade in zip(edges["Drug Name"], edges["_WMS Trade Description"])
-        ]
-        valid = edges["_Drug Identity Score"].ge(60.0)
+        identity_resolver = getattr(self, "_pack_size_resolver", PackSizeResolver(self.packsize))
+        scores = []
+        reference_matches = []
+        validation_results = []
+        for drug, trade in zip(edges["Drug Name"], edges["_WMS Trade Description"]):
+            score = Normalizer.drug_name_match_score(drug, trade)
+            reference_match = identity_resolver.same_product_identity(drug, trade)
+            passed = Normalizer.drug_name_validation_pass(
+                drug,
+                trade,
+                threshold=60.0,
+                reference_match=reference_match,
+            )
+            scores.append(score)
+            reference_matches.append(reference_match)
+            validation_results.append(bool(passed))
+
+        edges["_Drug Identity Score"] = scores
+        edges["_Product Master Identity Match"] = reference_matches
+        valid = pd.Series(validation_results, index=edges.index, dtype=bool)
 
         rejected = edges.loc[~valid]
         for _, row in rejected.iterrows():
@@ -1037,7 +1057,7 @@ class FullReconciliationEngine:
             .fillna("").astype(str).str.strip()
         )
         from engine.pack_size_resolver import PackSizeResolver
-        _pack_resolver = PackSizeResolver(self.packsize)
+        _pack_resolver = self._pack_size_resolver
         _resolved_pack = _pack_resolver.resolve_frame(
             master[["Drug Name", "Trade Description"]].copy(),
             drug_col="Drug Name",
