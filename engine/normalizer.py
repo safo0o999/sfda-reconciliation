@@ -8,7 +8,7 @@ import pandas as pd
 # Historical matching deployment signature. This value is written into every
 # completed Historical Rebuild/Append SummaryJson so production SQL can prove
 # exactly which matching logic the Azure worker executed.
-HISTORICAL_MATCH_LOGIC_VERSION = "SFDA_IDENTITY_V3_20260901"
+HISTORICAL_MATCH_LOGIC_VERSION = "SFDA_IDENTITY_V4_CONCENTRATION_20260901"
 HISTORICAL_MATCH_LEGACY_THRESHOLD = 60.0
 
 
@@ -110,11 +110,15 @@ class Normalizer:
         "AMPOULES", "AMP", "POWDER", "SOLVENT", "FILM", "COATED", "MODIFIED",
         "RELEASE", "DISPERSABLE", "DISPERSIBLE", "ORAL", "EYE", "EAR", "DROPS",
         "DROP", "CREAM", "GEL", "OINTMENT", "SPRAY", "INHALER", "NASAL", "DOSE",
+        "DOSES", "VAGINAL", "OVULE", "OVULES", "UNIT",
         "IV", "IM", "USE", "WATER", "FOR", "AND", "WITH", "OF", "THE", "USP",
         "BP", "BOTTLE", "BAG", "PHARMA", "PHARMACEUTICAL", "PHARMACEUTICALS",
         "JPI", "PSI", "JPM", "EIPICO", "TABUK", "JAMJOOM", "DALLAH", "SANOFI",
         "GLAXO", "SMITH", "KLINE", "SAUDI", "AMMAN", "MEDICAL", "UNION",
         "GLOBALPHARMA", "CIPLA", "AJA", "JULPHAR", "BATTERJEE", "JAZEERA",
+        "SANDOZ", "PFIZER", "MERCK", "SERONO", "GENZYME", "ABBOTT", "ARNET",
+        "AGUETTANT", "MEDAC", "ASPEN", "BIOCON", "EBEWE", "ALTHEA", "UNITED",
+        "SUDAIR", "REDDYS", "VIFOR", "HAUPT",
         "BAXTER", "EFISA", "JUNIOR", "MG", "MCG", "UG", "G", "GM", "KG",
         "ML", "L", "IU", "UNIT", "UNITS", "PFU",
     }
@@ -126,6 +130,7 @@ class Normalizer:
         "RINGERS": "RINGER",
         "LACTATED": "LACTATE",
         "NSS": "SALINE",
+        "TAZO": "TAZOPACTAM",
     }
 
     _COMMON_CHEMICAL_IDENTITY_TOKENS = {
@@ -134,13 +139,37 @@ class Normalizer:
     }
 
     @staticmethod
-    def _strength_signature(value):
-        """Return comparable strength/volume tokens without destroying decimals.
+    def _mass_to_mg(number, unit):
+        unit = str(unit or "").upper()
+        value = float(number)
+        if unit in {"MCG", "UG"}:
+            return value / 1000.0
+        if unit == "MG":
+            return value
+        if unit in {"G", "GM"}:
+            return value * 1000.0
+        if unit == "KG":
+            return value * 1_000_000.0
+        raise ValueError(f"Unsupported mass unit: {unit}")
 
-        The previous implementation normalized punctuation before parsing numeric
-        strength.  That could turn ``1.5 MG`` into ``1 5 MG`` and incorrectly
-        compare it with ``15MG``.  Parsing the raw text first preserves decimals
-        and treats G/GM as the same mass unit.
+    @staticmethod
+    def _volume_to_ml(number, unit):
+        unit = str(unit or "").upper()
+        value = float(number)
+        if unit == "ML":
+            return value
+        if unit == "L":
+            return value * 1000.0
+        raise ValueError(f"Unsupported volume unit: {unit}")
+
+    @staticmethod
+    def _strength_signature(value):
+        """Return normalized standalone strength tokens.
+
+        Volume tokens are retained for diagnostics/package-size logic, but V4 no
+        longer treats different standalone volumes as a drug-strength conflict.
+        A 100 ML bottle and a 5 ML concentration denominator are different
+        concepts and must not make an otherwise exact SFDA batch disappear.
         """
         raw = "" if value is None else str(value).upper().replace(",", ".")
         signature = {
@@ -158,23 +187,115 @@ class Normalizer:
             except (TypeError, ValueError):
                 continue
             unit = unit.upper()
-            if unit in {"MCG", "UG"}:
-                signature["mass_mg"].add(round(number / 1000.0, 9))
-            elif unit == "MG":
-                signature["mass_mg"].add(round(number, 9))
-            elif unit in {"G", "GM"}:
-                signature["mass_mg"].add(round(number * 1000.0, 9))
-            elif unit == "KG":
-                signature["mass_mg"].add(round(number * 1_000_000.0, 9))
-            elif unit == "ML":
-                signature["volume_ml"].add(round(number, 9))
-            elif unit == "L":
-                signature["volume_ml"].add(round(number * 1000.0, 9))
+            if unit in {"MCG", "UG", "MG", "G", "GM", "KG"}:
+                signature["mass_mg"].add(round(Normalizer._mass_to_mg(number, unit), 9))
+            elif unit in {"ML", "L"}:
+                signature["volume_ml"].add(round(Normalizer._volume_to_ml(number, unit), 9))
             elif unit in {"IU", "UNIT", "UNITS"}:
                 signature["activity_iu"].add(round(number, 9))
             elif unit == "%":
                 signature["percent"].add(round(number, 9))
         return signature
+
+    @staticmethod
+    def _mass_measurements(value):
+        raw = "" if value is None else str(value).upper().replace(",", ".")
+        pattern = re.compile(
+            r"(?<![A-Z0-9])(\d+(?:\.\d+)?)\s*(MCG|UG|MG|GM|G|KG)(?![A-Z])"
+        )
+        result = []
+        for number_text, unit in pattern.findall(raw):
+            try:
+                result.append(
+                    (
+                        round(Normalizer._mass_to_mg(float(number_text), unit), 9),
+                        number_text,
+                        unit.upper(),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    @staticmethod
+    def _concentration_signature(value):
+        """Return mass concentration values normalized to mg/ml.
+
+        Supports the formats that occur in SFDA/WMS names, including:
+        ``0.1MG/ML``, ``1MG/10ML``, ``20MG PER 2ML`` and ``500MG-10ML``.
+        """
+        raw = "" if value is None else str(value).upper().replace(",", ".")
+        raw = re.sub(r"\bPER\b", "/", raw)
+        pattern = re.compile(
+            r"(?<![A-Z0-9])"
+            r"(\d+(?:\.\d+)?)\s*(MCG|UG|MG|GM|G|KG)"
+            r"\s*(?:/|-)\s*"
+            r"(?:(\d+(?:\.\d+)?)\s*)?(ML|L)\b"
+        )
+        values = set()
+        for mass_text, mass_unit, volume_text, volume_unit in pattern.findall(raw):
+            try:
+                mass_mg = Normalizer._mass_to_mg(float(mass_text), mass_unit)
+                volume_ml = Normalizer._volume_to_ml(float(volume_text or "1"), volume_unit)
+                if volume_ml > 0:
+                    values.add(round(mass_mg / volume_ml, 9))
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+        return values
+
+    @staticmethod
+    def _close_numeric(left, right, rel_tol=0.015, abs_tol=1e-9):
+        left = float(left)
+        right = float(right)
+        return abs(left - right) <= max(abs_tol, rel_tol * max(abs(left), abs(right), 1e-9))
+
+    @staticmethod
+    def _decimal_loss_equivalent(sfda_name, wms_trade_description):
+        """Detect the WMS convention where decimal points disappear in strength.
+
+        Examples observed in production include 0.25MG -> 025MG, 12.5MG ->
+        125MG, 8.4G -> 84G and 16.8G -> 168G.  This repair is *never* used by
+        itself; callers require positive product-identity evidence first.
+        """
+        left = Normalizer._mass_measurements(sfda_name)
+        right = Normalizer._mass_measurements(wms_trade_description)
+        if not left or not right:
+            return False
+
+        def digits(number_text):
+            raw = str(number_text or "").strip()
+            compact = raw.replace(".", "").lstrip("0")
+            return compact or "0"
+
+        for _, left_raw, left_unit in left:
+            for _, right_raw, right_unit in right:
+                if left_unit != right_unit:
+                    continue
+                ld = digits(left_raw)
+                rd = digits(right_raw)
+                if ld == rd:
+                    if "." in left_raw or "." in right_raw or left_raw.startswith("0") or right_raw.startswith("0"):
+                        return True
+                if (ld + "0" == rd or rd + "0" == ld) and ("." in left_raw or "." in right_raw):
+                    return True
+        return False
+
+    @staticmethod
+    @lru_cache(maxsize=20000)
+    def compact_identity_key(value):
+        """Compact brand/product identity, ignoring separators and form noise."""
+        key = Normalizer._drug_key_scalar(value)
+        parts = []
+        for token in re.findall(r"[A-Z][A-Z0-9]*", key):
+            token = Normalizer._IDENTITY_TOKEN_ALIASES.get(token, token)
+            if token in Normalizer._IDENTITY_STOP_TOKENS:
+                continue
+            if token.isdigit() or re.fullmatch(r"\d+(?:MG|MCG|UG|G|GM|ML|L)?", token):
+                continue
+            if len(token) < 3:
+                continue
+            parts.append(token)
+        return "".join(parts)
 
     @staticmethod
     def _strength_tokens(value):
@@ -186,15 +307,92 @@ class Normalizer:
         return tokens
 
     @staticmethod
-    def _has_conflicting_strength(sfda_name, wms_trade_description):
+    def _shared_distinctive_identity_count(sfda_name, wms_trade_description):
+        left = set(Normalizer.drug_identity_tokens(sfda_name))
+        right = set(Normalizer.drug_identity_tokens(wms_trade_description))
+        return len(
+            {
+                token
+                for token in left.intersection(right)
+                if Normalizer._is_distinctive_identity_token(token)
+            }
+        )
+
+    @staticmethod
+    def _strength_relation(sfda_name, wms_trade_description, product_evidence=False):
+        """Return ``match``, ``conflict`` or ``unknown`` for dosage evidence.
+
+        V4 distinguishes concentration from package volume.  It also recognizes
+        mathematically equivalent concentration representations and, only when
+        product identity is already proven, known decimal-loss formatting.
+        """
+        sfda_conc = Normalizer._concentration_signature(sfda_name)
+        wms_conc = Normalizer._concentration_signature(wms_trade_description)
+
+        if sfda_conc and wms_conc:
+            if any(Normalizer._close_numeric(a, b) for a in sfda_conc for b in wms_conc):
+                return "match"
+            return "conflict"
+
+        sfda_mass = {value for value, _, _ in Normalizer._mass_measurements(sfda_name)}
+        wms_mass = {value for value, _, _ in Normalizer._mass_measurements(wms_trade_description)}
+
+        if sfda_mass and wms_mass and any(
+            Normalizer._close_numeric(a, b)
+            for a in sfda_mass
+            for b in wms_mass
+        ):
+            return "match"
+
+        # One side may state a concentration while the other abbreviates it to
+        # the per-ml mass (e.g. SURLEX 200MG/2ML vs SURLEX 100MG).
+        if product_evidence:
+            if sfda_conc and wms_mass and any(
+                Normalizer._close_numeric(c, m)
+                for c in sfda_conc
+                for m in wms_mass
+            ):
+                return "match"
+            if wms_conc and sfda_mass and any(
+                Normalizer._close_numeric(c, m)
+                for c in wms_conc
+                for m in sfda_mass
+            ):
+                return "match"
+
+            if Normalizer._decimal_loss_equivalent(sfda_name, wms_trade_description):
+                return "match"
+
+            # Combination drugs sometimes show total mass in SFDA but only the
+            # primary component mass in WMS (e.g. piperacillin/tazobactam
+            # 2.25GM vs piperacillin 2G + TAZO).  Two shared distinctive
+            # ingredient identities plus a trusted product identity are enough
+            # to avoid declaring a false strength conflict.
+            if Normalizer._shared_distinctive_identity_count(sfda_name, wms_trade_description) >= 2:
+                return "unknown"
+
+        # Standalone package volume is intentionally not compared here.
+        if sfda_mass and wms_mass:
+            return "conflict"
+
         sfda = Normalizer._strength_signature(sfda_name)
         wms = Normalizer._strength_signature(wms_trade_description)
-        for dimension in sfda:
+        for dimension in ("activity_iu", "percent"):
             left = sfda[dimension]
             right = wms[dimension]
-            if left and right and left.isdisjoint(right):
-                return True
-        return False
+            if left and right:
+                if any(Normalizer._close_numeric(a, b) for a in left for b in right):
+                    continue
+                return "conflict"
+        return "unknown"
+
+    @staticmethod
+    def _has_conflicting_strength(sfda_name, wms_trade_description, product_evidence=False):
+        return Normalizer._strength_relation(
+            sfda_name,
+            wms_trade_description,
+            product_evidence=product_evidence,
+        ) == "conflict"
 
     @staticmethod
     @lru_cache(maxsize=20000)
@@ -218,6 +416,12 @@ class Normalizer:
 
     @staticmethod
     def _has_shared_identity_token(sfda_name, wms_trade_description):
+        left_compact = Normalizer.compact_identity_key(sfda_name)
+        right_compact = Normalizer.compact_identity_key(wms_trade_description)
+        if left_compact and right_compact and min(len(left_compact), len(right_compact)) >= 6:
+            if left_compact in right_compact or right_compact in left_compact:
+                return True
+
         left = Normalizer.drug_identity_tokens(sfda_name)
         right = Normalizer.drug_identity_tokens(wms_trade_description)
         if not left or not right:
@@ -227,15 +431,14 @@ class Normalizer:
         for a in left:
             for b in right:
                 ratio = SequenceMatcher(None, a, b).ratio()
-                if ratio >= 0.86:
+                # 0.84 deliberately captures small brand spelling variants such
+                # as BIOVITIN/BIOTIN while still requiring a distinctive token.
+                if ratio >= 0.84:
                     strong_pairs.append((a, b, ratio))
 
         if not strong_pairs:
             return False
 
-        # One strong brand/product token is enough.  For generic chemical words
-        # (e.g. SODIUM/CHLORIDE), require at least two matching tokens to avoid
-        # accepting unrelated products merely because they share one salt word.
         if any(
             Normalizer._is_distinctive_identity_token(a)
             or Normalizer._is_distinctive_identity_token(b)
@@ -304,7 +507,18 @@ class Normalizer:
         if not sfda or not wms:
             return True
 
-        if Normalizer._has_conflicting_strength(sfda_name, wms_trade_description):
+        shared_identity = Normalizer._has_shared_identity_token(
+            sfda_name,
+            wms_trade_description,
+        )
+        product_evidence = bool(reference_match is True or shared_identity)
+        strength_relation = Normalizer._strength_relation(
+            sfda_name,
+            wms_trade_description,
+            product_evidence=product_evidence,
+        )
+
+        if strength_relation == "conflict":
             return False
 
         if sfda == wms or sfda in wms or wms in sfda:
@@ -313,7 +527,7 @@ class Normalizer:
         if reference_match is True:
             return True
 
-        if Normalizer._has_shared_identity_token(sfda_name, wms_trade_description):
+        if shared_identity:
             return True
 
         if Normalizer.drug_name_match_score(sfda_name, wms_trade_description) >= float(threshold):
