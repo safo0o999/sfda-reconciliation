@@ -84,56 +84,238 @@ class Normalizer:
     @lru_cache(maxsize=20000)
     def _drug_key_scalar(value):
         # Scalar normalization is used repeatedly during Historical matching.
-        # Cache by input text so the same SFDA/WMS drug name is normalized once
-        # per worker process rather than once per historical row.
-        value = "" if value is None else str(value)
-        return str(Normalizer.drug_name_key(pd.Series([value], dtype=object)).iloc[0])
+        # Keep it equivalent to drug_name_key(), but avoid constructing a pandas
+        # Series for every scalar call. This materially reduces product-identity
+        # setup time on the 13k-row Pack Size reference.
+        text = "" if value is None else str(value).strip().upper()
+        text = re.sub(
+            r"(?<=\d)\s*(MG|MCG|UG|G|ML|L|IU|UNIT|UNITS)\b",
+            r" \1",
+            text,
+        )
+        text = re.sub(r"[^A-Z0-9]+", " ", text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    _IDENTITY_STOP_TOKENS = {
+        "TABLET", "TABLETS", "TAB", "TABS", "CAPSULE", "CAPSULES", "CAP", "CAPS",
+        "SYRUP", "SYP", "SUSPENSION", "SUSP", "SOLUTION", "SOLN", "SOL",
+        "INJECTION", "INJ", "INFUSION", "INF", "VIAL", "VIALS", "AMPOULE",
+        "AMPOULES", "AMP", "POWDER", "SOLVENT", "FILM", "COATED", "MODIFIED",
+        "RELEASE", "DISPERSABLE", "DISPERSIBLE", "ORAL", "EYE", "EAR", "DROPS",
+        "DROP", "CREAM", "GEL", "OINTMENT", "SPRAY", "INHALER", "NASAL", "DOSE",
+        "IV", "IM", "USE", "WATER", "FOR", "AND", "WITH", "OF", "THE", "USP",
+        "BP", "BOTTLE", "BAG", "PHARMA", "PHARMACEUTICAL", "PHARMACEUTICALS",
+        "JPI", "PSI", "JPM", "EIPICO", "TABUK", "JAMJOOM", "DALLAH", "SANOFI",
+        "GLAXO", "SMITH", "KLINE", "SAUDI", "AMMAN", "MEDICAL", "UNION",
+        "GLOBALPHARMA", "CIPLA", "AJA", "JULPHAR", "BATTERJEE", "JAZEERA",
+        "BAXTER", "EFISA", "JUNIOR", "MG", "MCG", "UG", "G", "GM", "KG",
+        "ML", "L", "IU", "UNIT", "UNITS", "PFU",
+    }
+
+    _IDENTITY_TOKEN_ALIASES = {
+        "SOD": "SODIUM",
+        "CHLOR": "CHLORIDE",
+        "CHL": "CHLORIDE",
+        "RINGERS": "RINGER",
+        "LACTATED": "LACTATE",
+        "NSS": "SALINE",
+    }
+
+    _COMMON_CHEMICAL_IDENTITY_TOKENS = {
+        "SODIUM", "CHLORIDE", "POTASSIUM", "CALCIUM", "LACTATE", "DEXTROSE",
+        "HYDROCHLORIDE", "ACID", "BICARBONATE",
+    }
+
+    @staticmethod
+    def _strength_signature(value):
+        """Return comparable strength/volume tokens without destroying decimals.
+
+        The previous implementation normalized punctuation before parsing numeric
+        strength.  That could turn ``1.5 MG`` into ``1 5 MG`` and incorrectly
+        compare it with ``15MG``.  Parsing the raw text first preserves decimals
+        and treats G/GM as the same mass unit.
+        """
+        raw = "" if value is None else str(value).upper().replace(",", ".")
+        signature = {
+            "mass_mg": set(),
+            "volume_ml": set(),
+            "activity_iu": set(),
+            "percent": set(),
+        }
+        pattern = re.compile(
+            r"(?<![A-Z0-9])(\d+(?:\.\d+)?)\s*(MCG|UG|MG|GM|G|KG|ML|L|IU|UNIT|UNITS|%)(?![A-Z])"
+        )
+        for number_text, unit in pattern.findall(raw):
+            try:
+                number = float(number_text)
+            except (TypeError, ValueError):
+                continue
+            unit = unit.upper()
+            if unit in {"MCG", "UG"}:
+                signature["mass_mg"].add(round(number / 1000.0, 9))
+            elif unit == "MG":
+                signature["mass_mg"].add(round(number, 9))
+            elif unit in {"G", "GM"}:
+                signature["mass_mg"].add(round(number * 1000.0, 9))
+            elif unit == "KG":
+                signature["mass_mg"].add(round(number * 1_000_000.0, 9))
+            elif unit == "ML":
+                signature["volume_ml"].add(round(number, 9))
+            elif unit == "L":
+                signature["volume_ml"].add(round(number * 1000.0, 9))
+            elif unit in {"IU", "UNIT", "UNITS"}:
+                signature["activity_iu"].add(round(number, 9))
+            elif unit == "%":
+                signature["percent"].add(round(number, 9))
+        return signature
 
     @staticmethod
     def _strength_tokens(value):
+        signature = Normalizer._strength_signature(value)
+        tokens = set()
+        for dimension, values in signature.items():
+            for number in values:
+                tokens.add((dimension, number))
+        return tokens
+
+    @staticmethod
+    def _has_conflicting_strength(sfda_name, wms_trade_description):
+        sfda = Normalizer._strength_signature(sfda_name)
+        wms = Normalizer._strength_signature(wms_trade_description)
+        for dimension in sfda:
+            left = sfda[dimension]
+            right = wms[dimension]
+            if left and right and left.isdisjoint(right):
+                return True
+        return False
+
+    @staticmethod
+    @lru_cache(maxsize=20000)
+    def drug_identity_tokens(value):
+        """Return stable product-identity tokens with manufacturer/form noise removed."""
         key = Normalizer._drug_key_scalar(value)
-        return set(re.findall(r"\b\d+(?:\.\d+)?\s*(?:MG|MCG|UG|G|ML|L|IU|UNIT|UNITS)\b", key))
+        result = []
+        for token in re.findall(r"[A-Z][A-Z0-9]*", key):
+            token = Normalizer._IDENTITY_TOKEN_ALIASES.get(token, token)
+            if len(token) < 4 or token in Normalizer._IDENTITY_STOP_TOKENS:
+                continue
+            if token.isdigit():
+                continue
+            result.append(token)
+        return tuple(result)
+
+    @staticmethod
+    def _is_distinctive_identity_token(token):
+        token = str(token or "").upper()
+        return bool(token) and token not in Normalizer._COMMON_CHEMICAL_IDENTITY_TOKENS
+
+    @staticmethod
+    def _has_shared_identity_token(sfda_name, wms_trade_description):
+        left = Normalizer.drug_identity_tokens(sfda_name)
+        right = Normalizer.drug_identity_tokens(wms_trade_description)
+        if not left or not right:
+            return False
+
+        strong_pairs = []
+        for a in left:
+            for b in right:
+                ratio = SequenceMatcher(None, a, b).ratio()
+                if ratio >= 0.86:
+                    strong_pairs.append((a, b, ratio))
+
+        if not strong_pairs:
+            return False
+
+        # One strong brand/product token is enough.  For generic chemical words
+        # (e.g. SODIUM/CHLORIDE), require at least two matching tokens to avoid
+        # accepting unrelated products merely because they share one salt word.
+        if any(
+            Normalizer._is_distinctive_identity_token(a)
+            or Normalizer._is_distinctive_identity_token(b)
+            for a, b, _ in strong_pairs
+        ):
+            return True
+
+        matched_left = {a for a, _, _ in strong_pairs}
+        matched_right = {b for _, b, _ in strong_pairs}
+        return min(len(matched_left), len(matched_right)) >= 2
 
     @staticmethod
     def drug_name_match_score(sfda_name, wms_trade_description):
-        """Return a conservative 0..100 identity score for SFDA vs WMS names.
+        """Return a diagnostic 0..100 similarity score.
 
-        Exact/contained normalized drug names score highest. Conflicting explicit
-        strength/volume tokens are heavily penalized so RISPERDAL 25 MG cannot
-        silently select RISPERDAL 50 MG.
+        The score is retained for logging/diagnostics, but it is no longer the
+        sole hard gate for an exact BN + Expiry Month match.  Exact regulatory
+        matches are rejected only when product-identity checks show a clear
+        conflict.
         """
         sfda = Normalizer._drug_key_scalar(sfda_name)
         wms = Normalizer._drug_key_scalar(wms_trade_description)
         if not sfda or not wms:
             return 0.0
 
-        sfda_strength = Normalizer._strength_tokens(sfda)
-        wms_strength = Normalizer._strength_tokens(wms)
-        if sfda_strength and wms_strength and sfda_strength.isdisjoint(wms_strength):
+        if Normalizer._has_conflicting_strength(sfda_name, wms_trade_description):
             return 0.0
 
         if sfda == wms:
             return 100.0
-        if sfda in wms:
+        if sfda in wms or wms in sfda:
             return 98.0
 
         sfda_tokens = sfda.split()
         wms_tokens = set(wms.split())
-        token_coverage = (sum(1 for token in sfda_tokens if token in wms_tokens) / max(1, len(sfda_tokens)))
+        token_coverage = (
+            sum(1 for token in sfda_tokens if token in wms_tokens)
+            / max(1, len(sfda_tokens))
+        )
         sequence = SequenceMatcher(None, sfda, wms).ratio()
         return round(100.0 * (0.72 * token_coverage + 0.28 * sequence), 2)
 
     @staticmethod
-    def drug_name_validation_pass(sfda_name, wms_trade_description, threshold=60.0):
-        """Validation gate AFTER BN+Expiry matching.
+    def drug_name_validation_pass(
+        sfda_name,
+        wms_trade_description,
+        threshold=60.0,
+        reference_match=None,
+    ):
+        """Safety validation AFTER an exact BN + Expiry Month match.
 
-        BN + Expiry remains the regulatory matching key. This check does not
-        discover or choose a Generic; it only rejects an exact batch match when
-        the SFDA Drug Name and the WMS Trade Description are clearly unrelated.
-        Explicit strength/volume conflicts already score zero in
-        drug_name_match_score().
+        BN + Expiry Month remains the regulatory key.  This method is intentionally
+        a *conflict detector*, not a fuzzy discovery engine:
+
+        - missing/abbreviated WMS descriptions do not invalidate an exact key;
+        - explicit conflicting strengths reject the candidate;
+        - a trusted product-master/scientific-name bridge accepts known aliases;
+        - a shared brand/product token accepts common WMS/SFDA naming differences;
+        - the legacy score is retained only as a conservative final fallback.
         """
-        return Normalizer.drug_name_match_score(sfda_name, wms_trade_description) >= float(threshold)
+        sfda = Normalizer._drug_key_scalar(sfda_name)
+        wms = Normalizer._drug_key_scalar(wms_trade_description)
+
+        # No text evidence means there is nothing that can contradict the exact
+        # BN+expiry regulatory key.  Do not silently drop the batch.
+        if not sfda or not wms:
+            return True
+
+        if Normalizer._has_conflicting_strength(sfda_name, wms_trade_description):
+            return False
+
+        if sfda == wms or sfda in wms or wms in sfda:
+            return True
+
+        if reference_match is True:
+            return True
+
+        if Normalizer._has_shared_identity_token(sfda_name, wms_trade_description):
+            return True
+
+        if Normalizer.drug_name_match_score(sfda_name, wms_trade_description) >= float(threshold):
+            return True
+
+        # If the product master positively resolved both sides to different
+        # scientific identities, or if no positive identity evidence exists,
+        # treat the names as a conflict rather than weakening the threshold.
+        return False
 
     @staticmethod
     def identifier(series, length=None):
