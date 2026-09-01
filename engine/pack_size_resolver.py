@@ -77,14 +77,32 @@ class PackSizeResolver:
         identity = identity.loc[
             identity["_TradeKey"].ne("") & identity["_ScientificKey"].ne("")
         ].drop_duplicates(subset=["_TradeKey", "_ScientificKey"], keep="first")
-        self._identity_rows = identity[["_TradeKey", "_ScientificKey"]].reset_index(drop=True)
+        identity["_TradeCompact"] = identity["_TradeKey"].map(Normalizer.compact_identity_key)
+        identity["_ScientificCompact"] = identity["_ScientificKey"].map(Normalizer.compact_identity_key)
+        self._identity_rows = identity[[
+            "_TradeKey",
+            "_ScientificKey",
+            "_TradeCompact",
+            "_ScientificCompact",
+        ]].reset_index(drop=True)
         self._identity_tokens = {}
         self._identity_prefix_index = {}
+        self._trade_compact_prefix_index = {}
+        self._scientific_compact_prefix_index = {}
         for idx, row in self._identity_rows.iterrows():
+            idx = int(idx)
             tokens = Normalizer.drug_identity_tokens(row["_TradeKey"])
-            self._identity_tokens[int(idx)] = tokens
+            self._identity_tokens[idx] = tokens
             for token in tokens:
-                self._identity_prefix_index.setdefault(token[:4], set()).add(int(idx))
+                self._identity_prefix_index.setdefault(token[:4], set()).add(idx)
+
+            trade_compact = str(row.get("_TradeCompact") or "").strip()
+            if len(trade_compact) >= 4:
+                self._trade_compact_prefix_index.setdefault(trade_compact[:4], set()).add(idx)
+
+            scientific_compact = str(row.get("_ScientificCompact") or "").strip()
+            if len(scientific_compact) >= 4:
+                self._scientific_compact_prefix_index.setdefault(scientific_compact[:4], set()).add(idx)
         self._scientific_identity_cache = {}
 
     @classmethod
@@ -141,11 +159,13 @@ class PackSizeResolver:
         return bool(re.search(rf"\b{re.escape(number)}\s*{re.escape(unit_alias)}\b", wms_text, flags=re.IGNORECASE))
 
     def scientific_identity_keys(self, value: Any) -> set[str]:
-        """Resolve a trade-name phrase to configured Scientific Name identities.
+        """Resolve trade/scientific wording to configured Scientific Name keys.
 
-        This is deliberately separate from ``resolve()`` so the long-standing
-        PackageSize rule is unchanged.  Matching uses only strong product tokens
-        and is cached for repeated SFDA/WMS names during Historical builds.
+        V4 adds two conservative bridges without changing PackageSize selection:
+        1) separator-insensitive trade identity (AZI-ONCE/AZIONCE,
+           UNI FRESH/UNIFRESH, SOLU-MEDROL/SOLUMEDROL);
+        2) direct scientific-name evidence (NO-URIC/ALLOPURINOL,
+           BioVitin/BIOTIN, Monzeva/EMPAGLIFLOZIN).
         """
         cache_key = Normalizer._drug_key_scalar(value)
         if not cache_key:
@@ -155,6 +175,28 @@ class PackSizeResolver:
             return set(cached)
 
         input_tokens = Normalizer.drug_identity_tokens(cache_key)
+        input_compact = Normalizer.compact_identity_key(cache_key)
+        identities = set()
+
+        # Strong compact trade-name match: formatting differences only.
+        if len(input_compact) >= 4:
+            for idx in self._trade_compact_prefix_index.get(input_compact[:4], set()):
+                trade_compact = str(self._identity_rows.iloc[idx]["_TradeCompact"] or "").strip()
+                if min(len(input_compact), len(trade_compact)) >= 6 and (
+                    trade_compact in input_compact or input_compact in trade_compact
+                ):
+                    identities.add(str(self._identity_rows.iloc[idx]["_ScientificKey"]).strip())
+
+            # WMS sometimes carries the configured Scientific Name rather than
+            # the configured Trade Name.  Treat that as positive master evidence.
+            for idx in self._scientific_compact_prefix_index.get(input_compact[:4], set()):
+                scientific_compact = str(self._identity_rows.iloc[idx]["_ScientificCompact"] or "").strip()
+                if min(len(input_compact), len(scientific_compact)) >= 5 and (
+                    scientific_compact in input_compact or input_compact in scientific_compact
+                ):
+                    identities.add(str(self._identity_rows.iloc[idx]["_ScientificKey"]).strip())
+
+        # Existing token-based trade lookup remains as a second path.
         candidate_ids = set()
         for token in input_tokens:
             candidate_ids.update(self._identity_prefix_index.get(token[:4], set()))
@@ -169,7 +211,7 @@ class PackSizeResolver:
             for left in input_tokens:
                 for right in trade_tokens:
                     ratio = SequenceMatcher(None, left, right).ratio()
-                    if ratio >= 0.86:
+                    if ratio >= 0.84:
                         strong_pairs.append((left, right, ratio))
             if not strong_pairs:
                 continue
@@ -192,17 +234,16 @@ class PackSizeResolver:
             score = (0.65 * coverage) + (0.35 * best)
             scored.append((score, idx))
 
-        if not scored:
-            self._scientific_identity_cache[cache_key] = frozenset()
-            return set()
+        if scored:
+            best_score = max(score for score, _ in scored)
+            selected = [idx for score, idx in scored if score >= best_score - 0.08]
+            identities.update(
+                str(self._identity_rows.iloc[idx]["_ScientificKey"]).strip()
+                for idx in selected
+                if str(self._identity_rows.iloc[idx]["_ScientificKey"]).strip()
+            )
 
-        best_score = max(score for score, _ in scored)
-        selected = [idx for score, idx in scored if score >= best_score - 0.08]
-        identities = {
-            str(self._identity_rows.iloc[idx]["_ScientificKey"]).strip()
-            for idx in selected
-            if str(self._identity_rows.iloc[idx]["_ScientificKey"]).strip()
-        }
+        identities.discard("")
         self._scientific_identity_cache[cache_key] = frozenset(identities)
         return identities
 
