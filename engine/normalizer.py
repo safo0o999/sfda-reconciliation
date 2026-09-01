@@ -8,7 +8,7 @@ import pandas as pd
 # Historical matching deployment signature. This value is written into every
 # completed Historical Rebuild/Append SummaryJson so production SQL can prove
 # exactly which matching logic the Azure worker executed.
-HISTORICAL_MATCH_LOGIC_VERSION = "SFDA_IDENTITY_V4_CONCENTRATION_20260901"
+HISTORICAL_MATCH_LOGIC_VERSION = "SFDA_IDENTITY_V5_MULTI_EVIDENCE_20260902"
 HISTORICAL_MATCH_LEGACY_THRESHOLD = 60.0
 
 
@@ -225,6 +225,7 @@ class Normalizer:
         ``0.1MG/ML``, ``1MG/10ML``, ``20MG PER 2ML`` and ``500MG-10ML``.
         """
         raw = "" if value is None else str(value).upper().replace(",", ".")
+        raw = raw.replace("\\", "/").replace("∕", "/")
         raw = re.sub(r"\bPER\b", "/", raw)
         pattern = re.compile(
             r"(?<![A-Z0-9])"
@@ -242,6 +243,17 @@ class Normalizer:
             except (TypeError, ValueError, ZeroDivisionError):
                 continue
         return values
+
+    @staticmethod
+    def _percent_concentration_mg_per_ml(value):
+        """Convert explicit percent strengths to mg/ml for safe comparison.
+
+        For pharmaceutical w/v expressions, 1% = 1 g / 100 ml = 10 mg/ml.
+        This conversion is only consumed when product identity is already proven,
+        so a percent token cannot create a product match by itself.
+        """
+        signature = Normalizer._strength_signature(value)
+        return {round(float(percent) * 10.0, 9) for percent in signature["percent"]}
 
     @staticmethod
     def _close_numeric(left, right, rel_tol=0.015, abs_tol=1e-9):
@@ -273,10 +285,29 @@ class Normalizer:
                     continue
                 ld = digits(left_raw)
                 rd = digits(right_raw)
+
+                def safe_decimal_loss(decimal_raw, compact_raw):
+                    if "." not in decimal_raw:
+                        return False
+                    try:
+                        decimal_value = float(decimal_raw)
+                    except (TypeError, ValueError):
+                        return False
+                    # Conservative production rule: accept obvious leading-zero
+                    # loss (0.25 -> 025, 0.4 -> 04) and larger decimal strengths
+                    # observed in WMS formatting (8.4 -> 84, 12.5 -> 125, etc.).
+                    # Do NOT auto-collapse low-dose values such as 1.5MG -> 15MG;
+                    # those can represent genuinely different registered strengths.
+                    return decimal_value < 1.0 or decimal_value >= 5.0
+
                 if ld == rd:
-                    if "." in left_raw or "." in right_raw or left_raw.startswith("0") or right_raw.startswith("0"):
+                    if safe_decimal_loss(left_raw, right_raw) or safe_decimal_loss(right_raw, left_raw):
                         return True
-                if (ld + "0" == rd or rd + "0" == ld) and ("." in left_raw or "." in right_raw):
+                    if (left_raw.startswith("0") or right_raw.startswith("0")) and ("." in left_raw or "." in right_raw):
+                        return True
+                if ld + "0" == rd and safe_decimal_loss(left_raw, right_raw):
+                    return True
+                if rd + "0" == ld and safe_decimal_loss(right_raw, left_raw):
                     return True
         return False
 
@@ -361,6 +392,24 @@ class Normalizer:
                 return "match"
 
             if Normalizer._decimal_loss_equivalent(sfda_name, wms_trade_description):
+                return "match"
+
+            # Equivalent percentage/concentration notation. Example:
+            # OCTAGAM 1G/20ML = 50MG/ML = 5%. This bridge is deliberately
+            # enabled only after product identity has already been proven.
+            sfda_percent_conc = Normalizer._percent_concentration_mg_per_ml(sfda_name)
+            wms_percent_conc = Normalizer._percent_concentration_mg_per_ml(wms_trade_description)
+            if sfda_conc and wms_percent_conc and any(
+                Normalizer._close_numeric(c, p)
+                for c in sfda_conc
+                for p in wms_percent_conc
+            ):
+                return "match"
+            if wms_conc and sfda_percent_conc and any(
+                Normalizer._close_numeric(c, p)
+                for c in wms_conc
+                for p in sfda_percent_conc
+            ):
                 return "match"
 
             # Combination drugs sometimes show total mass in SFDA but only the
@@ -487,55 +536,67 @@ class Normalizer:
         wms_trade_description,
         threshold=HISTORICAL_MATCH_LEGACY_THRESHOLD,
         reference_match=None,
+        wms_description=None,
+        reference_match_description=None,
     ):
         """Safety validation AFTER an exact BN + Expiry Month match.
 
-        BN + Expiry Month remains the regulatory key.  This method is intentionally
-        a *conflict detector*, not a fuzzy discovery engine:
+        V5 evaluates both WMS text sources when available:
+        ``Trade Description`` and the more detailed ``Description`` field.
+        This is important when the trade text contains only a total dose while
+        Description carries the denominator, e.g. 100MG vs 100MG/10ML.
 
-        - missing/abbreviated WMS descriptions do not invalidate an exact key;
-        - explicit conflicting strengths reject the candidate;
-        - a trusted product-master/scientific-name bridge accepts known aliases;
-        - a shared brand/product token accepts common WMS/SFDA naming differences;
-        - the legacy score is retained only as a conservative final fallback.
+        A candidate is accepted when *either* WMS evidence source positively
+        proves the same product without a strength conflict. A contradictory or
+        weak source therefore cannot hide a mathematically equivalent strength
+        present in the other source. If no source provides positive identity
+        evidence, the conservative legacy threshold remains the final fallback.
         """
         sfda = Normalizer._drug_key_scalar(sfda_name)
-        wms = Normalizer._drug_key_scalar(wms_trade_description)
+        sources = [
+            (wms_trade_description, reference_match),
+            (wms_description, reference_match_description),
+        ]
 
-        # No text evidence means there is nothing that can contradict the exact
-        # BN+expiry regulatory key.  Do not silently drop the batch.
-        if not sfda or not wms:
+        # Deduplicate identical evidence strings while preserving priority.
+        normalized_sources = []
+        seen = set()
+        for source_text, source_reference in sources:
+            key = Normalizer._drug_key_scalar(source_text)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            normalized_sources.append((source_text, source_reference, key))
+
+        # No WMS text can contradict an exact regulatory key.
+        if not sfda or not normalized_sources:
             return True
 
-        shared_identity = Normalizer._has_shared_identity_token(
-            sfda_name,
-            wms_trade_description,
-        )
-        product_evidence = bool(reference_match is True or shared_identity)
-        strength_relation = Normalizer._strength_relation(
-            sfda_name,
-            wms_trade_description,
-            product_evidence=product_evidence,
-        )
+        for source_text, source_reference, wms in normalized_sources:
+            shared_identity = Normalizer._has_shared_identity_token(
+                sfda_name, source_text
+            )
+            product_evidence = bool(source_reference is True or shared_identity)
+            strength_relation = Normalizer._strength_relation(
+                sfda_name,
+                source_text,
+                product_evidence=product_evidence,
+            )
 
-        if strength_relation == "conflict":
-            return False
+            # A conflict in one abbreviated field does not reject the batch if
+            # the other WMS evidence source proves the equivalent concentration.
+            if strength_relation == "conflict":
+                continue
 
-        if sfda == wms or sfda in wms or wms in sfda:
-            return True
+            if sfda == wms or sfda in wms or wms in sfda:
+                return True
+            if source_reference is True:
+                return True
+            if shared_identity:
+                return True
+            if Normalizer.drug_name_match_score(sfda_name, source_text) >= float(threshold):
+                return True
 
-        if reference_match is True:
-            return True
-
-        if shared_identity:
-            return True
-
-        if Normalizer.drug_name_match_score(sfda_name, wms_trade_description) >= float(threshold):
-            return True
-
-        # If the product master positively resolved both sides to different
-        # scientific identities, or if no positive identity evidence exists,
-        # treat the names as a conflict rather than weakening the threshold.
         return False
 
     @staticmethod
