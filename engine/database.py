@@ -6013,7 +6013,7 @@ def _prepare_incremental_accept_refresh_scope(
         if candidate_frames else pd.DataFrame()
     )
     if not candidate_rows.empty:
-        for col in ["BN", "Expiry Month Key", "Generic Item Number", "Trade Name"]:
+        for col in ["BN", "Expiry Month Key", "Generic Item Number", "Trade Name", "Description"]:
             if col not in candidate_rows.columns:
                 candidate_rows[col] = ""
         candidate_rows["BN"] = Normalizer.text(candidate_rows["BN"])
@@ -6026,6 +6026,9 @@ def _prepare_incremental_accept_refresh_scope(
         candidate_rows["Trade Name"] = (
             candidate_rows["Trade Name"].fillna("").astype(str).str.strip()
         )
+        candidate_rows["Description"] = (
+            candidate_rows["Description"].fillna("").astype(str).str.strip()
+        )
         candidate_rows = candidate_rows.loc[
             candidate_rows["BN"].ne("")
             & candidate_rows["Expiry Month Key"].ne("")
@@ -6033,7 +6036,7 @@ def _prepare_incremental_accept_refresh_scope(
         ].sort_values("_Identity Source Priority", kind="stable").copy()
 
     resolved_generics: Dict[tuple[str, str], list[str]] = {}
-    trade_by_identity: Dict[tuple[str, str, str], str] = {}
+    evidence_by_identity: Dict[tuple[str, str, str], tuple[str, str]] = {}
     candidate_keys: Set[tuple[str, str]] = set()
     identity_exact_candidates = 0
     identity_accepted = 0
@@ -6048,17 +6051,24 @@ def _prepare_incremental_accept_refresh_scope(
             )
         )
 
-        # Build the WMS trade reference once.  This replaces repeated DataFrame
-        # scans inside the SFDA group loop.
+        # Build both WMS identity evidence sources once. Receipt rows may carry
+        # a detailed Description with full concentration (e.g. 100MG/10ML),
+        # while Trade Name can contain only the total dose (100MG). Dispatch-only
+        # candidates naturally keep Description blank.
         for (bn, month, generic), group in candidate_rows.groupby(
             ["BN", "Expiry Month Key", "Generic Item Number"],
             sort=False,
             dropna=False,
         ):
-            trade_by_identity[(str(bn), str(month), str(generic))] = next(
+            trade = next(
                 (str(v).strip() for v in group["Trade Name"] if str(v).strip()),
                 "",
             )
+            description = next(
+                (str(v).strip() for v in group["Description"] if str(v).strip()),
+                "",
+            )
+            evidence_by_identity[(str(bn), str(month), str(generic))] = (trade, description)
 
     if not current_sfda.empty and candidate_keys:
         current_sfda["BN"] = Normalizer.text(current_sfda["BN"])
@@ -6088,9 +6098,9 @@ def _prepare_incremental_accept_refresh_scope(
         # Candidate Generics are already grouped once by exact batch key, so each
         # SFDA key performs O(1) dictionary lookups instead of rescanning all ASN
         # rows.
-        candidates_by_batch: Dict[tuple[str, str], list[tuple[str, str]]] = {}
-        for (bn, month, generic), trade in trade_by_identity.items():
-            candidates_by_batch.setdefault((bn, month), []).append((generic, trade))
+        candidates_by_batch: Dict[tuple[str, str], list[tuple[str, str, str]]] = {}
+        for (bn, month, generic), (trade, description) in evidence_by_identity.items():
+            candidates_by_batch.setdefault((bn, month), []).append((generic, trade, description))
 
         for (bn, month), sf_group in current_sfda.groupby(
             ["BN", "Expiry Month Key"], sort=False
@@ -6101,15 +6111,20 @@ def _prepare_incremental_accept_refresh_scope(
 
             sfda_drug = str(sf_group.iloc[0]["Drug Name"])
             accepted: list[str] = []
-            for generic, trade in candidates:
-                score = Normalizer.drug_name_match_score(sfda_drug, trade)
+            for generic, trade, description in candidates:
+                trade_score = Normalizer.drug_name_match_score(sfda_drug, trade) if str(trade).strip() else 0.0
+                description_score = Normalizer.drug_name_match_score(sfda_drug, description) if str(description).strip() else 0.0
+                score = max(float(trade_score), float(description_score))
                 reference_match = pack_resolver.same_product_identity(sfda_drug, trade)
+                description_reference_match = pack_resolver.same_product_identity(sfda_drug, description)
                 identity_exact_candidates += 1
                 passed = Normalizer.drug_name_validation_pass(
                     sfda_drug,
                     trade,
                     threshold=HISTORICAL_MATCH_LEGACY_THRESHOLD,
                     reference_match=reference_match,
+                    wms_description=description,
+                    reference_match_description=description_reference_match,
                 )
                 if passed:
                     identity_accepted += 1
@@ -6121,9 +6136,9 @@ def _prepare_incremental_accept_refresh_scope(
                     logger.warning(
                         "Incremental exact batch match rejected by product-identity validation. "
                         "BN=%s expiry_month=%s generic=%s SFDA_drug=%s WMS_trade=%s "
-                        "score=%.2f product_master_match=%s",
-                        bn, month, str(generic), sfda_drug, str(trade), score,
-                        str(reference_match),
+                        "WMS_description=%s score=%.2f product_master_trade=%s product_master_description=%s",
+                        bn, month, str(generic), sfda_drug, str(trade), str(description), score,
+                        str(reference_match), str(description_reference_match),
                     )
             if accepted:
                 resolved_generics[(str(bn), str(month))] = accepted
@@ -6141,9 +6156,11 @@ def _prepare_incremental_accept_refresh_scope(
 
             drug_name = _text(row, "Drug Name")
             for generic in generics:
-                trade_text = trade_by_identity.get((bn, month, str(generic)), "")
+                trade_text, description_text = evidence_by_identity.get(
+                    (bn, month, str(generic)), ("", "")
+                )
                 resolved_pack, _pack_status = pack_resolver.resolve(
-                    drug_name, trade_text
+                    drug_name, trade_text or description_text
                 )
                 package_size = float(resolved_pack or 1.0)
                 if package_size <= 0:
