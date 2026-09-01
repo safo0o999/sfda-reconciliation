@@ -8,7 +8,11 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 import pandas as pd
 
-from engine.normalizer import Normalizer
+from engine.normalizer import (
+    HISTORICAL_MATCH_LEGACY_THRESHOLD,
+    HISTORICAL_MATCH_LOGIC_VERSION,
+    Normalizer,
+)
 from engine.pack_size_resolver import PackSizeResolver
 from engine.validator import Validator
 from engine.reference_data import load_current_warehouse_gln
@@ -257,10 +261,31 @@ class FullReconciliationEngine:
         # Build the PackageSize/product-identity reference once per engine run.
         # Reused by exact SFDA validation and final PackageSize resolution.
         self._pack_size_resolver = PackSizeResolver(self.packsize)
+        # Rebuild diagnostics are intentionally kept in-memory and copied into
+        # HistoricalBuildJobs.SummaryJson by historical_jobs.py. Besides proving
+        # which deployment ran, accepted_below_legacy_threshold demonstrates that
+        # the old hard >=60 gate is no longer controlling exact BN+expiry matches.
+        self._historical_match_diagnostics: Dict[str, Any] = {
+            "logic_version": HISTORICAL_MATCH_LOGIC_VERSION,
+            "legacy_threshold": float(HISTORICAL_MATCH_LEGACY_THRESHOLD),
+            "exact_candidates": 0,
+            "accepted": 0,
+            "rejected": 0,
+            "accepted_below_legacy_threshold": 0,
+            "accepted_below_legacy_threshold_samples": [],
+            "rejected_samples": [],
+        }
         # GLN is warehouse-scoped without changing any historical batch logic.
         # Madinah (WarehouseID=1) continues to use config/gln.xlsx exactly as
         # before. Other warehouses use only their own stored mapping.
         self.gln = load_current_warehouse_gln()
+
+    def historical_match_diagnostics(self) -> Dict[str, Any]:
+        """Return a JSON-safe snapshot of Historical exact-match diagnostics."""
+        diagnostics = dict(self._historical_match_diagnostics or {})
+        diagnostics["logic_version"] = HISTORICAL_MATCH_LOGIC_VERSION
+        diagnostics["legacy_threshold"] = float(HISTORICAL_MATCH_LEGACY_THRESHOLD)
+        return diagnostics
 
     @staticmethod
     def _month_key(series: pd.Series) -> pd.Series:
@@ -638,6 +663,16 @@ class FullReconciliationEngine:
         never selects a Generic by fuzzy search.
         """
         if candidates.empty or sfda.empty:
+            self._historical_match_diagnostics = {
+                "logic_version": HISTORICAL_MATCH_LOGIC_VERSION,
+                "legacy_threshold": float(HISTORICAL_MATCH_LEGACY_THRESHOLD),
+                "exact_candidates": 0,
+                "accepted": 0,
+                "rejected": 0,
+                "accepted_below_legacy_threshold": 0,
+                "accepted_below_legacy_threshold_samples": [],
+                "rejected_samples": [],
+            }
             return pd.DataFrame()
 
         c = candidates.copy()
@@ -647,6 +682,16 @@ class FullReconciliationEngine:
         )
         edges = c.merge(sfda, on=self.SFDA_KEYS, how="inner", validate="many_to_one")
         if edges.empty:
+            self._historical_match_diagnostics = {
+                "logic_version": HISTORICAL_MATCH_LOGIC_VERSION,
+                "legacy_threshold": float(HISTORICAL_MATCH_LEGACY_THRESHOLD),
+                "exact_candidates": 0,
+                "accepted": 0,
+                "rejected": 0,
+                "accepted_below_legacy_threshold": 0,
+                "accepted_below_legacy_threshold_samples": [],
+                "rejected_samples": [],
+            }
             return edges
 
         identity_resolver = getattr(self, "_pack_size_resolver", PackSizeResolver(self.packsize))
@@ -659,7 +704,7 @@ class FullReconciliationEngine:
             passed = Normalizer.drug_name_validation_pass(
                 drug,
                 trade,
-                threshold=60.0,
+                threshold=HISTORICAL_MATCH_LEGACY_THRESHOLD,
                 reference_match=reference_match,
             )
             scores.append(score)
@@ -670,7 +715,69 @@ class FullReconciliationEngine:
         edges["_Product Master Identity Match"] = reference_matches
         valid = pd.Series(validation_results, index=edges.index, dtype=bool)
 
-        rejected = edges.loc[~valid]
+        accepted_below_mask = valid & (
+            pd.to_numeric(edges["_Drug Identity Score"], errors="coerce").fillna(0)
+            < float(HISTORICAL_MATCH_LEGACY_THRESHOLD)
+        )
+        rejected_mask = ~valid
+
+        def _diagnostic_samples(mask: pd.Series, limit: int = 20) -> list[dict[str, Any]]:
+            def _json_text(value: Any) -> str:
+                try:
+                    if pd.isna(value):
+                        return ""
+                except (TypeError, ValueError):
+                    pass
+                return str(value).strip()
+
+            samples: list[dict[str, Any]] = []
+            for _, sample in edges.loc[mask].head(limit).iterrows():
+                raw_score = sample.get("_Drug Identity Score", 0)
+                try:
+                    score_value = 0.0 if pd.isna(raw_score) else float(raw_score)
+                except (TypeError, ValueError):
+                    score_value = 0.0
+                reference_value = sample.get("_Product Master Identity Match")
+                try:
+                    if pd.isna(reference_value):
+                        reference_value = None
+                except (TypeError, ValueError):
+                    pass
+                if reference_value is not None:
+                    reference_value = bool(reference_value)
+
+                samples.append({
+                    "bn": _json_text(sample.get("BN", "")),
+                    "expiry_month": _json_text(sample.get("Expiry Month Key", "")),
+                    "generic": _json_text(sample.get("Generic Item Number", "")),
+                    "sfda_drug": _json_text(sample.get("Drug Name", "")),
+                    "wms_trade": _json_text(sample.get("_WMS Trade Description", "")),
+                    "score": round(score_value, 2),
+                    "product_master_match": reference_value,
+                })
+            return samples
+
+        self._historical_match_diagnostics = {
+            "logic_version": HISTORICAL_MATCH_LOGIC_VERSION,
+            "legacy_threshold": float(HISTORICAL_MATCH_LEGACY_THRESHOLD),
+            "exact_candidates": int(len(edges)),
+            "accepted": int(valid.sum()),
+            "rejected": int(rejected_mask.sum()),
+            "accepted_below_legacy_threshold": int(accepted_below_mask.sum()),
+            "accepted_below_legacy_threshold_samples": _diagnostic_samples(accepted_below_mask),
+            "rejected_samples": _diagnostic_samples(rejected_mask),
+        }
+        logger.warning(
+            "HISTORICAL_MATCH_DIAGNOSTICS version=%s exact_candidates=%s accepted=%s "
+            "rejected=%s accepted_below_legacy_60=%s",
+            HISTORICAL_MATCH_LOGIC_VERSION,
+            int(len(edges)),
+            int(valid.sum()),
+            int(rejected_mask.sum()),
+            int(accepted_below_mask.sum()),
+        )
+
+        rejected = edges.loc[rejected_mask]
         for _, row in rejected.iterrows():
             logger.warning(
                 "Historical exact batch match rejected by drug-name validation. BN=%s expiry_month=%s generic=%s SFDA_drug=%s WMS_trade=%s score=%.2f",
