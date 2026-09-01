@@ -886,6 +886,11 @@ def append_events(
         prepared_dispatches = _deduplicate_parameters(dispatch_rows, _dispatch_parameters)
     phase_timings["prepare_parameters"] = round(time.perf_counter() - prep_started, 3)
 
+    # The duplicate probe may narrow these lists to only missing EventKeys.
+    # Durable target INSERTs still keep their anti-join for race-safe idempotency.
+    receipts_to_save = prepared_receipts
+    dispatches_to_save = prepared_dispatches
+
     logger.info(
         "Bulk event save started. WarehouseID=%s BuildID=%s prepared_receipts=%s "
         "prepared_dispatches=%s assume_empty=%s",
@@ -986,14 +991,15 @@ def append_events(
           );
     """
 
-    def _all_prepared_events_already_exist() -> bool:
-        """Fast retry probe for post-save Historical Append recovery.
+    def _missing_prepared_event_keys() -> tuple[Set[str], Set[str]]:
+        """Return only EventKeys missing from the active durable build.
 
-        A failed Append can be retried with every EventKey already durable in SQL.
-        Sending the full 28k-row payload through OPENJSON again is unnecessary and
-        can be much slower than an indexed key-only existence check.  This probe
-        stages only EventKey values and short-circuits the save when *all* prepared
-        rows are already present for the active WarehouseID + BuildID.
+        This is both the retry fast path and the partial-duplicate optimization.
+        Large multi-month uploads often contain a mix of already-durable rows and
+        genuinely new rows.  The old boolean probe could only detect the
+        all-duplicate case, so mixed uploads still sent every prepared row through
+        OPENJSON.  Returning missing keys lets the JSON stage carry only rows that
+        can actually be inserted.
         """
         with Database().connect() as connection:
             cursor = connection.cursor()
@@ -1022,75 +1028,288 @@ def append_events(
                     )
                 cursor.fast_executemany = False
 
-                cursor.execute(
-                    r"""
-                    SELECT
+                missing_receipts: Set[str] = set()
+                missing_dispatches: Set[str] = set()
+
+                if prepared_receipts:
+                    cursor.execute(
+                        r"""
+                        SELECT s.EventKey
+                        FROM #ReceiptEventKeyProbe AS s
+                        WHERE NOT EXISTS
                         (
-                            SELECT COUNT_BIG(*)
-                            FROM #ReceiptEventKeyProbe AS s
-                            WHERE EXISTS
-                            (
-                                SELECT 1
-                                FROM dbo.ReceiptEvents AS t
-                                WHERE t.WarehouseID = ?
-                                  AND t.BuildID = ?
-                                  AND t.EventKey = s.EventKey
-                            )
-                        ) AS ExistingReceiptKeys,
+                            SELECT 1
+                            FROM dbo.ReceiptEvents AS t
+                            WHERE t.WarehouseID = ?
+                              AND t.BuildID = ?
+                              AND t.EventKey = s.EventKey
+                        );
+                        """,
+                        warehouse_id,
+                        active_build_id,
+                    )
+                    missing_receipts = {str(row[0]) for row in cursor.fetchall()}
+
+                if prepared_dispatches:
+                    cursor.execute(
+                        r"""
+                        SELECT s.EventKey
+                        FROM #DispatchEventKeyProbe AS s
+                        WHERE NOT EXISTS
                         (
-                            SELECT COUNT_BIG(*)
-                            FROM #DispatchEventKeyProbe AS s
-                            WHERE EXISTS
-                            (
-                                SELECT 1
-                                FROM dbo.DispatchEvents AS t
-                                WHERE t.WarehouseID = ?
-                                  AND t.BuildID = ?
-                                  AND t.EventKey = s.EventKey
-                            )
-                        ) AS ExistingDispatchKeys;
-                    """,
-                    warehouse_id,
-                    active_build_id,
-                    warehouse_id,
-                    active_build_id,
-                )
-                row = cursor.fetchone()
-                existing_receipts = int((row[0] if row else 0) or 0)
-                existing_dispatches = int((row[1] if row else 0) or 0)
-                return (
-                    existing_receipts == len(prepared_receipts)
-                    and existing_dispatches == len(prepared_dispatches)
-                )
+                            SELECT 1
+                            FROM dbo.DispatchEvents AS t
+                            WHERE t.WarehouseID = ?
+                              AND t.BuildID = ?
+                              AND t.EventKey = s.EventKey
+                        );
+                        """,
+                        warehouse_id,
+                        active_build_id,
+                    )
+                    missing_dispatches = {str(row[0]) for row in cursor.fetchall()}
+
+                return missing_receipts, missing_dispatches
             finally:
                 cursor.close()
 
     def _save_openjson() -> tuple[int, int]:
+        """Stage JSON payloads first, then touch each target event table once.
+
+        The previous OPENJSON path performed a target-table NOT EXISTS probe for
+        every 2,000-row JSON chunk.  On large mixed append files that caused the
+        same ReceiptEvents / DispatchEvents indexes to be revisited dozens of
+        times.  This path keeps the efficient JSON transport but separates it
+        from durable-table de-duplication:
+
+        1. Load all prepared rows into session-local temp staging tables.
+        2. Build one EventKey index per stage.
+        3. Execute one anti-join INSERT into ReceiptEvents and one into
+           DispatchEvents.
+
+        EventKey semantics, WarehouseID/BuildID scoping, and retry safety remain
+        unchanged.
+        """
         receipt_inserted = 0
         dispatch_inserted = 0
-        # Keep each payload bounded so pyodbc sends a handful of nvarchar(max)
-        # values instead of tens of thousands of individual parameter rows.
-        json_batch_size = max(250, int(os.getenv("SFDA_APPEND_JSON_BATCH_SIZE", "2000") or 2000))
+        json_batch_size = max(
+            250,
+            int(os.getenv("SFDA_APPEND_JSON_BATCH_SIZE", "4000") or 4000),
+        )
+
+        receipt_stage_json_sql = r"""
+            ;WITH Parsed AS
+            (
+                SELECT
+                    CONVERT(varchar(64), JSON_VALUE(j.value, '$[0]')) AS EventKey,
+                    CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[1]')) AS BN,
+                    CONVERT(char(7), JSON_VALUE(j.value, '$[2]')) AS ExpiryMonthKey,
+                    TRY_CONVERT(date, JSON_VALUE(j.value, '$[3]')) AS ExpiryDate,
+                    CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[4]')) AS GenericItemNumber,
+                    JSON_VALUE(j.value, '$[5]') AS TradeItemNumber,
+                    JSON_VALUE(j.value, '$[6]') AS TradeName,
+                    TRY_CONVERT(decimal(38, 6), JSON_VALUE(j.value, '$[7]')) AS ReceivedQuantity,
+                    JSON_VALUE(j.value, '$[8]') AS InboundShipment,
+                    JSON_VALUE(j.value, '$[9]') AS ASNLine,
+                    JSON_VALUE(j.value, '$[10]') AS SupplierName,
+                    JSON_VALUE(j.value, '$[11]') AS SupplierCode,
+                    JSON_VALUE(j.value, '$[12]') AS Description,
+                    JSON_VALUE(j.value, '$[13]') AS ItemFamilyGroup,
+                    TRY_CONVERT(datetime2(7), JSON_VALUE(j.value, '$[14]')) AS ReceivedDate
+                FROM OPENJSON(CAST(? AS nvarchar(max))) AS j
+            )
+            INSERT INTO #ReceiptEventJsonStage
+            (
+                EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
+                ASNLine, SupplierName, SupplierCode, Description, ItemFamilyGroup,
+                ReceivedDate
+            )
+            SELECT
+                EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
+                ASNLine, SupplierName, SupplierCode, Description, ItemFamilyGroup,
+                ReceivedDate
+            FROM Parsed
+            WHERE EventKey IS NOT NULL;
+        """
+
+        dispatch_stage_json_sql = r"""
+            ;WITH Parsed AS
+            (
+                SELECT
+                    CONVERT(varchar(64), JSON_VALUE(j.value, '$[0]')) AS EventKey,
+                    CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[1]')) AS BN,
+                    CONVERT(char(7), JSON_VALUE(j.value, '$[2]')) AS ExpiryMonthKey,
+                    TRY_CONVERT(date, JSON_VALUE(j.value, '$[3]')) AS ExpiryDate,
+                    CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[4]')) AS GenericItemNumber,
+                    JSON_VALUE(j.value, '$[5]') AS TradeItemNumber,
+                    JSON_VALUE(j.value, '$[6]') AS TradeName,
+                    TRY_CONVERT(decimal(38, 6), JSON_VALUE(j.value, '$[7]')) AS DispatchedQuantity,
+                    JSON_VALUE(j.value, '$[8]') AS ToAddress,
+                    JSON_VALUE(j.value, '$[9]') AS SalesOrderNumber,
+                    JSON_VALUE(j.value, '$[10]') AS OrderLine,
+                    TRY_CONVERT(datetime2(7), JSON_VALUE(j.value, '$[11]')) AS DispatchDate,
+                    JSON_VALUE(j.value, '$[12]') AS Custody
+                FROM OPENJSON(CAST(? AS nvarchar(max))) AS j
+            )
+            INSERT INTO #DispatchEventJsonStage
+            (
+                EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
+                SalesOrderNumber, OrderLine, DispatchDate, Custody
+            )
+            SELECT
+                EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
+                SalesOrderNumber, OrderLine, DispatchDate, Custody
+            FROM Parsed
+            WHERE EventKey IS NOT NULL;
+        """
+
         with Database().connect() as connection:
             cursor = connection.cursor()
             try:
+                stage_create_started = time.perf_counter()
+                cursor.execute(r"""
+                    SELECT TOP (0)
+                        EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                        TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
+                        ASNLine, SupplierName, SupplierCode, Description, ItemFamilyGroup,
+                        ReceivedDate
+                    INTO #ReceiptEventJsonStage
+                    FROM dbo.ReceiptEvents;
+
+                    SELECT TOP (0)
+                        EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                        TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
+                        SalesOrderNumber, OrderLine, DispatchDate, Custody
+                    INTO #DispatchEventJsonStage
+                    FROM dbo.DispatchEvents;
+                """)
+                phase_timings["openjson_stage_create"] = round(
+                    time.perf_counter() - stage_create_started, 3
+                )
+
                 receipt_started = time.perf_counter()
-                for row_batch in _chunks(prepared_receipts, json_batch_size):
-                    payload = _event_json_payload(row_batch)
-                    cursor.execute(receipt_json_sql, payload, warehouse_id, active_build_id)
-                    receipt_inserted += max(0, int(cursor.rowcount or 0))
-                phase_timings["openjson_receipts"] = round(time.perf_counter() - receipt_started, 3)
+                for row_batch in _chunks(receipts_to_save, json_batch_size):
+                    cursor.execute(
+                        receipt_stage_json_sql,
+                        _event_json_payload(row_batch),
+                    )
+                phase_timings["openjson_stage_receipts"] = round(
+                    time.perf_counter() - receipt_started, 3
+                )
 
                 dispatch_started = time.perf_counter()
-                for row_batch in _chunks(prepared_dispatches, json_batch_size):
-                    payload = _event_json_payload(row_batch)
-                    cursor.execute(dispatch_json_sql, payload, warehouse_id, active_build_id)
-                    dispatch_inserted += max(0, int(cursor.rowcount or 0))
-                phase_timings["openjson_dispatches"] = round(time.perf_counter() - dispatch_started, 3)
+                for row_batch in _chunks(dispatches_to_save, json_batch_size):
+                    cursor.execute(
+                        dispatch_stage_json_sql,
+                        _event_json_payload(row_batch),
+                    )
+                phase_timings["openjson_stage_dispatches"] = round(
+                    time.perf_counter() - dispatch_started, 3
+                )
+
+                index_started = time.perf_counter()
+                if receipts_to_save:
+                    cursor.execute(
+                        "CREATE UNIQUE CLUSTERED INDEX IX_ReceiptEventJsonStage_EventKey "
+                        "ON #ReceiptEventJsonStage(EventKey);"
+                    )
+                if dispatches_to_save:
+                    cursor.execute(
+                        "CREATE UNIQUE CLUSTERED INDEX IX_DispatchEventJsonStage_EventKey "
+                        "ON #DispatchEventJsonStage(EventKey);"
+                    )
+                phase_timings["openjson_stage_indexes"] = round(
+                    time.perf_counter() - index_started, 3
+                )
+
+                receipt_insert_started = time.perf_counter()
+                if receipts_to_save:
+                    cursor.execute(
+                        r"""
+                        INSERT INTO dbo.ReceiptEvents
+                        (
+                            EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                            TradeItemNumber, TradeName, ReceivedQuantity, InboundShipment,
+                            ASNLine, SupplierName, SupplierCode, Description, ItemFamilyGroup,
+                            ReceivedDate
+                        )
+                        SELECT
+                            s.EventKey, s.BN, s.ExpiryMonthKey, s.ExpiryDate, s.GenericItemNumber,
+                            s.TradeItemNumber, s.TradeName, s.ReceivedQuantity, s.InboundShipment,
+                            s.ASNLine, s.SupplierName, s.SupplierCode, s.Description, s.ItemFamilyGroup,
+                            s.ReceivedDate
+                        FROM #ReceiptEventJsonStage AS s
+                        WHERE NOT EXISTS
+                        (
+                            SELECT 1
+                            FROM dbo.ReceiptEvents AS t WITH (UPDLOCK, HOLDLOCK)
+                            WHERE t.WarehouseID = ?
+                              AND t.BuildID = ?
+                              AND t.EventKey = s.EventKey
+                        );
+                        """,
+                        warehouse_id,
+                        active_build_id,
+                    )
+                    receipt_inserted = max(0, int(cursor.rowcount or 0))
+                phase_timings["openjson_insert_receipts"] = round(
+                    time.perf_counter() - receipt_insert_started, 3
+                )
+
+                dispatch_insert_started = time.perf_counter()
+                if dispatches_to_save:
+                    cursor.execute(
+                        r"""
+                        INSERT INTO dbo.DispatchEvents
+                        (
+                            EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
+                            TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
+                            SalesOrderNumber, OrderLine, DispatchDate, Custody
+                        )
+                        SELECT
+                            s.EventKey, s.BN, s.ExpiryMonthKey, s.ExpiryDate, s.GenericItemNumber,
+                            s.TradeItemNumber, s.TradeName, s.DispatchedQuantity, s.ToAddress,
+                            s.SalesOrderNumber, s.OrderLine, s.DispatchDate, s.Custody
+                        FROM #DispatchEventJsonStage AS s
+                        WHERE NOT EXISTS
+                        (
+                            SELECT 1
+                            FROM dbo.DispatchEvents AS t WITH (UPDLOCK, HOLDLOCK)
+                            WHERE t.WarehouseID = ?
+                              AND t.BuildID = ?
+                              AND t.EventKey = s.EventKey
+                        );
+                        """,
+                        warehouse_id,
+                        active_build_id,
+                    )
+                    dispatch_inserted = max(0, int(cursor.rowcount or 0))
+                phase_timings["openjson_insert_dispatches"] = round(
+                    time.perf_counter() - dispatch_insert_started, 3
+                )
+
+                # Preserve the legacy timing field names used by the dashboard
+                # while exposing the new stage/insert split above.
+                phase_timings["openjson_receipts"] = round(
+                    phase_timings.get("openjson_stage_receipts", 0.0)
+                    + phase_timings.get("openjson_insert_receipts", 0.0),
+                    3,
+                )
+                phase_timings["openjson_dispatches"] = round(
+                    phase_timings.get("openjson_stage_dispatches", 0.0)
+                    + phase_timings.get("openjson_insert_dispatches", 0.0),
+                    3,
+                )
 
                 commit_started = time.perf_counter()
                 connection.commit()
-                phase_timings["commit"] = round(time.perf_counter() - commit_started, 3)
+                phase_timings["commit"] = round(
+                    time.perf_counter() - commit_started, 3
+                )
             except Exception:
                 connection.rollback()
                 raise
@@ -1251,25 +1470,40 @@ def append_events(
         }
         if json_enabled:
             duplicate_probe_started = time.perf_counter()
-            all_already_present = False
+            probe_succeeded = False
+            missing_receipt_keys: Set[str] = set()
+            missing_dispatch_keys: Set[str] = set()
             try:
-                all_already_present = _all_prepared_events_already_exist()
+                missing_receipt_keys, missing_dispatch_keys = _missing_prepared_event_keys()
+                probe_succeeded = True
+                receipts_to_save = [
+                    row for row in prepared_receipts if str(row[0]) in missing_receipt_keys
+                ]
+                dispatches_to_save = [
+                    row for row in prepared_dispatches if str(row[0]) in missing_dispatch_keys
+                ]
+                phase_timings["duplicate_probe_missing_receipts"] = len(receipts_to_save)
+                phase_timings["duplicate_probe_missing_dispatches"] = len(dispatches_to_save)
             except Exception:
                 logger.exception(
-                    "Historical event duplicate fast-path probe failed; continuing with OPENJSON save. "
+                    "Historical event duplicate/partial probe failed; continuing with full OPENJSON save. "
                     "WarehouseID=%s BuildID=%s",
                     warehouse_id,
                     active_build_id,
                 )
+                receipts_to_save = prepared_receipts
+                dispatches_to_save = prepared_dispatches
             phase_timings["duplicate_probe"] = round(
                 time.perf_counter() - duplicate_probe_started, 3
             )
 
-            if all_already_present:
+            if probe_succeeded and not receipts_to_save and not dispatches_to_save:
                 save_mode = "duplicate_fast_path"
                 inserted_receipts = 0
                 inserted_dispatches = 0
             else:
+                if probe_succeeded:
+                    save_mode = "openjson_partial"
                 try:
                     inserted_receipts, inserted_dispatches = _save_openjson()
                 except Exception:
