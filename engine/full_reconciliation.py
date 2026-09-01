@@ -680,6 +680,10 @@ class FullReconciliationEngine:
             c.get("Trade Description", pd.Series("", index=c.index, dtype=object))
             .fillna("").astype(str).str.strip()
         )
+        c["_WMS Description"] = (
+            c.get("Description", pd.Series("", index=c.index, dtype=object))
+            .fillna("").astype(str).str.strip()
+        )
         edges = c.merge(sfda, on=self.SFDA_KEYS, how="inner", validate="many_to_one")
         if edges.empty:
             self._historical_match_diagnostics = {
@@ -697,22 +701,34 @@ class FullReconciliationEngine:
         identity_resolver = getattr(self, "_pack_size_resolver", PackSizeResolver(self.packsize))
         scores = []
         reference_matches = []
+        description_reference_matches = []
         validation_results = []
-        for drug, trade in zip(edges["Drug Name"], edges["_WMS Trade Description"]):
-            score = Normalizer.drug_name_match_score(drug, trade)
+        for drug, trade, description in zip(
+            edges["Drug Name"],
+            edges["_WMS Trade Description"],
+            edges["_WMS Description"],
+        ):
+            trade_score = Normalizer.drug_name_match_score(drug, trade) if str(trade).strip() else 0.0
+            description_score = Normalizer.drug_name_match_score(drug, description) if str(description).strip() else 0.0
+            score = max(float(trade_score), float(description_score))
             reference_match = identity_resolver.same_product_identity(drug, trade)
+            description_reference_match = identity_resolver.same_product_identity(drug, description)
             passed = Normalizer.drug_name_validation_pass(
                 drug,
                 trade,
                 threshold=HISTORICAL_MATCH_LEGACY_THRESHOLD,
                 reference_match=reference_match,
+                wms_description=description,
+                reference_match_description=description_reference_match,
             )
             scores.append(score)
             reference_matches.append(reference_match)
+            description_reference_matches.append(description_reference_match)
             validation_results.append(bool(passed))
 
         edges["_Drug Identity Score"] = scores
         edges["_Product Master Identity Match"] = reference_matches
+        edges["_Product Master Description Match"] = description_reference_matches
         valid = pd.Series(validation_results, index=edges.index, dtype=bool)
 
         accepted_below_mask = valid & (
@@ -738,13 +754,21 @@ class FullReconciliationEngine:
                 except (TypeError, ValueError):
                     score_value = 0.0
                 reference_value = sample.get("_Product Master Identity Match")
+                description_reference_value = sample.get("_Product Master Description Match")
                 try:
                     if pd.isna(reference_value):
                         reference_value = None
                 except (TypeError, ValueError):
                     pass
+                try:
+                    if pd.isna(description_reference_value):
+                        description_reference_value = None
+                except (TypeError, ValueError):
+                    pass
                 if reference_value is not None:
                     reference_value = bool(reference_value)
+                if description_reference_value is not None:
+                    description_reference_value = bool(description_reference_value)
 
                 samples.append({
                     "bn": _json_text(sample.get("BN", "")),
@@ -752,8 +776,10 @@ class FullReconciliationEngine:
                     "generic": _json_text(sample.get("Generic Item Number", "")),
                     "sfda_drug": _json_text(sample.get("Drug Name", "")),
                     "wms_trade": _json_text(sample.get("_WMS Trade Description", "")),
+                    "wms_description": _json_text(sample.get("_WMS Description", "")),
                     "score": round(score_value, 2),
                     "product_master_match": reference_value,
+                    "product_master_description_match": description_reference_value,
                 })
             return samples
 
@@ -780,12 +806,13 @@ class FullReconciliationEngine:
         rejected = edges.loc[rejected_mask]
         for _, row in rejected.iterrows():
             logger.warning(
-                "Historical exact batch match rejected by drug-name validation. BN=%s expiry_month=%s generic=%s SFDA_drug=%s WMS_trade=%s score=%.2f",
+                "Historical exact batch match rejected by drug-name validation. BN=%s expiry_month=%s generic=%s SFDA_drug=%s WMS_trade=%s WMS_description=%s score=%.2f",
                 str(row.get("BN", "")),
                 str(row.get("Expiry Month Key", "")),
                 str(row.get("Generic Item Number", "")),
                 str(row.get("Drug Name", "")),
                 str(row.get("_WMS Trade Description", "")),
+                str(row.get("_WMS Description", "")),
                 float(row.get("_Drug Identity Score", 0) or 0),
             )
 
