@@ -5934,20 +5934,20 @@ def reconcile_batch_master_event_totals() -> Dict[str, int]:
 def _prepare_incremental_accept_refresh_scope(
     receipt_history_rows: List[Dict[str, Any]],
     sfda_df: pd.DataFrame,
+    dispatch_history_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[list[tuple[str, str, str]], list[tuple[Any, ...]], Dict[str, Any]]:
     """Prepare the affected Accept keys and exact SFDA identity rows efficiently.
 
-    Historical Append can contain thousands of ASN rows while the SFDA report can
-    contain many thousands of batch rows.  The previous implementation iterated
-    every SFDA BN+expiry group and, for each group, scanned the complete ASN
-    candidate DataFrame again.  Runtime therefore grew roughly with
-    ``SFDA groups x ASN rows`` even though only a small intersection of keys can
-    ever affect this Append.
+    Historical Append can contain thousands of WMS rows while the SFDA report can
+    contain many thousands of batch rows. Exact SFDA identity must be discoverable
+    from either Receipt or Dispatch history, because an SFDA batch may legitimately
+    be dispatch-only in the uploaded historical window. Receipt keys remain the
+    only source for Stage-2 "Missing Batch in SFDA" discovery.
 
-    This implementation keeps the same matching/business rules, but indexes the
-    uploaded ASN candidates once and restricts SFDA work to the exact intersecting
-    BN + ExpiryMonthKey keys.  Drug-name validation and PackageSize resolution are
-    unchanged.
+    The uploaded WMS candidates are indexed once and SFDA work is restricted to
+    the exact intersecting BN + ExpiryMonthKey keys. Product-name validation is a
+    conflict detector after the exact key match; it no longer rejects known aliases
+    merely because their fuzzy score is below 60.
     """
     started_at = time.perf_counter()
 
@@ -5993,7 +5993,21 @@ def _prepare_incremental_accept_refresh_scope(
 
     pack_resolver = PackSizeResolver.from_config()
 
-    candidate_rows = pd.DataFrame(receipt_history_rows or [])
+    candidate_frames = []
+    receipt_candidates = pd.DataFrame(receipt_history_rows or [])
+    if not receipt_candidates.empty:
+        receipt_candidates["_Identity Source Priority"] = 0
+        candidate_frames.append(receipt_candidates)
+
+    dispatch_candidates = pd.DataFrame(dispatch_history_rows or [])
+    if not dispatch_candidates.empty:
+        dispatch_candidates["_Identity Source Priority"] = 1
+        candidate_frames.append(dispatch_candidates)
+
+    candidate_rows = (
+        pd.concat(candidate_frames, ignore_index=True, sort=False)
+        if candidate_frames else pd.DataFrame()
+    )
     if not candidate_rows.empty:
         for col in ["BN", "Expiry Month Key", "Generic Item Number", "Trade Name"]:
             if col not in candidate_rows.columns:
@@ -6012,7 +6026,7 @@ def _prepare_incremental_accept_refresh_scope(
             candidate_rows["BN"].ne("")
             & candidate_rows["Expiry Month Key"].ne("")
             & candidate_rows["Generic Item Number"].ne("")
-        ].copy()
+        ].sort_values("_Identity Source Priority", kind="stable").copy()
 
     resolved_generics: Dict[tuple[str, str], list[str]] = {}
     trade_by_identity: Dict[tuple[str, str, str], str] = {}
@@ -6081,13 +6095,21 @@ def _prepare_incremental_accept_refresh_scope(
             accepted: list[str] = []
             for generic, trade in candidates:
                 score = Normalizer.drug_name_match_score(sfda_drug, trade)
-                if score >= 60.0:
+                reference_match = pack_resolver.same_product_identity(sfda_drug, trade)
+                if Normalizer.drug_name_validation_pass(
+                    sfda_drug,
+                    trade,
+                    threshold=60.0,
+                    reference_match=reference_match,
+                ):
                     accepted.append(str(generic))
                 else:
                     logger.warning(
-                        "Incremental exact batch match rejected by drug-name validation. "
-                        "BN=%s expiry_month=%s generic=%s SFDA_drug=%s WMS_trade=%s score=%.2f",
+                        "Incremental exact batch match rejected by product-identity validation. "
+                        "BN=%s expiry_month=%s generic=%s SFDA_drug=%s WMS_trade=%s "
+                        "score=%.2f product_master_match=%s",
                         bn, month, str(generic), sfda_drug, str(trade), score,
+                        str(reference_match),
                     )
             if accepted:
                 resolved_generics[(str(bn), str(month))] = accepted
@@ -6122,6 +6144,8 @@ def _prepare_incremental_accept_refresh_scope(
 
     metrics = {
         "candidate_rows": int(len(candidate_rows)),
+        "identity_receipt_rows": int(len(receipt_history_rows or [])),
+        "identity_dispatch_rows": int(len(dispatch_history_rows or [])),
         "affected_receipt_keys": int(len(affected)),
         "candidate_batch_keys": int(len(candidate_keys)),
         "relevant_sfda_batch_keys": int(len(resolved_generics)),
@@ -6166,6 +6190,7 @@ def refresh_historical_append_incremental(
     accept_affected, sfda_rows, scope_metrics = _prepare_incremental_accept_refresh_scope(
         receipt_history_rows,
         sfda_df,
+        dispatch_history_rows=dispatch_history_rows,
     )
 
     def _movement_key(row: Dict[str, Any]) -> tuple[str, str, str]:
@@ -6497,11 +6522,13 @@ def refresh_historical_append_incremental(
             cursor.execute(r"""
                 ;WITH AffectedGenerics AS
                 (
+                    -- Stage 2 (Missing Batch in SFDA) remains receipt-driven.
                     SELECT DISTINCT GenericItemNumber
                     FROM #AffectedAcceptKeys
                 ),
                 ExactIdentityRows AS
                 (
+                    -- Previously proven exact identities already in BatchMaster.
                     SELECT
                         bm.GenericItemNumber,
                         bm.GTIN,
@@ -6517,6 +6544,24 @@ def refresh_historical_append_incremental(
                       AND bm.BuildID = ?
                       AND NULLIF(bm.GTIN, N'') IS NOT NULL
                       AND UPPER(LTRIM(RTRIM(ISNULL(bm.GenericExistsInSFDA, N'')))) = N'YES'
+
+                    UNION ALL
+
+                    -- Exact identities discovered in THIS Append, including a
+                    -- dispatch-only exact SFDA batch. This allows that exact row
+                    -- to establish the Generic immediately for receipt Stage 2.
+                    SELECT
+                        s.ResolvedGenericItemNumber,
+                        s.GTIN,
+                        s.DrugName,
+                        s.PackageSize,
+                        CAST(NULL AS nvarchar(255)) AS TradeItemNumber,
+                        CAST(NULL AS nvarchar(500)) AS TradeName,
+                        SYSUTCDATETIME() AS LastUpdated
+                    FROM #CurrentAcceptSFDA AS s
+                    INNER JOIN AffectedGenerics AS ag
+                        ON ag.GenericItemNumber = s.ResolvedGenericItemNumber
+                    WHERE NULLIF(s.GTIN, N'') IS NOT NULL
                 ),
                 GenericReference AS
                 (
@@ -6550,12 +6595,12 @@ def refresh_historical_append_incremental(
                     Custody, GenericExistsInSFDA, LastUpdated
                 )
                 SELECT
-                    ra.BN,
-                    ra.ExpiryMonthKey,
-                    COALESCE(sf.ExpiryDate, ra.ExpiryDate),
-                    ra.GenericItemNumber,
-                    COALESCE(NULLIF(ra.TradeItemNumber, N''), gr.TradeItemNumber, N''),
-                    COALESCE(NULLIF(ra.TradeName, N''), gr.TradeName, N''),
+                    a.BN,
+                    a.ExpiryMonthKey,
+                    COALESCE(sf.ExpiryDate, ra.ExpiryDate, da.ExpiryDate),
+                    a.GenericItemNumber,
+                    COALESCE(NULLIF(ra.TradeItemNumber, N''), NULLIF(da.TradeItemNumber, N''), gr.TradeItemNumber, N''),
+                    COALESCE(NULLIF(ra.TradeName, N''), NULLIF(da.TradeName, N''), gr.TradeName, N''),
                     COALESCE(NULLIF(sf.GTIN, N''), gr.GTIN, N''),
                     COALESCE(NULLIF(sf.DrugName, N''), gr.DrugName, N''),
                     CASE
@@ -6582,38 +6627,45 @@ def refresh_historical_append_incremental(
                     COALESCE(NULLIF(da.Custody, N''), N''),
                     CASE WHEN sf.BN IS NOT NULL THEN N'Yes' ELSE N'Missing Batch in SFDA' END,
                     SYSUTCDATETIME()
-                FROM #ReceiptAggregate AS ra
-                INNER JOIN #AffectedAcceptKeys AS aa
-                    ON aa.BN = ra.BN
-                   AND aa.ExpiryMonthKey = ra.ExpiryMonthKey
-                   AND aa.GenericItemNumber = ra.GenericItemNumber
-                LEFT JOIN GenericReference AS gr
-                    ON gr.GenericItemNumber = ra.GenericItemNumber
+                FROM #AffectedMovementKeys AS a
+                LEFT JOIN #ReceiptAggregate AS ra
+                    ON ra.BN = a.BN
+                   AND ra.ExpiryMonthKey = a.ExpiryMonthKey
+                   AND ra.GenericItemNumber = a.GenericItemNumber
                 LEFT JOIN #DispatchAggregate AS da
-                    ON da.BN = ra.BN
-                   AND da.ExpiryMonthKey = ra.ExpiryMonthKey
-                   AND da.GenericItemNumber = ra.GenericItemNumber
+                    ON da.BN = a.BN
+                   AND da.ExpiryMonthKey = a.ExpiryMonthKey
+                   AND da.GenericItemNumber = a.GenericItemNumber
+                LEFT JOIN GenericReference AS gr
+                    ON gr.GenericItemNumber = a.GenericItemNumber
                 OUTER APPLY
                 (
                     SELECT TOP (1)
                         s.BN, s.ExpiryDate, s.GTIN, s.DrugName, s.PackageSize,
                         s.Quantity, s.Active, s.QuantitySentPending, s.QuantityReceivePending
                     FROM #CurrentAcceptSFDA AS s
-                    WHERE s.BN = ra.BN
-                      AND s.ExpiryMonthKey = ra.ExpiryMonthKey
-                      AND s.ResolvedGenericItemNumber = ra.GenericItemNumber
+                    WHERE s.BN = a.BN
+                      AND s.ExpiryMonthKey = a.ExpiryMonthKey
+                      AND s.ResolvedGenericItemNumber = a.GenericItemNumber
                     ORDER BY s.GTIN
                 ) AS sf
-                WHERE (sf.BN IS NOT NULL OR gr.GenericItemNumber IS NOT NULL)
+                WHERE
+                    (
+                        -- Stage 1: exact SFDA batch may be Receipt, Dispatch, or both.
+                        sf.BN IS NOT NULL
+                        OR
+                        -- Stage 2: keep the existing receipt-only discovery rule.
+                        (ra.BN IS NOT NULL AND gr.GenericItemNumber IS NOT NULL)
+                    )
                   AND NOT EXISTS
                   (
                       SELECT 1
                       FROM dbo.BatchMaster AS existing
                       WHERE existing.WarehouseID = ?
                         AND existing.BuildID = ?
-                        AND existing.BN = ra.BN
-                        AND existing.ExpiryMonthKey = ra.ExpiryMonthKey
-                        AND existing.GenericItemNumber = ra.GenericItemNumber
+                        AND existing.BN = a.BN
+                        AND existing.ExpiryMonthKey = a.ExpiryMonthKey
+                        AND existing.GenericItemNumber = a.GenericItemNumber
                   );
             """, warehouse_id, build_id, warehouse_id, build_id)
             batch_inserted = max(0, int(cursor.rowcount or 0))
@@ -6959,7 +7011,7 @@ def refresh_accept_history_incremental(
             batch_updated = max(0, int(cursor.rowcount or 0))
 
             # Insert newly seen batches only when their Generic already has a
-            # proven identity in Batch Master. This preserves the Genericâ†”GTIN
+            # proven identity in Batch Master. This preserves the GenericÃ¢â€ â€GTIN
             # authority and prevents BN/expiry collisions from inventing a drug.
             cursor.execute(r"""
                 ;WITH ReceiptAggregate AS
