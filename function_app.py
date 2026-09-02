@@ -4045,6 +4045,29 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
         from engine.reconciliation import ReconciliationEngine
 
         batch_master = optional_batch_master()
+        supplier_history = pd.DataFrame()
+        sto_incoming_history = pd.DataFrame()
+        validated_sfda_identity = pd.DataFrame()
+        if mode == "accept":
+            try:
+                from engine.database import (
+                    get_supplier_history_df,
+                    get_sto_incoming_history_df,
+                )
+                supplier_history = get_supplier_history_df()
+                sto_incoming_history = get_sto_incoming_history_df()
+                if not batch_master.empty:
+                    from engine.full_reconciliation import FullReconciliationEngine
+                    identity_engine = FullReconciliationEngine(
+                        pd.DataFrame(), pd.DataFrame(), sfda_df
+                    )
+                    validated_sfda_identity = identity_engine.prepare_stage2_sfda_identity(
+                        sfda_df, batch_master
+                    )
+            except Exception as exc:
+                # Upload & Run remains usable without Historical Build; the
+                # engine then keeps its original current-file-only allocation.
+                logger.warning("Daily Accept source history read skipped: %s", exc)
 
         processed_transactions = pd.DataFrame()
         accept_confirmation = {
@@ -4106,6 +4129,9 @@ def run_daily(req: func.HttpRequest, mode: str) -> func.HttpResponse:
             inventory_df=inventory_df,
             batch_master_df=batch_master,
             processed_transactions_df=processed_transactions,
+            supplier_history_df=supplier_history,
+            sto_incoming_history_df=sto_incoming_history,
+            validated_sfda_identity_df=validated_sfda_identity,
         ).run()
 
         report = result["report"]

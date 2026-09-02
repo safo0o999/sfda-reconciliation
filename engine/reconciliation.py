@@ -57,6 +57,9 @@ class ReconciliationEngine:
         inventory_df: pd.DataFrame | None = None,
         batch_master_df: pd.DataFrame | None = None,
         processed_transactions_df: pd.DataFrame | None = None,
+        supplier_history_df: pd.DataFrame | None = None,
+        sto_incoming_history_df: pd.DataFrame | None = None,
+        validated_sfda_identity_df: pd.DataFrame | None = None,
     ) -> None:
         normalized_mode = str(mode or "").strip().lower()
         if normalized_mode not in {"accept", "dispatch"}:
@@ -80,6 +83,25 @@ class ReconciliationEngine:
         self.batch_master = (
             batch_master_df.copy()
             if batch_master_df is not None
+            else pd.DataFrame()
+        )
+
+        # Optional cumulative source history lets Daily Accept use the same
+        # Supplier-first confirmed-allocation rule as Full Accept. Empty history
+        # deliberately preserves the standalone Upload & Run fallback.
+        self.supplier_history = (
+            supplier_history_df.copy()
+            if supplier_history_df is not None
+            else pd.DataFrame()
+        )
+        self.sto_incoming_history = (
+            sto_incoming_history_df.copy()
+            if sto_incoming_history_df is not None
+            else pd.DataFrame()
+        )
+        self.validated_sfda_identity = (
+            validated_sfda_identity_df.copy()
+            if validated_sfda_identity_df is not None
             else pd.DataFrame()
         )
 
@@ -174,10 +196,10 @@ class ReconciliationEngine:
 
         reference = self._generic_identity_reference()
 
-        # Upload & Run must NOT depend on Historical Build / Batch Master.
+        # Current-file batch discovery does not depend on Historical Build.
         # The current WMS row can establish identity when it has an exact
-        # BN + Expiry Month candidate in the current SFDA file.
-        # Historical identity, when available, is only an additional cross-check.
+        # BN + Expiry Month candidate in the current SFDA file. Historical
+        # identity, when available, remains only an additional cross-check.
         if reference.empty:
             result["_Proven GTIN"] = ""
             result["_Proven Drug Name"] = ""
@@ -639,10 +661,10 @@ class ReconciliationEngine:
     def _filter_accept_sfda_relevant(self, frame: pd.DataFrame) -> pd.DataFrame:
         """Keep ASN rows whose BN + Expiry Month exists in CURRENT SFDA.
 
-        Upload & Run is intentionally independent from Historical Build /
-        Batch Master.  The current SFDA file defines the daily batch universe.
-        Product identity is then taken from the matching WMS row and optionally
-        cross-checked against trusted Batch Master identity when available.
+        The current SFDA file defines the daily batch universe. Product identity
+        is taken from the matching WMS row and optionally cross-checked against
+        trusted Batch Master identity. Cumulative source history is used later
+        only to align Supplier/STO quantity allocation with Full Accept.
         """
         if frame.empty:
             return frame.copy()
@@ -666,6 +688,163 @@ class ReconciliationEngine:
         result["SFDA Relevance Status"] = "No Current SFDA Batch"
         result.loc[keep, "SFDA Relevance Status"] = "BN + Expiry Month Found in Current SFDA"
         return result.loc[keep].drop(columns=["_CurrentSFDAKey"], errors="ignore").copy()
+
+    def _historical_accept_source_totals(self) -> pd.DataFrame:
+        """Return cumulative Supplier/STO receipt packs at the Full Accept grain."""
+
+        parts = []
+        for source, receipt_type in (
+            (self.supplier_history, SUPPLIER),
+            (self.sto_incoming_history, STO_INCOMING),
+        ):
+            if source is None or source.empty:
+                continue
+            frame = source.copy().rename(columns={
+                "GenericItemNumber": "Generic Item Number",
+                "ExpiryMonthKey": "Expiry Month Key",
+                "ExpiryDate": "Expiry Date",
+                "ReceivedQuantityEach": "Received Quantity Each",
+                "ReceivedQuantityPack": "Received Quantity Pack",
+            })
+            frame = self._ensure_expiry_month_key(frame)
+            for column in ["BN", "Expiry Month Key", "Generic Item Number"]:
+                if column not in frame.columns:
+                    frame[column] = ""
+                frame[column] = Normalizer.text(frame[column])
+            each = pd.to_numeric(
+                frame.get("Received Quantity Each", 0), errors="coerce"
+            ).fillna(0).clip(lower=0)
+            package_size = pd.to_numeric(
+                frame.get("PackageSize", 0), errors="coerce"
+            ).fillna(0)
+            stored_pack = pd.to_numeric(
+                frame.get(
+                    "Received Quantity Pack",
+                    pd.Series(0.0, index=frame.index, dtype=float),
+                ),
+                errors="coerce",
+            ).fillna(0).clip(lower=0)
+            frame["_Historical Source Pack"] = stored_pack
+            valid = package_size.gt(0)
+            frame.loc[valid, "_Historical Source Pack"] = (
+                each.loc[valid] / package_size.loc[valid]
+            )
+            frame["Receipt Type"] = receipt_type
+            parts.append(frame[
+                self.MATCH_KEYS
+                + ["Generic Item Number", "Receipt Type", "_Historical Source Pack"]
+            ])
+
+        if not parts:
+            return pd.DataFrame(columns=self.MATCH_KEYS + [
+                "Generic Item Number", "Receipt Type", "_Historical Source Pack"
+            ])
+        combined = pd.concat(parts, ignore_index=True)
+        return (
+            combined.groupby(
+                self.MATCH_KEYS + ["Generic Item Number", "Receipt Type"],
+                dropna=False,
+            )["_Historical Source Pack"]
+            .sum()
+            .reset_index()
+        )
+
+    def _apply_full_accept_source_allocation(self, report: pd.DataFrame) -> pd.DataFrame:
+        """Allocate Daily Accept using Full Accept's Supplier/STO confirmation order."""
+
+        result = report.copy()
+        result["To Be Accept"] = 0
+        result["Available RSD Receive Pending"] = 0.0
+        history = self._historical_accept_source_totals()
+        history_map = {}
+        if not history.empty:
+            for row in history.to_dict(orient="records"):
+                key = tuple(
+                    str(row.get(column, "") or "").strip()
+                    for column in self.MATCH_KEYS + ["Generic Item Number"]
+                )
+                history_map.setdefault(key, {})[str(row.get("Receipt Type", ""))] = float(
+                    row.get("_Historical Source Pack", 0) or 0
+                )
+
+        group_keys = self.MATCH_KEYS + ["Generic Item Number"]
+        for key_values, group in result.groupby(group_keys, dropna=False, sort=False):
+            if not isinstance(key_values, tuple):
+                key_values = (key_values,)
+            key = tuple(str(value or "").strip() for value in key_values)
+            pending = max(0.0, float(pd.to_numeric(
+                pd.Series([group["Quantity Receive Pending"].iloc[0]]),
+                errors="coerce",
+            ).fillna(0).iloc[0]))
+            requested_by_type = {}
+            historical = history_map.get(key)
+            if historical:
+                quantity = float(pd.to_numeric(
+                    pd.Series([group["Quantity"].iloc[0]]), errors="coerce"
+                ).fillna(0).iloc[0])
+                confirmed = max(0.0, quantity - pending)
+                supplier_total = max(0.0, historical.get(SUPPLIER, 0.0))
+                sto_total = max(0.0, historical.get(STO_INCOMING, 0.0))
+                supplier_open = max(0.0, supplier_total - confirmed)
+                confirmed_after_supplier = max(0.0, confirmed - supplier_total)
+                sto_open = max(0.0, sto_total - confirmed_after_supplier)
+                open_by_type = {SUPPLIER: supplier_open, STO_INCOMING: sto_open}
+                for receipt_type in (SUPPLIER, STO_INCOMING):
+                    current = pd.to_numeric(
+                        group.loc[
+                            group["Receipt Type"].eq(receipt_type),
+                            "Received Quantity Pack",
+                        ],
+                        errors="coerce",
+                    ).fillna(0).clip(lower=0).sum()
+                    requested_by_type[receipt_type] = min(
+                        float(current), open_by_type[receipt_type]
+                    )
+            else:
+                for receipt_type in (SUPPLIER, STO_INCOMING):
+                    requested_by_type[receipt_type] = float(pd.to_numeric(
+                        group.loc[
+                            group["Receipt Type"].eq(receipt_type),
+                            "Received Quantity Pack",
+                        ],
+                        errors="coerce",
+                    ).fillna(0).clip(lower=0).sum())
+
+            remaining = pending
+            for receipt_type in (SUPPLIER, STO_INCOMING):
+                requested_remaining = requested_by_type.get(receipt_type, 0.0)
+                for index in group.index[group["Receipt Type"].eq(receipt_type)]:
+                    result.at[index, "Available RSD Receive Pending"] = remaining
+                    row_request = min(
+                        requested_remaining,
+                        max(0.0, float(result.at[index, "Received Quantity Pack"] or 0)),
+                    )
+                    allocated = self._safe_int(min(remaining, row_request))
+                    result.at[index, "To Be Accept"] = allocated
+                    requested_remaining = max(0.0, requested_remaining - allocated)
+                    remaining = max(0.0, remaining - allocated)
+        return result
+
+    def _apply_full_accept_identity_scope(self, report: pd.DataFrame) -> pd.DataFrame:
+        """Use Full Accept's approved BN/month/Generic identities when available."""
+
+        if report.empty or self.validated_sfda_identity.empty:
+            return report.copy()
+        result = report.copy()
+        approved = self.validated_sfda_identity.copy()
+        keys = self.MATCH_KEYS + ["Generic Item Number"]
+        for frame in (result, approved):
+            for column in keys:
+                if column not in frame.columns:
+                    frame[column] = ""
+                frame[column] = Normalizer.text(frame[column])
+        approved = approved[keys].drop_duplicates().assign(_FullAcceptIdentity=True)
+        result = result.merge(
+            approved, on=keys, how="left", validate="many_to_one"
+        )
+        return result.loc[
+            result["_FullAcceptIdentity"].eq(True)
+        ].drop(columns=["_FullAcceptIdentity"], errors="ignore").copy()
 
     def _apply_daily_generic_reference(self, report: pd.DataFrame) -> pd.DataFrame:
         """Fill SFDA identity for a relevant missing batch using its Generic.
@@ -876,6 +1055,7 @@ class ReconciliationEngine:
             )
             report = self._verify_current_sfda_identity(report)
             report = self._apply_daily_generic_reference(report)
+            report = self._apply_full_accept_identity_scope(report)
             if "SFDA Expiry Date" in report.columns:
                 verified = report.get("SFDA Identity Status", "").eq("Verified Generic-GTIN")
                 report.loc[verified, "Expiry Date"] = report.loc[verified, "SFDA Expiry Date"]
@@ -932,8 +1112,6 @@ class ReconciliationEngine:
 
         # Supplier ALWAYS receives priority against Quantity Receive Pending.
         # STO Incoming can consume only the quantity remaining after Supplier.
-        report["To Be Accept"] = 0
-        report["Available RSD Receive Pending"] = 0.0
         report["STO Pending RSD Qty"] = 0.0
         report["Required Action"] = ""
         report["Receipt Type Priority"] = report["Receipt Type"].map(
@@ -948,27 +1126,7 @@ class ReconciliationEngine:
             report["PackageSize"], errors="coerce"
         ).fillna(0).gt(0)
 
-        for _, group in report.groupby(
-            self.MATCH_KEYS + ["Generic Item Number"], dropna=False, sort=False
-        ):
-            pending = float(
-                pd.to_numeric(
-                    pd.Series([group["Quantity Receive Pending"].iloc[0]]),
-                    errors="coerce",
-                ).fillna(0).iloc[0]
-            )
-            remaining = max(0.0, pending)
-            for index in group.index:
-                report.at[index, "Available RSD Receive Pending"] = remaining
-                if not bool(valid_package.loc[index]):
-                    continue
-                requested = float(max(0, report.at[index, "Received Quantity Pack"]))
-                allocated = min(remaining, requested)
-                report.at[index, "To Be Accept"] = self._safe_int(allocated)
-                remaining = max(
-                    0.0,
-                    remaining - float(report.at[index, "To Be Accept"]),
-                )
+        report = self._apply_full_accept_source_allocation(report)
 
         sto_mask = report["Receipt Type"].eq(STO_INCOMING)
         report.loc[sto_mask, "STO Pending RSD Qty"] = (

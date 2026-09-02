@@ -22,7 +22,7 @@ logger = logging.getLogger("SFDA-Reconciliation.FullReconciliation")
 
 
 HISTORICAL_RECEIPT_EVENT_KEY_VERSION = (
-    "RECEIPT_EVENT_KEY_V2_LPN_COLLISION_SAFE_20260902"
+    "RECEIPT_EVENT_KEY_V3_SOURCE_FILE_INDEPENDENT_20260902"
 )
 
 
@@ -960,9 +960,12 @@ class FullReconciliationEngine:
         frame = frame.loc[valid_mask].copy()
         frame["Received Quantity"] = received_quantity.loc[valid_mask].to_numpy()
 
-        # Missing WMS batches must remain available for final SFDA classification.
-        legacy_event_keys = self._build_event_keys(
-            "RECEIPT",
+        # Source file name is excluded from the durable receipt identity so the
+        # same movement cannot re-enter through Rebuild or a later Append under
+        # a different report name. LPN remains included so two real pallet
+        # receipts with otherwise identical fields are never collapsed.
+        canonical_receipt_keys = self._build_event_keys(
+            "RECEIPT-CANONICAL",
             [
                 frame["Inbound Shipment"],
                 frame["ASN Line"],
@@ -972,15 +975,26 @@ class FullReconciliationEngine:
                 frame["Trade Item"],
                 frame["Received Date"],
                 frame["Received Quantity"],
-                frame["_Source File"],
+                frame.get("LPN", pd.Series("", index=frame.index, dtype=object)),
             ],
         )
-        frame["Event Key"], self._receipt_event_key_diagnostics = (
-            self._disambiguate_receipt_event_keys_with_lpn(
-                legacy_event_keys,
-                frame.get("LPN", pd.Series("", index=frame.index, dtype=object)),
-            )
-        )
+        frame["_Canonical Receipt Key"] = canonical_receipt_keys
+        before_overlap_dedup = len(frame)
+        frame = frame.drop_duplicates(
+            subset=["_Canonical Receipt Key"], keep="first"
+        ).copy()
+        overlap_duplicates = before_overlap_dedup - len(frame)
+
+        # Missing WMS batches must remain available for final SFDA classification.
+        frame["Event Key"] = frame["_Canonical Receipt Key"]
+        self._receipt_event_key_diagnostics = {
+            "version": HISTORICAL_RECEIPT_EVENT_KEY_VERSION,
+            "legacy_collision_groups": 0,
+            "legacy_collision_rows": 0,
+            "lpn_disambiguated_rows": 0,
+            "additional_unique_events": 0,
+            "overlapping_source_duplicates_removed": int(overlap_duplicates),
+        }
 
         result = (
             frame[self.RECEIPT_EVENT_COLUMNS]
