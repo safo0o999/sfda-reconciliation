@@ -4023,6 +4023,7 @@ def list_historical_build_jobs(limit: int = 500) -> List[Dict[str, Any]]:
 
 def sync_batch_master_sfda_snapshot(
     sfda_df: pd.DataFrame,
+    validated_sfda_identity_df: pd.DataFrame | None = None,
 ) -> Dict[str, int]:
     """Synchronize BatchMaster from the current SFDA snapshot by BN + expiry month.
 
@@ -4030,10 +4031,11 @@ def sync_batch_master_sfda_snapshot(
     BatchMaster is never used as a prerequisite for an exact batch match because
     it may have been inherited earlier from another batch of the same Generic.
 
-    Safety rule: only unambiguous SFDA BN + expiry-month keys (exactly one GTIN)
-    are eligible.  When a key matches, GTIN, Drug Name, exact SFDA expiry date and
-    all SFDA quantities are overwritten from that exact SFDA row and the batch is
-    marked GenericExistsInSFDA = Yes.
+    Safety rule: Full Accept/Dispatch pass only rows already approved by the V6
+    multi-evidence identity gate. Independently, only unambiguous SFDA BN +
+    expiry-month keys (exactly one GTIN) are eligible. When a key matches, GTIN,
+    Drug Name, exact SFDA expiry date and all SFDA quantities are overwritten
+    from that exact SFDA row and the batch is marked GenericExistsInSFDA = Yes.
     """
 
     initialize_database()
@@ -4043,11 +4045,32 @@ def sync_batch_master_sfda_snapshot(
     from engine.full_reconciliation import FullReconciliationEngine
     from engine.normalizer import Normalizer
 
-    frame = Normalizer.normalize_sfda(sfda_df.copy())
-    frame["Expiry Month Key"] = FullReconciliationEngine._month_key(frame["Expiry Date"])
+    if validated_sfda_identity_df is not None:
+        frame = validated_sfda_identity_df.copy()
+        required = [
+            "BN",
+            "Expiry Month Key",
+            "GTIN",
+            "Expiry Date",
+            "Drug Name",
+            "Quantity",
+            "Active",
+            "Quantity sent pending",
+            "Quantity Receive Pending",
+        ]
+        for column in required:
+            if column not in frame.columns:
+                frame[column] = None
+    else:
+        frame = Normalizer.normalize_sfda(sfda_df.copy())
+        frame["Expiry Month Key"] = FullReconciliationEngine._month_key(frame["Expiry Date"])
     frame["GTIN"] = Normalizer.text(frame["GTIN"])
     frame["Drug Name"] = Normalizer.text(frame["Drug Name"])
     frame["BN"] = Normalizer.text(frame["BN"])
+    if "Generic Item Number" not in frame.columns:
+        frame["Generic Item Number"] = ""
+    frame["Generic Item Number"] = Normalizer.text(frame["Generic Item Number"])
+    frame["Expiry Date"] = Normalizer.date(frame["Expiry Date"])
     for column in ["Quantity", "Active", "Quantity sent pending", "Quantity Receive Pending"]:
         frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0)
 
@@ -4071,8 +4094,14 @@ def sync_batch_master_sfda_snapshot(
     )
     frame = frame.loc[frame["_GTINCount"].eq(1)].copy()
 
+    validated_generic_scope = validated_sfda_identity_df is not None
+    group_keys = ["BN", "Expiry Month Key"]
+    if validated_generic_scope:
+        frame = frame.loc[frame["Generic Item Number"].ne("")].copy()
+        group_keys.append("Generic Item Number")
+
     grouped = (
-        frame.groupby(["BN", "Expiry Month Key"], dropna=False)
+        frame.groupby(group_keys, dropna=False)
         .agg(**{
             "GTIN": ("GTIN", "first"),
             "Expiry Date": ("Expiry Date", "first"),
@@ -4089,6 +4118,7 @@ def sync_batch_master_sfda_snapshot(
         (
             _text(row, "BN"),
             _text(row, "Expiry Month Key"),
+            _text(row, "Generic Item Number"),
             _text(row, "GTIN"),
             _value(row, "Expiry Date"),
             _text(row, "Drug Name"),
@@ -4117,6 +4147,7 @@ def sync_batch_master_sfda_snapshot(
                 CREATE TABLE #SFDABatchState (
                     BN nvarchar(255) NOT NULL,
                     ExpiryMonthKey nvarchar(20) NOT NULL,
+                    GenericItemNumber nvarchar(255) NOT NULL,
                     GTIN nvarchar(100) NOT NULL,
                     ExpiryDate date NULL,
                     DrugName nvarchar(1000) NULL,
@@ -4124,15 +4155,15 @@ def sync_batch_master_sfda_snapshot(
                     Active decimal(38,6) NOT NULL,
                     QuantitySentPending decimal(38,6) NOT NULL,
                     QuantityReceivePending decimal(38,6) NOT NULL,
-                    PRIMARY KEY (BN, ExpiryMonthKey)
+                    PRIMARY KEY (BN, ExpiryMonthKey, GenericItemNumber)
                 );
             """)
             cursor.fast_executemany = True
             cursor.executemany(r"""
                 INSERT INTO #SFDABatchState
-                (BN, ExpiryMonthKey, GTIN, ExpiryDate, DrugName, SFDAQuantity, Active,
+                (BN, ExpiryMonthKey, GenericItemNumber, GTIN, ExpiryDate, DrugName, SFDAQuantity, Active,
                  QuantitySentPending, QuantityReceivePending)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """, rows)
             cursor.fast_executemany = False
 
@@ -4151,6 +4182,10 @@ def sync_batch_master_sfda_snapshot(
                 INNER JOIN #SFDABatchState AS s
                     ON s.BN = bm.BN
                    AND s.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND (
+                        s.GenericItemNumber = N''
+                        OR s.GenericItemNumber = bm.GenericItemNumber
+                   )
                 WHERE bm.WarehouseID = ?;
             """, (warehouse_id,))
             updated = max(0, int(cursor.rowcount or 0))
@@ -4161,7 +4196,10 @@ def sync_batch_master_sfda_snapshot(
 
     return {
         "sfda_rows": int(len(sfda_df)),
-        "unambiguous_sfda_keys": int(len(grouped)),
+        "unambiguous_sfda_keys": int(
+            len(grouped[["BN", "Expiry Month Key"]].drop_duplicates())
+        ),
+        "validated_identity_rows": int(len(frame)),
         "updated_rows": updated,
     }
 
