@@ -965,7 +965,21 @@ class Normalizer:
                     "Closed Date",
                     "Transaction Date",
                 ],
-            )
+            ),
+            # WMS transaction timestamps are exported month-first (for example
+            # 8/1/2026 means August 1, not January 8). Parse these explicit
+            # formats before the conservative day-first fallback used by other
+            # report sources.
+            formats=[
+                "%m/%d/%Y %I:%M:%S %p",
+                "%m/%d/%Y %I:%M %p",
+                "%m/%d/%Y %H:%M:%S",
+                "%m/%d/%Y %H:%M",
+                "%m/%d/%Y",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d",
+            ],
+            fallback_dayfirst=True,
         )
         df["Generic Item Number"] = Normalizer.identifier(
             Normalizer._optional_series(
@@ -1097,7 +1111,19 @@ class Normalizer:
                     "Date Dispatched",
                     "Transaction Date",
                 ],
-            )
+            ),
+            # Full Dispatch uses the same month-first WMS transaction timestamp
+            # convention as ASN receipts.
+            formats=[
+                "%m/%d/%Y %I:%M:%S %p",
+                "%m/%d/%Y %I:%M %p",
+                "%m/%d/%Y %H:%M:%S",
+                "%m/%d/%Y %H:%M",
+                "%m/%d/%Y",
+                "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d",
+            ],
+            fallback_dayfirst=True,
         )
         df["Generic Item Number"] = Normalizer.identifier(
             Normalizer._optional_series(
