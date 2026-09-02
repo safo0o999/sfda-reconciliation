@@ -7585,12 +7585,12 @@ def _full_dispatch_transaction_key(
 
 
 def get_full_dispatch_confirmed_allocations() -> pd.DataFrame:
-    """Return Full Dispatch quantities already reserved from historical evidence.
+    """Return only SFDA-confirmed Full Dispatch historical consumption.
 
-    Submitted quantities are treated as reserved immediately after a successful
-    Full Dispatch run. This prevents regenerating the same historical WMS
-    movement on a retry before SFDA confirmation. Confirmed quantities are also
-    returned for audit/status purposes.
+    A generated CSV is not proof that the user uploaded it. Submitted quantities
+    remain pending for audit and confirmation, but only quantities proven by a
+    later SFDA report are deducted from Customer History. Therefore a retry with
+    unchanged SFDA correctly regenerates the same operational file.
     """
     initialize_database()
     sql = r"""
@@ -7600,14 +7600,14 @@ def get_full_dispatch_confirmed_allocations() -> pd.DataFrame:
             GenericItemNumber AS [Generic Item Number],
             ToAddress AS [To Address],
             GLN,
-            SubmittedQuantityEach AS [Reserved Full Dispatch Quantity Each],
-            SubmittedQuantityPack AS [Reserved Full Dispatch Quantity Pack],
+            ConfirmedQuantityEach AS [Reserved Full Dispatch Quantity Each],
+            ConfirmedQuantityPack AS [Reserved Full Dispatch Quantity Pack],
             ConfirmedQuantityEach AS [Confirmed Full Dispatch Quantity Each],
             ConfirmedQuantityPack AS [Confirmed Full Dispatch Quantity Pack],
             LastConfirmedAt AS [Last Full Dispatch Confirmed At]
         FROM dbo.FullDispatchTransactions
-        WHERE SubmittedQuantityPack > 0
-           OR SubmittedQuantityEach > 0;
+        WHERE ConfirmedQuantityPack > 0
+           OR ConfirmedQuantityEach > 0;
     """
     with Database().connect() as connection:
         return pd.read_sql(sql, connection)

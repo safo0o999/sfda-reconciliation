@@ -72,6 +72,7 @@ class Exporter:
         "SFDA Active",
         "Quantity Sent Pending",
         "Quantity Receive Pending",
+        "SFDA Confirmed Accept",
         "To Be Accept",
         "Reconciliation Status",
     ]
@@ -83,6 +84,9 @@ class Exporter:
         "Expiry Date",
         "Expiry Month Key",
         "Generic Item Number",
+        "SFDA Quantity",
+        "Quantity Receive Pending",
+        "SFDA Confirmed Accept",
         "Supplier Accept Qty",
         "STO Accept Qty",
         "Total To Be Accept",
@@ -118,8 +122,9 @@ class Exporter:
 
         groups = [
             (1, 6, "Batch Identification", "5B9BD5"),
-            (7, 9, "Accept Allocation", "4472C4"),
-            (10, 10, "Source", "70AD47"),
+            (7, 9, "SFDA State", "5B9BD5"),
+            (10, 12, "Accept Allocation", "4472C4"),
+            (13, 13, "Source", "70AD47"),
         ]
         for start, end, label, color in groups:
             if start < end:
@@ -149,7 +154,7 @@ class Exporter:
             cell.font = Font(bold=True, color="FFFFFF")
             cell.fill = PatternFill(
                 fill_type="solid",
-                fgColor=("17365D" if column_index <= 6 else "2F5597" if column_index <= 9 else "548235"),
+                fgColor=("17365D" if column_index <= 9 else "2F5597" if column_index <= 12 else "548235"),
             )
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             cell.border = border
@@ -182,7 +187,7 @@ class Exporter:
                     cell.fill = stripe_fill
 
         if len(report) > 0:
-            worksheet.auto_filter.ref = f"A2:J{2 + len(report)}"
+            worksheet.auto_filter.ref = f"A2:M{2 + len(report)}"
         worksheet.freeze_panes = "A3"
         worksheet.sheet_view.showGridLines = False
         for column_index, max_length in enumerate(max_lengths, start=1):
@@ -1170,8 +1175,8 @@ class Exporter:
             elif is_full_accept_reconciliation:
                 group_definitions = [
                     (1, 7, "Batch Identification", "5B9BD5"),
-                    (8, 13, "Quantity Comparison", "4472C4"),
-                    (14, 15, "Decision", "70AD47"),
+                    (8, 14, "Quantity Comparison", "4472C4"),
+                    (15, 16, "Decision", "70AD47"),
                 ]
             elif is_full_dispatch_reconciliation:
                 group_definitions = [
@@ -1287,7 +1292,7 @@ class Exporter:
             )
             if is_batch_master:
                 header_fill = "2F5597" if column_index >= 10 else "17365D"
-            elif is_full_accept_reconciliation and column_index >= 14:
+            elif is_full_accept_reconciliation and column_index >= 15:
                 header_fill = "548235"
             elif is_full_accept_reconciliation and column_index >= 8:
                 header_fill = "2F5597"

@@ -186,6 +186,7 @@ class FullReconciliationEngine:
         "SFDA Active",
         "Quantity Sent Pending",
         "Quantity Receive Pending",
+        "SFDA Confirmed Accept",
         "To Be Accept",
         "Reconciliation Status",
     ]
@@ -2104,6 +2105,7 @@ class FullReconciliationEngine:
         batch_master_df: pd.DataFrame,
         sto_incoming_df: pd.DataFrame,
         supplier_accept_details: pd.DataFrame | None = None,
+        supplier_master_df: pd.DataFrame | None = None,
         validated_sfda_identity_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Reconcile TRK800 STO receipts against current RSD Receive Pending.
@@ -2121,7 +2123,9 @@ class FullReconciliationEngine:
                 "GTIN", "Drug Name", "BN", "Expiry Date", "Expiry Month Key",
                 "Generic Item Number", "PackageSize", "STO Received Quantity Each",
                 "STO Received Quantity Pack", "Quantity Receive Pending",
-                "Available RSD Receive Pending", "To Be Accept", "STO Pending RSD Qty",
+                "SFDA Confirmed Accept", "Confirmed STO Quantity Pack",
+                "STO Unprocessed Quantity Pack", "Available RSD Receive Pending",
+                "To Be Accept", "STO Pending RSD Qty",
                 "RSD Status", "Required Action",
             ])
 
@@ -2204,8 +2208,83 @@ class FullReconciliationEngine:
         sto["Quantity Receive Pending"] = pd.to_numeric(
             sto.get("Quantity Receive Pending", 0), errors="coerce"
         ).fillna(0).clip(lower=0)
+        sto["Quantity"] = pd.to_numeric(
+            sto.get("Quantity", 0), errors="coerce"
+        ).fillna(0).clip(lower=0)
+        sto["SFDA Confirmed Accept"] = (
+            sto["Quantity"] - sto["Quantity Receive Pending"]
+        ).clip(lower=0)
 
-        supplier_allocated = pd.DataFrame(columns=["BN", "Expiry Month Key", "_Supplier Accept"])
+        supplier_master = (
+            supplier_master_df.copy()
+            if supplier_master_df is not None
+            else pd.DataFrame()
+        )
+        if supplier_master.empty:
+            supplier_received = pd.DataFrame(
+                columns=[*self.KEYS, "_Supplier Received Pack"]
+            )
+        else:
+            for column in self.KEYS:
+                supplier_master[column] = Normalizer.text(supplier_master[column])
+            supplier_each = pd.to_numeric(
+                supplier_master.get("Received Quantity Each", 0), errors="coerce"
+            ).fillna(0).clip(lower=0)
+            supplier_pack_size = pd.to_numeric(
+                supplier_master.get("PackageSize", 0), errors="coerce"
+            ).fillna(0)
+            supplier_master["_Supplier Received Pack"] = 0.0
+            valid_supplier_pack = supplier_pack_size.gt(0)
+            supplier_master.loc[valid_supplier_pack, "_Supplier Received Pack"] = (
+                supplier_each.loc[valid_supplier_pack]
+                / supplier_pack_size.loc[valid_supplier_pack]
+            )
+            supplier_received = (
+                supplier_master.groupby(self.KEYS, dropna=False)["_Supplier Received Pack"]
+                .sum().reset_index()
+            )
+
+        sto = sto.merge(
+            supplier_received,
+            on=self.KEYS,
+            how="left",
+            validate="many_to_one",
+        )
+        sto["_Supplier Received Pack"] = pd.to_numeric(
+            sto.get("_Supplier Received Pack", 0), errors="coerce"
+        ).fillna(0).clip(lower=0)
+        sto["Confirmed STO Quantity Pack"] = (
+            sto["SFDA Confirmed Accept"] - sto["_Supplier Received Pack"]
+        ).clip(lower=0)
+
+        # Allocate already-confirmed cumulative Accept against historical STO
+        # rows once, in stable order. This is vectorized per batch so large
+        # histories do not add Python work per receipt row.
+        sto_received_pack = pd.to_numeric(
+            sto["STO Received Quantity Pack"], errors="coerce"
+        ).fillna(0).clip(lower=0)
+        prior_sto_received = (
+            sto_received_pack.groupby(
+                [sto[key] for key in self.KEYS], sort=False, dropna=False
+            ).cumsum()
+            - sto_received_pack
+        )
+        confirmed_sto_available = (
+            pd.to_numeric(sto["Confirmed STO Quantity Pack"], errors="coerce")
+            .fillna(0)
+            .sub(prior_sto_received)
+            .clip(lower=0)
+        )
+        confirmed_sto_consumed = pd.concat(
+            [sto_received_pack, confirmed_sto_available], axis=1
+        ).min(axis=1)
+        sto["STO Unprocessed Quantity Pack"] = (
+            sto_received_pack - confirmed_sto_consumed
+        ).clip(lower=0)
+
+        supplier_allocated = pd.DataFrame(
+            columns=[*self.KEYS, "_Supplier Accept"]
+        )
         if supplier_accept_details is not None and not supplier_accept_details.empty:
             supplier_tmp = supplier_accept_details.copy()
             supplier_tmp["To Be Accept"] = pd.to_numeric(
@@ -2226,22 +2305,30 @@ class FullReconciliationEngine:
             sto["Quantity Receive Pending"] - sto["_Supplier Accept"]
         ).clip(lower=0)
 
-        # Allocate remaining pending in stable order when several sending
-        # warehouses/shipments share the same batch.
-        sto["To Be Accept"] = 0
+        # Allocate remaining pending in the same stable row order when several
+        # sending warehouses/shipments share a batch, without per-row loops.
         sto = sto.reset_index(drop=True)
-        for _, group in sto.groupby(self.KEYS, dropna=False, sort=False):
-            remaining = float(group["Available RSD Receive Pending"].iloc[0] if len(group) else 0)
-            for index in group.index:
-                requested = float(max(0, sto.at[index, "STO Received Quantity Pack"]))
-                allocated = min(remaining, requested)
-                sto.at[index, "To Be Accept"] = int(max(0, allocated))
-                remaining -= allocated
-                if remaining < 0:
-                    remaining = 0
+        requested_sto = pd.to_numeric(
+            sto["STO Unprocessed Quantity Pack"], errors="coerce"
+        ).fillna(0).clip(lower=0)
+        prior_requested_sto = (
+            requested_sto.groupby(
+                [sto[key] for key in self.KEYS], sort=False, dropna=False
+            ).cumsum()
+            - requested_sto
+        )
+        available_for_row = (
+            pd.to_numeric(sto["Available RSD Receive Pending"], errors="coerce")
+            .fillna(0)
+            .sub(prior_requested_sto)
+            .clip(lower=0)
+        )
+        sto["To Be Accept"] = pd.concat(
+            [requested_sto, available_for_row], axis=1
+        ).min(axis=1).fillna(0).astype("int64")
 
         sto["STO Pending RSD Qty"] = (
-            pd.to_numeric(sto["STO Received Quantity Pack"], errors="coerce").fillna(0)
+            pd.to_numeric(sto["STO Unprocessed Quantity Pack"], errors="coerce").fillna(0)
             - pd.to_numeric(sto["To Be Accept"], errors="coerce").fillna(0)
         ).clip(lower=0)
         sto["RSD Status"] = "RSD Transfer Pending - Follow Up"
@@ -2260,7 +2347,9 @@ class FullReconciliationEngine:
             "GTIN", "Drug Name", "BN", "Expiry Date", "Expiry Month Key",
             "Generic Item Number", "PackageSize", "STO Received Quantity Each",
             "STO Received Quantity Pack", "Quantity Receive Pending",
-            "Available RSD Receive Pending", "To Be Accept", "STO Pending RSD Qty",
+            "SFDA Confirmed Accept", "Confirmed STO Quantity Pack",
+            "STO Unprocessed Quantity Pack", "Available RSD Receive Pending",
+            "To Be Accept", "STO Pending RSD Qty",
             "RSD Status", "Required Action",
         ]
         return self._ensure_columns(sto, columns)[columns].reset_index(drop=True)
@@ -2361,15 +2450,18 @@ class FullReconciliationEngine:
             report["Historical Received Quantity Pack"],
             errors="coerce",
         ).fillna(0)
-        already_accepted_in_sfda = (
-            pd.to_numeric(report["SFDA Active"], errors="coerce").fillna(0)
-            + pd.to_numeric(
-                report["Quantity Sent Pending"],
-                errors="coerce",
+        # SFDA Quantity is the cumulative quantity reported by the supplier.
+        # Quantity Receive Pending is the portion not accepted yet. Their
+        # difference is therefore the durable cumulative Accept proof. Unlike
+        # Active, it does not fall when stock is later dispatched.
+        report["SFDA Confirmed Accept"] = (
+            pd.to_numeric(report["SFDA Quantity"], errors="coerce").fillna(0)
+            - pd.to_numeric(
+                report["Quantity Receive Pending"], errors="coerce"
             ).fillna(0)
-        )
+        ).clip(lower=0)
         remaining_accept = (
-            historical_received_pack - already_accepted_in_sfda
+            historical_received_pack - report["SFDA Confirmed Accept"]
         ).clip(lower=0)
 
         quantity_receive_pending = pd.to_numeric(
@@ -2403,7 +2495,7 @@ class FullReconciliationEngine:
         ] = 0
 
         logger.info(
-            "Full Accept logic v2026.08.06.3 applied. rows=%s positive_accept_rows=%s",
+            "Full Accept cumulative SFDA confirmation logic applied. rows=%s positive_accept_rows=%s",
             len(report),
             int(pd.to_numeric(report["To Be Accept"], errors="coerce").fillna(0).gt(0).sum()),
         )
@@ -3022,6 +3114,7 @@ class FullReconciliationEngine:
             batch_master_df,
             sto_incoming_df if sto_incoming_df is not None else pd.DataFrame(),
             supplier_accept_details,
+            supplier_master,
             validated_sfda_identity,
         )
         sto_return_cancel = (
@@ -3067,7 +3160,8 @@ class FullReconciliationEngine:
 
         distribution_columns = [
             "GTIN", "Drug Name", "BN", "Expiry Date", "Expiry Month Key",
-            "Generic Item Number", "Supplier Accept Qty", "STO Accept Qty",
+            "Generic Item Number", "SFDA Quantity", "Quantity Receive Pending",
+            "SFDA Confirmed Accept", "Supplier Accept Qty", "STO Accept Qty",
             "Total To Be Accept", "Accept Source",
         ]
         distribution_parts = []
@@ -3077,15 +3171,28 @@ class FullReconciliationEngine:
         ):
             if frame is None or frame.empty:
                 continue
+            frame = frame.copy()
+            if "SFDA Quantity" not in frame.columns:
+                frame["SFDA Quantity"] = pd.to_numeric(
+                    frame.get(
+                        "Quantity",
+                        pd.Series(0, index=frame.index, dtype=float),
+                    ),
+                    errors="coerce",
+                ).fillna(0)
             part = self._ensure_columns(
                 frame,
                 [
                     "GTIN", "Drug Name", "BN", "Expiry Date",
-                    "Expiry Month Key", "Generic Item Number", "To Be Accept",
+                    "Expiry Month Key", "Generic Item Number", "SFDA Quantity",
+                    "Quantity Receive Pending", "SFDA Confirmed Accept",
+                    "To Be Accept",
                 ],
             )[[
                 "GTIN", "Drug Name", "BN", "Expiry Date",
-                "Expiry Month Key", "Generic Item Number", "To Be Accept",
+                "Expiry Month Key", "Generic Item Number", "SFDA Quantity",
+                "Quantity Receive Pending", "SFDA Confirmed Accept",
+                "To Be Accept",
             ]].copy()
             part[quantity_column] = pd.to_numeric(
                 part.pop("To Be Accept"), errors="coerce"
@@ -3099,6 +3206,13 @@ class FullReconciliationEngine:
                         "Drug Name": ("Drug Name", "first"),
                         "Expiry Month Key": ("Expiry Month Key", "first"),
                         "Generic Item Number": ("Generic Item Number", "first"),
+                        "SFDA Quantity": ("SFDA Quantity", "first"),
+                        "Quantity Receive Pending": (
+                            "Quantity Receive Pending", "first"
+                        ),
+                        "SFDA Confirmed Accept": (
+                            "SFDA Confirmed Accept", "first"
+                        ),
                         quantity_column: (quantity_column, "sum"),
                     }
                 )
@@ -3123,6 +3237,20 @@ class FullReconciliationEngine:
                         current = accept_distribution[column].fillna("").astype(str).str.strip()
                         fallback = accept_distribution[sto_column].fillna("").astype(str).str.strip()
                         accept_distribution[column] = current.where(current.ne(""), fallback)
+                        accept_distribution = accept_distribution.drop(columns=[sto_column])
+                for column in [
+                    "SFDA Quantity", "Quantity Receive Pending",
+                    "SFDA Confirmed Accept",
+                ]:
+                    sto_column = f"{column} STO"
+                    if sto_column in accept_distribution.columns:
+                        current = pd.to_numeric(
+                            accept_distribution[column], errors="coerce"
+                        )
+                        fallback = pd.to_numeric(
+                            accept_distribution[sto_column], errors="coerce"
+                        )
+                        accept_distribution[column] = current.combine_first(fallback).fillna(0)
                         accept_distribution = accept_distribution.drop(columns=[sto_column])
 
             accept_distribution["Supplier Accept Qty"] = pd.to_numeric(
