@@ -2193,19 +2193,29 @@ def _run_full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
         if batch_master.empty:
             raise ValueError("Historical Batch Master is empty. Complete Step 1 first.")
 
-        # Keep persisted Batch Master aligned with the same latest SFDA snapshot
-        # used by Product Intelligence and Full Accept.
-        batch_master_sync = sync_batch_master_sfda_snapshot(sfda_df)
+        # Apply the same V6 multi-evidence identity gate used by Historical
+        # Rebuild/Append before the latest SFDA snapshot can update BatchMaster
+        # or produce Full Accept actions.
+        full_engine = FullReconciliationEngine(
+            pd.DataFrame(), pd.DataFrame(), sfda_df
+        )
+        validated_sfda_identity = full_engine.prepare_stage2_sfda_identity(
+            sfda_df,
+            batch_master,
+        )
+        batch_master_sync = sync_batch_master_sfda_snapshot(
+            sfda_df,
+            validated_sfda_identity,
+        )
         batch_master = get_batch_master_df()
 
-        result = FullReconciliationEngine(
-            pd.DataFrame(), pd.DataFrame(), sfda_df
-        ).run_accept_reconciliation(
+        result = full_engine.run_accept_reconciliation(
             sfda_df,
             batch_master,
             supplier_history,
             sto_incoming_history,
             sto_return_history,
+            validated_sfda_identity,
         )
         accept_details = result["accept_details"]
         supplier_variance = result["supplier_variance"]
@@ -2258,6 +2268,10 @@ def _run_full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
             "batch_master_rows": int(len(batch_master)),
             "batch_master_sfda_rows_updated": int(
                 batch_master_sync.get("updated_rows", 0)
+            ),
+            "validated_sfda_identity_rows": int(len(validated_sfda_identity)),
+            "identity_logic_version": full_engine.historical_match_diagnostics().get(
+                "logic_version"
             ),
             "accept_rows": int(len(accept_upload)),
             "supplier_variance_rows": int(len(supplier_variance)),
@@ -2504,16 +2518,30 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
 
         replace_latest_inventory_snapshot(inventory_df, inventory_name)
         replace_latest_sfda_snapshot(sfda_df, sfda_name)
-        batch_master_sync = sync_batch_master_sfda_snapshot(sfda_df)
+        batch_master = get_batch_master_df()
+        if batch_master.empty:
+            raise ValueError("Historical Batch Master is empty. Complete Step 1 first.")
+
+        full_engine = FullReconciliationEngine(
+            pd.DataFrame(), pd.DataFrame(), sfda_df
+        )
+        validated_sfda_identity = full_engine.prepare_stage2_sfda_identity(
+            sfda_df,
+            batch_master,
+        )
+        batch_master_sync = sync_batch_master_sfda_snapshot(
+            sfda_df,
+            validated_sfda_identity,
+        )
         batch_master = get_batch_master_df()
 
-        result = FullReconciliationEngine(
-            pd.DataFrame(), pd.DataFrame(), sfda_df
-        ).run_dispatch_reconciliation(
+        result = full_engine.run_dispatch_reconciliation(
             inventory_df,
             sfda_df,
             customer_history,
             reserved_full_dispatch,
+            batch_master,
+            validated_sfda_identity,
         )
         dispatch_details = result["dispatch_details"]
         summary_df = result["summary"]
@@ -2558,6 +2586,10 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
             "batch_master_rows": int(len(batch_master)),
             "batch_master_sfda_rows_updated": int(
                 batch_master_sync.get("updated_rows", 0)
+            ),
+            "validated_sfda_identity_rows": int(len(validated_sfda_identity)),
+            "identity_logic_version": full_engine.historical_match_diagnostics().get(
+                "logic_version"
             ),
             "dispatch_allocation_rows": int(len(dispatch_upload)),
             "dispatch_files": len(outputs["dispatch_files"]),
