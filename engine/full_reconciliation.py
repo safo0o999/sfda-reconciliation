@@ -21,6 +21,11 @@ from engine.reference_data import load_current_warehouse_gln
 logger = logging.getLogger("SFDA-Reconciliation.FullReconciliation")
 
 
+HISTORICAL_RECEIPT_EVENT_KEY_VERSION = (
+    "RECEIPT_EVENT_KEY_V2_LPN_COLLISION_SAFE_20260902"
+)
+
+
 class FullReconciliationEngine:
     """Historical-data and full-reconciliation engine.
 
@@ -275,6 +280,13 @@ class FullReconciliationEngine:
             "accepted_below_legacy_threshold_samples": [],
             "rejected_samples": [],
         }
+        self._receipt_event_key_diagnostics: Dict[str, Any] = {
+            "version": HISTORICAL_RECEIPT_EVENT_KEY_VERSION,
+            "legacy_collision_groups": 0,
+            "legacy_collision_rows": 0,
+            "lpn_disambiguated_rows": 0,
+            "additional_unique_events": 0,
+        }
         # GLN is warehouse-scoped without changing any historical batch logic.
         # Madinah (WarehouseID=1) continues to use config/gln.xlsx exactly as
         # before. Other warehouses use only their own stored mapping.
@@ -285,6 +297,13 @@ class FullReconciliationEngine:
         diagnostics = dict(self._historical_match_diagnostics or {})
         diagnostics["logic_version"] = HISTORICAL_MATCH_LOGIC_VERSION
         diagnostics["legacy_threshold"] = float(HISTORICAL_MATCH_LEGACY_THRESHOLD)
+        return diagnostics
+
+    def receipt_event_key_diagnostics(self) -> Dict[str, Any]:
+        """Return JSON-safe diagnostics for backward-compatible receipt keys."""
+
+        diagnostics = dict(self._receipt_event_key_diagnostics or {})
+        diagnostics["version"] = HISTORICAL_RECEIPT_EVENT_KEY_VERSION
         return diagnostics
 
     @staticmethod
@@ -331,6 +350,70 @@ class FullReconciliationEngine:
             keys.append(hashlib.sha256(raw_key.encode("utf-8")).hexdigest())
 
         return keys
+
+    @classmethod
+    def _disambiguate_receipt_event_keys_with_lpn(
+        cls,
+        legacy_keys: Sequence[str],
+        lpn_values: Iterable[Any],
+    ) -> tuple[List[str], Dict[str, Any]]:
+        """Disambiguate only legacy receipt-key collisions using LPN.
+
+        Unique rows keep the exact historical EventKey produced by V1.  This is
+        critical for Append retry safety: deploying this version and uploading
+        the same file again must not make every existing event look new.
+
+        When multiple rows share one V1 key, a deterministic LPN anchor retains
+        that legacy key and each additional distinct LPN receives a V2 key. Rows
+        that repeat the same LPN still collapse, preserving true duplicate-file
+        protection.  Because the anchor is deterministic, reordering the input
+        does not change the resulting EventKey set.
+        """
+
+        keys = list(legacy_keys)
+        lpns = [cls._clean_key_part(value) for value in lpn_values]
+        if len(keys) != len(lpns):
+            raise ValueError("Receipt EventKey and LPN collections must have equal length.")
+
+        groups: Dict[str, List[int]] = {}
+        for index, key in enumerate(keys):
+            groups.setdefault(str(key), []).append(index)
+
+        legacy_unique_count = len(set(keys))
+        collision_groups = 0
+        collision_rows = 0
+        disambiguated_rows = 0
+
+        for legacy_key, indices in groups.items():
+            if len(indices) < 2:
+                continue
+
+            collision_groups += 1
+            collision_rows += len(indices)
+            group_lpns = [lpns[index] for index in indices]
+            non_blank_lpns = sorted({value for value in group_lpns if value})
+            if not non_blank_lpns:
+                continue
+
+            # A blank LPN keeps the legacy key when present. Otherwise the
+            # lexicographically smallest LPN is the stable legacy-key anchor.
+            anchor_lpn = "" if any(not value for value in group_lpns) else non_blank_lpns[0]
+            for index in indices:
+                lpn = lpns[index]
+                if not lpn or lpn == anchor_lpn:
+                    continue
+                raw_key = f"RECEIPT-LPN-V2|{legacy_key}|{lpn}"
+                keys[index] = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+                disambiguated_rows += 1
+
+        diagnostics = {
+            "version": HISTORICAL_RECEIPT_EVENT_KEY_VERSION,
+            "legacy_collision_groups": int(collision_groups),
+            "legacy_collision_rows": int(collision_rows),
+            "lpn_disambiguated_rows": int(disambiguated_rows),
+            "additional_unique_events": int(len(set(keys)) - legacy_unique_count),
+        }
+        return keys, diagnostics
 
     @staticmethod
     def _ensure_columns(dataframe: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
@@ -852,7 +935,7 @@ class FullReconciliationEngine:
         frame["Received Quantity"] = received_quantity.loc[valid_mask].to_numpy()
 
         # Missing WMS batches must remain available for final SFDA classification.
-        frame["Event Key"] = self._build_event_keys(
+        legacy_event_keys = self._build_event_keys(
             "RECEIPT",
             [
                 frame["Inbound Shipment"],
@@ -866,6 +949,12 @@ class FullReconciliationEngine:
                 frame["_Source File"],
             ],
         )
+        frame["Event Key"], self._receipt_event_key_diagnostics = (
+            self._disambiguate_receipt_event_keys_with_lpn(
+                legacy_event_keys,
+                frame.get("LPN", pd.Series("", index=frame.index, dtype=object)),
+            )
+        )
 
         result = (
             frame[self.RECEIPT_EVENT_COLUMNS]
@@ -873,11 +962,16 @@ class FullReconciliationEngine:
             .reset_index(drop=True)
         )
         logger.info(
-            "Receipt events prepared in %.2f seconds. input_rows=%s valid_rows=%s unique_events=%s",
+            "Receipt events prepared in %.2f seconds. input_rows=%s valid_rows=%s "
+            "unique_events=%s event_key_version=%s legacy_collision_groups=%s "
+            "additional_unique_events=%s",
             time.perf_counter() - started_at,
             len(self.asn),
             len(frame),
             len(result),
+            HISTORICAL_RECEIPT_EVENT_KEY_VERSION,
+            self._receipt_event_key_diagnostics.get("legacy_collision_groups", 0),
+            self._receipt_event_key_diagnostics.get("additional_unique_events", 0),
         )
         return result
 
@@ -1795,6 +1889,28 @@ class FullReconciliationEngine:
         ]:
             sfda[column] = pd.to_numeric(sfda[column], errors="coerce").fillna(0)
 
+        sfda["BN"] = Normalizer.text(sfda["BN"])
+        sfda["GTIN"] = Normalizer.text(sfda["GTIN"])
+        sfda = sfda.loc[
+            sfda["BN"].ne("")
+            & sfda["Expiry Month Key"].astype(str).str.strip().ne("")
+            & sfda["GTIN"].ne("")
+        ].copy()
+
+        identity_counts = (
+            sfda.groupby(["BN", "Expiry Month Key"], dropna=False)["GTIN"]
+            .nunique()
+            .rename("_GTIN Count")
+            .reset_index()
+        )
+        sfda = sfda.merge(
+            identity_counts,
+            on=["BN", "Expiry Month Key"],
+            how="left",
+            validate="many_to_one",
+        )
+        sfda = sfda.loc[sfda["_GTIN Count"].eq(1)].copy()
+
         return (
             sfda.groupby(["BN", "Expiry Month Key"], dropna=False)
             .agg(
@@ -1809,6 +1925,103 @@ class FullReconciliationEngine:
                 }
             )
             .reset_index()
+        )
+
+    def prepare_stage2_sfda_identity(
+        self,
+        sfda_df: pd.DataFrame,
+        batch_master_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Apply the historical V6 identity gate to current Stage-2 SFDA rows.
+
+        BN + expiry month discovers the regulatory candidate. BatchMaster then
+        supplies the already-scoped WMS Generic, Trade Description and detailed
+        Description used by the same multi-evidence validation as Rebuild and
+        Append. The returned grain is BN + expiry month + Generic, so Full
+        Accept and Full Dispatch cannot cross-allocate between two WMS products
+        that happen to share an operational batch key.
+        """
+
+        sfda = self._prepare_stage2_sfda(sfda_df)
+        master = (
+            batch_master_df.copy()
+            if batch_master_df is not None
+            else pd.DataFrame()
+        )
+        output_columns = self.KEYS + [
+            "Expiry Date",
+            "GTIN",
+            "Drug Name",
+            "Quantity",
+            "Active",
+            "Quantity sent pending",
+            "Quantity Receive Pending",
+        ]
+        if sfda.empty or master.empty:
+            return pd.DataFrame(columns=output_columns)
+
+        master = self._rename_history_columns(master)
+        candidate_columns = self.KEYS + [
+            "Trade Description",
+            "Description",
+            "Item Family Group",
+        ]
+        candidates = self._ensure_columns(master, candidate_columns)[
+            candidate_columns
+        ].copy()
+        for column in self.KEYS:
+            candidates[column] = Normalizer.text(candidates[column])
+        candidates = candidates.loc[
+            candidates["BN"].ne("")
+            & candidates["Expiry Month Key"].ne("")
+            & candidates["Generic Item Number"].ne("")
+        ].copy()
+        candidates = candidates.loc[
+            ~self._excluded_item_family_mask(candidates["Item Family Group"])
+        ].copy()
+        candidates = candidates.drop_duplicates(subset=self.KEYS, keep="first")
+
+        accepted = self._resolve_exact_sfda_generic_candidates(
+            candidates,
+            sfda,
+        )
+        accepted = self._ensure_columns(accepted, output_columns)[
+            output_columns
+        ].copy()
+        if accepted.empty:
+            return accepted
+
+        for column in self.KEYS:
+            accepted[column] = Normalizer.text(accepted[column])
+        accepted = accepted.drop_duplicates(subset=self.KEYS, keep="first")
+
+        generic_counts = (
+            accepted.groupby(self.SFDA_KEYS, dropna=False)["Generic Item Number"]
+            .nunique()
+            .rename("_Accepted Generic Count")
+            .reset_index()
+        )
+        accepted = accepted.merge(
+            generic_counts,
+            on=self.SFDA_KEYS,
+            how="left",
+            validate="many_to_one",
+        )
+        ambiguous_generic_keys = int(
+            accepted.loc[
+                accepted["_Accepted Generic Count"].gt(1),
+                self.SFDA_KEYS,
+            ].drop_duplicates().shape[0]
+        )
+        if ambiguous_generic_keys:
+            logger.warning(
+                "Stage-2 identity excluded %s BN+expiry-month key(s) accepted for multiple WMS Generics.",
+                ambiguous_generic_keys,
+            )
+        return (
+            accepted.loc[accepted["_Accepted Generic Count"].eq(1)]
+            .drop(columns=["_Accepted Generic Count"], errors="ignore")
+            .reset_index(drop=True)
         )
 
     @staticmethod
@@ -1891,6 +2104,7 @@ class FullReconciliationEngine:
         batch_master_df: pd.DataFrame,
         sto_incoming_df: pd.DataFrame,
         supplier_accept_details: pd.DataFrame | None = None,
+        validated_sfda_identity_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Reconcile TRK800 STO receipts against current RSD Receive Pending.
 
@@ -1911,7 +2125,11 @@ class FullReconciliationEngine:
                 "RSD Status", "Required Action",
             ])
 
-        sfda = self._prepare_stage2_sfda(sfda_df)
+        sfda = (
+            validated_sfda_identity_df.copy()
+            if validated_sfda_identity_df is not None
+            else self.prepare_stage2_sfda_identity(sfda_df, batch_master_df)
+        )
         master = batch_master_df.copy() if batch_master_df is not None else pd.DataFrame()
 
         for column in ["BN", "Expiry Month Key", "Generic Item Number"]:
@@ -1954,7 +2172,7 @@ class FullReconciliationEngine:
 
         sto = sto.merge(
             sfda,
-            on=["BN", "Expiry Month Key"],
+            on=self.KEYS,
             how="left",
             suffixes=("", " SFDA"),
             validate="many_to_one",
@@ -1994,12 +2212,12 @@ class FullReconciliationEngine:
                 supplier_tmp.get("To Be Accept", 0), errors="coerce"
             ).fillna(0)
             supplier_allocated = (
-                supplier_tmp.groupby(["BN", "Expiry Month Key"], dropna=False)["To Be Accept"]
+                supplier_tmp.groupby(self.KEYS, dropna=False)["To Be Accept"]
                 .sum().reset_index().rename(columns={"To Be Accept": "_Supplier Accept"})
             )
         sto = sto.merge(
             supplier_allocated,
-            on=["BN", "Expiry Month Key"],
+            on=self.KEYS,
             how="left",
             validate="many_to_one",
         )
@@ -2012,7 +2230,7 @@ class FullReconciliationEngine:
         # warehouses/shipments share the same batch.
         sto["To Be Accept"] = 0
         sto = sto.reset_index(drop=True)
-        for _, group in sto.groupby(["BN", "Expiry Month Key"], dropna=False, sort=False):
+        for _, group in sto.groupby(self.KEYS, dropna=False, sort=False):
             remaining = float(group["Available RSD Receive Pending"].iloc[0] if len(group) else 0)
             for index in group.index:
                 requested = float(max(0, sto.at[index, "STO Received Quantity Pack"]))
@@ -2051,10 +2269,15 @@ class FullReconciliationEngine:
         self,
         sfda_df: pd.DataFrame,
         batch_master_df: pd.DataFrame,
+        validated_sfda_identity_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Build the one-time Accept alignment by historical batch."""
 
-        sfda = self._prepare_stage2_sfda(sfda_df)
+        sfda = (
+            validated_sfda_identity_df.copy()
+            if validated_sfda_identity_df is not None
+            else self.prepare_stage2_sfda_identity(sfda_df, batch_master_df)
+        )
         master = batch_master_df.copy()
         if master.empty:
             return pd.DataFrame(columns=self.ACCEPT_RECONCILIATION_COLUMNS)
@@ -2077,7 +2300,7 @@ class FullReconciliationEngine:
 
         report = master.merge(
             sfda,
-            on=["BN", "Expiry Month Key"],
+            on=self.KEYS,
             how="left",
             suffixes=("", " SFDA"),
             validate="many_to_one",
@@ -2200,10 +2423,15 @@ class FullReconciliationEngine:
         self,
         sfda_df: pd.DataFrame,
         supplier_history_df: pd.DataFrame,
+        validated_sfda_identity_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Compare supplier-reported SFDA quantity with physical receipts."""
 
-        sfda = self._prepare_stage2_sfda(sfda_df)
+        sfda = (
+            validated_sfda_identity_df.copy()
+            if validated_sfda_identity_df is not None
+            else self._prepare_stage2_sfda(sfda_df)
+        )
         supplier = self._rename_history_columns(supplier_history_df)
         if supplier.empty:
             return pd.DataFrame(columns=self.SUPPLIER_VARIANCE_COLUMNS)
@@ -2220,7 +2448,7 @@ class FullReconciliationEngine:
 
         report = supplier.merge(
             sfda,
-            on=["BN", "Expiry Month Key"],
+            on=(self.KEYS if "Generic Item Number" in sfda.columns else self.SFDA_KEYS),
             how="left",
             suffixes=("", " SFDA"),
             validate="many_to_one",
@@ -2261,6 +2489,8 @@ class FullReconciliationEngine:
         sfda_df: pd.DataFrame,
         customer_history_df: pd.DataFrame,
         confirmed_full_dispatch_df: pd.DataFrame | None = None,
+        batch_master_df: pd.DataFrame | None = None,
+        validated_sfda_identity_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
         """Allocate only unconsumed historical Dispatch evidence by GLN.
 
@@ -2269,7 +2499,14 @@ class FullReconciliationEngine:
         ledger is therefore subtracted customer-by-customer before allocation.
         """
 
-        sfda = self._prepare_stage2_sfda(sfda_df)
+        sfda = (
+            validated_sfda_identity_df.copy()
+            if validated_sfda_identity_df is not None
+            else self.prepare_stage2_sfda_identity(
+                sfda_df,
+                batch_master_df if batch_master_df is not None else pd.DataFrame(),
+            )
+        )
         inventory = self._prepare_stage2_inventory(inventory_df)
         customer = self._rename_history_columns(customer_history_df)
 
@@ -2293,11 +2530,11 @@ class FullReconciliationEngine:
         customer.loc[missing_gln, "Customer Status"] = "DUMMY"
 
         batch_current = inventory.groupby(
-            ["BN", "Expiry Month Key"], dropna=False
+            self.KEYS, dropna=False
         )["Current Inventory Quantity Each"].sum().reset_index()
         target = sfda.merge(
             batch_current,
-            on=["BN", "Expiry Month Key"],
+            on=self.KEYS,
             how="left",
             validate="one_to_one",
         )
@@ -2313,14 +2550,14 @@ class FullReconciliationEngine:
             customer.loc[
                 pd.to_numeric(customer.get("PackageSize", 0), errors="coerce").gt(0)
             ]
-            .groupby(["BN", "Expiry Month Key"], dropna=False)["PackageSize"]
+            .groupby(self.KEYS, dropna=False)["PackageSize"]
             .first()
             .reset_index()
             .rename(columns={"PackageSize": "_Customer PackageSize"})
         )
         target = target.merge(
             customer_pack_lookup,
-            on=["BN", "Expiry Month Key"],
+            on=self.KEYS,
             how="left",
             validate="one_to_one",
         )
@@ -2369,6 +2606,7 @@ class FullReconciliationEngine:
                 [
                     "BN",
                     "Expiry Month Key",
+                    "Generic Item Number",
                     "SFDA Expiry Date",
                     "GTIN",
                     "Drug Name",
@@ -2382,7 +2620,7 @@ class FullReconciliationEngine:
                     "Required Dispatch Pack",
                 ]
             ],
-            on=["BN", "Expiry Month Key"],
+            on=self.KEYS,
             how="inner",
             validate="many_to_one",
         )
@@ -2582,7 +2820,7 @@ class FullReconciliationEngine:
         # row, allocation = min(available, max(required - prior_available, 0)).
         # This preserves output row-for-row while avoiding thousands of DataFrame
         # .loc writes in Python.
-        group_keys = ["BN", "Expiry Month Key"]
+        group_keys = self.KEYS
         available_pack = pd.to_numeric(
             details["Available Historical Dispatch Quantity Pack"],
             errors="coerce",
@@ -2613,18 +2851,18 @@ class FullReconciliationEngine:
         #
         # This is dispatch-only logic. Full Dispatch never creates/assumes Accept.
         allocated_by_batch = (
-            details.groupby(["BN", "Expiry Month Key"], dropna=False)["To Be Dispatch"]
+            details.groupby(self.KEYS, dropna=False)["To Be Dispatch"]
             .sum()
             .reset_index()
             .rename(columns={"To Be Dispatch": "_Known Customer Allocation"})
             if not details.empty
             else pd.DataFrame(
-                columns=["BN", "Expiry Month Key", "_Known Customer Allocation"]
+                columns=[*self.KEYS, "_Known Customer Allocation"]
             )
         )
         residual_target = target.merge(
             allocated_by_batch,
-            on=["BN", "Expiry Month Key"],
+            on=self.KEYS,
             how="left",
             validate="one_to_one",
         )
@@ -2641,55 +2879,6 @@ class FullReconciliationEngine:
         ].copy()
 
         if not residual_target.empty:
-            # Prefer a Generic already represented by Customer History for this
-            # batch; otherwise fall back to Inventory's Generic when available.
-            customer_generic = (
-                customer.loc[
-                    customer["Generic Item Number"].astype(str).str.strip().ne("")
-                ]
-                .groupby(["BN", "Expiry Month Key"], dropna=False)["Generic Item Number"]
-                .first()
-                .reset_index()
-                .rename(columns={"Generic Item Number": "_Customer Generic"})
-            )
-            inventory_generic = (
-                inventory.loc[
-                    inventory["Generic Item Number"].astype(str).str.strip().ne("")
-                ]
-                .groupby(["BN", "Expiry Month Key"], dropna=False)["Generic Item Number"]
-                .first()
-                .reset_index()
-                .rename(columns={"Generic Item Number": "_Inventory Generic"})
-            )
-            residual_target = residual_target.merge(
-                customer_generic,
-                on=["BN", "Expiry Month Key"],
-                how="left",
-                validate="one_to_one",
-            ).merge(
-                inventory_generic,
-                on=["BN", "Expiry Month Key"],
-                how="left",
-                validate="one_to_one",
-            )
-            residual_target["Generic Item Number"] = (
-                residual_target["_Customer Generic"]
-                .fillna("")
-                .astype(str)
-                .str.strip()
-            )
-            no_customer_generic = residual_target["Generic Item Number"].eq("")
-            residual_target.loc[
-                no_customer_generic, "Generic Item Number"
-            ] = (
-                residual_target.loc[
-                    no_customer_generic, "_Inventory Generic"
-                ]
-                .fillna("")
-                .astype(str)
-                .str.strip()
-            )
-
             dummy_rows = pd.DataFrame()
             dummy_rows["To Address"] = pd.Series(
                 ["UNMAPPED / DUMMY GLN"] * len(residual_target),
@@ -2795,6 +2984,7 @@ class FullReconciliationEngine:
         supplier_history_df: pd.DataFrame,
         sto_incoming_df: pd.DataFrame | None = None,
         sto_return_df: pd.DataFrame | None = None,
+        validated_sfda_identity_df: pd.DataFrame | None = None,
     ) -> Dict[str, pd.DataFrame]:
         """Run Full Accept with strict receipt-source separation.
 
@@ -2806,6 +2996,12 @@ class FullReconciliationEngine:
 
         Validator.validate(Normalizer.normalize_sfda(sfda_df.copy()), "SFDA")
 
+        validated_sfda_identity = (
+            validated_sfda_identity_df.copy()
+            if validated_sfda_identity_df is not None
+            else self.prepare_stage2_sfda_identity(sfda_df, batch_master_df)
+        )
+
         supplier_master = self._supplier_only_master_for_accept(
             batch_master_df,
             supplier_history_df,
@@ -2813,10 +3009,12 @@ class FullReconciliationEngine:
         supplier_accept_details = self.build_accept_reconciliation(
             sfda_df,
             supplier_master,
+            validated_sfda_identity,
         )
         supplier_variance = self.build_supplier_variance(
             sfda_df,
             supplier_history_df,
+            validated_sfda_identity,
         )
 
         sto_incoming = self.build_sto_incoming_reconciliation(
@@ -2824,6 +3022,7 @@ class FullReconciliationEngine:
             batch_master_df,
             sto_incoming_df if sto_incoming_df is not None else pd.DataFrame(),
             supplier_accept_details,
+            validated_sfda_identity,
         )
         sto_return_cancel = (
             sto_return_df.copy()
@@ -2872,6 +3071,7 @@ class FullReconciliationEngine:
             "sto_incoming": sto_incoming,
             "sto_return_cancel_dispatch": sto_return_cancel,
             "accept_upload": accept_upload,
+            "validated_sfda_identity": validated_sfda_identity,
         }
 
     def run_dispatch_reconciliation(
@@ -2880,15 +3080,27 @@ class FullReconciliationEngine:
         sfda_df: pd.DataFrame,
         customer_history_df: pd.DataFrame,
         confirmed_full_dispatch_df: pd.DataFrame | None = None,
+        batch_master_df: pd.DataFrame | None = None,
+        validated_sfda_identity_df: pd.DataFrame | None = None,
     ) -> Dict[str, pd.DataFrame]:
         """Run the Full Dispatch stage after Accept is completed in SFDA."""
 
         Validator.validate(Normalizer.normalize_sfda(sfda_df.copy()), "SFDA")
+        validated_sfda_identity = (
+            validated_sfda_identity_df.copy()
+            if validated_sfda_identity_df is not None
+            else self.prepare_stage2_sfda_identity(
+                sfda_df,
+                batch_master_df if batch_master_df is not None else pd.DataFrame(),
+            )
+        )
         dispatch_details = self.build_dispatch_reconciliation(
             inventory_df,
             sfda_df,
             customer_history_df,
             confirmed_full_dispatch_df,
+            batch_master_df,
+            validated_sfda_identity,
         )
         empty_accept = pd.DataFrame(columns=self.ACCEPT_RECONCILIATION_COLUMNS)
         empty_variance = pd.DataFrame(columns=self.SUPPLIER_VARIANCE_COLUMNS)
@@ -2909,6 +3121,7 @@ class FullReconciliationEngine:
             "dispatch_details": dispatch_details,
             "summary": summary,
             "dispatch_upload": dispatch_upload,
+            "validated_sfda_identity": validated_sfda_identity,
         }
 
     def run_full_reconciliation(
@@ -2925,7 +3138,10 @@ class FullReconciliationEngine:
             sfda_df, batch_master_df, supplier_history_df
         )
         dispatch_result = self.run_dispatch_reconciliation(
-            inventory_df, sfda_df, customer_history_df
+            inventory_df,
+            sfda_df,
+            customer_history_df,
+            batch_master_df=batch_master_df,
         )
         summary = self.build_reconciliation_summary(
             accept_result["accept_details"],
@@ -2991,6 +3207,8 @@ class FullReconciliationEngine:
             "excluded_receipt_keys": list(self.excluded_receipt_keys),
             "excluded_dispatch_keys": list(self.excluded_dispatch_keys),
             "sfda_summary": sfda_summary,
+            "receipt_event_key_version": HISTORICAL_RECEIPT_EVENT_KEY_VERSION,
+            "receipt_event_key_diagnostics": self.receipt_event_key_diagnostics(),
         }
 
     def run(
