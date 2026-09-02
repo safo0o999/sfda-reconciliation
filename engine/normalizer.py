@@ -909,6 +909,18 @@ class Normalizer:
                 ["ASN Line", "Line Number"],
             )
         )
+        # LPN is intentionally retained as receipt-event identity evidence.
+        # Several valid WMS receipt rows can share the same shipment, ASN line,
+        # batch, timestamp and quantity while representing different physical
+        # license plates.  The historical engine uses this normalized value only
+        # to disambiguate those otherwise-colliding events; it does not change
+        # Batch Master grain or any SFDA product-matching rule.
+        df["LPN"] = Normalizer.identifier(
+            Normalizer._optional_series(
+                df,
+                ["LPN", "License Plate Number", "License Plate", "Pallet LPN"],
+            )
+        )
         df["Supplier Name"] = Normalizer.text(
             Normalizer._optional_series(
                 df,
