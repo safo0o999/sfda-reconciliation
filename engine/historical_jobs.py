@@ -48,6 +48,8 @@ from engine.warehouse_context import historical_build_scope, warehouse_scope
 
 logger = logging.getLogger("SFDA-Reconciliation.HistoricalJobs")
 
+HISTORICAL_JOB_WORKER_VERSION = "HISTORICAL_WORKER_V6_MATCH_DIAGNOSTICS_20260902"
+
 
 def _supports_keyword_argument(func: Any, keyword: str) -> bool:
     """Return True when the imported callable accepts the requested keyword.
@@ -444,8 +446,9 @@ def process_historical_build_job(
 
     try:
         logger.warning(
-            "HISTORICAL_MATCH_LOGIC_VERSION job_id=%s warehouse_id=%s operation=%s version=%s",
+            "HISTORICAL_MATCH_LOGIC_VERSION job_id=%s warehouse_id=%s operation=%s version=%s worker=%s",
             job_id, warehouse_id, operation, HISTORICAL_MATCH_LOGIC_VERSION,
+            HISTORICAL_JOB_WORKER_VERSION,
         )
         update_historical_build_job(
             job_id,
@@ -771,6 +774,7 @@ def process_historical_build_job(
         match_diagnostics.setdefault("logic_version", HISTORICAL_MATCH_LOGIC_VERSION)
 
         summary = {
+            "historical_job_worker_version": HISTORICAL_JOB_WORKER_VERSION,
             "historical_match_logic_version": HISTORICAL_MATCH_LOGIC_VERSION,
             "historical_match_diagnostics": match_diagnostics,
             "asn_files": len(input_manifest.get("asn_files", [])),
