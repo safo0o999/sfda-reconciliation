@@ -4,7 +4,7 @@ import re
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -75,6 +75,125 @@ class Exporter:
         "To Be Accept",
         "Reconciliation Status",
     ]
+
+    ACCEPT_DISTRIBUTION_COLUMNS = [
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "Expiry Month Key",
+        "Generic Item Number",
+        "Supplier Accept Qty",
+        "STO Accept Qty",
+        "Total To Be Accept",
+        "Accept Source",
+    ]
+
+    @staticmethod
+    def build_full_accept_reconciliation_workbook(
+        accept_details,
+        accept_distribution,
+        file_name="Full_Accept_Reconciliation.xlsx",
+    ):
+        """Build Full Accept details plus the exact Supplier/STO CSV allocation."""
+
+        generated = Exporter.build_formatted_excel_file(
+            df=accept_details,
+            file_name=file_name,
+            sheet_name="Full Accept",
+            title="One-Time Full Reconciliation - Accept",
+            columns=list(accept_details.columns),
+            sort_columns=["Generic Item Number", "BN", "Expiry Date"],
+        )
+        payload = generated[file_name]
+        workbook = load_workbook(io.BytesIO(base64.b64decode(payload["content"])))
+        worksheet = workbook.create_sheet(title="Accept Distribution")
+
+        report = (
+            accept_distribution.copy()
+            if accept_distribution is not None
+            else pd.DataFrame()
+        ).reindex(columns=Exporter.ACCEPT_DISTRIBUTION_COLUMNS)
+        report = report.dropna(how="all").reset_index(drop=True)
+
+        groups = [
+            (1, 6, "Batch Identification", "5B9BD5"),
+            (7, 9, "Accept Allocation", "4472C4"),
+            (10, 10, "Source", "70AD47"),
+        ]
+        for start, end, label, color in groups:
+            if start < end:
+                worksheet.merge_cells(
+                    start_row=1, start_column=start, end_row=1, end_column=end
+                )
+            cell = worksheet.cell(row=1, column=start, value=label)
+            cell.font = Font(bold=True, color="FFFFFF", size=11)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            for column_index in range(start, end + 1):
+                worksheet.cell(row=1, column=column_index).fill = PatternFill(
+                    fill_type="solid", fgColor=color
+                )
+
+        border = Border(
+            left=Side(style="thin", color="B8C4CE"),
+            right=Side(style="thin", color="B8C4CE"),
+            top=Side(style="thin", color="B8C4CE"),
+            bottom=Side(style="thin", color="B8C4CE"),
+        )
+        identifier_columns = {"GTIN", "BN", "Generic Item Number"}
+        date_columns = {"Expiry Date"}
+        max_lengths = [len(column) for column in report.columns]
+
+        for column_index, column_name in enumerate(report.columns, start=1):
+            cell = worksheet.cell(row=2, column=column_index, value=column_name)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(
+                fill_type="solid",
+                fgColor=("17365D" if column_index <= 6 else "2F5597" if column_index <= 9 else "548235"),
+            )
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
+
+        stripe_fill = PatternFill(fill_type="solid", fgColor="EAF2F8")
+        for row_index, values in enumerate(report.itertuples(index=False, name=None), start=3):
+            for offset, value in enumerate(values):
+                column_name = report.columns[offset]
+                if pd.isna(value):
+                    value = None
+                elif column_name in date_columns:
+                    parsed = pd.to_datetime(value, errors="coerce")
+                    if not pd.isna(parsed):
+                        value = parsed.to_pydatetime()
+                elif column_name in identifier_columns:
+                    value = Exporter._normalize_identifier(value)
+                elif hasattr(value, "item"):
+                    value = value.item()
+                if value is not None:
+                    max_lengths[offset] = max(max_lengths[offset], len(str(value)))
+                cell = worksheet.cell(row=row_index, column=offset + 1, value=value)
+                cell.border = border
+                if column_name in identifier_columns:
+                    cell.number_format = "@"
+                elif column_name in date_columns:
+                    cell.number_format = "dd-mm-yyyy"
+                elif isinstance(value, (int, float)):
+                    cell.number_format = "#,##0.##"
+                if row_index % 2 == 0:
+                    cell.fill = stripe_fill
+
+        if len(report) > 0:
+            worksheet.auto_filter.ref = f"A2:J{2 + len(report)}"
+        worksheet.freeze_panes = "A3"
+        worksheet.sheet_view.showGridLines = False
+        for column_index, max_length in enumerate(max_lengths, start=1):
+            worksheet.column_dimensions[get_column_letter(column_index)].width = min(
+                max(max_length + 2, 12), 45
+            )
+
+        output = io.BytesIO()
+        workbook.save(output)
+        payload["content"] = base64.b64encode(output.getvalue()).decode("ascii")
+        return generated
 
     FULL_DISPATCH_RECONCILIATION_COLUMNS = [
         "To Address",

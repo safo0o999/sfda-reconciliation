@@ -2218,6 +2218,7 @@ def _run_full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
             validated_sfda_identity,
         )
         accept_details = result["accept_details"]
+        accept_distribution = result["accept_distribution"]
         supplier_variance = result["supplier_variance"]
         sto_incoming = result["sto_incoming"]
         sto_return_cancel = result["sto_return_cancel_dispatch"]
@@ -2227,13 +2228,9 @@ def _run_full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
                 df=batch_master,
                 file_name="Batch_Master.xlsx",
             ),
-            "accept_details": Exporter.build_formatted_excel_file(
-                df=accept_details,
-                file_name="Full_Accept_Reconciliation.xlsx",
-                sheet_name="Full Accept",
-                title="One-Time Full Reconciliation - Accept",
-                columns=list(accept_details.columns),
-                sort_columns=["Generic Item Number", "BN", "Expiry Date"],
+            "accept_details": Exporter.build_full_accept_reconciliation_workbook(
+                accept_details=accept_details,
+                accept_distribution=accept_distribution,
             ),
             "supplier_variance": Exporter.build_formatted_excel_file(
                 df=supplier_variance,
@@ -2274,6 +2271,13 @@ def _run_full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
                 "logic_version"
             ),
             "accept_rows": int(len(accept_upload)),
+            "accept_distribution_rows": int(len(accept_distribution)),
+            "supplier_accept_quantity": float(pd.to_numeric(
+                accept_distribution.get("Supplier Accept Qty", 0), errors="coerce"
+            ).sum()),
+            "sto_accept_quantity": float(pd.to_numeric(
+                accept_distribution.get("STO Accept Qty", 0), errors="coerce"
+            ).sum()),
             "supplier_variance_rows": int(len(supplier_variance)),
             "sto_incoming_rows": int(len(sto_incoming)),
             "sto_incoming_followup_rows": int(
@@ -3216,6 +3220,7 @@ def full_reconciliation_run(req: func.HttpRequest) -> func.HttpResponse:
         )
 
         accept_details = result["accept_details"]
+        accept_distribution = result["accept_distribution"]
         supplier_variance = result["supplier_variance"]
         dispatch_details = result["dispatch_details"]
         summary_df = result["summary"]
@@ -3224,13 +3229,9 @@ def full_reconciliation_run(req: func.HttpRequest) -> func.HttpResponse:
         dispatch_upload = result["dispatch_upload"]
 
         outputs: Dict[str, Any] = {
-            "accept_details": Exporter.build_formatted_excel_file(
-                df=accept_details,
-                file_name="Full_Accept_Reconciliation.xlsx",
-                sheet_name="Full Accept",
-                title="One-Time Full Reconciliation - Accept",
-                columns=list(accept_details.columns),
-                sort_columns=["Generic Item Number", "BN", "Expiry Date"],
+            "accept_details": Exporter.build_full_accept_reconciliation_workbook(
+                accept_details=accept_details,
+                accept_distribution=accept_distribution,
             ),
             "supplier_variance": Exporter.build_formatted_excel_file(
                 df=supplier_variance,

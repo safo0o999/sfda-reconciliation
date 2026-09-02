@@ -3065,12 +3065,119 @@ class FullReconciliationEngine:
         else:
             accept_upload = pd.DataFrame(columns=["GTIN", "BN", "Expiry Date", "To Be Accept"])
 
+        distribution_columns = [
+            "GTIN", "Drug Name", "BN", "Expiry Date", "Expiry Month Key",
+            "Generic Item Number", "Supplier Accept Qty", "STO Accept Qty",
+            "Total To Be Accept", "Accept Source",
+        ]
+        distribution_parts = []
+        for frame, quantity_column in (
+            (supplier_upload, "Supplier Accept Qty"),
+            (sto_upload, "STO Accept Qty"),
+        ):
+            if frame is None or frame.empty:
+                continue
+            part = self._ensure_columns(
+                frame,
+                [
+                    "GTIN", "Drug Name", "BN", "Expiry Date",
+                    "Expiry Month Key", "Generic Item Number", "To Be Accept",
+                ],
+            )[[
+                "GTIN", "Drug Name", "BN", "Expiry Date",
+                "Expiry Month Key", "Generic Item Number", "To Be Accept",
+            ]].copy()
+            part[quantity_column] = pd.to_numeric(
+                part.pop("To Be Accept"), errors="coerce"
+            ).fillna(0)
+            part = (
+                part.groupby(
+                    ["GTIN", "BN", "Expiry Date"], dropna=False, as_index=False
+                )
+                .agg(
+                    **{
+                        "Drug Name": ("Drug Name", "first"),
+                        "Expiry Month Key": ("Expiry Month Key", "first"),
+                        "Generic Item Number": ("Generic Item Number", "first"),
+                        quantity_column: (quantity_column, "sum"),
+                    }
+                )
+            )
+            distribution_parts.append(part)
+
+        if distribution_parts:
+            accept_distribution = distribution_parts[0]
+            for part in distribution_parts[1:]:
+                accept_distribution = accept_distribution.merge(
+                    part,
+                    on=["GTIN", "BN", "Expiry Date"],
+                    how="outer",
+                    suffixes=("", " STO"),
+                    validate="one_to_one",
+                )
+                for column in [
+                    "Drug Name", "Expiry Month Key", "Generic Item Number",
+                ]:
+                    sto_column = f"{column} STO"
+                    if sto_column in accept_distribution.columns:
+                        current = accept_distribution[column].fillna("").astype(str).str.strip()
+                        fallback = accept_distribution[sto_column].fillna("").astype(str).str.strip()
+                        accept_distribution[column] = current.where(current.ne(""), fallback)
+                        accept_distribution = accept_distribution.drop(columns=[sto_column])
+
+            accept_distribution["Supplier Accept Qty"] = pd.to_numeric(
+                accept_distribution.get(
+                    "Supplier Accept Qty",
+                    pd.Series(0, index=accept_distribution.index, dtype=float),
+                ),
+                errors="coerce",
+            ).fillna(0)
+            accept_distribution["STO Accept Qty"] = pd.to_numeric(
+                accept_distribution.get(
+                    "STO Accept Qty",
+                    pd.Series(0, index=accept_distribution.index, dtype=float),
+                ),
+                errors="coerce",
+            ).fillna(0)
+            accept_distribution["Total To Be Accept"] = (
+                accept_distribution["Supplier Accept Qty"]
+                + accept_distribution["STO Accept Qty"]
+            )
+            accept_distribution["Accept Source"] = "Supplier"
+            accept_distribution.loc[
+                accept_distribution["Supplier Accept Qty"].le(0), "Accept Source"
+            ] = "STO"
+            accept_distribution.loc[
+                accept_distribution["Supplier Accept Qty"].gt(0)
+                & accept_distribution["STO Accept Qty"].gt(0),
+                "Accept Source",
+            ] = "Supplier + STO"
+            accept_distribution = self._ensure_columns(
+                accept_distribution, distribution_columns
+            )[distribution_columns].sort_values(
+                ["Generic Item Number", "BN", "Expiry Date"], kind="stable"
+            ).reset_index(drop=True)
+        else:
+            accept_distribution = pd.DataFrame(columns=distribution_columns)
+
+        upload_total = float(pd.to_numeric(
+            accept_upload.get("To Be Accept", 0), errors="coerce"
+        ).sum())
+        distribution_total = float(pd.to_numeric(
+            accept_distribution.get("Total To Be Accept", 0), errors="coerce"
+        ).sum())
+        if abs(upload_total - distribution_total) > 0.000001:
+            raise ValueError(
+                "Accept distribution total does not match the SFDA upload total."
+            )
+
         return {
             "accept_details": supplier_accept_details,
             "supplier_variance": supplier_variance,
             "sto_incoming": sto_incoming,
             "sto_return_cancel_dispatch": sto_return_cancel,
             "accept_upload": accept_upload,
+            "accept_distribution": accept_distribution,
             "validated_sfda_identity": validated_sfda_identity,
         }
 
