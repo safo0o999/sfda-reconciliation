@@ -30,8 +30,13 @@ ACCEPT_TYPES = {SUPPLIER, STO_INCOMING}
 # Supplier variance is intentionally supplier-only.
 SUPPLIER_VARIANCE_TYPES = {SUPPLIER}
 
-# These types never participate in SFDA/RSD calculations.
-EXCLUDED_TYPES = {CUSTOMER_RETURN, RESERVATION, PRINCIPAL, UNCLASSIFIED}
+# Physical returns are retained as a separate historical/reversal stream. They
+# never produce Accept and never increase ordinary Dispatch history.
+RETURN_TYPES = {STO_RETURN, CUSTOMER_RETURN}
+
+# These types never participate in SFDA/RSD calculations. Customer Return is
+# no longer fully excluded; it participates only in the reversal side stream.
+EXCLUDED_TYPES = {RESERVATION, PRINCIPAL, UNCLASSIFIED}
 
 
 def normalize_inbound_shipment(value: Any) -> str:
@@ -67,7 +72,7 @@ def classification_status(receipt_type: str) -> str:
         SUPPLIER: "Supplier Receipt - SFDA Reconciliation",
         STO_INCOMING: "STO Incoming - Match RSD Receive Pending",
         STO_RETURN: "STO Return - Cancel Previous RSD Dispatch",
-        CUSTOMER_RETURN: "Customer Return - Excluded from SFDA/RSD",
+        CUSTOMER_RETURN: "Customer Return - Cancel Previous RSD Dispatch",
         RESERVATION: "Reservation - Excluded from SFDA/RSD",
         PRINCIPAL: "Principal - Excluded from SFDA/RSD",
         UNCLASSIFIED: "Unclassified TRK - Review Required",

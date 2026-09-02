@@ -29,7 +29,7 @@ from engine.database import (
     historical_build_job_is_active,
     get_supplier_history_df,
     get_sto_incoming_history_df,
-    get_sto_return_history_df,
+    get_returns_history_df,
     replace_batch_master,
     replace_customer_history,
     replace_supplier_history,
@@ -624,7 +624,7 @@ def process_historical_build_job(
             supplier_history = get_supplier_history_df()
             customer_history = get_customer_history_df()
             sto_incoming_history = get_sto_incoming_history_df()
-            sto_return_history = get_sto_return_history_df()
+            returns_history = get_returns_history_df()
             mark_stage("load_historical_export_data")
         else:
             # SAFE REBUILD: build the complete replacement dataset from the new
@@ -664,8 +664,30 @@ def process_historical_build_job(
             supplier_history = engine.build_supplier_history(supplier_summary, master)
             customer_history = engine.build_customer_history(customer_summary, master)
             sto_incoming_history = _build_sto_history_from_prepared(prepared, master, "TRK800")
-            sto_return_history = _build_sto_history_from_prepared(
-                prepared, master, "TRK49", required_action="Cancel Previous RSD Dispatch"
+            return_parts = []
+            for prefix, return_type in (
+                ("TRK49", "STO Return"),
+                ("TRK30", "Customer Return"),
+            ):
+                return_frame = _build_sto_history_from_prepared(
+                    prepared,
+                    master,
+                    prefix,
+                    required_action="Cancel Previous RSD Dispatch",
+                )
+                if return_frame.empty:
+                    continue
+                return_frame = return_frame.copy()
+                return_frame["Return Type"] = return_type
+                return_frame["Return From"] = return_frame.get("Source Warehouse", "")
+                return_frame["Return From Code"] = return_frame.get(
+                    "Source Warehouse Code", ""
+                )
+                return_parts.append(return_frame)
+            returns_history = (
+                pd.concat(return_parts, ignore_index=True, sort=False)
+                if return_parts
+                else pd.DataFrame()
             )
             mark_stage("build_new_histories_in_memory")
             ensure_active()
@@ -691,7 +713,7 @@ def process_historical_build_job(
             supplier_history=supplier_history,
             sto_incoming_history=sto_incoming_history,
             customer_history=customer_history,
-            sto_return_history=sto_return_history,
+            returns_history=returns_history,
             file_name="Historical_Database.xlsx",
         )
         file_name, file_bytes, mime_type = _decode_exported_file(exported)
@@ -722,14 +744,14 @@ def process_historical_build_job(
         mark_stage("upload_historical_database_workbook")
         logger.info(
             "HISTORICAL_PERF job_id=%s export=%s sheets=7 batch_rows=%s "
-            "supplier_rows=%s sto_in_rows=%s customer_rows=%s sto_return_rows=%s seconds=%.3f",
+            "supplier_rows=%s sto_in_rows=%s customer_rows=%s return_rows=%s seconds=%.3f",
             job_id,
             file_name,
             len(master),
             len(supplier_history),
             len(sto_incoming_history),
             len(customer_history),
-            len(sto_return_history),
+            len(returns_history),
             perf_counter() - export_started,
         )
         del exported, file_bytes
@@ -794,7 +816,10 @@ def process_historical_build_job(
             "supplier_history_rows": len(supplier_history),
             "customer_history_rows": len(customer_history),
             "sto_incoming_rows": len(sto_incoming_history),
-            "sto_return_rows": len(sto_return_history),
+            # Legacy key is retained for dashboard/API compatibility; it now
+            # represents the unified STO + customer return sheet.
+            "sto_return_rows": len(returns_history),
+            "return_history_rows": len(returns_history),
             "stage_timings_seconds": timings,
             "total_seconds": round(perf_counter() - job_started_at, 3),
             "activation": activation_result,

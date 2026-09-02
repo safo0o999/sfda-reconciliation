@@ -636,6 +636,20 @@ class Exporter:
         return output
 
     @staticmethod
+    def build_cancel_dispatch_files_by_customer(cancel_df):
+        """Build the same regulatory CSV body with an unambiguous file name."""
+        working = cancel_df.copy() if cancel_df is not None else pd.DataFrame()
+        if not working.empty:
+            working["To Be Dispatch"] = pd.to_numeric(
+                working.get("To Be Cancel Dispatch", 0), errors="coerce"
+            ).fillna(0)
+        generated = Exporter.build_dispatch_files_by_customer(working)
+        return {
+            f"Cancel_Dispatch_{file_name}": content
+            for file_name, content in generated.items()
+        }
+
+    @staticmethod
     def _is_batch_master_report(file_name, sheet_name):
         file_text = str(file_name or "").strip().lower()
         sheet_text = str(sheet_name or "").strip().lower()
@@ -877,7 +891,8 @@ class Exporter:
         supplier_history,
         sto_incoming_history,
         customer_history,
-        sto_return_history,
+        returns_history=None,
+        sto_return_history=None,
         file_name="Historical_Database.xlsx",
     ):
         """Build the complete Historical Database as one seven-sheet workbook.
@@ -923,9 +938,9 @@ class Exporter:
             Exporter.CUSTOMER_HISTORY_COLUMNS,
             ["To Address", "Generic Item Number", "BN", "Expiry Date"],
         )
-        sto_return = prepared(
-            sto_return_history,
-            sort_columns=["Source Warehouse", "Generic Item Number", "BN", "Expiry Date"],
+        returns = prepared(
+            returns_history if returns_history is not None else sto_return_history,
+            sort_columns=["Return Type", "Return From", "Generic Item Number", "BN", "Expiry Date"],
         )
 
         workbook = Workbook()
@@ -996,7 +1011,7 @@ class Exporter:
             ("Supplier History Rows", len(supplier), "Supplier receipt history"),
             ("STO Incoming Rows", len(sto_in), "Incoming inter-warehouse transfer history"),
             ("Customer History Rows", len(customer), "Customer dispatch history"),
-            ("STO Return/Cancel Rows", len(sto_return), "STO return / cancel-dispatch history"),
+            ("Return/Cancel Rows", len(returns), "STO and customer return / cancel-dispatch history"),
             ("Total Received Qty Each", qty_sum(master, "Received Quantity Each"), "Historical receipts across eligible receipt types"),
             ("Total Dispatched Qty Each", qty_sum(master, "Total Dispatched Qty"), "Historical dispatch quantity"),
         ]
@@ -1016,7 +1031,7 @@ class Exporter:
         add_data_sheet(supplier, "Supplier History", "Historical Supplier Receipt History")
         add_data_sheet(sto_in, "STO Incoming History", "Historical STO Incoming Receipt History")
         add_data_sheet(customer, "Customer History", "Historical Customer Dispatch History")
-        add_data_sheet(sto_return, "STO Return Cancel", "STO Returns - Cancel Previous RSD Dispatch")
+        add_data_sheet(returns, "Returns History", "STO and Customer Returns - Cancel Previous RSD Dispatch")
 
         output = io.BytesIO()
         workbook.save(output)

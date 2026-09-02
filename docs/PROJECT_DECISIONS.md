@@ -32,3 +32,18 @@
 - ERP integration.
 - Power BI integration.
 - User roles and audit logging.
+
+## 2026-09-02
+
+### Return Reconciliation
+- TRK49 (STO Return) and TRK30 (Customer Return) are stored together in the
+  Historical Database `Returns History` sheet.
+- Returns never produce Accept and never increase ordinary Dispatch history.
+- ASN Supplier Name is the returning party and is matched to Customer History
+  To Address; the approved warehouse GLN mapping supplies the regulatory GLN.
+- Full Dispatch produces a separate Cancel Dispatch report and CSV group.
+- Cancel quantity is capped by the original customer dispatch and previously
+  confirmed cancellations are deducted before generating new quantities.
+- Unmatched customer, missing GLN, and missing PackageSize rows are exceptions
+  and cannot produce an automatic cancellation.
+- Existing Accept and Full Dispatch calculation outputs remain unchanged.

@@ -237,6 +237,31 @@ class FullReconciliationEngine:
         "Reconciliation Status",
     ]
 
+    RETURN_CANCEL_RECONCILIATION_COLUMNS = [
+        "Return Type",
+        "Inbound Shipment",
+        "Return From",
+        "To Address",
+        "GLN",
+        "GTIN",
+        "Drug Name",
+        "BN",
+        "Expiry Date",
+        "Expiry Month Key",
+        "Generic Item Number",
+        "PackageSize",
+        "Returned Quantity Each",
+        "Returned Quantity Pack",
+        "Historical Dispatch Quantity Each",
+        "Historical Dispatch Quantity Pack",
+        "Previously Confirmed Cancel Dispatch Each",
+        "Previously Confirmed Cancel Dispatch Pack",
+        "Available Cancel Dispatch Quantity Each",
+        "Available Cancel Dispatch Quantity Pack",
+        "To Be Cancel Dispatch",
+        "Return Reconciliation Status",
+    ]
+
     RECONCILIATION_SUMMARY_COLUMNS = [
         "Metric",
         "Value",
@@ -3069,6 +3094,243 @@ class FullReconciliationEngine:
         ]
         return pd.DataFrame(metrics, columns=self.RECONCILIATION_SUMMARY_COLUMNS)
 
+    def build_return_cancel_reconciliation(
+        self,
+        returns_history_df: pd.DataFrame | None,
+        customer_history_df: pd.DataFrame,
+        confirmed_cancel_df: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        """Match ASN returns to prior customer dispatch and allocate safe cancels.
+
+        This is a side stream: it does not mutate or net Customer History and it
+        never contributes to ordinary Full Dispatch allocation.  ``Supplier
+        Name`` from ASN is exposed by Returns History as ``Return From`` and is
+        matched to Customer History ``To Address`` using a punctuation/case
+        insensitive key.
+        """
+        returns = (
+            returns_history_df.copy()
+            if returns_history_df is not None
+            else pd.DataFrame()
+        )
+        if returns.empty:
+            return pd.DataFrame(columns=self.RETURN_CANCEL_RECONCILIATION_COLUMNS)
+
+        returns = self._ensure_columns(
+            returns,
+            [
+                "Return Type", "Inbound Shipment", "Return From",
+                "Source Warehouse", "BN", "Expiry Month Key", "Expiry Date",
+                "Generic Item Number", "Received Quantity Each",
+                "Received Quantity Pack", "First Received Date",
+            ],
+        )
+        empty_return_from = Normalizer.text(returns["Return From"]).eq("")
+        returns.loc[empty_return_from, "Return From"] = returns.loc[
+            empty_return_from, "Source Warehouse"
+        ]
+        for column in ["BN", "Expiry Month Key", "Generic Item Number"]:
+            returns[column] = Normalizer.text(returns[column])
+        returns["Return From"] = returns["Return From"].fillna("").astype(str).str.strip()
+        returns["_Party Key"] = returns["Return From"].map(self._identity_text)
+        returns["Received Quantity Each"] = pd.to_numeric(
+            returns["Received Quantity Each"], errors="coerce"
+        ).fillna(0).clip(lower=0)
+        returns["First Received Date"] = pd.to_datetime(
+            returns["First Received Date"], errors="coerce"
+        )
+
+        group_keys = [
+            "Return Type", "_Party Key", "Return From", "BN",
+            "Expiry Month Key", "Generic Item Number",
+        ]
+        returns = (
+            returns.groupby(group_keys, dropna=False)
+            .agg(
+                **{
+                    "Inbound Shipment": (
+                        "Inbound Shipment",
+                        lambda values: ", ".join(
+                            dict.fromkeys(
+                                str(value).strip()
+                                for value in values
+                                if str(value).strip()
+                            )
+                        ),
+                    ),
+                    "Return Expiry Date": ("Expiry Date", "max"),
+                    "Returned Quantity Each": ("Received Quantity Each", "sum"),
+                    "First Received Date": ("First Received Date", "min"),
+                }
+            )
+            .reset_index()
+        )
+
+        customer = self._ensure_columns(
+            self._rename_history_columns(customer_history_df),
+            self.CUSTOMER_HISTORY_COLUMNS,
+        )
+        for column in ["BN", "Expiry Month Key", "Generic Item Number"]:
+            customer[column] = Normalizer.text(customer[column])
+        customer["To Address"] = customer["To Address"].fillna("").astype(str).str.strip()
+        customer["_Party Key"] = customer["To Address"].map(self._identity_text)
+        customer["GLN"] = customer["GLN"].fillna("").astype(str).str.strip()
+        customer["Dispatch Quantity Each"] = pd.to_numeric(
+            customer["Dispatch Quantity Each"], errors="coerce"
+        ).fillna(0).clip(lower=0)
+        customer["Dispatch Quantity Pack"] = pd.to_numeric(
+            customer["Dispatch Quantity Pack"], errors="coerce"
+        ).fillna(0).clip(lower=0)
+        customer["PackageSize"] = pd.to_numeric(
+            customer["PackageSize"], errors="coerce"
+        ).fillna(0)
+
+        customer_keys = ["_Party Key", "BN", "Expiry Month Key", "Generic Item Number"]
+        customer = (
+            customer.sort_values([*customer_keys, "To Address"], kind="stable")
+            .groupby(customer_keys, dropna=False)
+            .agg(
+                **{
+                    "To Address": ("To Address", "first"),
+                    "GLN": ("GLN", "first"),
+                    "GTIN": ("GTIN", "first"),
+                    "Drug Name": ("Drug Name", "first"),
+                    "Expiry Date": ("Expiry Date", "max"),
+                    "PackageSize": ("PackageSize", "first"),
+                    "Historical Dispatch Quantity Each": (
+                        "Dispatch Quantity Each", "sum"
+                    ),
+                    "Historical Dispatch Quantity Pack": (
+                        "Dispatch Quantity Pack", "sum"
+                    ),
+                }
+            )
+            .reset_index()
+        )
+
+        details = returns.merge(
+            customer,
+            on=customer_keys,
+            how="left",
+            validate="many_to_one",
+        )
+        history_expiry = Normalizer.date(details.get("Expiry Date", pd.Series(dtype=object)))
+        return_expiry = Normalizer.date(details["Return Expiry Date"])
+        details["Expiry Date"] = history_expiry.combine_first(return_expiry)
+        details["PackageSize"] = pd.to_numeric(
+            details.get("PackageSize", 0), errors="coerce"
+        ).fillna(0)
+        details["Returned Quantity Pack"] = 0.0
+        valid_pack = details["PackageSize"].gt(0)
+        details.loc[valid_pack, "Returned Quantity Pack"] = (
+            details.loc[valid_pack, "Returned Quantity Each"]
+            / details.loc[valid_pack, "PackageSize"]
+        )
+
+        confirmed_each = "Previously Confirmed Cancel Dispatch Each"
+        confirmed_pack = "Previously Confirmed Cancel Dispatch Pack"
+        confirmed = confirmed_cancel_df.copy() if confirmed_cancel_df is not None else pd.DataFrame()
+        merge_keys = [
+            "Return Type", "BN", "Expiry Month Key", "Generic Item Number",
+            "To Address", "GLN",
+        ]
+        if confirmed.empty:
+            details[confirmed_each] = 0.0
+            details[confirmed_pack] = 0.0
+        else:
+            confirmed = self._ensure_columns(
+                confirmed, [*merge_keys, confirmed_each, confirmed_pack]
+            )
+            for column in merge_keys:
+                confirmed[column] = confirmed[column].fillna("").astype(str).str.strip()
+            confirmed[confirmed_each] = pd.to_numeric(
+                confirmed[confirmed_each], errors="coerce"
+            ).fillna(0)
+            confirmed[confirmed_pack] = pd.to_numeric(
+                confirmed[confirmed_pack], errors="coerce"
+            ).fillna(0)
+            confirmed = (
+                confirmed.groupby(merge_keys, dropna=False)[[confirmed_each, confirmed_pack]]
+                .sum().reset_index()
+            )
+            for column in merge_keys:
+                if column not in details.columns:
+                    details[column] = ""
+                details[column] = details[column].fillna("").astype(str).str.strip()
+            details = details.merge(
+                confirmed, on=merge_keys, how="left", validate="many_to_one"
+            )
+            details[confirmed_each] = pd.to_numeric(
+                details[confirmed_each], errors="coerce"
+            ).fillna(0)
+            details[confirmed_pack] = pd.to_numeric(
+                details[confirmed_pack], errors="coerce"
+            ).fillna(0)
+
+        dispatch_keys = [
+            "BN", "Expiry Month Key", "Generic Item Number", "To Address", "GLN"
+        ]
+        details["_Open Return Pack"] = (
+            details["Returned Quantity Pack"] - details[confirmed_pack]
+        ).clip(lower=0)
+        details["_Confirmed Cancel Total Pack"] = details.groupby(
+            dispatch_keys, dropna=False
+        )[confirmed_pack].transform("sum")
+        details["Available Cancel Dispatch Quantity Pack"] = (
+            pd.to_numeric(
+                details["Historical Dispatch Quantity Pack"], errors="coerce"
+            ).fillna(0)
+            - details["_Confirmed Cancel Total Pack"]
+        ).clip(lower=0)
+        details["Available Cancel Dispatch Quantity Each"] = (
+            pd.to_numeric(
+                details["Historical Dispatch Quantity Each"], errors="coerce"
+            ).fillna(0)
+            - details.groupby(dispatch_keys, dropna=False)[confirmed_each].transform("sum")
+        ).clip(lower=0)
+
+        details = details.sort_values(
+            [*dispatch_keys, "First Received Date", "Return Type"], kind="stable"
+        ).reset_index(drop=True)
+        prior_open = (
+            details["_Open Return Pack"].groupby(
+                [details[key] for key in dispatch_keys], dropna=False, sort=False
+            ).cumsum()
+            - details["_Open Return Pack"]
+        )
+        capacity_for_row = (
+            details["Available Cancel Dispatch Quantity Pack"] - prior_open
+        ).clip(lower=0)
+        details["To Be Cancel Dispatch"] = pd.concat(
+            [details["_Open Return Pack"], capacity_for_row], axis=1
+        ).min(axis=1).fillna(0).apply(lambda value: int(max(0, value)))
+
+        details["Return Reconciliation Status"] = "No New Return Quantity"
+        no_history = details["To Address"].fillna("").astype(str).str.strip().eq("")
+        no_gln = details["GLN"].fillna("").astype(str).str.strip().isin(
+            ["", "99999999999999"]
+        )
+        invalid_pack = details["PackageSize"].le(0)
+        excess = details["_Open Return Pack"].gt(
+            details["Available Cancel Dispatch Quantity Pack"]
+        )
+        details.loc[details["To Be Cancel Dispatch"].gt(0), "Return Reconciliation Status"] = (
+            "Cancel Dispatch Required"
+        )
+        details.loc[excess, "Return Reconciliation Status"] = (
+            "Partial Cancel - Return Exceeds Available Historical Dispatch"
+        )
+        details.loc[invalid_pack, "Return Reconciliation Status"] = "Exception - Missing PackageSize"
+        details.loc[no_gln, "Return Reconciliation Status"] = "Exception - Missing Customer GLN"
+        details.loc[no_history, "Return Reconciliation Status"] = (
+            "Exception - No Matching Customer Dispatch"
+        )
+        details.loc[no_history | no_gln | invalid_pack, "To Be Cancel Dispatch"] = 0
+
+        return self._ensure_columns(
+            details, self.RETURN_CANCEL_RECONCILIATION_COLUMNS
+        )[self.RETURN_CANCEL_RECONCILIATION_COLUMNS].reset_index(drop=True)
+
     def run_accept_reconciliation(
         self,
         sfda_df: pd.DataFrame,
@@ -3317,6 +3579,8 @@ class FullReconciliationEngine:
         confirmed_full_dispatch_df: pd.DataFrame | None = None,
         batch_master_df: pd.DataFrame | None = None,
         validated_sfda_identity_df: pd.DataFrame | None = None,
+        returns_history_df: pd.DataFrame | None = None,
+        confirmed_cancel_dispatch_df: pd.DataFrame | None = None,
     ) -> Dict[str, pd.DataFrame]:
         """Run the Full Dispatch stage after Accept is completed in SFDA."""
 
@@ -3352,10 +3616,51 @@ class FullReconciliationEngine:
             "To Be Dispatch"
         ]
 
+        return_cancel_details = self.build_return_cancel_reconciliation(
+            returns_history_df,
+            customer_history_df,
+            confirmed_cancel_dispatch_df,
+        )
+        cancel_dispatch_upload = return_cancel_details.loc[
+            pd.to_numeric(
+                return_cancel_details.get("To Be Cancel Dispatch", 0),
+                errors="coerce",
+            ).fillna(0).gt(0)
+        ].copy()
+
+        if not return_cancel_details.empty:
+            summary = pd.concat(
+                [
+                    summary,
+                    pd.DataFrame(
+                        [
+                            ("Return detail rows", len(return_cancel_details)),
+                            (
+                                "Cancel dispatch rows",
+                                len(cancel_dispatch_upload),
+                            ),
+                            (
+                                "Cancel dispatch quantity packs",
+                                float(pd.to_numeric(
+                                    cancel_dispatch_upload.get(
+                                        "To Be Cancel Dispatch", 0
+                                    ),
+                                    errors="coerce",
+                                ).fillna(0).sum()),
+                            ),
+                        ],
+                        columns=self.RECONCILIATION_SUMMARY_COLUMNS,
+                    ),
+                ],
+                ignore_index=True,
+            )
+
         return {
             "dispatch_details": dispatch_details,
             "summary": summary,
             "dispatch_upload": dispatch_upload,
+            "return_cancel_details": return_cancel_details,
+            "cancel_dispatch_upload": cancel_dispatch_upload,
             "validated_sfda_identity": validated_sfda_identity,
         }
 
