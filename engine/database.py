@@ -6175,12 +6175,16 @@ def _prepare_incremental_accept_refresh_scope(
 
     metrics = {
         "logic_version": HISTORICAL_MATCH_LOGIC_VERSION,
+        "append_match_pipeline": "V6_PREPARED_TRADE_AND_DESCRIPTION",
         "legacy_threshold": float(HISTORICAL_MATCH_LEGACY_THRESHOLD),
         "identity_exact_candidates": int(identity_exact_candidates),
         "identity_accepted": int(identity_accepted),
         "identity_rejected": int(identity_rejected),
         "identity_accepted_below_legacy_threshold": int(identity_accepted_below_legacy_threshold),
         "candidate_rows": int(len(candidate_rows)),
+        "candidate_rows_with_description": int(
+            candidate_rows["Description"].astype(str).str.strip().ne("").sum()
+        ) if not candidate_rows.empty else 0,
         "identity_receipt_rows": int(len(receipt_history_rows or [])),
         "identity_dispatch_rows": int(len(dispatch_history_rows or [])),
         "affected_receipt_keys": int(len(affected)),
@@ -7050,7 +7054,7 @@ def refresh_accept_history_incremental(
             batch_updated = max(0, int(cursor.rowcount or 0))
 
             # Insert newly seen batches only when their Generic already has a
-            # proven identity in Batch Master. This preserves the GenericÃ¢â€ â€GTIN
+            # proven identity in Batch Master. This preserves the GenericÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬ÂGTIN
             # authority and prevents BN/expiry collisions from inventing a drug.
             cursor.execute(r"""
                 ;WITH ReceiptAggregate AS
