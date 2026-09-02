@@ -41,14 +41,17 @@ from engine.database import (
     update_historical_build_job,
 )
 from engine.exporter import Exporter
-from engine.full_reconciliation import FullReconciliationEngine
+from engine.full_reconciliation import (
+    HISTORICAL_RECEIPT_EVENT_KEY_VERSION,
+    FullReconciliationEngine,
+)
 from engine.normalizer import HISTORICAL_MATCH_LOGIC_VERSION
 from engine.warehouse_context import historical_build_scope, warehouse_scope
 
 
 logger = logging.getLogger("SFDA-Reconciliation.HistoricalJobs")
 
-HISTORICAL_JOB_WORKER_VERSION = "HISTORICAL_WORKER_V6_MATCH_DIAGNOSTICS_20260902"
+HISTORICAL_JOB_WORKER_VERSION = "HISTORICAL_WORKER_V7_LPN_COLLISION_SAFE_20260902"
 
 
 def _supports_keyword_argument(func: Any, keyword: str) -> bool:
@@ -776,6 +779,10 @@ def process_historical_build_job(
         summary = {
             "historical_job_worker_version": HISTORICAL_JOB_WORKER_VERSION,
             "historical_match_logic_version": HISTORICAL_MATCH_LOGIC_VERSION,
+            "historical_receipt_event_key_version": HISTORICAL_RECEIPT_EVENT_KEY_VERSION,
+            "receipt_event_key_diagnostics": dict(
+                prepared.get("receipt_event_key_diagnostics") or {}
+            ),
             "historical_match_diagnostics": match_diagnostics,
             "asn_files": len(input_manifest.get("asn_files", [])),
             "dispatch_files": len(input_manifest.get("dispatch_files", [])),
