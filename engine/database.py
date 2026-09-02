@@ -3036,8 +3036,34 @@ def get_cached_dashboard_summary() -> Dict[str, Any]:
             TotalSFDABatches,
             MissingSupplierBatches,
             STOFollowupBatches,
-            HistoricalFrom,
-            HistoricalTo,
+            COALESCE(
+                (
+                    SELECT MIN(d.TransactionDate)
+                    FROM dbo.BatchMaster AS coverage
+                    CROSS APPLY
+                    (
+                        VALUES
+                            (coverage.FirstReceivedDate),
+                            (coverage.FirstDispatchDate)
+                    ) AS d(TransactionDate)
+                    WHERE coverage.WarehouseID = ?
+                ),
+                HistoricalFrom
+            ) AS HistoricalFrom,
+            COALESCE(
+                (
+                    SELECT MAX(d.TransactionDate)
+                    FROM dbo.BatchMaster AS coverage
+                    CROSS APPLY
+                    (
+                        VALUES
+                            (coverage.LastReceivedDate),
+                            (coverage.LastDispatchDate)
+                    ) AS d(TransactionDate)
+                    WHERE coverage.WarehouseID = ?
+                ),
+                HistoricalTo
+            ) AS HistoricalTo,
             CustomerCount,
             CustomersWithGLN,
             DummyGLNCustomers,
@@ -3050,7 +3076,12 @@ def get_cached_dashboard_summary() -> Dict[str, Any]:
 
     try:
         with Database().connect() as connection:
-            row = connection.cursor().execute(sql, warehouse_id).fetchone()
+            row = connection.cursor().execute(
+                sql,
+                warehouse_id,
+                warehouse_id,
+                warehouse_id,
+            ).fetchone()
     except pyodbc.Error as exc:
         # Page-load endpoints must never fall back to historical aggregation.
         # If the cache table is unavailable, return an empty lightweight payload
