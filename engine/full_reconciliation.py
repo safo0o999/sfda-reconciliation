@@ -1064,6 +1064,10 @@ class FullReconciliationEngine:
             "Item Family Group",
             "Receipt Trade Name",
             "Dispatch Trade Name",
+            # V5 product validation evaluates both WMS identity sources. Keep
+            # the detailed receipt Description in the Rebuild candidate frame
+            # so Rebuild has the same evidence as the SQL Append path.
+            "Description",
         ]
         candidates = self._ensure_columns(master, candidate_columns)[candidate_columns].copy()
         candidates["Generic Item Number"] = (
