@@ -2806,23 +2806,29 @@ def get_historical_status() -> Dict[str, Any]:
             ) AS STOFollowupBatches,
             (
                 SELECT MIN(d.TransactionDate)
-                FROM (
-                    SELECT ReceivedDate AS TransactionDate FROM dbo.ReceiptEvents WHERE WarehouseID = ?
-                    UNION ALL
-                    SELECT DispatchDate AS TransactionDate FROM dbo.DispatchEvents WHERE WarehouseID = ?
-                ) d
+                FROM dbo.BatchMaster AS coverage
+                CROSS APPLY
+                (
+                    VALUES
+                        (coverage.FirstReceivedDate),
+                        (coverage.FirstDispatchDate)
+                ) AS d(TransactionDate)
+                WHERE coverage.WarehouseID = ?
             ) AS HistoricalFrom,
             (
                 SELECT MAX(d.TransactionDate)
-                FROM (
-                    SELECT ReceivedDate AS TransactionDate FROM dbo.ReceiptEvents WHERE WarehouseID = ?
-                    UNION ALL
-                    SELECT DispatchDate AS TransactionDate FROM dbo.DispatchEvents WHERE WarehouseID = ?
-                ) d
+                FROM dbo.BatchMaster AS coverage
+                CROSS APPLY
+                (
+                    VALUES
+                        (coverage.LastReceivedDate),
+                        (coverage.LastDispatchDate)
+                ) AS d(TransactionDate)
+                WHERE coverage.WarehouseID = ?
             ) AS HistoricalTo;
     """
 
-    params = (warehouse_id,) * 11
+    params = (warehouse_id,) * 9
     with Database().connect() as connection:
         row = connection.cursor().execute(sql, params).fetchone()
 

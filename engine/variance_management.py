@@ -253,7 +253,7 @@ class VarianceManagementEngine:
                     "Expiry Date": row.get("Expiry Date"),
                     "Expiry Month Key": row.get("Expiry Month Key") or "",
                     "Generic Item Number": row.get("Generic Item Number") or "",
-                    "Description": row.get("Description") or "",
+                    "Description": description,
                     "Received Quantity Each": self._clean_number(
                         row.get("Received Quantity Each")
                     ),

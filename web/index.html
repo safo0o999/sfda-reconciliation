@@ -711,7 +711,7 @@
  
           <aside class="ops-side">
             <div class="card"><div class="card-header"><div class="card-title">Quick Actions</div></div><div class="quick-actions"><button class="btn btn-success" data-go="upload">▶ Run Reconciliation</button><button class="btn btn-primary" data-go="upload">⇩ Prepare Accept</button><button class="btn btn-warning" data-go="upload">⇢ Prepare Dispatch</button><button class="btn btn-purple" data-go="history">◷ Upload History</button></div></div>
-            <div class="card"><div class="card-header"><div class="card-title">Customer / GLN</div></div><div class="mini-donut-wrap"><div style="position:relative"><div class="mini-donut" id="homeGlnDonut"></div><div class="mini-donut-label"><div><div style="font-size:18px" id="homeGlnTotal">—</div><div>Total</div></div></div></div><div class="mini-legend"><div class="mini-legend-row"><span><i class="legend-dot" style="background:#239247"></i>With GLN</span><strong id="homeGlnMapped">—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#d94747"></i>Dummy GLN</span><strong id="homeGlnDummy">—</strong></div><div class="mini-legend-row"><span><i class="legend-dot" style="background:#c8ced8"></i>Not Mapped</span><strong id="homeGlnUnmapped">—</strong></div></div></div></div>
+            <div class="card"><div class="card-header"><div><div class="card-title">Historical Database Summary</div><div class="card-subtitle">Current warehouse historical foundation</div></div></div><div class="card-body"><div class="status-line"><span>Batch Master</span><strong id="homeHistoricalBatchRows">—</strong></div><div class="status-line"><span>Supplier History</span><strong id="homeHistoricalSupplierRows">—</strong></div><div class="status-line"><span>Customer History</span><strong id="homeHistoricalCustomerRows">—</strong></div><div class="status-line"><span>Last Build</span><strong id="homeHistoricalLastBuild">—</strong></div></div></div>
             <div class="card"><div class="card-header"><div><div class="card-title">Recent Uploads</div><div class="card-subtitle">Latest locally selected report types</div></div></div><div class="recent-upload-list" id="recentUploads"><div class="empty"><strong>No uploads yet</strong>Selected files will appear after a run.</div></div></div>
             <div class="card"><div class="card-header"><div class="card-title">System Status</div></div><div class="card-body"><div class="status-line"><span>Azure Function</span><span class="status-ok" id="homeHealth">Checking...</span></div><div class="status-line"><span>Version</span><strong id="homeVersion">—</strong></div><div class="status-line"><span>Total Local Runs</span><strong id="homeRuns">0</strong></div><div class="status-line"><span>Successful Runs</span><strong id="homeSuccess">0</strong></div><div class="status-line"><span>Generated Files</span><strong id="homeGenerated">—</strong></div></div></div>
           </aside>
@@ -918,11 +918,11 @@
                 <div class="file-meta" id="step2AcceptSfdaMeta">No file selected</div>
               </div>
               <button class="btn btn-success" id="step2AcceptButton" type="button" disabled style="margin-top:14px;width:100%">▶ Run Full Accept Reconciliation</button>
-              <div class="card progress-card" id="acceptProgressCard" style="box-shadow:none;margin-top:14px;display:none">
-                <div class="progress-head"><span id="acceptProgressLabel">Running Full Accept...</span><span id="acceptProgressPercent">0%</span></div>
-                <div class="progress-track"><div class="progress-bar" id="acceptProgressBar"></div></div>
+              <div class="card progress-card" id="fullAcceptProgressCard" style="box-shadow:none;margin-top:14px;display:none">
+                <div class="progress-head"><span id="fullAcceptProgressLabel">Running Full Accept...</span><span id="fullAcceptProgressPercent">0%</span></div>
+                <div class="progress-track"><div class="progress-bar" id="fullAcceptProgressBar"></div></div>
                 <div class="progress-steps">
-                  <div class="progress-step" id="acceptStepRead">○ Reading SFDA file</div><div class="progress-step" id="acceptStepValidate">○ Validating data</div><div class="progress-step" id="acceptStepMatch">○ Matching historical data</div><div class="progress-step" id="acceptStepGenerate">○ Generating Accept outputs</div>
+                  <div class="progress-step" id="fullAcceptStepRead">○ Reading SFDA file</div><div class="progress-step" id="fullAcceptStepValidate">○ Validating data</div><div class="progress-step" id="fullAcceptStepMatch">○ Matching historical data</div><div class="progress-step" id="fullAcceptStepGenerate">○ Generating Accept outputs</div>
                 </div>
               </div>
             </div>
@@ -943,11 +943,11 @@
                 </div>
               </div>
               <button class="btn btn-purple" id="step2DispatchButton" type="button" disabled style="margin-top:14px;width:100%">▶ Run Full Dispatch Reconciliation</button>
-              <div class="card progress-card" id="dispatchProgressCard" style="box-shadow:none;margin-top:14px;display:none">
-                <div class="progress-head"><span id="dispatchProgressLabel">Running Full Dispatch...</span><span id="dispatchProgressPercent">0%</span></div>
-                <div class="progress-track"><div class="progress-bar" id="dispatchProgressBar"></div></div>
+              <div class="card progress-card" id="fullDispatchProgressCard" style="box-shadow:none;margin-top:14px;display:none">
+                <div class="progress-head"><span id="fullDispatchProgressLabel">Running Full Dispatch...</span><span id="fullDispatchProgressPercent">0%</span></div>
+                <div class="progress-track"><div class="progress-bar" id="fullDispatchProgressBar"></div></div>
                 <div class="progress-steps">
-                  <div class="progress-step" id="dispatchStepRead">○ Reading current files</div><div class="progress-step" id="dispatchStepValidate">○ Validating data</div><div class="progress-step" id="dispatchStepMatch">○ Matching customer history</div><div class="progress-step" id="dispatchStepGenerate">○ Generating Dispatch outputs</div>
+                  <div class="progress-step" id="fullDispatchStepRead">○ Reading current files</div><div class="progress-step" id="fullDispatchStepValidate">○ Validating data</div><div class="progress-step" id="fullDispatchStepMatch">○ Matching customer history</div><div class="progress-step" id="fullDispatchStepGenerate">○ Generating Dispatch outputs</div>
                 </div>
               </div>
             </div>
@@ -1926,7 +1926,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }
   }
  
-  async function waitForReconciliationJob(statusUrl){
+  async function waitForReconciliationJob(statusUrl,onProgress=null){
     if(!statusUrl) throw new Error("Background job status URL was not returned.");
     while(true){
       await new Promise(resolve=>setTimeout(resolve,2500));
@@ -1935,6 +1935,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       if(!response.ok||payload.status==="Failed") throw new Error(payload.details||payload.error||`Unable to read background job status (HTTP ${response.status}).`);
       const job=payload.job||{};
       const status=String(job.status||"").toLowerCase();
+      if(typeof onProgress==="function") onProgress(job);
       if(status==="completed") return job.result||{};
       if(status==="failed") throw new Error(job.error||"Background reconciliation failed.");
     }
@@ -2487,24 +2488,9 @@ Drug Traceability Reconciliation Platform</textarea></label>
     const withGln=Number(summary.customer_with_gln_count||0);
     const dummy=Number(summary.customer_dummy_gln_count||0);
     const unmapped=Number(summary.customer_unmapped_count||0);
-    const totalCustomers=Number(summary.customer_count||withGln+dummy+unmapped);
-
     if($("homeCustomersWithGln")) $("homeCustomersWithGln").textContent=formatNumber(withGln);
     if($("homeDummyGln")) $("homeDummyGln").textContent=formatNumber(dummy);
     if($("homeVariance")) $("homeVariance").textContent=formatNumber(Number(varianceSummary.total_items||0));
-
-    if($("homeGlnTotal")) $("homeGlnTotal").textContent=formatNumber(totalCustomers);
-    if($("homeGlnMapped")) $("homeGlnMapped").textContent=formatNumber(withGln);
-    if($("homeGlnDummy")) $("homeGlnDummy").textContent=formatNumber(dummy);
-    if($("homeGlnUnmapped")) $("homeGlnUnmapped").textContent=formatNumber(unmapped);
-
-    const donut=$("homeGlnDonut");
-    if(donut){
-      const denominator=Math.max(withGln+dummy+unmapped,1);
-      const mappedPct=withGln/denominator*100;
-      const dummyPct=dummy/denominator*100;
-      donut.style.background=`conic-gradient(#239247 0 ${mappedPct}%,#d94747 ${mappedPct}% ${mappedPct+dummyPct}%,#c8ced8 ${mappedPct+dummyPct}% 100%)`;
-    }
 
     const exceptionBody=$("homeExceptionsBody");
     if(exceptionBody){
@@ -2541,6 +2527,28 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }
   }
 
+  async function loadDashboardVarianceData({forceRefresh=false}={}){
+    const exceptionBody=$("homeExceptionsBody");
+    if(exceptionBody){
+      exceptionBody.innerHTML='<tr><td colspan="6"><div class="empty"><strong>Loading Variance Management</strong>Retrieving the highest-priority current exceptions.</div></td></tr>';
+    }
+    const params=new URLSearchParams({page:"1",page_size:"25"});
+    if(forceRefresh) params.set("refresh","true");
+    const response=await fetch(`${VARIANCE_API_URL}?${params.toString()}`,{
+      cache:"no-store",
+      credentials:"same-origin"
+    });
+    const payload=await response.json().catch(()=>({}));
+    if(response.status===401){await logout();throw new Error("Your session has expired. Please sign in again.");}
+    if(!response.ok||payload.status==="Failed") throw new Error(payload.details||payload.error||"Unable to load dashboard exceptions.");
+    dashboardVarianceData={
+      summary:payload.summary||{},
+      items:Array.isArray(payload.items)?payload.items:[]
+    };
+    renderDashboardLinkedData();
+    return dashboardVarianceData;
+  }
+
   async function loadDashboardLinkedData(){
     const response=await fetch(DASHBOARD_SUMMARY_API_URL,{cache:"no-store",credentials:"same-origin"});
     const payload=await response.json().catch(()=>({}));
@@ -2567,7 +2575,8 @@ Drug Traceability Reconciliation Platform</textarea></label>
       if(includeLinked){
         await Promise.all([
           refreshAzureHistory({silent:true,limit:10}),
-          loadDashboardLinkedData()
+          loadDashboardLinkedData(),
+          loadDashboardVarianceData({forceRefresh:!silent})
         ]);
       }else{
         await refreshAzureHistory({silent:true});
@@ -2582,10 +2591,18 @@ Drug Traceability Reconciliation Platform</textarea></label>
   }
 
   function formatHistoricalCoverage(fromValue,toValue){
-    const from=parseUtcTimestamp(fromValue),to=parseUtcTimestamp(toValue);
+    const monthLabel=value=>{
+      if(!value) return "";
+      const match=String(value).trim().match(/^(\d{4})-(\d{2})/);
+      if(!match) return "";
+      const year=Number(match[1]),month=Number(match[2]);
+      if(month<1||month>12) return "";
+      return new Intl.DateTimeFormat("en-US",{month:"short",year:"numeric"})
+        .format(new Date(Date.UTC(year,month-1,1)));
+    };
+    const from=monthLabel(fromValue),to=monthLabel(toValue);
     if(!from||!to) return "—";
-    const formatter=new Intl.DateTimeFormat("en-US",{month:"short",year:"numeric",timeZone:"Asia/Riyadh"});
-    return `${formatter.format(from)} → ${formatter.format(to)}`;
+    return from===to?from:`${from} → ${to}`;
   }
 
   function renderHistoricalDashboardCards(status){
@@ -2594,6 +2611,10 @@ Drug Traceability Reconciliation Platform</textarea></label>
     if($("homeMissingSupplierBatches")) $("homeMissingSupplierBatches").textContent=formatNumber(data.missing_supplier_batches||0);
     if($("homeStoFollowup")) $("homeStoFollowup").textContent=formatNumber(data.sto_followup_batches||0);
     if($("homeHistoricalCoverage")) $("homeHistoricalCoverage").textContent=formatHistoricalCoverage(data.historical_from,data.historical_to);
+    if($("homeHistoricalBatchRows")) $("homeHistoricalBatchRows").textContent=formatNumber(data.batch_master_rows||0);
+    if($("homeHistoricalSupplierRows")) $("homeHistoricalSupplierRows").textContent=formatNumber(data.supplier_history_rows||0);
+    if($("homeHistoricalCustomerRows")) $("homeHistoricalCustomerRows").textContent=formatNumber(data.customer_history_rows||0);
+    if($("homeHistoricalLastBuild")) $("homeHistoricalLastBuild").textContent=formatHistoricalDate(data.last_build_utc);
   }
 
   function updateDashboard(){
@@ -2734,8 +2755,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   const fullSetupFiles = [];
   let fullAcceptReportFiles = [];
   let fullDispatchReportFiles = [];
-  let step1ProgressTimer = null;
-  let step2ProgressTimer = null;
+  const setupProgressTimers = {step1:null,fullAccept:null,fullDispatch:null};
   let historicalDataReady = false;
   let historicalStatusData = {};
 
@@ -2895,35 +2915,44 @@ Drug Traceability Reconciliation Platform</textarea></label>
   }
 
   function startSetupProgress(prefix){
-    const timerName=prefix==="step1"?"step1": "step2";
-    if(timerName==="step1") clearInterval(step1ProgressTimer);
-    else clearInterval(step2ProgressTimer);
+    clearInterval(setupProgressTimers[prefix]);
 
     let percent=8;
-    configureProgress(prefix,percent,prefix==="step1"?"Reading historical files...":"Reading current files...");
+    configureProgress(
+      prefix,
+      percent,
+      prefix==="step1"
+        ? "Reading historical files..."
+        : prefix==="fullAccept"
+          ? "Reading SFDA file..."
+          : "Reading Inventory and SFDA files..."
+    );
     const timer=setInterval(()=>{
       percent=Math.min(91,percent+5);
       const label=prefix==="step1"
         ? (percent<30?"Reading historical files...":percent<52?"Validating and normalizing data...":percent<78?"Building cumulative Batch Master...":"Saving historical tables to Azure SQL...")
-        : prefix==="accept"
+        : prefix==="fullAccept"
           ? (percent<30?"Reading SFDA file...":percent<52?"Validating SFDA data...":percent<78?"Matching Batch Master and Supplier History...":"Generating Accept outputs...")
           : (percent<30?"Reading Inventory and SFDA files...":percent<52?"Validating current data...":percent<78?"Matching Customer History...":"Generating Dispatch outputs...");
       configureProgress(prefix,percent,label);
     },1200);
 
-    if(timerName==="step1") step1ProgressTimer=timer;
-    else step2ProgressTimer=timer;
+    setupProgressTimers[prefix]=timer;
+  }
+
+  function stopSetupProgress(prefix){
+    clearInterval(setupProgressTimers[prefix]);
+    setupProgressTimers[prefix]=null;
   }
 
   function finishSetupProgress(prefix,success){
-    if(prefix==="step1") clearInterval(step1ProgressTimer);
-    else clearInterval(step2ProgressTimer);
+    stopSetupProgress(prefix);
     configureProgress(
       prefix,
       success?100:100,
       success
-        ? (prefix==="step1"?"Historical data completed successfully.":prefix==="accept"?"Full Accept completed successfully.":"Full Dispatch completed successfully.")
-        : (prefix==="step1"?"Historical data build failed.":prefix==="accept"?"Full Accept failed.":"Full Dispatch failed."),
+        ? (prefix==="step1"?"Historical data completed successfully.":prefix==="fullAccept"?"Full Accept completed successfully.":"Full Dispatch completed successfully.")
+        : (prefix==="step1"?"Historical data build failed.":prefix==="fullAccept"?"Full Accept failed.":"Full Dispatch failed."),
       !success
     );
   }
@@ -3194,15 +3223,19 @@ Drug Traceability Reconciliation Platform</textarea></label>
     const formData=new FormData();
     formData.append("sfda",sfda.files[0],sfda.files[0].name);
     button.disabled=true; button.textContent="Running Full Accept Reconciliation...";
-    startSetupProgress("accept");
+    startSetupProgress("fullAccept");
     try{
       const response=await fetch("/api/full-reconciliation/accept",{method:"POST",body:formData,cache:"no-store"});
       let result=await parseApiResponse(response);
       if(String(result.status||"").toLowerCase()==="accepted"){
-        configureProgress("accept",12,"Full Accept queued; processing in background...");
-        result=await waitForReconciliationJob(result.status_url);
+        stopSetupProgress("fullAccept");
+        configureProgress("fullAccept",12,"Full Accept queued; processing in background...");
+        result=await waitForReconciliationJob(result.status_url,job=>{
+          const percent=Math.max(12,Math.min(99,Number(job.progress||12)));
+          configureProgress("fullAccept",percent,job.current_stage||"Full Accept is processing in background...");
+        });
       }
-      finishSetupProgress("accept",true);
+      finishSetupProgress("fullAccept",true);
       const batchMasterFiles=collectOutputFiles({batch_master:result.outputs?.batch_master});
       const excelFiles=collectOutputFiles({accept_details:result.outputs?.accept_details,supplier_variance:result.outputs?.supplier_variance});
       const acceptCsvFiles=collectOutputFiles(result.outputs?.accept_files||{});
@@ -3222,7 +3255,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       await refreshHistoricalStatus({silent:true});
       await refreshAzureHistory({silent:true});
       toast("Full Accept Reconciliation completed successfully.","success");
-    }catch(error){ finishSetupProgress("accept",false); showSetupError(error.message||String(error)); }
+    }catch(error){ finishSetupProgress("fullAccept",false); showSetupError(error.message||String(error)); }
     finally{ button.textContent="▶ Run Full Accept Reconciliation"; updateFullSetupButtons(); }
   });
 
@@ -3236,15 +3269,19 @@ Drug Traceability Reconciliation Platform</textarea></label>
     formData.append("inventory",inventory.files[0],inventory.files[0].name);
     formData.append("sfda",sfda.files[0],sfda.files[0].name);
     button.disabled=true; button.textContent="Running Full Dispatch Reconciliation...";
-    startSetupProgress("dispatch");
+    startSetupProgress("fullDispatch");
     try{
       const response=await fetch("/api/full-reconciliation/dispatch",{method:"POST",body:formData,cache:"no-store"});
       let result=await parseApiResponse(response);
       if(String(result.status||"").toLowerCase()==="accepted"){
-        configureProgress("dispatch",12,"Full Dispatch queued; processing in background...");
-        result=await waitForReconciliationJob(result.status_url);
+        stopSetupProgress("fullDispatch");
+        configureProgress("fullDispatch",12,"Full Dispatch queued; processing in background...");
+        result=await waitForReconciliationJob(result.status_url,job=>{
+          const percent=Math.max(12,Math.min(99,Number(job.progress||12)));
+          configureProgress("fullDispatch",percent,job.current_stage||"Full Dispatch is processing in background...");
+        });
       }
-      finishSetupProgress("dispatch",true);
+      finishSetupProgress("fullDispatch",true);
       const batchMasterFiles=collectOutputFiles({batch_master:result.outputs?.batch_master});
       const excelFiles=collectOutputFiles({dispatch_details:result.outputs?.dispatch_details,summary:result.outputs?.summary});
       const dispatchCsvFiles=collectOutputFiles(result.outputs?.dispatch_files||{});
@@ -3264,7 +3301,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       await refreshHistoricalStatus({silent:true});
       await refreshAzureHistory({silent:true});
       toast("Full Dispatch Reconciliation completed successfully.","success");
-    }catch(error){ finishSetupProgress("dispatch",false); showSetupError(error.message||String(error)); }
+    }catch(error){ finishSetupProgress("fullDispatch",false); showSetupError(error.message||String(error)); }
     finally{ button.textContent="▶ Run Full Dispatch Reconciliation"; updateFullSetupButtons(); }
   });
 
