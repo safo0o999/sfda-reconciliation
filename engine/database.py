@@ -3218,7 +3218,7 @@ def reset_current_warehouse_data(
 ) -> Dict[str, Any]:
     """Verified batched reset of operational data for exactly one warehouse.
 
-    WAREHOUSE_RESET_V8_VERSIONED uses a fixed WarehouseID-scoped delete plan for
+    WAREHOUSE_RESET_V9_VERIFIED uses a fixed WarehouseID-scoped delete plan for
     operational tables. Before deleting FullReconciliationRuns it also discovers
     only its direct FK children, because legacy child tables may not carry a
     WarehouseID column and must be scoped safely through the parent FullRunID.
@@ -3290,7 +3290,7 @@ def reset_current_warehouse_data(
             progress_callback(int(progress), str(stage), dict(extra or {}))
         except Exception:
             # Progress reporting must never make destructive work fail.
-            logger.exception("WAREHOUSE_RESET_V8_VERSIONED progress callback failed.")
+            logger.exception("WAREHOUSE_RESET_V9_VERIFIED progress callback failed.")
 
     with Database().connect() as connection:
         cursor = connection.cursor()
@@ -3311,7 +3311,7 @@ def reset_current_warehouse_data(
 
         try:
             logger.info(
-                "WAREHOUSE_RESET_V8_VERSIONED started. WarehouseID=%s tables=%s",
+                "WAREHOUSE_RESET_V9_VERIFIED started. WarehouseID=%s tables=%s",
                 resolved_warehouse_id,
                 len(reset_tables),
             )
@@ -3368,7 +3368,7 @@ def reset_current_warehouse_data(
                 connection.commit()
                 deleted[child_table] = deleted.get(child_table, 0) + affected
                 logger.info(
-                    "WAREHOUSE_RESET_V8_VERSIONED cleared %s FK child row(s) from %s.%s for WarehouseID=%s.",
+                    "WAREHOUSE_RESET_V9_VERIFIED cleared %s FK child row(s) from %s.%s for WarehouseID=%s.",
                     affected,
                     child_schema,
                     child_table,
@@ -3376,6 +3376,7 @@ def reset_current_warehouse_data(
                 )
 
             existing_tables: List[str] = []
+            legacy_admin_tables: List[str] = []
             for table in reset_tables:
                 metadata = cursor.execute(
                     """
@@ -3389,18 +3390,26 @@ def reset_current_warehouse_data(
                 has_warehouse = bool(metadata and int(metadata[1] or 0))
                 if exists and has_warehouse:
                     existing_tables.append(table)
+                elif exists and resolved_warehouse_id == 1:
+                    # A known operational table without WarehouseID predates
+                    # Multi-Warehouse and therefore belongs to Warehouse 1.
+                    # Leaving it behind would make an Admin reset incomplete.
+                    legacy_admin_tables.append(table)
                 elif exists:
                     skipped.append(table)
                     logger.warning(
-                        "WAREHOUSE_RESET_V8_VERSIONED skipped %s because it has no WarehouseID column.",
+                        "WAREHOUSE_RESET_V9_VERIFIED skipped %s because it has no WarehouseID column.",
                         table,
                     )
 
-            if not existing_tables:
-                raise RuntimeError("No WarehouseID-scoped operational tables were found for reset.")
+            if not existing_tables and not legacy_admin_tables:
+                raise RuntimeError("No operational tables were found for reset.")
 
-            total = len(existing_tables)
-            for index, table in enumerate(existing_tables, start=1):
+            work_items = [(table, True) for table in existing_tables] + [
+                (table, False) for table in legacy_admin_tables
+            ]
+            total = len(work_items)
+            for index, (table, is_warehouse_scoped) in enumerate(work_items, start=1):
                 progress = 34 + int((index - 1) * 34 / max(1, total))
                 emit(
                     progress,
@@ -3420,17 +3429,25 @@ def reset_current_warehouse_data(
                 # Bounded batches make progress durable and observable instead.
                 effective_batch_size = int(
                     batch_size
-                    or os.getenv("WAREHOUSE_RESET_BATCH_SIZE", "10000")
-                    or 10000
+                    or os.getenv(
+                        "WAREHOUSE_RESET_BATCH_SIZE",
+                        "25000" if resolved_warehouse_id == 1 else "10000",
+                    )
+                    or (25000 if resolved_warehouse_id == 1 else 10000)
                 )
                 effective_batch_size = max(1000, min(effective_batch_size, 50000))
                 table_deleted = 0
                 batch_no = 0
                 while True:
-                    cursor.execute(
-                        f"DELETE TOP ({effective_batch_size}) FROM dbo.{q(table)} WHERE WarehouseID = ?;",
-                        resolved_warehouse_id,
-                    )
+                    if is_warehouse_scoped:
+                        cursor.execute(
+                            f"DELETE TOP ({effective_batch_size}) FROM dbo.{q(table)} WHERE WarehouseID = ?;",
+                            resolved_warehouse_id,
+                        )
+                    else:
+                        cursor.execute(
+                            f"DELETE TOP ({effective_batch_size}) FROM dbo.{q(table)};"
+                        )
                     affected = max(0, int(cursor.rowcount or 0))
                     connection.commit()
                     table_deleted += affected
@@ -3450,7 +3467,7 @@ def reset_current_warehouse_data(
                             },
                         )
                         logger.info(
-                            "WAREHOUSE_RESET_V8_VERSIONED batch. WarehouseID=%s table=%s batch=%s deleted=%s table_deleted=%s.",
+                            "WAREHOUSE_RESET_V9_VERIFIED batch. WarehouseID=%s table=%s batch=%s deleted=%s table_deleted=%s.",
                             resolved_warehouse_id, table, batch_no, affected, table_deleted,
                         )
                     if affected < effective_batch_size:
@@ -3458,7 +3475,7 @@ def reset_current_warehouse_data(
 
                 deleted[table] = deleted.get(table, 0) + table_deleted
                 logger.info(
-                    "WAREHOUSE_RESET_V8_VERSIONED table complete. WarehouseID=%s table=%s deleted=%s batches=%s.",
+                    "WAREHOUSE_RESET_V9_VERIFIED table complete. WarehouseID=%s table=%s deleted=%s batches=%s.",
                     resolved_warehouse_id, table, table_deleted, batch_no,
                 )
 
@@ -3471,6 +3488,7 @@ def reset_current_warehouse_data(
                     "DELETE FROM dbo.HistoricalBuildVersions WHERE WarehouseID = ?;",
                     resolved_warehouse_id,
                 )
+                deleted_versions = max(0, int(cursor.rowcount or 0))
                 cursor.execute(
                     """
                     INSERT INTO dbo.HistoricalBuildVersions
@@ -3480,9 +3498,11 @@ def reset_current_warehouse_data(
                     resolved_warehouse_id, reset_build_id,
                 )
                 connection.commit()
-                deleted["HistoricalBuildVersions"] = deleted.get("HistoricalBuildVersions", 0)
+                deleted["HistoricalBuildVersions"] = (
+                    deleted.get("HistoricalBuildVersions", 0) + deleted_versions
+                )
                 logger.info(
-                    "WAREHOUSE_RESET_V8_VERSIONED created fresh active BuildID=%s WarehouseID=%s.",
+                    "WAREHOUSE_RESET_V9_VERIFIED created fresh active BuildID=%s WarehouseID=%s.",
                     reset_build_id, resolved_warehouse_id,
                 )
             except pyodbc.Error as exc:
@@ -3495,20 +3515,49 @@ def reset_current_warehouse_data(
             # Verify every WarehouseID-scoped table that participated in the
             # reset, not only a small core subset. Success is impossible while
             # any warehouse-owned row remains.
-            verification_tables = tuple(existing_tables)
             remaining: Dict[str, int] = {}
-            for table in verification_tables:
-                if table not in existing_tables:
-                    continue
+            for table, is_warehouse_scoped in work_items:
+                sql = (
+                    f"SELECT COUNT_BIG(*) FROM dbo.{q(table)} WHERE WarehouseID = ?;"
+                    if is_warehouse_scoped
+                    else f"SELECT COUNT_BIG(*) FROM dbo.{q(table)};"
+                )
                 count = int(
-                    cursor.execute(
-                        f"SELECT COUNT_BIG(*) FROM dbo.{q(table)} WHERE WarehouseID = ?;",
-                        resolved_warehouse_id,
+                    (
+                        cursor.execute(sql, resolved_warehouse_id)
+                        if is_warehouse_scoped
+                        else cursor.execute(sql)
                     ).fetchone()[0]
                     or 0
                 )
                 if count:
                     remaining[table] = count
+
+            build_version_row = cursor.execute(
+                """
+                SELECT
+                    COUNT_BIG(*) AS TotalRows,
+                    SUM(CASE WHEN IsActive = 1 THEN 1 ELSE 0 END) AS ActiveRows,
+                    SUM(CASE WHEN IsActive = 1 AND SourceJobID = N'Warehouse Reset' THEN 1 ELSE 0 END) AS ResetRows
+                FROM dbo.HistoricalBuildVersions
+                WHERE WarehouseID = ?;
+                """,
+                resolved_warehouse_id,
+            ).fetchone()
+            build_version_audit = {
+                "total_rows": int((build_version_row[0] if build_version_row else 0) or 0),
+                "active_rows": int((build_version_row[1] if build_version_row else 0) or 0),
+                "reset_rows": int((build_version_row[2] if build_version_row else 0) or 0),
+            }
+            if build_version_audit != {
+                "total_rows": 1,
+                "active_rows": 1,
+                "reset_rows": 1,
+            }:
+                raise RuntimeError(
+                    "Warehouse reset verification found invalid HistoricalBuildVersions state: "
+                    + json.dumps(build_version_audit, sort_keys=True)
+                )
 
             if remaining:
                 raise RuntimeError(
@@ -3518,13 +3567,16 @@ def reset_current_warehouse_data(
 
             result = {
                 "status": "Completed",
-                "version": "WAREHOUSE_RESET_V8_VERSIONED",
+                "version": "WAREHOUSE_RESET_V9_VERIFIED",
                 "warehouse_id": resolved_warehouse_id,
                 "deleted_rows": deleted,
                 "deleted_rows_total": int(sum(deleted.values())),
-                "tables_cleared": len(existing_tables),
+                "tables_cleared": len(work_items),
                 "skipped_tables": skipped,
+                "legacy_admin_tables_cleared": legacy_admin_tables,
                 "remaining_rows": remaining,
+                "historical_build_versions": build_version_audit,
+                "clean_state_verified": True,
                 "preserved": [
                     "Warehouses",
                     "ApplicationUsers",
@@ -3535,7 +3587,7 @@ def reset_current_warehouse_data(
                 ],
             }
             logger.info(
-                "WAREHOUSE_RESET_V8_VERSIONED completed. WarehouseID=%s deleted_rows_total=%s tables=%s",
+                "WAREHOUSE_RESET_V9_VERIFIED completed. WarehouseID=%s deleted_rows_total=%s tables=%s",
                 resolved_warehouse_id,
                 result["deleted_rows_total"],
                 result["tables_cleared"],
@@ -3548,7 +3600,7 @@ def reset_current_warehouse_data(
             except Exception:
                 pass
             logger.exception(
-                "WAREHOUSE_RESET_V8_VERSIONED failed for WarehouseID=%s. Already committed table clears remain deleted; retry is safe.",
+                "WAREHOUSE_RESET_V9_VERIFIED failed for WarehouseID=%s. Already committed table clears remain deleted; retry is safe.",
                 resolved_warehouse_id,
             )
             raise

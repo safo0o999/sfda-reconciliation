@@ -24,7 +24,7 @@ APPLICATION_NAME = "SFDA Reconciliation"
 APPLICATION_VERSION = "6.0.0"
 app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 _PROCESS_STARTED_AT = datetime.now(timezone.utc)
-_RESET_ENGINE_VERSION = "WAREHOUSE_RESET_V8_VERSIONED"
+_RESET_ENGINE_VERSION = "WAREHOUSE_RESET_V9_VERIFIED"
 _HISTORICAL_REBUILD_ENGINE_VERSION = "VERSIONED_BUILD_V8_20260826"
 
 
@@ -1048,7 +1048,7 @@ def dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="warehouse-data/reset/recover", methods=["POST"])
 def warehouse_data_reset_recover_route(req: func.HttpRequest) -> func.HttpResponse:
     """Recover a reset lock left by a worker that existed before this Function process started."""
-    denied = _auth_guard(req)
+    denied = _auth_guard(req, admin=True)
     if denied:
         return denied
 
@@ -1143,7 +1143,7 @@ def warehouse_data_reset_recover_route(req: func.HttpRequest) -> func.HttpRespon
 @app.route(route="warehouse-data/reset", methods=["POST"])
 def warehouse_data_reset_route(req: func.HttpRequest) -> func.HttpResponse:
     """Queue a destructive warehouse reset and return immediately."""
-    denied = _auth_guard(req)
+    denied = _auth_guard(req, admin=True)
     if denied:
         return denied
 
@@ -1180,14 +1180,78 @@ def warehouse_data_reset_route(req: func.HttpRequest) -> func.HttpResponse:
                     f"Active reset job: {active_job}",
                 )
 
-            # Acquire the reset lock before checking other job types so no new
-            # Historical/Daily/Full job can enter after this point.
-            storage.write_warehouse_reset_lock(job_id, warehouse_name)
+            # Persist the owner status first so lock readers never mistake the
+            # short acquisition window for an abandoned lock. Conditional Blob
+            # creation then guarantees that two Reset requests cannot both win.
+            storage.write_background_job_status(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "job_type": "warehouse_reset",
+                    "reset_engine_version": _RESET_ENGINE_VERSION,
+                    "status": "Queued",
+                    "progress": 2,
+                    "current_stage": "Acquiring exclusive warehouse reset lock",
+                    "submitted_by": submitted_by,
+                    "warehouse_id": warehouse_id,
+                    "warehouse_name": warehouse_name,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "result": {},
+                    "error": "",
+                },
+            )
+            if not storage.try_create_warehouse_reset_lock(job_id, warehouse_name):
+                competing_lock = storage.read_warehouse_reset_lock() or {}
+                storage.write_background_job_status(
+                    job_id,
+                    {
+                        "job_id": job_id,
+                        "job_type": "warehouse_reset",
+                        "reset_engine_version": _RESET_ENGINE_VERSION,
+                        "status": "Failed",
+                        "progress": 100,
+                        "current_stage": "Reset lock acquisition rejected",
+                        "submitted_by": submitted_by,
+                        "warehouse_id": warehouse_id,
+                        "warehouse_name": warehouse_name,
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "result": {},
+                        "error": "Another warehouse reset acquired the lock first.",
+                    },
+                )
+                return error_response(
+                    "A warehouse reset is already running.",
+                    409,
+                    f"Active reset job: {competing_lock.get('job_id') or 'unknown'}",
+                )
+
+            def mark_submission_failed(stage: str, error: str) -> None:
+                storage.write_background_job_status(
+                    job_id,
+                    {
+                        "job_id": job_id,
+                        "job_type": "warehouse_reset",
+                        "reset_engine_version": _RESET_ENGINE_VERSION,
+                        "status": "Failed",
+                        "progress": 100,
+                        "current_stage": str(stage),
+                        "submitted_by": submitted_by,
+                        "warehouse_id": warehouse_id,
+                        "warehouse_name": warehouse_name,
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "result": {},
+                        "error": str(error),
+                    },
+                )
 
             from engine.database import get_active_historical_build_job
             active_historical = get_active_historical_build_job(warehouse_id)
             if active_historical:
                 storage.clear_warehouse_reset_lock(job_id, force=True)
+                mark_submission_failed(
+                    "Reset blocked by active Historical Build",
+                    f"Historical Build {active_historical.get('JobID')} is still active.",
+                )
                 return error_response(
                     "Historical Build is still active for this warehouse.",
                     409,
@@ -1198,6 +1262,10 @@ def warehouse_data_reset_route(req: func.HttpRequest) -> func.HttpResponse:
             if active_background:
                 storage.clear_warehouse_reset_lock(job_id, force=True)
                 active = active_background[0]
+                mark_submission_failed(
+                    "Reset blocked by active reconciliation",
+                    f"Reconciliation job {active.get('job_id') or 'unknown'} is still active.",
+                )
                 return error_response(
                     "A reconciliation job is still active for this warehouse.",
                     409,
@@ -1225,6 +1293,10 @@ def warehouse_data_reset_route(req: func.HttpRequest) -> func.HttpResponse:
             connection_string = os.getenv("AzureWebJobsStorage")
             if not connection_string:
                 storage.clear_warehouse_reset_lock(job_id, force=True)
+                mark_submission_failed(
+                    "Reset queue configuration failed",
+                    "AzureWebJobsStorage is missing.",
+                )
                 raise RuntimeError("AzureWebJobsStorage is missing.")
 
             queue = QueueClient.from_connection_string(
@@ -1253,6 +1325,10 @@ def warehouse_data_reset_route(req: func.HttpRequest) -> func.HttpResponse:
                 )
             except Exception:
                 storage.clear_warehouse_reset_lock(job_id, force=True)
+                mark_submission_failed(
+                    "Reset queue submission failed",
+                    "Unable to enqueue warehouse reset.",
+                )
                 raise
 
         return json_response(
@@ -1832,6 +1908,28 @@ def batch_master_build(req: func.HttpRequest) -> func.HttpResponse:
             operation,
             manifest,
         )
+
+        # Close the submission/reset race: if Reset acquired its atomic lock
+        # while files were uploading, do not enqueue work against data that is
+        # being cleared. The SQL job row makes Reset detect the opposite order.
+        reset_lock = storage.read_warehouse_reset_lock()
+        if reset_lock:
+            update_historical_build_job(
+                job_id,
+                status="Failed",
+                progress=0,
+                current_stage="Blocked by warehouse reset",
+                error_message=(
+                    f"Reset job {reset_lock.get('job_id') or 'unknown'} acquired "
+                    "the warehouse lock before Historical Build was queued."
+                ),
+                mark_completed=True,
+            )
+            return error_response(
+                "Warehouse reset is in progress.",
+                409,
+                f"Reset job {reset_lock.get('job_id') or 'unknown'} must finish before Historical Build.",
+            )
 
         # Producer and Queue Trigger use the exact same storage account.
         # The helper is also reused by status-based ghost queue recovery.
@@ -3565,6 +3663,36 @@ def _queue_reconciliation_job(
         },
     )
 
+    # Status is visible before this second lock check. Therefore either Reset
+    # sees this active job and stops, or this submission sees Reset and stops;
+    # neither worker can enter the destructive overlap window.
+    reset_lock = storage.read_warehouse_reset_lock()
+    if reset_lock:
+        storage.write_background_job_status(
+            job_id,
+            {
+                "job_id": job_id,
+                "job_type": job_type,
+                "status": "Failed",
+                "progress": 100,
+                "current_stage": "Blocked by warehouse reset",
+                "submitted_by": submitted_by,
+                "warehouse_id": warehouse_id,
+                "warehouse_name": warehouse_name,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "result": {},
+                "error": (
+                    f"Reset job {reset_lock.get('job_id') or 'unknown'} acquired "
+                    "the warehouse lock before reconciliation was queued."
+                ),
+            },
+        )
+        return error_response(
+            "Warehouse reset is in progress.",
+            409,
+            f"Reset job {reset_lock.get('job_id') or 'unknown'} must finish before reconciliation.",
+        )
+
     connection_string = os.getenv("AzureWebJobsStorage")
     if not connection_string:
         raise RuntimeError("AzureWebJobsStorage is missing.")
@@ -3737,6 +3865,8 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
 
         if job_type == "warehouse_reset":
             started_at = datetime.now(timezone.utc).isoformat()
+            database_result: Dict[str, Any] = {}
+            blob_result: Dict[str, Any] = {}
             try:
                 storage.write_background_job_status(
                     job_id,
@@ -3804,9 +3934,50 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
                     f"background-jobs/{storage.sanitize_file_name(job_id)}.json"
                 )
                 lock_blob_name = storage.scoped_blob_name("system/reset-active.json")
+                last_blob_heartbeat = [0.0]
+
+                def _blob_reset_progress(
+                    container: str,
+                    deleted_count: int,
+                    pending_count: int,
+                ) -> None:
+                    # Keep a long Admin/legacy cleanup alive without turning
+                    # every 256-file deletion batch into an extra Blob write.
+                    now = time.monotonic()
+                    if pending_count and now - last_blob_heartbeat[0] < 5:
+                        return
+                    last_blob_heartbeat[0] = now
+                    storage.write_background_job_status(
+                        job_id,
+                        {
+                            **base_status,
+                            "status": "Running",
+                            "progress": 80,
+                            "current_stage": f"Clearing {container}",
+                            "started_at": started_at,
+                            "updated_at": datetime.now(timezone.utc).isoformat(),
+                            "result": {
+                                "database": database_result,
+                                "blob_progress": {
+                                    "container": container,
+                                    "deleted": deleted_count,
+                                    "pending": pending_count,
+                                },
+                            },
+                            "error": "",
+                        },
+                    )
+
                 blob_result = storage.delete_current_warehouse_data(
-                    preserve_blob_names=[status_blob_name, lock_blob_name]
+                    preserve_blob_names=[status_blob_name, lock_blob_name],
+                    progress_callback=_blob_reset_progress,
                 )
+
+                if not bool(blob_result.get("clean_state_verified")):
+                    raise RuntimeError(
+                        "Warehouse Blob reset verification found remaining run files: "
+                        f"{int(blob_result.get('remaining_blobs_total') or 0)}"
+                    )
 
                 storage.write_background_job_status(
                     job_id,
@@ -3828,11 +3999,6 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
                     _VARIANCE_CACHE.pop(warehouse_id, None)
 
                 warnings = []
-                failed_blob_count = int(blob_result.get("failed_blobs_total") or 0)
-                if failed_blob_count:
-                    warnings.append(
-                        f"Database reset completed, but {failed_blob_count} archived run file(s) could not be deleted."
-                    )
 
                 result = {
                     "status": "Completed",
@@ -3842,6 +4008,10 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
                     "database": database_result,
                     "blob": blob_result,
                     "warnings": warnings,
+                    "clean_state_verified": bool(
+                        database_result.get("clean_state_verified")
+                        and blob_result.get("clean_state_verified")
+                    ),
                     "preserved": [
                         "Warehouse account and users",
                         "Warehouse GLN mapping",
@@ -3872,7 +4042,11 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
                         "progress": 100,
                         "current_stage": "Warehouse reset failed",
                         "completed_at": datetime.now(timezone.utc).isoformat(),
-                        "result": {},
+                        "result": {
+                            "database": database_result,
+                            "blob": blob_result,
+                            "clean_state_verified": False,
+                        },
                         "error": str(exc),
                     },
                 )

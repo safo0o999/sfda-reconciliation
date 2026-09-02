@@ -1,10 +1,11 @@
 import os
 import json
 import logging
+import re
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
 
@@ -446,6 +447,40 @@ class BlobStorage:
             {"job_id": str(job_id), "category": "warehouse-reset-lock"},
         )
 
+    def try_create_warehouse_reset_lock(
+        self,
+        job_id: str,
+        warehouse_name: str,
+        expires_hours: int = 6,
+    ) -> bool:
+        """Atomically acquire the warehouse reset lock without overwriting an owner."""
+        created_at = datetime.now(timezone.utc)
+        payload = {
+            "job_id": str(job_id),
+            "warehouse_name": str(warehouse_name or ""),
+            "status": "Active",
+            "created_at": created_at.isoformat(),
+            "expires_at": (
+                created_at + timedelta(hours=max(1, int(expires_hours)))
+            ).isoformat(),
+        }
+        blob = self.service.get_blob_client(
+            container=METADATA_CONTAINER,
+            blob=self.scoped_blob_name(RESET_LOCK_BLOB),
+        )
+        try:
+            blob.upload_blob(
+                json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                overwrite=False,
+                content_settings=ContentSettings(
+                    content_type="application/json; charset=utf-8"
+                ),
+                metadata={"job_id": str(job_id), "category": "warehouse-reset-lock"},
+            )
+            return True
+        except ResourceExistsError:
+            return False
+
     def read_warehouse_reset_lock(self) -> Optional[Dict[str, Any]]:
         """Return the active reset lock, automatically ignoring stale locks."""
         try:
@@ -602,8 +637,10 @@ class BlobStorage:
     def delete_current_warehouse_data(
         self,
         preserve_blob_names: Optional[List[str]] = None,
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        max_passes: int = 3,
     ) -> Dict[str, Any]:
-        """Delete only Blob data stored under the current warehouse prefix.
+        """Delete and verify Blob data owned by the current warehouse.
 
         Reference/configuration files are not stored in these run containers, so
         GLN mappings, Pack Size and business rules are never touched here.
@@ -621,6 +658,40 @@ class BlobStorage:
         preserved = {str(name) for name in (preserve_blob_names or []) if str(name).strip()}
         deleted: Dict[str, int] = {}
         failed: Dict[str, List[str]] = {}
+        remaining: Dict[str, List[str]] = {}
+
+        def is_target(name: str) -> bool:
+            if not name or name in preserved:
+                return False
+            if name.startswith(prefix):
+                return True
+            # Warehouse 1 owns pre-Multi-Warehouse run archives. A valid wN/
+            # prefix always belongs to that explicit warehouse and is preserved.
+            return warehouse_id == 1 and re.match(r"^w\d+/", name) is None
+
+        def target_names(container) -> List[str]:
+            if warehouse_id != 1:
+                return [
+                    str(blob.name)
+                    for blob in container.list_blobs(name_starts_with=prefix)
+                    if is_target(str(blob.name or ""))
+                ]
+            # Admin/Warehouse 1 must also remove legacy unscoped archives, so a
+            # full listing is unavoidable until those archives are gone. Use one
+            # linear scan and a set instead of the previous two-list/O(n^2) path.
+            return sorted({
+                str(blob.name)
+                for blob in container.list_blobs()
+                if is_target(str(blob.name or ""))
+            })
+
+        def emit(container_name: str, deleted_count: int, pending_count: int) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(container_name, int(deleted_count), int(pending_count))
+            except Exception:
+                logger.exception("Warehouse Blob reset progress callback failed.")
 
         for container_name in (
             INPUTS_CONTAINER,
@@ -628,59 +699,65 @@ class BlobStorage:
             METADATA_CONTAINER,
         ):
             container = self.service.get_container_client(container_name)
-            names = [
-                str(blob.name)
-                for blob in container.list_blobs(name_starts_with=prefix)
-                if str(blob.name) not in preserved
-            ]
-            # Warehouse 1 owns legacy unscoped run archives created before
-            # Multi-Warehouse. Preserve only the explicit reset status/lock names.
-            if warehouse_id == 1:
-                for blob in container.list_blobs():
-                    name = str(blob.name or "")
-                    if name in preserved:
-                        continue
-                    if name.startswith("w") and "/" in name and name.split("/", 1)[0][1:].isdigit():
-                        continue
-                    if name and name not in names:
-                        names.append(name)
-
             container_deleted = 0
             container_failed: List[str] = []
-            for chunk in self._chunks(names, 256):
-                if not chunk:
-                    continue
-                try:
-                    container.delete_blobs(*chunk, delete_snapshots="include")
-                    container_deleted += len(chunk)
-                except Exception:
-                    # Do not turn an otherwise successful SQL reset into a generic
-                    # failure because one archived Blob could not be removed.
-                    for blob_name in chunk:
-                        try:
-                            container.delete_blob(blob_name, delete_snapshots="include")
-                            container_deleted += 1
-                        except ResourceNotFoundError:
-                            pass
-                        except Exception:
-                            logger.exception(
-                                "Warehouse reset could not delete blob %s/%s",
-                                container_name,
-                                blob_name,
-                            )
-                            container_failed.append(blob_name)
+            passes = max(1, min(int(max_passes or 1), 5))
+            for pass_number in range(1, passes + 1):
+                names = target_names(container)
+                emit(container_name, container_deleted, len(names))
+                if not names:
+                    break
+                pass_deleted = 0
+                for chunk in self._chunks(names, 256):
+                    if not chunk:
+                        continue
+                    try:
+                        container.delete_blobs(*chunk, delete_snapshots="include")
+                        container_deleted += len(chunk)
+                        pass_deleted += len(chunk)
+                    except Exception:
+                        for blob_name in chunk:
+                            try:
+                                container.delete_blob(blob_name, delete_snapshots="include")
+                                container_deleted += 1
+                                pass_deleted += 1
+                            except ResourceNotFoundError:
+                                pass
+                            except Exception:
+                                logger.exception(
+                                    "Warehouse reset could not delete blob %s/%s",
+                                    container_name,
+                                    blob_name,
+                                )
+                                container_failed.append(blob_name)
+                    emit(container_name, container_deleted, max(0, len(names) - pass_deleted))
+
+                logger.info(
+                    "Warehouse Blob reset pass completed. warehouse_id=%s container=%s pass=%s deleted=%s",
+                    warehouse_id,
+                    container_name,
+                    pass_number,
+                    container_deleted,
+                )
 
             deleted[container_name] = container_deleted
             if container_failed:
-                failed[container_name] = container_failed
+                failed[container_name] = sorted(set(container_failed))
+            final_remaining = target_names(container)
+            if final_remaining:
+                remaining[container_name] = final_remaining
+            emit(container_name, container_deleted, len(final_remaining))
 
         return {
-            "status": "CompletedWithWarnings" if failed else "Completed",
+            "status": "Incomplete" if remaining else "Completed",
             "warehouse_id": warehouse_id,
             "deleted_blobs": deleted,
             "deleted_blobs_total": int(sum(deleted.values())),
             "failed_blobs": failed,
             "failed_blobs_total": int(sum(len(items) for items in failed.values())),
+            "remaining_blobs": remaining,
+            "remaining_blobs_total": int(sum(len(items) for items in remaining.values())),
+            "clean_state_verified": not bool(remaining),
             "legacy_unscoped_madinah_blobs_deleted": warehouse_id == 1,
         }
 

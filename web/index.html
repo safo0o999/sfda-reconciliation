@@ -1449,6 +1449,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
     // remains available to every authenticated warehouse user. Admin-only
     // sections are hidden separately below.
     if(adminButton) adminButton.style.display="";
+    if($("warehouseResetCard")) $("warehouseResetCard").style.display=isAdmin?"":"none";
     if($("adminUsersCard")) $("adminUsersCard").style.display=isAdmin?"":"none";
     if($("adminSecurityCard")) $("adminSecurityCard").style.display=isAdmin?"":"none";
     if($("adminRefreshUsers")) $("adminRefreshUsers").style.display=isAdmin?"":"none";
@@ -3858,6 +3859,16 @@ Drug Traceability Reconciliation Platform</textarea></label>
       if(!resetResult||String(resetResult.status||"").toLowerCase()==="failed"){
         throw new Error(resetResult?.details||resetResult?.error||"Warehouse reset failed.");
       }
+      if(resetResult.clean_state_verified!==true){
+        throw new Error("Reset finished without a verified clean state. Run Reset again or review the reset job details.");
+      }
+
+      const deletedRows=Number(resetResult?.database?.deleted_rows_total||0);
+      const deletedFiles=Number(resetResult?.blob?.deleted_blobs_total||0);
+      if($("warehouseResetInfo")){
+        $("warehouseResetInfo").textContent=
+          `Clean state verified · ${formatNumber(deletedRows)} database rows and ${formatNumber(deletedFiles)} run files deleted.`;
+      }
 
       const key=dashboardPreviewStorageKey();
       if(key) localStorage.removeItem(key);
@@ -3912,7 +3923,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
         console.warn("Warehouse reset completed, but one or more page refreshes failed.",failedReloads);
         toast(`${warehouseName} data was reset. Refresh the page once to reload all views.`,"warning");
       }else{
-        toast(`${warehouseName} data reset completed. The warehouse is ready for a fresh build.`,"success");
+        toast(`${warehouseName} clean state verified. The warehouse is ready for a fresh build.`,"success");
       }
     }catch(error){
       toast(error.message||String(error),"error");
