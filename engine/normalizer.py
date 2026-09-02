@@ -8,7 +8,7 @@ import pandas as pd
 # Historical matching deployment signature. This value is written into every
 # completed Historical Rebuild/Append SummaryJson so production SQL can prove
 # exactly which matching logic the Azure worker executed.
-HISTORICAL_MATCH_LOGIC_VERSION = "SFDA_IDENTITY_V5_MULTI_EVIDENCE_20260902"
+HISTORICAL_MATCH_LOGIC_VERSION = "SFDA_IDENTITY_V6_CROSS_SOURCE_CONCENTRATION_20260902"
 HISTORICAL_MATCH_LEGACY_THRESHOLD = 60.0
 
 
@@ -222,18 +222,47 @@ class Normalizer:
         """Return mass concentration values normalized to mg/ml.
 
         Supports the formats that occur in SFDA/WMS names, including:
-        ``0.1MG/ML``, ``1MG/10ML``, ``20MG PER 2ML`` and ``500MG-10ML``.
+        ``0.1MG/ML``, ``1MG/10ML``, ``20MG PER 2ML``, ``500MG-10ML``
+        and shared-unit ranges such as ``3.3-5.3MG/ML``.
         """
         raw = "" if value is None else str(value).upper().replace(",", ".")
-        raw = raw.replace("\\", "/").replace("∕", "/")
+        raw = (
+            raw.replace("\\", "/")
+            .replace("∕", "/")
+            .replace("–", "-")
+            .replace("—", "-")
+        )
         raw = re.sub(r"\bPER\b", "/", raw)
+        values = set()
+
+        # Some WMS descriptions express a registered concentration range while
+        # writing the unit only once: ``3.3 - 5.3 MG/ML``.  Both endpoints are
+        # legitimate evidence; the ordinary concentration regex below sees only
+        # the second endpoint.
+        range_pattern = re.compile(
+            r"(?<![A-Z0-9])"
+            r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*"
+            r"(MCG|UG|MG|GM|G|KG)"
+            r"\s*/\s*"
+            r"(?:(\d+(?:\.\d+)?)\s*)?(ML|L)\b"
+        )
+        for first_mass, second_mass, mass_unit, volume_text, volume_unit in range_pattern.findall(raw):
+            try:
+                volume_ml = Normalizer._volume_to_ml(float(volume_text or "1"), volume_unit)
+                if volume_ml <= 0:
+                    continue
+                for mass_text in (first_mass, second_mass):
+                    mass_mg = Normalizer._mass_to_mg(float(mass_text), mass_unit)
+                    values.add(round(mass_mg / volume_ml, 9))
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+
         pattern = re.compile(
             r"(?<![A-Z0-9])"
             r"(\d+(?:\.\d+)?)\s*(MCG|UG|MG|GM|G|KG)"
             r"\s*(?:/|-)\s*"
             r"(?:(\d+(?:\.\d+)?)\s*)?(ML|L)\b"
         )
-        values = set()
         for mass_text, mass_unit, volume_text, volume_unit in pattern.findall(raw):
             try:
                 mass_mg = Normalizer._mass_to_mg(float(mass_text), mass_unit)
@@ -243,6 +272,71 @@ class Normalizer:
             except (TypeError, ValueError, ZeroDivisionError):
                 continue
         return values
+
+    @staticmethod
+    def _compact_concentration_measurements(value):
+        """Return malformed compact concentrations such as ``33MGML``.
+
+        WMS occasionally removes both the decimal point and the concentration
+        slash.  This parser only recognizes the explicit joined unit signal
+        (mass unit immediately followed by volume unit); it does not reinterpret
+        ordinary standalone strengths such as ``15MG``.
+        """
+        raw = "" if value is None else str(value).upper().replace(",", ".")
+        pattern = re.compile(
+            r"(?<![A-Z0-9])"
+            r"(\d+(?:\.\d+)?)\s*(MCG|UG|MG|GM|G|KG)\s*(ML|L)\b"
+        )
+        result = []
+        for number_text, mass_unit, volume_unit in pattern.findall(raw):
+            try:
+                mass_mg = Normalizer._mass_to_mg(float(number_text), mass_unit)
+                volume_ml = Normalizer._volume_to_ml(1.0, volume_unit)
+                result.append((round(mass_mg / volume_ml, 9), number_text))
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+        return result
+
+    @staticmethod
+    def _compact_decimal_loss_concentration_equivalent(left_name, right_name):
+        """Match decimal-loss only when WMS exposes the malformed ``MGML`` cue.
+
+        Example: ``OMNITROPE 3.3MG/ML`` vs ``OMNITROPE 33MGML``.  The narrow
+        joined-unit requirement prevents this repair from changing the existing
+        safety decision for ordinary strengths such as 1.5MG vs 15MG.
+        """
+
+        def _digits(value):
+            text = format(float(value), ".12g")
+            if "." not in text:
+                return ""
+            compact = text.replace(".", "").lstrip("0")
+            return compact or "0"
+
+        def _raw_digits(value):
+            text = str(value or "").strip()
+            if not text or "." in text:
+                return ""
+            compact = text.lstrip("0")
+            return compact or "0"
+
+        left_standard = Normalizer._concentration_signature(left_name)
+        right_standard = Normalizer._concentration_signature(right_name)
+        left_compact = Normalizer._compact_concentration_measurements(left_name)
+        right_compact = Normalizer._compact_concentration_measurements(right_name)
+
+        for standard, compact_rows in (
+            (left_standard, right_compact),
+            (right_standard, left_compact),
+        ):
+            for standard_value in standard:
+                standard_digits = _digits(standard_value)
+                if not standard_digits:
+                    continue
+                for _compact_value, raw_number in compact_rows:
+                    if standard_digits == _raw_digits(raw_number):
+                        return True
+        return False
 
     @staticmethod
     def _percent_concentration_mg_per_ml(value):
@@ -359,6 +453,11 @@ class Normalizer:
         """
         sfda_conc = Normalizer._concentration_signature(sfda_name)
         wms_conc = Normalizer._concentration_signature(wms_trade_description)
+
+        if product_evidence and Normalizer._compact_decimal_loss_concentration_equivalent(
+            sfda_name, wms_trade_description
+        ):
+            return "match"
 
         if sfda_conc and wms_conc:
             if any(Normalizer._close_numeric(a, b) for a in sfda_conc for b in wms_conc):
@@ -572,32 +671,51 @@ class Normalizer:
         if not sfda or not normalized_sources:
             return True
 
+        evaluated_sources = []
+        candidate_product_evidence = False
         for source_text, source_reference, wms in normalized_sources:
             shared_identity = Normalizer._has_shared_identity_token(
                 sfda_name, source_text
             )
-            product_evidence = bool(source_reference is True or shared_identity)
+            lexical_identity = bool(sfda == wms or sfda in wms or wms in sfda)
+            candidate_product_evidence = bool(
+                candidate_product_evidence
+                or source_reference is True
+                or shared_identity
+                or lexical_identity
+            )
+            evaluated_sources.append(
+                (source_text, source_reference, wms, shared_identity, lexical_identity)
+            )
+
+        results = []
+        for source_text, source_reference, wms, shared_identity, lexical_identity in evaluated_sources:
             strength_relation = Normalizer._strength_relation(
                 sfda_name,
                 source_text,
-                product_evidence=product_evidence,
+                product_evidence=candidate_product_evidence,
             )
+            identity_pass = bool(
+                lexical_identity
+                or source_reference is True
+                or shared_identity
+                or Normalizer.drug_name_match_score(sfda_name, source_text) >= float(threshold)
+            )
+            results.append((strength_relation, identity_pass))
 
-            # A conflict in one abbreviated field does not reject the batch if
-            # the other WMS evidence source proves the equivalent concentration.
-            if strength_relation == "conflict":
-                continue
-
-            if sfda == wms or sfda in wms or wms in sfda:
-                return True
-            if source_reference is True:
-                return True
-            if shared_identity:
-                return True
-            if Normalizer.drug_name_match_score(sfda_name, source_text) >= float(threshold):
-                return True
-
-        return False
+        # Multi-source evidence rule:
+        # - one source may establish product identity while another proves the
+        #   mathematically equivalent strength/concentration;
+        # - a proven strength match wins over an abbreviated conflicting source;
+        # - if no source proves a match, any explicit conflict rejects the row.
+        if any(
+            relation == "match" and (identity_pass or candidate_product_evidence)
+            for relation, identity_pass in results
+        ):
+            return True
+        if any(relation == "conflict" for relation, _identity_pass in results):
+            return False
+        return any(identity_pass for _relation, identity_pass in results)
 
     @staticmethod
     def identifier(series, length=None):
