@@ -1048,7 +1048,7 @@ def dashboard_summary(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="warehouse-data/reset/recover", methods=["POST"])
 def warehouse_data_reset_recover_route(req: func.HttpRequest) -> func.HttpResponse:
     """Recover a reset lock left by a worker that existed before this Function process started."""
-    denied = _auth_guard(req, admin=True)
+    denied = _auth_guard(req)
     if denied:
         return denied
 
@@ -1143,7 +1143,7 @@ def warehouse_data_reset_recover_route(req: func.HttpRequest) -> func.HttpRespon
 @app.route(route="warehouse-data/reset", methods=["POST"])
 def warehouse_data_reset_route(req: func.HttpRequest) -> func.HttpResponse:
     """Queue a destructive warehouse reset and return immediately."""
-    denied = _auth_guard(req, admin=True)
+    denied = _auth_guard(req)
     if denied:
         return denied
 

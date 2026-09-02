@@ -164,7 +164,7 @@ class WarehouseResetBlobTests(unittest.TestCase):
 
 
 class WarehouseResetAuthorizationTests(unittest.TestCase):
-    def test_reset_routes_require_admin_guard(self):
+    def test_reset_routes_require_authenticated_warehouse_user(self):
         source = (Path(__file__).resolve().parents[1] / "function_app.py").read_text(
             encoding="utf-8"
         )
@@ -180,20 +180,18 @@ class WarehouseResetAuthorizationTests(unittest.TestCase):
         }
         self.assertEqual(set(functions), required)
         for name, node in functions.items():
-            admin_calls = [
+            guard_calls = [
                 call
                 for call in ast.walk(node)
                 if isinstance(call, ast.Call)
                 and isinstance(call.func, ast.Name)
                 and call.func.id == "_auth_guard"
-                and any(
-                    keyword.arg == "admin"
-                    and isinstance(keyword.value, ast.Constant)
-                    and keyword.value.value is True
-                    for keyword in call.keywords
-                )
             ]
-            self.assertTrue(admin_calls, f"{name} must require admin=True")
+            self.assertTrue(guard_calls, f"{name} must require authentication")
+            self.assertTrue(
+                all(not call.keywords for call in guard_calls),
+                f"{name} must remain available to authenticated warehouse users",
+            )
 
 
 if __name__ == "__main__":
