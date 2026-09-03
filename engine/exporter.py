@@ -9,6 +9,8 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
+from engine.trade_code import combine_trade_codes, trade_code_count, trade_code_status
+
 
 class Exporter:
     MAX_ROWS_PER_FILE = 20
@@ -27,6 +29,9 @@ class Exporter:
         "Quantity sent pending",
         "Quantity Receive Pending",
         "Generic Item Number",
+        "Trade Code",
+        "Trade Code Count",
+        "Trade Code Status",
         "Description",
         "Trade Description",
         "Received Quantity Each",
@@ -45,18 +50,33 @@ class Exporter:
 
     SUPPLIER_HISTORY_COLUMNS = [
         "Supplier Name", "Supplier Code", "GTIN", "Drug Name",
-        "Generic Item Number", "Description", "Trade Description", "BN",
+        "Generic Item Number", "Trade Code", "Description", "Trade Description", "BN",
         "Expiry Date", "PackageSize", "Received Quantity Each",
         "Received Quantity Pack", "First Received Date", "Last Received Date",
         "Item Family Group",
     ]
 
     CUSTOMER_HISTORY_COLUMNS = [
-        "To Address", "GLN", "GTIN", "Drug Name", "Generic Item Number",
+        "To Address", "GLN", "GTIN", "Drug Name", "Generic Item Number", "Trade Code",
         "Trade Description", "BN", "Expiry Date", "PackageSize",
         "Dispatch Quantity Each", "Dispatch Quantity Pack",
         "First Dispatch Date", "Last Dispatch Date", "Custody",
     ]
+
+    @staticmethod
+    def _with_trade_code_columns(dataframe, include_summary=False):
+        """Expose the internal TradeItemNumber projection as report columns."""
+
+        report = dataframe.copy() if dataframe is not None else pd.DataFrame()
+        internal = report.get(
+            "Trade Item Number",
+            report.get("Trade Code", pd.Series("", index=report.index, dtype=object)),
+        )
+        report["Trade Code"] = internal.map(combine_trade_codes)
+        if include_summary:
+            report["Trade Code Count"] = report["Trade Code"].map(trade_code_count)
+            report["Trade Code Status"] = report["Trade Code"].map(trade_code_status)
+        return report.drop(columns=["Trade Item Number"], errors="ignore")
 
     FULL_ACCEPT_RECONCILIATION_COLUMNS = [
         "GTIN",
@@ -738,7 +758,7 @@ class Exporter:
             WMS batches belonging to a Generic proven in Sheet 1, excluding all
             batches already present in Sheet 1.
         """
-        source = df.copy() if df is not None else pd.DataFrame()
+        source = Exporter._with_trade_code_columns(df, include_summary=True)
         source = source.reindex(columns=Exporter.BATCH_MASTER_COLUMNS)
         status = source.get(
             "Generic Exists in SFDA",
@@ -814,7 +834,7 @@ class Exporter:
                 cell.border = border
                 lower = str(name).lower()
                 identifier_flags.append(any(x in lower for x in [
-                    "gtin", "generic item", "trade item", "gln", "bn"
+                    "gtin", "generic item", "trade item", "trade code", "gln", "bn"
                 ]))
                 date_flags.append("date" in lower or "expiry" in lower)
                 max_lengths.append(len(str(name)))
@@ -903,7 +923,9 @@ class Exporter:
         - Missing From SFDA contains received WMS batches for Generics proven by Stage 1.
         - Supplier/STO/Customer histories remain separate audit views in their own sheets.
         """
-        master = batch_master.copy() if batch_master is not None else pd.DataFrame()
+        master = Exporter._with_trade_code_columns(
+            batch_master, include_summary=True
+        )
         master = master.reindex(columns=Exporter.BATCH_MASTER_COLUMNS)
         status = master.get(
             "Generic Exists in SFDA",
@@ -913,7 +935,7 @@ class Exporter:
         missing = master.loc[status.eq("MISSING BATCH IN SFDA")].copy()
 
         def prepared(frame, columns=None, sort_columns=None):
-            out = frame.copy() if frame is not None else pd.DataFrame()
+            out = Exporter._with_trade_code_columns(frame)
             if columns is not None:
                 out = out.reindex(columns=columns)
             if sort_columns:
@@ -1098,10 +1120,13 @@ class Exporter:
         )
 
         if is_batch_master:
+            report = Exporter._with_trade_code_columns(report, include_summary=True)
             report = report.reindex(columns=Exporter.BATCH_MASTER_COLUMNS)
         elif is_supplier_history:
+            report = Exporter._with_trade_code_columns(report)
             report = report.reindex(columns=Exporter.SUPPLIER_HISTORY_COLUMNS)
         elif is_customer_history:
+            report = Exporter._with_trade_code_columns(report)
             report = report.reindex(columns=Exporter.CUSTOMER_HISTORY_COLUMNS)
         elif is_full_accept_reconciliation:
             report = report.reindex(

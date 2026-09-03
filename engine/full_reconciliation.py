@@ -14,6 +14,7 @@ from engine.normalizer import (
     Normalizer,
 )
 from engine.pack_size_resolver import PackSizeResolver
+from engine.trade_code import combine_trade_codes
 from engine.validator import Validator
 from engine.reference_data import load_current_warehouse_gln
 
@@ -1387,16 +1388,18 @@ class FullReconciliationEngine:
             master[column] = pd.to_numeric(master[column], errors="coerce").fillna(0)
             master.loc[missing_batch_mask, column] = 0
 
-        master["Trade Item Number"] = (
-            master["Receipt Trade Item Number"].fillna("").astype(str).str.strip()
-        )
-        missing_trade_item = master["Trade Item Number"].eq("")
-        master.loc[missing_trade_item, "Trade Item Number"] = (
-            master.loc[missing_trade_item, "Dispatch Trade Item Number"]
-            .fillna("")
-            .astype(str)
-            .str.strip()
-        )
+        # Batch Master keeps its existing BN + Expiry Month + Generic grain.
+        # A real WMS batch can legitimately move under multiple Trade Codes, so
+        # preserve every distinct code instead of selecting an arbitrary MAX().
+        # Receipt codes remain first because ASN is the physical receipt source;
+        # dispatch-only codes are appended when they add new evidence.
+        master["Trade Item Number"] = [
+            combine_trade_codes(receipt_code, dispatch_code)
+            for receipt_code, dispatch_code in zip(
+                master["Receipt Trade Item Number"],
+                master["Dispatch Trade Item Number"],
+            )
+        ]
 
         master["Trade Description"] = (
             master["Receipt Trade Name"].fillna("").astype(str).str.strip()
@@ -1626,6 +1629,7 @@ class FullReconciliationEngine:
                     "Generic Item Number",
                     "BN",
                     "Expiry Date",
+                    "Trade Item Number",
                 ],
                 kind="stable",
             )
@@ -1814,6 +1818,7 @@ class FullReconciliationEngine:
                     "Generic Item Number",
                     "BN",
                     "Expiry Date",
+                    "Trade Item Number",
                 ],
                 kind="stable",
             )

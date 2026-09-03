@@ -1557,45 +1557,9 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
     started_at = time.perf_counter()
 
     receipt_sql = r"""
-        WITH RankedReceipt AS
+        WITH EligibleReceipt AS
         (
-            SELECT
-                BN,
-                ExpiryMonthKey,
-                ExpiryDate,
-                GenericItemNumber,
-                TradeItemNumber,
-                TradeName,
-                Description,
-                SupplierName,
-                SupplierCode,
-                ItemFamilyGroup,
-                ReceivedQuantity,
-                ReceivedDate,
-                EventKey,
-                InboundShipment,
-                ROW_NUMBER() OVER
-                (
-                    PARTITION BY BN, ExpiryMonthKey, GenericItemNumber
-                    ORDER BY
-                        CASE
-                            WHEN InboundShipment LIKE 'TRK5060%' THEN 0
-                            WHEN InboundShipment LIKE 'TRK800%' THEN 1
-                            ELSE 2
-                        END,
-                        ReceivedDate ASC,
-                        EventKey ASC
-                ) AS rn,
-                MAX(ExpiryDate) OVER
-                    (PARTITION BY BN, ExpiryMonthKey, GenericItemNumber) AS ReceiptExpiryDate,
-                COUNT_BIG(*) OVER
-                    (PARTITION BY BN, ExpiryMonthKey, GenericItemNumber) AS ReceiveRuns,
-                SUM(ReceivedQuantity) OVER
-                    (PARTITION BY BN, ExpiryMonthKey, GenericItemNumber) AS TotalReceiveQty,
-                MIN(ReceivedDate) OVER
-                    (PARTITION BY BN, ExpiryMonthKey, GenericItemNumber) AS FirstReceivedDate,
-                MAX(ReceivedDate) OVER
-                    (PARTITION BY BN, ExpiryMonthKey, GenericItemNumber) AS LastReceivedDate
+            SELECT *
             FROM dbo.ReceiptEvents
             WHERE WarehouseID = ?
               AND (
@@ -1606,6 +1570,71 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
               AND REPLACE(REPLACE(REPLACE(
                     UPPER(LTRIM(RTRIM(ISNULL(ItemFamilyGroup, '')))),
                     ' ', ''), '-', ''), '_', '') <> 'LABORATORYSUPPLIES'
+        ),
+        ReceiptTradeCodes AS
+        (
+            SELECT
+                BN,
+                ExpiryMonthKey,
+                GenericItemNumber,
+                LEFT(
+                    STRING_AGG(CONVERT(nvarchar(max), TradeItemNumber), N' | ')
+                        WITHIN GROUP (ORDER BY TradeItemNumber),
+                    255
+                ) AS TradeItemNumber
+            FROM
+            (
+                SELECT DISTINCT
+                    BN, ExpiryMonthKey, GenericItemNumber, TradeItemNumber
+                FROM EligibleReceipt
+                WHERE NULLIF(LTRIM(RTRIM(TradeItemNumber)), '') IS NOT NULL
+            ) AS distinct_codes
+            GROUP BY BN, ExpiryMonthKey, GenericItemNumber
+        ),
+        RankedReceipt AS
+        (
+            SELECT
+                r.BN,
+                r.ExpiryMonthKey,
+                r.ExpiryDate,
+                r.GenericItemNumber,
+                tc.TradeItemNumber,
+                r.TradeName,
+                r.Description,
+                r.SupplierName,
+                r.SupplierCode,
+                r.ItemFamilyGroup,
+                r.ReceivedQuantity,
+                r.ReceivedDate,
+                r.EventKey,
+                r.InboundShipment,
+                ROW_NUMBER() OVER
+                (
+                    PARTITION BY r.BN, r.ExpiryMonthKey, r.GenericItemNumber
+                    ORDER BY
+                        CASE
+                            WHEN r.InboundShipment LIKE 'TRK5060%' THEN 0
+                            WHEN r.InboundShipment LIKE 'TRK800%' THEN 1
+                            ELSE 2
+                        END,
+                        r.ReceivedDate ASC,
+                        r.EventKey ASC
+                ) AS rn,
+                MAX(r.ExpiryDate) OVER
+                    (PARTITION BY r.BN, r.ExpiryMonthKey, r.GenericItemNumber) AS ReceiptExpiryDate,
+                COUNT_BIG(*) OVER
+                    (PARTITION BY r.BN, r.ExpiryMonthKey, r.GenericItemNumber) AS ReceiveRuns,
+                SUM(r.ReceivedQuantity) OVER
+                    (PARTITION BY r.BN, r.ExpiryMonthKey, r.GenericItemNumber) AS TotalReceiveQty,
+                MIN(r.ReceivedDate) OVER
+                    (PARTITION BY r.BN, r.ExpiryMonthKey, r.GenericItemNumber) AS FirstReceivedDate,
+                MAX(r.ReceivedDate) OVER
+                    (PARTITION BY r.BN, r.ExpiryMonthKey, r.GenericItemNumber) AS LastReceivedDate
+            FROM EligibleReceipt AS r
+            LEFT JOIN ReceiptTradeCodes AS tc
+              ON tc.BN = r.BN
+             AND tc.ExpiryMonthKey = r.ExpiryMonthKey
+             AND tc.GenericItemNumber = r.GenericItemNumber
         )
         SELECT
             BN,
@@ -1627,24 +1656,53 @@ def get_event_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
 
     dispatch_sql = r"""
+        WITH EligibleDispatch AS
+        (
+            SELECT *
+            FROM dbo.DispatchEvents
+            WHERE WarehouseID = ?
+              AND REPLACE(REPLACE(REPLACE(
+                    UPPER(LTRIM(RTRIM(ISNULL(Custody, '')))),
+                    ' ', ''), '-', ''), '_', '') <> 'BIOCHEMICALS'
+        ),
+        DispatchTradeCodes AS
+        (
+            SELECT
+                BN,
+                ExpiryMonthKey,
+                GenericItemNumber,
+                LEFT(
+                    STRING_AGG(CONVERT(nvarchar(max), TradeItemNumber), N' | ')
+                        WITHIN GROUP (ORDER BY TradeItemNumber),
+                    255
+                ) AS TradeItemNumber
+            FROM
+            (
+                SELECT DISTINCT
+                    BN, ExpiryMonthKey, GenericItemNumber, TradeItemNumber
+                FROM EligibleDispatch
+                WHERE NULLIF(LTRIM(RTRIM(TradeItemNumber)), '') IS NOT NULL
+            ) AS distinct_codes
+            GROUP BY BN, ExpiryMonthKey, GenericItemNumber
+        )
         SELECT
-            BN,
-            ExpiryMonthKey AS [Expiry Month Key],
-            MAX(ExpiryDate) AS [Dispatch Expiry Date],
-            GenericItemNumber AS [Generic Item Number],
-            MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
-            MAX(NULLIF(TradeName, '')) AS [Trade Name],
-            MAX(NULLIF(Custody, '')) AS [Custody],
+            d.BN,
+            d.ExpiryMonthKey AS [Expiry Month Key],
+            MAX(d.ExpiryDate) AS [Dispatch Expiry Date],
+            d.GenericItemNumber AS [Generic Item Number],
+            tc.TradeItemNumber AS [Trade Item Number],
+            MAX(NULLIF(d.TradeName, '')) AS [Trade Name],
+            MAX(NULLIF(d.Custody, '')) AS [Custody],
             COUNT_BIG(*) AS [Dispatch Runs],
-            SUM(DispatchedQuantity) AS [Total Dispatched Qty],
-            MIN(DispatchDate) AS [First Dispatch Date],
-            MAX(DispatchDate) AS [Last Dispatch Date]
-        FROM dbo.DispatchEvents
-        WHERE WarehouseID = ?
-          AND REPLACE(REPLACE(REPLACE(
-                UPPER(LTRIM(RTRIM(ISNULL(Custody, '')))),
-                ' ', ''), '-', ''), '_', '') <> 'BIOCHEMICALS'
-        GROUP BY BN, ExpiryMonthKey, GenericItemNumber;
+            SUM(d.DispatchedQuantity) AS [Total Dispatched Qty],
+            MIN(d.DispatchDate) AS [First Dispatch Date],
+            MAX(d.DispatchDate) AS [Last Dispatch Date]
+        FROM EligibleDispatch AS d
+        LEFT JOIN DispatchTradeCodes AS tc
+          ON tc.BN = d.BN
+         AND tc.ExpiryMonthKey = d.ExpiryMonthKey
+         AND tc.GenericItemNumber = d.GenericItemNumber
+        GROUP BY d.BN, d.ExpiryMonthKey, d.GenericItemNumber, tc.TradeItemNumber;
     """
 
     with Database().connect() as connection:
@@ -1678,7 +1736,7 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             ExpiryMonthKey AS [Expiry Month Key],
             MAX(ExpiryDate) AS [Expiry Date],
             GenericItemNumber AS [Generic Item Number],
-            MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
+            TradeItemNumber AS [Trade Item Number],
             MAX(NULLIF(TradeName, '')) AS [Trade Name],
             MAX(NULLIF(Description, '')) AS [Description],
             MAX(NULLIF(ItemFamilyGroup, '')) AS [Item Family Group],
@@ -1691,7 +1749,8 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
           AND REPLACE(REPLACE(REPLACE(
                 UPPER(LTRIM(RTRIM(ISNULL(ItemFamilyGroup, '')))),
                 ' ', ''), '-', ''), '_', '') <> 'LABORATORYSUPPLIES'
-        GROUP BY SupplierName, SupplierCode, BN, ExpiryMonthKey, GenericItemNumber;
+        GROUP BY SupplierName, SupplierCode, BN, ExpiryMonthKey,
+                 GenericItemNumber, TradeItemNumber;
     """
 
     customer_sql = r"""
@@ -1701,7 +1760,7 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
             ExpiryMonthKey AS [Expiry Month Key],
             MAX(ExpiryDate) AS [Expiry Date],
             GenericItemNumber AS [Generic Item Number],
-            MAX(NULLIF(TradeItemNumber, '')) AS [Trade Item Number],
+            TradeItemNumber AS [Trade Item Number],
             MAX(NULLIF(TradeName, '')) AS [Trade Name],
             MAX(NULLIF(Custody, '')) AS [Custody],
             SUM(DispatchedQuantity) AS [Dispatch Quantity Each],
@@ -1712,7 +1771,7 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
           AND REPLACE(REPLACE(REPLACE(
                 UPPER(LTRIM(RTRIM(ISNULL(Custody, '')))),
                 ' ', ''), '-', ''), '_', '') <> 'BIOCHEMICALS'
-        GROUP BY ToAddress, BN, ExpiryMonthKey, GenericItemNumber;
+        GROUP BY ToAddress, BN, ExpiryMonthKey, GenericItemNumber, TradeItemNumber;
     """
 
     with Database().connect() as connection:
@@ -1788,7 +1847,7 @@ def _get_sto_receipt_history(
                 ExpiryMonthKey,
                 MAX(ExpiryDate) AS ExpiryDate,
                 GenericItemNumber,
-                MAX(NULLIF(TradeItemNumber, '')) AS TradeItemNumber,
+                TradeItemNumber,
                 MAX(NULLIF(TradeName, '')) AS TradeName,
                 MAX(NULLIF(Description, '')) AS Description,
                 MAX(NULLIF(ItemFamilyGroup, '')) AS ItemFamilyGroup,
@@ -1803,7 +1862,8 @@ def _get_sto_receipt_history(
                 SupplierCode,
                 BN,
                 ExpiryMonthKey,
-                GenericItemNumber
+                GenericItemNumber,
+                TradeItemNumber
         )
         SELECT
             r.InboundShipment AS [Inbound Shipment],
@@ -1813,6 +1873,7 @@ def _get_sto_receipt_history(
             r.ExpiryMonthKey AS [Expiry Month Key],
             COALESCE(b.ExpiryDate, r.ExpiryDate) AS [Expiry Date],
             r.GenericItemNumber AS [Generic Item Number],
+            COALESCE(NULLIF(r.TradeItemNumber, ''), '') AS [Trade Item Number],
             COALESCE(NULLIF(b.GTIN, ''), '') AS GTIN,
             COALESCE(NULLIF(b.DrugName, ''), '') AS [Drug Name],
             COALESCE(NULLIF(b.TradeName, ''), r.TradeName, '') AS [Trade Description],
@@ -1938,7 +1999,7 @@ def get_returns_history_df() -> pd.DataFrame:
         return pd.DataFrame(columns=[
             "Return Type", "Inbound Shipment", "Return From",
             "Return From Code", "BN", "Expiry Month Key", "Expiry Date",
-            "Generic Item Number", "GTIN", "Drug Name", "Trade Description",
+            "Generic Item Number", "Trade Item Number", "GTIN", "Drug Name", "Trade Description",
             "Description", "Item Family Group", "PackageSize",
             "Received Quantity Each", "Received Quantity Pack",
             "First Received Date", "Last Received Date", "SFDA Match Status",
@@ -1947,7 +2008,7 @@ def get_returns_history_df() -> pd.DataFrame:
 
     result = pd.concat(parts, ignore_index=True, sort=False)
     return result.sort_values(
-        ["Last Received Date", "Return Type", "Return From", "BN"],
+        ["Last Received Date", "Return Type", "Return From", "BN", "Trade Item Number"],
         kind="stable",
     ).reset_index(drop=True)
 
@@ -5916,7 +5977,6 @@ def reconcile_affected_batch_master_event_totals(
                         MAX(NULLIF(r.SupplierCode, N'')) AS SupplierCode,
                         MAX(NULLIF(r.TradeName, N'')) AS TradeName,
                         MAX(NULLIF(r.ItemFamilyGroup, N'')) AS ItemFamilyGroup,
-                        MAX(NULLIF(r.TradeItemNumber, N'')) AS TradeItemNumber,
                         SUM(COALESCE(r.ReceivedQuantity, 0)) AS TotalReceiveQty,
                         COUNT_BIG(*) AS ReceiveRuns,
                         MIN(r.ReceivedDate) AS FirstReceivedDate,
@@ -5954,6 +6014,50 @@ def reconcile_affected_batch_master_event_totals(
                         d.BN,
                         d.ExpiryMonthKey,
                         d.GenericItemNumber
+                ),
+                TradeCodes AS
+                (
+                    SELECT
+                        BN,
+                        ExpiryMonthKey,
+                        GenericItemNumber,
+                        LEFT(
+                            STRING_AGG(CONVERT(nvarchar(max), TradeItemNumber), N' | ')
+                                WITHIN GROUP (ORDER BY SourcePriority, TradeItemNumber),
+                            255
+                        ) AS TradeItemNumber
+                    FROM
+                    (
+                        SELECT
+                            BN,
+                            ExpiryMonthKey,
+                            GenericItemNumber,
+                            TradeItemNumber,
+                            MIN(SourcePriority) AS SourcePriority
+                        FROM
+                        (
+                            SELECT r.BN, r.ExpiryMonthKey, r.GenericItemNumber,
+                                   NULLIF(LTRIM(RTRIM(r.TradeItemNumber)), N'') AS TradeItemNumber,
+                                   0 AS SourcePriority
+                            FROM dbo.ReceiptEvents r
+                            INNER JOIN #AffectedMovementKeys a
+                                ON a.BN = r.BN
+                               AND a.ExpiryMonthKey = r.ExpiryMonthKey
+                               AND a.GenericItemNumber = r.GenericItemNumber
+                            UNION ALL
+                            SELECT d.BN, d.ExpiryMonthKey, d.GenericItemNumber,
+                                   NULLIF(LTRIM(RTRIM(d.TradeItemNumber)), N''),
+                                   1
+                            FROM dbo.DispatchEvents d
+                            INNER JOIN #AffectedMovementKeys a
+                                ON a.BN = d.BN
+                               AND a.ExpiryMonthKey = d.ExpiryMonthKey
+                               AND a.GenericItemNumber = d.GenericItemNumber
+                        ) source_codes
+                        WHERE TradeItemNumber IS NOT NULL
+                        GROUP BY BN, ExpiryMonthKey, GenericItemNumber, TradeItemNumber
+                    ) distinct_codes
+                    GROUP BY BN, ExpiryMonthKey, GenericItemNumber
                 )
                 UPDATE bm
                 SET
@@ -5962,7 +6066,7 @@ def reconcile_affected_batch_master_event_totals(
                     bm.SupplierCode = COALESCE(NULLIF(ra.SupplierCode, N''), bm.SupplierCode),
                     bm.TradeName = COALESCE(NULLIF(ra.TradeName, N''), bm.TradeName),
                     bm.ItemFamilyGroup = COALESCE(NULLIF(ra.ItemFamilyGroup, N''), bm.ItemFamilyGroup),
-                    bm.TradeItemNumber = COALESCE(NULLIF(ra.TradeItemNumber, N''), bm.TradeItemNumber),
+                    bm.TradeItemNumber = COALESCE(NULLIF(tc.TradeItemNumber, N''), bm.TradeItemNumber),
                     bm.TotalReceiveQty = COALESCE(ra.TotalReceiveQty, 0),
                     bm.ReceiveRuns = COALESCE(ra.ReceiveRuns, 0),
                     bm.FirstReceivedDate = ra.FirstReceivedDate,
@@ -5984,7 +6088,11 @@ def reconcile_affected_batch_master_event_totals(
                 LEFT JOIN DispatchAggregate AS da
                     ON da.BN = bm.BN
                    AND da.ExpiryMonthKey = bm.ExpiryMonthKey
-                   AND da.GenericItemNumber = bm.GenericItemNumber;
+                   AND da.GenericItemNumber = bm.GenericItemNumber
+                LEFT JOIN TradeCodes AS tc
+                    ON tc.BN = bm.BN
+                   AND tc.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND tc.GenericItemNumber = bm.GenericItemNumber;
             """)
             reconciled = max(0, int(cursor.rowcount or 0))
             connection.commit()
@@ -6053,9 +6161,43 @@ def reconcile_batch_master_event_totals() -> Dict[str, int]:
                         MAX(NULLIF(d.Custody, N'')) AS Custody
                     FROM dbo.DispatchEvents d
                     GROUP BY d.BN, d.ExpiryMonthKey, d.GenericItemNumber
+                ),
+                TradeCodes AS
+                (
+                    SELECT
+                        BN,
+                        ExpiryMonthKey,
+                        GenericItemNumber,
+                        LEFT(
+                            STRING_AGG(CONVERT(nvarchar(max), TradeItemNumber), N' | ')
+                                WITHIN GROUP (ORDER BY SourcePriority, TradeItemNumber),
+                            255
+                        ) AS TradeItemNumber
+                    FROM
+                    (
+                        SELECT
+                            BN, ExpiryMonthKey, GenericItemNumber, TradeItemNumber,
+                            MIN(SourcePriority) AS SourcePriority
+                        FROM
+                        (
+                            SELECT r.BN, r.ExpiryMonthKey, r.GenericItemNumber,
+                                   NULLIF(LTRIM(RTRIM(r.TradeItemNumber)), N'') AS TradeItemNumber,
+                                   0 AS SourcePriority
+                            FROM dbo.ReceiptEvents r
+                            UNION ALL
+                            SELECT d.BN, d.ExpiryMonthKey, d.GenericItemNumber,
+                                   NULLIF(LTRIM(RTRIM(d.TradeItemNumber)), N''),
+                                   1
+                            FROM dbo.DispatchEvents d
+                        ) source_codes
+                        WHERE TradeItemNumber IS NOT NULL
+                        GROUP BY BN, ExpiryMonthKey, GenericItemNumber, TradeItemNumber
+                    ) distinct_codes
+                    GROUP BY BN, ExpiryMonthKey, GenericItemNumber
                 )
                 UPDATE bm
                 SET
+                    bm.TradeItemNumber = COALESCE(NULLIF(tc.TradeItemNumber, N''), bm.TradeItemNumber),
                     bm.TotalReceiveQty = COALESCE(ra.TotalReceiveQty, 0),
                     bm.ReceiveRuns = COALESCE(ra.ReceiveRuns, 0),
                     bm.FirstReceivedDate = ra.FirstReceivedDate,
@@ -6074,8 +6216,13 @@ def reconcile_batch_master_event_totals() -> Dict[str, int]:
                     ON da.BN = bm.BN
                    AND da.ExpiryMonthKey = bm.ExpiryMonthKey
                    AND da.GenericItemNumber = bm.GenericItemNumber
+                LEFT JOIN TradeCodes tc
+                    ON tc.BN = bm.BN
+                   AND tc.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND tc.GenericItemNumber = bm.GenericItemNumber
                 WHERE
-                    COALESCE(bm.TotalReceiveQty, 0) <> COALESCE(ra.TotalReceiveQty, 0)
+                    ISNULL(bm.TradeItemNumber, N'') <> ISNULL(tc.TradeItemNumber, ISNULL(bm.TradeItemNumber, N''))
+                    OR COALESCE(bm.TotalReceiveQty, 0) <> COALESCE(ra.TotalReceiveQty, 0)
                     OR COALESCE(bm.ReceiveRuns, 0) <> COALESCE(ra.ReceiveRuns, 0)
                     OR ISNULL(bm.FirstReceivedDate, '19000101') <> ISNULL(ra.FirstReceivedDate, '19000101')
                     OR ISNULL(bm.LastReceivedDate, '19000101') <> ISNULL(ra.LastReceivedDate, '19000101')
@@ -6627,7 +6774,6 @@ def refresh_historical_append_incremental(
                     r.ExpiryMonthKey,
                     r.GenericItemNumber,
                     MAX(r.ExpiryDate) AS ExpiryDate,
-                    MAX(NULLIF(r.TradeItemNumber, N'')) AS TradeItemNumber,
                     MAX(NULLIF(r.TradeName, N'')) AS TradeName,
                     MAX(NULLIF(r.Description, N'')) AS Description,
                     MAX(NULLIF(r.ItemFamilyGroup, N'')) AS ItemFamilyGroup,
@@ -6649,7 +6795,6 @@ def refresh_historical_append_incremental(
                     d.ExpiryMonthKey,
                     d.GenericItemNumber,
                     MAX(d.ExpiryDate) AS ExpiryDate,
-                    MAX(NULLIF(d.TradeItemNumber, N'')) AS TradeItemNumber,
                     MAX(NULLIF(d.TradeName, N'')) AS TradeName,
                     SUM(COALESCE(d.DispatchedQuantity, 0)) AS TotalDispatchedQty,
                     COUNT_BIG(*) AS DispatchRuns,
@@ -6662,6 +6807,47 @@ def refresh_historical_append_incremental(
 
                 CREATE UNIQUE CLUSTERED INDEX IX_DispatchAggregate_Batch
                     ON #DispatchAggregate (BN, ExpiryMonthKey, GenericItemNumber);
+
+                SELECT
+                    BN,
+                    ExpiryMonthKey,
+                    GenericItemNumber,
+                    LEFT(
+                        STRING_AGG(CONVERT(nvarchar(max), TradeItemNumber), N' | ')
+                            WITHIN GROUP (ORDER BY SourcePriority, TradeItemNumber),
+                        255
+                    ) AS TradeItemNumber
+                INTO #BatchTradeCodes
+                FROM
+                (
+                    SELECT
+                        BN,
+                        ExpiryMonthKey,
+                        GenericItemNumber,
+                        TradeItemNumber,
+                        MIN(SourcePriority) AS SourcePriority
+                    FROM
+                    (
+                        SELECT
+                            BN, ExpiryMonthKey, GenericItemNumber,
+                            TradeItemNumber, 0 AS SourcePriority
+                        FROM #ReceiptAffectedRows
+                        WHERE NULLIF(LTRIM(RTRIM(TradeItemNumber)), N'') IS NOT NULL
+
+                        UNION ALL
+
+                        SELECT
+                            BN, ExpiryMonthKey, GenericItemNumber,
+                            TradeItemNumber, 1 AS SourcePriority
+                        FROM #DispatchAffectedRows
+                        WHERE NULLIF(LTRIM(RTRIM(TradeItemNumber)), N'') IS NOT NULL
+                    ) AS all_codes
+                    GROUP BY BN, ExpiryMonthKey, GenericItemNumber, TradeItemNumber
+                ) AS distinct_codes
+                GROUP BY BN, ExpiryMonthKey, GenericItemNumber;
+
+                CREATE UNIQUE CLUSTERED INDEX IX_BatchTradeCodes_Batch
+                    ON #BatchTradeCodes (BN, ExpiryMonthKey, GenericItemNumber);
             """)
             timings["aggregate_movement_events"] = round(time.perf_counter() - aggregate_started, 3)
 
@@ -6670,7 +6856,7 @@ def refresh_historical_append_incremental(
                 UPDATE bm
                 SET
                     bm.ExpiryDate = COALESCE(sf.ExpiryDate, ra.ExpiryDate, da.ExpiryDate, bm.ExpiryDate),
-                    bm.TradeItemNumber = COALESCE(NULLIF(ra.TradeItemNumber, N''), NULLIF(da.TradeItemNumber, N''), bm.TradeItemNumber),
+                    bm.TradeItemNumber = COALESCE(NULLIF(btc.TradeItemNumber, N''), bm.TradeItemNumber),
                     bm.TradeName = COALESCE(NULLIF(ra.TradeName, N''), NULLIF(da.TradeName, N''), bm.TradeName),
                     bm.Description = COALESCE(NULLIF(ra.Description, N''), bm.Description),
                     bm.ItemFamilyGroup = COALESCE(NULLIF(ra.ItemFamilyGroup, N''), bm.ItemFamilyGroup),
@@ -6711,6 +6897,10 @@ def refresh_historical_append_incremental(
                     ON da.BN = bm.BN
                    AND da.ExpiryMonthKey = bm.ExpiryMonthKey
                    AND da.GenericItemNumber = bm.GenericItemNumber
+                LEFT JOIN #BatchTradeCodes AS btc
+                    ON btc.BN = bm.BN
+                   AND btc.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND btc.GenericItemNumber = bm.GenericItemNumber
                 OUTER APPLY
                 (
                     SELECT TOP (1)
@@ -6809,7 +6999,7 @@ def refresh_historical_append_incremental(
                     a.ExpiryMonthKey,
                     COALESCE(sf.ExpiryDate, ra.ExpiryDate, da.ExpiryDate),
                     a.GenericItemNumber,
-                    COALESCE(NULLIF(ra.TradeItemNumber, N''), NULLIF(da.TradeItemNumber, N''), gr.TradeItemNumber, N''),
+                    COALESCE(NULLIF(btc.TradeItemNumber, N''), gr.TradeItemNumber, N''),
                     COALESCE(NULLIF(ra.TradeName, N''), NULLIF(da.TradeName, N''), gr.TradeName, N''),
                     COALESCE(NULLIF(sf.GTIN, N''), gr.GTIN, N''),
                     COALESCE(NULLIF(sf.DrugName, N''), gr.DrugName, N''),
@@ -6846,6 +7036,10 @@ def refresh_historical_append_incremental(
                     ON da.BN = a.BN
                    AND da.ExpiryMonthKey = a.ExpiryMonthKey
                    AND da.GenericItemNumber = a.GenericItemNumber
+                LEFT JOIN #BatchTradeCodes AS btc
+                    ON btc.BN = a.BN
+                   AND btc.ExpiryMonthKey = a.ExpiryMonthKey
+                   AND btc.GenericItemNumber = a.GenericItemNumber
                 LEFT JOIN GenericReference AS gr
                     ON gr.GenericItemNumber = a.GenericItemNumber
                 OUTER APPLY
@@ -6920,7 +7114,7 @@ def refresh_historical_append_incremental(
                     MIN(r.ReceivedDate),
                     MAX(r.ReceivedDate),
                     COALESCE(NULLIF(MAX(r.ItemFamilyGroup), N''), bm.ItemFamilyGroup, N''),
-                    COALESCE(NULLIF(MAX(r.TradeItemNumber), N''), bm.TradeItemNumber, N''),
+                    COALESCE(NULLIF(r.TradeItemNumber, N''), N''),
                     SYSUTCDATETIME()
                 FROM #ReceiptAffectedRows AS r
                 INNER JOIN #AffectedAcceptKeys AS a
@@ -6941,7 +7135,7 @@ def refresh_historical_append_incremental(
                     r.SupplierName, r.SupplierCode, r.BN, r.ExpiryMonthKey,
                     r.GenericItemNumber, bm.GTIN, bm.DrugName, bm.Description,
                     bm.TradeName, bm.ExpiryDate, bm.PackageSize,
-                    bm.ItemFamilyGroup, bm.TradeItemNumber;
+                    bm.ItemFamilyGroup, bm.TradeItemNumber, r.TradeItemNumber;
             """, warehouse_id, build_id)
             supplier_rebuilt = max(0, int(cursor.rowcount or 0))
             timings["supplier_history_refresh"] = round(time.perf_counter() - supplier_started, 3)
@@ -6984,7 +7178,7 @@ def refresh_historical_append_incremental(
                     MIN(d.DispatchDate),
                     MAX(d.DispatchDate),
                     COALESCE(NULLIF(MAX(d.Custody), N''), NULLIF(MAX(bm.Custody), N''), N''),
-                    COALESCE(NULLIF(MAX(d.TradeItemNumber), N''), bm.TradeItemNumber, N''),
+                    COALESCE(NULLIF(d.TradeItemNumber, N''), N''),
                     SYSUTCDATETIME()
                 FROM #DispatchAffectedRows AS d
                 INNER JOIN #AffectedDispatchKeys AS a
@@ -7007,7 +7201,8 @@ def refresh_historical_append_incremental(
                     bm.TradeName,
                     bm.ExpiryDate,
                     bm.PackageSize,
-                    bm.TradeItemNumber;
+                    bm.TradeItemNumber,
+                    d.TradeItemNumber;
             """, warehouse_id, build_id)
             customer_rebuilt = max(0, int(cursor.rowcount or 0))
             timings["customer_history_refresh"] = round(time.perf_counter() - customer_started, 3)
@@ -7121,6 +7316,51 @@ def refresh_accept_history_incremental(
             )
 
             cursor.execute(r"""
+                SELECT
+                    BN,
+                    ExpiryMonthKey,
+                    GenericItemNumber,
+                    LEFT(
+                        STRING_AGG(CONVERT(nvarchar(max), TradeItemNumber), N' | ')
+                            WITHIN GROUP (ORDER BY SourcePriority, TradeItemNumber),
+                        255
+                    ) AS TradeItemNumber
+                INTO #AffectedAcceptTradeCodes
+                FROM
+                (
+                    SELECT
+                        BN, ExpiryMonthKey, GenericItemNumber, TradeItemNumber,
+                        MIN(SourcePriority) AS SourcePriority
+                    FROM
+                    (
+                        SELECT r.BN, r.ExpiryMonthKey, r.GenericItemNumber,
+                               NULLIF(LTRIM(RTRIM(r.TradeItemNumber)), N'') AS TradeItemNumber,
+                               0 AS SourcePriority
+                        FROM dbo.ReceiptEvents r
+                        INNER JOIN #AffectedAcceptKeys a
+                            ON a.BN = r.BN
+                           AND a.ExpiryMonthKey = r.ExpiryMonthKey
+                           AND a.GenericItemNumber = r.GenericItemNumber
+                        UNION ALL
+                        SELECT d.BN, d.ExpiryMonthKey, d.GenericItemNumber,
+                               NULLIF(LTRIM(RTRIM(d.TradeItemNumber)), N''),
+                               1
+                        FROM dbo.DispatchEvents d
+                        INNER JOIN #AffectedAcceptKeys a
+                            ON a.BN = d.BN
+                           AND a.ExpiryMonthKey = d.ExpiryMonthKey
+                           AND a.GenericItemNumber = d.GenericItemNumber
+                    ) source_codes
+                    WHERE TradeItemNumber IS NOT NULL
+                    GROUP BY BN, ExpiryMonthKey, GenericItemNumber, TradeItemNumber
+                ) distinct_codes
+                GROUP BY BN, ExpiryMonthKey, GenericItemNumber;
+
+                CREATE UNIQUE CLUSTERED INDEX IX_AffectedAcceptTradeCodes_Batch
+                    ON #AffectedAcceptTradeCodes (BN, ExpiryMonthKey, GenericItemNumber);
+            """)
+
+            cursor.execute(r"""
                 CREATE TABLE #CurrentAcceptSFDA
                 (
                     GTIN nvarchar(255) NULL,
@@ -7159,7 +7399,6 @@ def refresh_accept_history_incremental(
                         r.ExpiryMonthKey,
                         r.GenericItemNumber,
                         MAX(r.ExpiryDate) AS ExpiryDate,
-                        MAX(NULLIF(r.TradeItemNumber, N'')) AS TradeItemNumber,
                         MAX(NULLIF(r.TradeName, N'')) AS TradeName,
                         MAX(NULLIF(r.Description, N'')) AS Description,
                         MAX(NULLIF(r.ItemFamilyGroup, N'')) AS ItemFamilyGroup,
@@ -7183,7 +7422,7 @@ def refresh_accept_history_incremental(
                 UPDATE bm
                 SET
                     bm.ExpiryDate = COALESCE(sf.ExpiryDate, ra.ExpiryDate, bm.ExpiryDate),
-                    bm.TradeItemNumber = COALESCE(NULLIF(ra.TradeItemNumber, N''), bm.TradeItemNumber),
+                    bm.TradeItemNumber = COALESCE(NULLIF(tc.TradeItemNumber, N''), bm.TradeItemNumber),
                     bm.TradeName = COALESCE(NULLIF(ra.TradeName, N''), bm.TradeName),
                     bm.Description = COALESCE(NULLIF(ra.Description, N''), bm.Description),
                     bm.ItemFamilyGroup = COALESCE(NULLIF(ra.ItemFamilyGroup, N''), bm.ItemFamilyGroup),
@@ -7207,6 +7446,10 @@ def refresh_accept_history_incremental(
                     ON ra.BN = bm.BN
                    AND ra.ExpiryMonthKey = bm.ExpiryMonthKey
                    AND ra.GenericItemNumber = bm.GenericItemNumber
+                LEFT JOIN #AffectedAcceptTradeCodes tc
+                    ON tc.BN = bm.BN
+                   AND tc.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND tc.GenericItemNumber = bm.GenericItemNumber
                 OUTER APPLY
                 (
                     SELECT TOP (1)
@@ -7232,7 +7475,6 @@ def refresh_accept_history_incremental(
                         r.ExpiryMonthKey,
                         r.GenericItemNumber,
                         MAX(r.ExpiryDate) AS ExpiryDate,
-                        MAX(NULLIF(r.TradeItemNumber, N'')) AS TradeItemNumber,
                         MAX(NULLIF(r.TradeName, N'')) AS TradeName,
                         MAX(NULLIF(r.Description, N'')) AS Description,
                         MAX(NULLIF(r.ItemFamilyGroup, N'')) AS ItemFamilyGroup,
@@ -7326,7 +7568,7 @@ def refresh_accept_history_incremental(
                     ra.ExpiryMonthKey,
                     COALESCE(sf.ExpiryDate, ra.ExpiryDate),
                     ra.GenericItemNumber,
-                    COALESCE(NULLIF(ra.TradeItemNumber, N''), gr.TradeItemNumber, N''),
+                    COALESCE(NULLIF(tc.TradeItemNumber, N''), gr.TradeItemNumber, N''),
                     COALESCE(NULLIF(ra.TradeName, N''), gr.TradeName, N''),
                     COALESCE(NULLIF(sf.GTIN, N''), gr.GTIN, N''),
                     COALESCE(NULLIF(sf.DrugName, N''), gr.DrugName, N''),
@@ -7350,6 +7592,10 @@ def refresh_accept_history_incremental(
                     CASE WHEN sf.BN IS NOT NULL THEN N'Yes' ELSE N'Missing Batch in SFDA' END,
                     SYSUTCDATETIME()
                 FROM ReceiptAggregate ra
+                LEFT JOIN #AffectedAcceptTradeCodes tc
+                    ON tc.BN = ra.BN
+                   AND tc.ExpiryMonthKey = ra.ExpiryMonthKey
+                   AND tc.GenericItemNumber = ra.GenericItemNumber
                 LEFT JOIN GenericReference gr
                     ON gr.GenericItemNumber = ra.GenericItemNumber
                 LEFT JOIN DispatchAggregate da
@@ -7420,7 +7666,7 @@ def refresh_accept_history_incremental(
                     MIN(r.ReceivedDate),
                     MAX(r.ReceivedDate),
                     COALESCE(NULLIF(MAX(r.ItemFamilyGroup), N''), bm.ItemFamilyGroup, N''),
-                    COALESCE(NULLIF(MAX(r.TradeItemNumber), N''), bm.TradeItemNumber, N''),
+                    COALESCE(NULLIF(r.TradeItemNumber, N''), N''),
                     SYSUTCDATETIME()
                 FROM dbo.ReceiptEvents r
                 INNER JOIN #AffectedAcceptKeys a
@@ -7437,7 +7683,7 @@ def refresh_accept_history_incremental(
                         N' ', N''), N'-', N''), N'_', N'') <> N'LABORATORYSUPPLIES'
                 GROUP BY
                     r.SupplierName, r.SupplierCode, r.BN, r.ExpiryMonthKey,
-                    r.GenericItemNumber, bm.GTIN, bm.DrugName, bm.Description,
+                    r.GenericItemNumber, r.TradeItemNumber, bm.GTIN, bm.DrugName, bm.Description,
                     bm.TradeName, bm.ExpiryDate, bm.PackageSize,
                     bm.ItemFamilyGroup, bm.TradeItemNumber;
             """)
@@ -7552,6 +7798,51 @@ def refresh_dispatch_history_incremental(
                 affected,
             )
 
+            cursor.execute(r"""
+                SELECT
+                    BN,
+                    ExpiryMonthKey,
+                    GenericItemNumber,
+                    LEFT(
+                        STRING_AGG(CONVERT(nvarchar(max), TradeItemNumber), N' | ')
+                            WITHIN GROUP (ORDER BY SourcePriority, TradeItemNumber),
+                        255
+                    ) AS TradeItemNumber
+                INTO #AffectedDispatchTradeCodes
+                FROM
+                (
+                    SELECT
+                        BN, ExpiryMonthKey, GenericItemNumber, TradeItemNumber,
+                        MIN(SourcePriority) AS SourcePriority
+                    FROM
+                    (
+                        SELECT r.BN, r.ExpiryMonthKey, r.GenericItemNumber,
+                               NULLIF(LTRIM(RTRIM(r.TradeItemNumber)), N'') AS TradeItemNumber,
+                               0 AS SourcePriority
+                        FROM dbo.ReceiptEvents r
+                        INNER JOIN #AffectedDispatchKeys a
+                            ON a.BN = r.BN
+                           AND a.ExpiryMonthKey = r.ExpiryMonthKey
+                           AND a.GenericItemNumber = r.GenericItemNumber
+                        UNION ALL
+                        SELECT d.BN, d.ExpiryMonthKey, d.GenericItemNumber,
+                               NULLIF(LTRIM(RTRIM(d.TradeItemNumber)), N''),
+                               1
+                        FROM dbo.DispatchEvents d
+                        INNER JOIN #AffectedDispatchKeys a
+                            ON a.BN = d.BN
+                           AND a.ExpiryMonthKey = d.ExpiryMonthKey
+                           AND a.GenericItemNumber = d.GenericItemNumber
+                    ) source_codes
+                    WHERE TradeItemNumber IS NOT NULL
+                    GROUP BY BN, ExpiryMonthKey, GenericItemNumber, TradeItemNumber
+                ) distinct_codes
+                GROUP BY BN, ExpiryMonthKey, GenericItemNumber;
+
+                CREATE UNIQUE CLUSTERED INDEX IX_AffectedDispatchTradeCodes_Batch
+                    ON #AffectedDispatchTradeCodes (BN, ExpiryMonthKey, GenericItemNumber);
+            """)
+
             # Recalculate dispatch totals only for affected Batch Master rows.
             cursor.execute(r"""
                 ;WITH DispatchAggregate AS
@@ -7574,6 +7865,7 @@ def refresh_dispatch_history_incremental(
                 )
                 UPDATE bm
                 SET
+                    bm.TradeItemNumber = COALESCE(NULLIF(tc.TradeItemNumber, N''), bm.TradeItemNumber),
                     bm.TotalDispatchedQty = COALESCE(a.TotalDispatchedQty, 0),
                     bm.DispatchRuns = COALESCE(a.DispatchRuns, 0),
                     bm.FirstDispatchDate = a.FirstDispatchDate,
@@ -7584,7 +7876,11 @@ def refresh_dispatch_history_incremental(
                 INNER JOIN DispatchAggregate a
                     ON a.BN = bm.BN
                    AND a.ExpiryMonthKey = bm.ExpiryMonthKey
-                   AND a.GenericItemNumber = bm.GenericItemNumber;
+                   AND a.GenericItemNumber = bm.GenericItemNumber
+                LEFT JOIN #AffectedDispatchTradeCodes tc
+                    ON tc.BN = bm.BN
+                   AND tc.ExpiryMonthKey = bm.ExpiryMonthKey
+                   AND tc.GenericItemNumber = bm.GenericItemNumber;
             """)
             batch_updated = max(0, int(cursor.rowcount or 0))
 
@@ -7628,7 +7924,7 @@ def refresh_dispatch_history_incremental(
                     MIN(d.DispatchDate),
                     MAX(d.DispatchDate),
                     COALESCE(NULLIF(MAX(d.Custody), N''), NULLIF(MAX(bm.Custody), N''), N''),
-                    COALESCE(NULLIF(MAX(d.TradeItemNumber), N''), bm.TradeItemNumber, N''),
+                    COALESCE(NULLIF(d.TradeItemNumber, N''), N''),
                     SYSUTCDATETIME()
                 FROM dbo.DispatchEvents d
                 INNER JOIN #AffectedDispatchKeys a
@@ -7644,6 +7940,7 @@ def refresh_dispatch_history_incremental(
                     d.BN,
                     d.ExpiryMonthKey,
                     d.GenericItemNumber,
+                    d.TradeItemNumber,
                     bm.GTIN,
                     bm.DrugName,
                     bm.TradeName,

@@ -46,12 +46,13 @@ from engine.full_reconciliation import (
     FullReconciliationEngine,
 )
 from engine.normalizer import HISTORICAL_MATCH_LOGIC_VERSION
+from engine.trade_code import TRADE_CODE_LOGIC_VERSION, aggregate_trade_codes
 from engine.warehouse_context import historical_build_scope, warehouse_scope
 
 
 logger = logging.getLogger("SFDA-Reconciliation.HistoricalJobs")
 
-HISTORICAL_JOB_WORKER_VERSION = "HISTORICAL_WORKER_V7_LPN_COLLISION_SAFE_20260902"
+HISTORICAL_JOB_WORKER_VERSION = "HISTORICAL_WORKER_V8_TRADE_CODE_GRAIN_20260903"
 
 
 def _supports_keyword_argument(func: Any, keyword: str) -> bool:
@@ -228,25 +229,25 @@ def _build_rebuild_summaries_from_prepared(
         agg = eligible.groupby(keys, dropna=False).agg(
             **{
                 "Receipt Expiry Date": ("Expiry Date", "max"),
+                "Trade Item Number": ("Trade Item", aggregate_trade_codes),
                 "Receive Runs": ("Event Key", "size"),
                 "Total Receive Qty": ("Received Quantity", "sum"),
                 "First Received Date": ("Received Date", "min"),
                 "Last Received Date": ("Received Date", "max"),
             }
         ).reset_index()
-        preferred = preferred.rename(columns={"Trade Item": "Trade Item Number"})
-        keep = keys + ["Trade Item Number", "Trade Name", "Description", "Supplier Name", "Supplier Code", "Item Family Group"]
+        keep = keys + ["Trade Name", "Description", "Supplier Name", "Supplier Code", "Item Family Group"]
         receipt_summary = preferred[keep].merge(agg, on=keys, how="inner", validate="one_to_one")
 
         supplier_source = receipt.loc[shipment.str.startswith("TRK5060")].copy()
         if supplier_source.empty:
             supplier_summary = pd.DataFrame()
         else:
-            skeys = ["Supplier Name", "Supplier Code", *keys]
+            supplier_source["Trade Item Number"] = supplier_source["Trade Item"]
+            skeys = ["Supplier Name", "Supplier Code", *keys, "Trade Item Number"]
             supplier_summary = supplier_source.groupby(skeys, dropna=False).agg(
                 **{
                     "Expiry Date": ("Expiry Date", "max"),
-                    "Trade Item Number": ("Trade Item", _nonblank_max),
                     "Trade Name": ("Trade Name", _nonblank_max),
                     "Description": ("Description", _nonblank_max),
                     "Item Family Group": ("Item Family Group", _nonblank_max),
@@ -266,7 +267,7 @@ def _build_rebuild_summaries_from_prepared(
         dispatch_summary = dispatch.groupby(keys, dropna=False).agg(
             **{
                 "Dispatch Expiry Date": ("Expiry Date", "max"),
-                "Trade Item Number": ("Trade Item Number", _nonblank_max),
+                "Trade Item Number": ("Trade Item Number", aggregate_trade_codes),
                 "Trade Name": ("Trade Name", _nonblank_max),
                 "Custody": ("Custody", _nonblank_max),
                 "Dispatch Runs": ("Event Key", "size"),
@@ -276,11 +277,10 @@ def _build_rebuild_summaries_from_prepared(
             }
         ).reset_index()
 
-        ckeys = ["To Address", *keys]
+        ckeys = ["To Address", *keys, "Trade Item Number"]
         customer_summary = dispatch.groupby(ckeys, dropna=False).agg(
             **{
                 "Expiry Date": ("Expiry Date", "max"),
-                "Trade Item Number": ("Trade Item Number", _nonblank_max),
                 "Trade Name": ("Trade Name", _nonblank_max),
                 "Custody": ("Custody", _nonblank_max),
                 "Dispatch Quantity Each": ("Dispatched Quantity", "sum"),
@@ -312,11 +312,14 @@ def _build_sto_history_from_prepared(
     source["Received Quantity"] = pd.to_numeric(source["Received Quantity"], errors="coerce").fillna(0)
     source["Received Date"] = pd.to_datetime(source["Received Date"], errors="coerce")
     source["Expiry Date"] = pd.to_datetime(source["Expiry Date"], errors="coerce")
-    keys = ["Inbound Shipment", "Supplier Name", "Supplier Code", "BN", "Expiry Month Key", "Generic Item Number"]
+    source["Trade Item Number"] = source["Trade Item"]
+    keys = [
+        "Inbound Shipment", "Supplier Name", "Supplier Code", "BN",
+        "Expiry Month Key", "Generic Item Number", "Trade Item Number",
+    ]
     agg = source.groupby(keys, dropna=False).agg(
         **{
             "Receipt Expiry Date": ("Expiry Date", "max"),
-            "Trade Item Number": ("Trade Item", _nonblank_max),
             "Receipt Trade Name": ("Trade Name", _nonblank_max),
             "Description": ("Description", _nonblank_max),
             "Item Family Group": ("Item Family Group", _nonblank_max),
@@ -355,6 +358,7 @@ def _build_sto_history_from_prepared(
             "Expiry Month Key": r.get("Expiry Month Key", ""),
             "Expiry Date": ref.get("Expiry Date") if pd.notna(ref.get("Expiry Date")) else r.get("Receipt Expiry Date"),
             "Generic Item Number": generic,
+            "Trade Item Number": r.get("Trade Item Number", ""),
             "GTIN": ref.get("GTIN", ""),
             "Drug Name": ref.get("Drug Name", ""),
             "Trade Description": ref.get("Trade Description", "") or r.get("Receipt Trade Name", ""),
@@ -802,6 +806,7 @@ def process_historical_build_job(
             "historical_job_worker_version": HISTORICAL_JOB_WORKER_VERSION,
             "historical_match_logic_version": HISTORICAL_MATCH_LOGIC_VERSION,
             "historical_receipt_event_key_version": HISTORICAL_RECEIPT_EVENT_KEY_VERSION,
+            "trade_code_logic_version": TRADE_CODE_LOGIC_VERSION,
             "receipt_event_key_diagnostics": dict(
                 prepared.get("receipt_event_key_diagnostics") or {}
             ),
