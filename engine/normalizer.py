@@ -8,7 +8,7 @@ import pandas as pd
 # Historical matching deployment signature. This value is written into every
 # completed Historical Rebuild/Append SummaryJson so production SQL can prove
 # exactly which matching logic the Azure worker executed.
-HISTORICAL_MATCH_LOGIC_VERSION = "SFDA_IDENTITY_V6_CROSS_SOURCE_CONCENTRATION_20260902"
+HISTORICAL_MATCH_LOGIC_VERSION = "SFDA_IDENTITY_V7_TARGETED_DOSE_IDENTITY_20260903"
 HISTORICAL_MATCH_LEGACY_THRESHOLD = 60.0
 
 
@@ -138,6 +138,14 @@ class Normalizer:
         "HYDROCHLORIDE", "ACID", "BICARBONATE",
     }
 
+    # Curated regulatory/operational naming bridges. These aliases are only
+    # consumed after an exact BN + expiry-month candidate is found; they never
+    # create an SFDA candidate or prove a Generic on their own.
+    _KNOWN_PRODUCT_IDENTITY_PHRASES = (
+        ("TISSEEL", "GLUE TISSUE"),
+        ("THYMOGLOBULINE", "ANTITHYMOCYTE GLOBULIN"),
+    )
+
     @staticmethod
     def _mass_to_mg(number, unit):
         unit = str(unit or "").upper()
@@ -253,6 +261,29 @@ class Normalizer:
                     continue
                 for mass_text in (first_mass, second_mass):
                     mass_mg = Normalizer._mass_to_mg(float(mass_text), mass_unit)
+                    values.add(round(mass_mg / volume_ml, 9))
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+
+        # WMS sometimes omits the slash between a total dose and its volume,
+        # e.g. ``4MG2ML`` or ``4MG 2ML``. The explicit mass-unit + volume-unit
+        # structure is narrow enough to distinguish this from a standalone
+        # strength such as ``15MG``.
+        compact_dose_volume_pattern = re.compile(
+            r"(?<![A-Z0-9])"
+            r"(\d+(?:\.\d+)?)\s*(MCG|UG|MG|GM|G|KG)"
+            r"\s*(\d+(?:\.\d+)?)\s*(ML|L)\b"
+        )
+        for (
+            mass_text,
+            mass_unit,
+            volume_text,
+            volume_unit,
+        ) in compact_dose_volume_pattern.findall(raw):
+            try:
+                mass_mg = Normalizer._mass_to_mg(float(mass_text), mass_unit)
+                volume_ml = Normalizer._volume_to_ml(float(volume_text), volume_unit)
+                if volume_ml > 0:
                     values.add(round(mass_mg / volume_ml, 9))
             except (TypeError, ValueError, ZeroDivisionError):
                 continue
@@ -444,6 +475,60 @@ class Normalizer:
         )
 
     @staticmethod
+    def _known_product_identity_alias(sfda_name, wms_trade_description):
+        """Return True for a deliberately curated cross-system product alias."""
+        left = re.sub(r"[^A-Z0-9]+", "", str(sfda_name or "").upper())
+        right = re.sub(r"[^A-Z0-9]+", "", str(wms_trade_description or "").upper())
+        if not left or not right:
+            return False
+
+        for first, second in Normalizer._KNOWN_PRODUCT_IDENTITY_PHRASES:
+            first_key = re.sub(r"[^A-Z0-9]+", "", first.upper())
+            second_key = re.sub(r"[^A-Z0-9]+", "", second.upper())
+            if (
+                (first_key in left and second_key in right)
+                or (second_key in left and first_key in right)
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _explicit_combination_mass_total(value):
+        """Return the total mg for an explicitly ``+`` separated combination."""
+        raw = "" if value is None else str(value).upper().replace(",", ".")
+        if "+" not in raw:
+            return None
+
+        measurements = Normalizer._mass_measurements(raw)
+        if len(measurements) < 2:
+            return None
+        return round(sum(mass_mg for mass_mg, _raw, _unit in measurements), 9)
+
+    @staticmethod
+    def _combination_total_mass_equivalent(left_name, right_name):
+        """Compare an explicit ingredient sum with the other side's total dose."""
+        left_total = Normalizer._explicit_combination_mass_total(left_name)
+        right_total = Normalizer._explicit_combination_mass_total(right_name)
+        left_masses = {
+            value
+            for value, _raw, _unit in Normalizer._mass_measurements(left_name)
+        }
+        right_masses = {
+            value
+            for value, _raw, _unit in Normalizer._mass_measurements(right_name)
+        }
+
+        if left_total is not None and any(
+            Normalizer._close_numeric(left_total, value) for value in right_masses
+        ):
+            return True
+        if right_total is not None and any(
+            Normalizer._close_numeric(right_total, value) for value in left_masses
+        ):
+            return True
+        return False
+
+    @staticmethod
     def _strength_relation(sfda_name, wms_trade_description, product_evidence=False):
         """Return ``match``, ``conflict`` or ``unknown`` for dosage evidence.
 
@@ -477,6 +562,14 @@ class Normalizer:
         # One side may state a concentration while the other abbreviates it to
         # the per-ml mass (e.g. SURLEX 200MG/2ML vs SURLEX 100MG).
         if product_evidence:
+            # Registered combination products may state the total strength on
+            # one side and explicit ingredient strengths on the other, e.g.
+            # MADOPAR 250MG vs LEVODOPA 200MG + BENSERAZIDE 50MG.
+            if Normalizer._combination_total_mass_equivalent(
+                sfda_name, wms_trade_description
+            ):
+                return "match"
+
             if sfda_conc and wms_mass and any(
                 Normalizer._close_numeric(c, m)
                 for c in sfda_conc
@@ -564,6 +657,11 @@ class Normalizer:
 
     @staticmethod
     def _has_shared_identity_token(sfda_name, wms_trade_description):
+        if Normalizer._known_product_identity_alias(
+            sfda_name, wms_trade_description
+        ):
+            return True
+
         left_compact = Normalizer.compact_identity_key(sfda_name)
         right_compact = Normalizer.compact_identity_key(wms_trade_description)
         if left_compact and right_compact and min(len(left_compact), len(right_compact)) >= 6:
