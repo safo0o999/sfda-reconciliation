@@ -14,7 +14,7 @@ from engine.normalizer import (
     Normalizer,
 )
 from engine.pack_size_resolver import PackSizeResolver
-from engine.trade_code import combine_trade_codes
+from engine.trade_code import aggregate_trade_codes, combine_trade_codes
 from engine.validator import Validator
 from engine.reference_data import load_current_warehouse_gln
 
@@ -218,14 +218,13 @@ class FullReconciliationEngine:
         "Expiry Date",
         "Expiry Month Key",
         "Generic Item Number",
+        "Trade Item Number",
         "Custody",
         "PackageSize",
         "Historical Dispatch Quantity Each",
         "Historical Dispatch Quantity Pack",
         "Previously Confirmed Full Dispatch Each",
         "Previously Confirmed Full Dispatch Pack",
-        "Reserved Full Dispatch Quantity Each",
-        "Reserved Full Dispatch Quantity Pack",
         "Available Historical Dispatch Quantity Each",
         "Available Historical Dispatch Quantity Pack",
         "Current Inventory Quantity Each",
@@ -2093,6 +2092,10 @@ class FullReconciliationEngine:
                         "sum",
                     ),
                     "Inventory Trade Name": ("Trade Name", "first"),
+                    "Inventory Trade Item Number": (
+                        "Trade Item Number",
+                        aggregate_trade_codes,
+                    ),
                 }
             )
             .reset_index()
@@ -2665,9 +2668,22 @@ class FullReconciliationEngine:
         customer["Customer Status"] = "REGISTERED"
         customer.loc[missing_gln, "Customer Status"] = "DUMMY"
 
-        batch_current = inventory.groupby(
-            self.KEYS, dropna=False
-        )["Current Inventory Quantity Each"].sum().reset_index()
+        batch_current = (
+            inventory.groupby(self.KEYS, dropna=False)
+            .agg(
+                **{
+                    "Current Inventory Quantity Each": (
+                        "Current Inventory Quantity Each",
+                        "sum",
+                    ),
+                    "Inventory Trade Item Number": (
+                        "Inventory Trade Item Number",
+                        aggregate_trade_codes,
+                    ),
+                }
+            )
+            .reset_index()
+        )
         target = sfda.merge(
             batch_current,
             on=self.KEYS,
@@ -2677,6 +2693,45 @@ class FullReconciliationEngine:
         target["Current Inventory Quantity Each"] = pd.to_numeric(
             target["Current Inventory Quantity Each"], errors="coerce"
         ).fillna(0)
+
+        # Full Dispatch details must retain the WMS Trade Item Number.  Use the
+        # Batch Master value for synthetic residual Dummy-GLN rows because it
+        # already combines valid receipt/dispatch codes for the batch.  Current
+        # Inventory is the safe fallback when an older Batch Master row has no
+        # trade code yet.
+        master_trade = self._rename_history_columns(
+            batch_master_df.copy()
+            if batch_master_df is not None
+            else pd.DataFrame()
+        )
+        master_trade = self._ensure_columns(
+            master_trade,
+            [*self.KEYS, "Trade Item Number"],
+        )[[*self.KEYS, "Trade Item Number"]].copy()
+        for column in self.KEYS:
+            master_trade[column] = Normalizer.text(master_trade[column])
+        master_trade = (
+            master_trade.groupby(self.KEYS, dropna=False)["Trade Item Number"]
+            .agg(aggregate_trade_codes)
+            .reset_index()
+            .rename(
+                columns={
+                    "Trade Item Number": "Batch Master Trade Item Number",
+                }
+            )
+        )
+        target = target.merge(
+            master_trade,
+            on=self.KEYS,
+            how="left",
+            validate="one_to_one",
+        )
+        batch_trade = target["Batch Master Trade Item Number"].fillna("").astype(str).str.strip()
+        inventory_trade = target["Inventory Trade Item Number"].fillna("").astype(str).str.strip()
+        target["Fallback Trade Item Number"] = batch_trade.where(
+            batch_trade.ne(""),
+            inventory_trade,
+        )
 
         # Resolve PackageSize for Inventory Each -> Pack conversion.
         # Prefer the historical Customer value when available; otherwise use the
@@ -2743,6 +2798,7 @@ class FullReconciliationEngine:
                     "BN",
                     "Expiry Month Key",
                     "Generic Item Number",
+                    "Fallback Trade Item Number",
                     "SFDA Expiry Date",
                     "GTIN",
                     "Drug Name",
@@ -2766,6 +2822,20 @@ class FullReconciliationEngine:
             history_expiry = Normalizer.date(details["Expiry Date"])
             details["Expiry Date"] = sfda_expiry.combine_first(history_expiry)
             details = details.drop(columns=["SFDA Expiry Date"])
+
+        details["Trade Item Number"] = (
+            details.get("Trade Item Number", "")
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+        missing_trade_code = details["Trade Item Number"].eq("")
+        details.loc[missing_trade_code, "Trade Item Number"] = (
+            details.loc[missing_trade_code, "Fallback Trade Item Number"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
 
         confirmed = (
             confirmed_full_dispatch_df.copy()
@@ -3027,6 +3097,9 @@ class FullReconciliationEngine:
             dummy_rows["Expiry Date"] = residual_target["SFDA Expiry Date"].to_numpy()
             dummy_rows["Expiry Month Key"] = residual_target["Expiry Month Key"].to_numpy()
             dummy_rows["Generic Item Number"] = residual_target["Generic Item Number"].to_numpy()
+            dummy_rows["Trade Item Number"] = residual_target[
+                "Fallback Trade Item Number"
+            ].to_numpy()
             dummy_rows["PackageSize"] = residual_target["PackageSize"].to_numpy()
             dummy_rows["Historical Dispatch Quantity Each"] = 0.0
             dummy_rows["Historical Dispatch Quantity Pack"] = 0.0
