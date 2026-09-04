@@ -8208,31 +8208,115 @@ def save_full_dispatch_pending_transactions(
             );
     """
 
-    saved = 0
+    bulk_sql = r"""
+        ;WITH source AS
+        (
+            SELECT
+                CONVERT(varchar(64), JSON_VALUE(j.value, '$[0]')) AS TransactionKey,
+                CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[1]')) AS BN,
+                TRY_CONVERT(date, JSON_VALUE(j.value, '$[2]')) AS ExpiryDate,
+                CONVERT(nvarchar(7), JSON_VALUE(j.value, '$[3]')) AS ExpiryMonthKey,
+                CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[4]')) AS GenericItemNumber,
+                CONVERT(nvarchar(1000), JSON_VALUE(j.value, '$[5]')) AS ToAddress,
+                CONVERT(nvarchar(100), JSON_VALUE(j.value, '$[6]')) AS GLN,
+                TRY_CONVERT(decimal(38,6), JSON_VALUE(j.value, '$[7]')) AS NewQuantityEach,
+                TRY_CONVERT(decimal(38,6), JSON_VALUE(j.value, '$[8]')) AS NewQuantityPack,
+                CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[9]')) AS RunNumber
+            FROM OPENJSON(CAST(? AS nvarchar(max))) AS j
+        )
+        MERGE dbo.FullDispatchTransactions WITH (HOLDLOCK) AS target
+        USING source
+        ON target.TransactionKey = source.TransactionKey
+        WHEN MATCHED THEN
+            UPDATE SET
+                BN = source.BN,
+                ExpiryDate = source.ExpiryDate,
+                ExpiryMonthKey = source.ExpiryMonthKey,
+                GenericItemNumber = source.GenericItemNumber,
+                ToAddress = source.ToAddress,
+                GLN = source.GLN,
+                SubmittedQuantityEach = CASE
+                    WHEN target.SubmittedQuantityEach >=
+                         target.ConfirmedQuantityEach + source.NewQuantityEach
+                    THEN target.SubmittedQuantityEach
+                    ELSE target.ConfirmedQuantityEach + source.NewQuantityEach
+                END,
+                SubmittedQuantityPack = CASE
+                    WHEN target.SubmittedQuantityPack >=
+                         target.ConfirmedQuantityPack + source.NewQuantityPack
+                    THEN target.SubmittedQuantityPack
+                    ELSE target.ConfirmedQuantityPack + source.NewQuantityPack
+                END,
+                LastSubmittedRun = source.RunNumber,
+                UpdatedAt = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN
+            INSERT
+            (
+                TransactionKey, BN, ExpiryDate, ExpiryMonthKey,
+                GenericItemNumber, ToAddress, GLN,
+                SubmittedQuantityEach, SubmittedQuantityPack,
+                ConfirmedQuantityEach, ConfirmedQuantityPack,
+                FirstSubmittedRun, LastSubmittedRun
+            )
+            VALUES
+            (
+                source.TransactionKey, source.BN, source.ExpiryDate,
+                source.ExpiryMonthKey, source.GenericItemNumber,
+                source.ToAddress, source.GLN,
+                source.NewQuantityEach, source.NewQuantityPack,
+                0, 0, source.RunNumber, source.RunNumber
+            );
+    """
+
+    saved = len(prepared)
     with Database().connect() as connection:
         cursor = connection.cursor()
         try:
-            for row in prepared.values():
+            json_batch_size = max(
+                100,
+                int(os.getenv("FULL_DISPATCH_JSON_BATCH_SIZE", "4000") or 4000),
+            )
+            bulk_rows = [
+                [
+                    row["TransactionKey"], row["BN"], str(row["ExpiryDate"]),
+                    row["ExpiryMonthKey"], row["GenericItemNumber"],
+                    row["ToAddress"], row["GLN"], row["Each"], row["Pack"],
+                    str(run_number),
+                ]
+                for row in prepared.values()
+            ]
+            for row_batch in _chunks(bulk_rows, json_batch_size):
                 cursor.execute(
-                    sql,
-                    (
-                        row["TransactionKey"],
-                        row["BN"],
-                        row["ExpiryDate"],
-                        row["ExpiryMonthKey"],
-                        row["GenericItemNumber"],
-                        row["ToAddress"],
-                        row["GLN"],
-                        row["Each"],
-                        row["Pack"],
-                        str(run_number),
+                    bulk_sql,
+                    json.dumps(
+                        row_batch,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     ),
                 )
-                saved += 1
             connection.commit()
-        except Exception:
+        except Exception as bulk_exc:
             connection.rollback()
-            raise
+            logger.warning(
+                "OPENJSON Full Dispatch ledger save failed; using row fallback: %s",
+                bulk_exc,
+            )
+            cursor = connection.cursor()
+            try:
+                for row in prepared.values():
+                    cursor.execute(
+                        sql,
+                        (
+                            row["TransactionKey"], row["BN"], row["ExpiryDate"],
+                            row["ExpiryMonthKey"], row["GenericItemNumber"],
+                            row["ToAddress"], row["GLN"], row["Each"], row["Pack"],
+                            str(run_number),
+                        ),
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
     return saved
 
@@ -8372,19 +8456,114 @@ def save_full_cancel_dispatch_pending_transactions(
                     'CANCEL_DISPATCH', source.SourceType
                 );
         """
+        bulk_sql = r"""
+            ;WITH source AS
+            (
+                SELECT
+                    CONVERT(varchar(64), JSON_VALUE(j.value, '$[0]')) AS TransactionKey,
+                    CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[1]')) AS BN,
+                    TRY_CONVERT(date, JSON_VALUE(j.value, '$[2]')) AS ExpiryDate,
+                    CONVERT(nvarchar(7), JSON_VALUE(j.value, '$[3]')) AS ExpiryMonthKey,
+                    CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[4]')) AS GenericItemNumber,
+                    CONVERT(nvarchar(1000), JSON_VALUE(j.value, '$[5]')) AS ToAddress,
+                    CONVERT(nvarchar(100), JSON_VALUE(j.value, '$[6]')) AS GLN,
+                    CONVERT(nvarchar(64), JSON_VALUE(j.value, '$[7]')) AS SourceType,
+                    TRY_CONVERT(decimal(38,6), JSON_VALUE(j.value, '$[8]')) AS NewQuantityEach,
+                    TRY_CONVERT(decimal(38,6), JSON_VALUE(j.value, '$[9]')) AS NewQuantityPack,
+                    CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[10]')) AS RunNumber
+                FROM OPENJSON(CAST(? AS nvarchar(max))) AS j
+            )
+            MERGE dbo.FullDispatchTransactions WITH (HOLDLOCK) AS target
+            USING source
+            ON target.TransactionKey = source.TransactionKey
+            WHEN MATCHED THEN
+                UPDATE SET
+                    BN = source.BN,
+                    ExpiryDate = source.ExpiryDate,
+                    ExpiryMonthKey = source.ExpiryMonthKey,
+                    GenericItemNumber = source.GenericItemNumber,
+                    ToAddress = source.ToAddress,
+                    GLN = source.GLN,
+                    TransactionType = 'CANCEL_DISPATCH',
+                    SourceType = source.SourceType,
+                    SubmittedQuantityEach = CASE
+                        WHEN target.SubmittedQuantityEach >=
+                             target.ConfirmedQuantityEach + source.NewQuantityEach
+                        THEN target.SubmittedQuantityEach
+                        ELSE target.ConfirmedQuantityEach + source.NewQuantityEach
+                    END,
+                    SubmittedQuantityPack = CASE
+                        WHEN target.SubmittedQuantityPack >=
+                             target.ConfirmedQuantityPack + source.NewQuantityPack
+                        THEN target.SubmittedQuantityPack
+                        ELSE target.ConfirmedQuantityPack + source.NewQuantityPack
+                    END,
+                    LastSubmittedRun = source.RunNumber,
+                    UpdatedAt = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN
+                INSERT
+                (
+                    TransactionKey, BN, ExpiryDate, ExpiryMonthKey,
+                    GenericItemNumber, ToAddress, GLN,
+                    SubmittedQuantityEach, SubmittedQuantityPack,
+                    ConfirmedQuantityEach, ConfirmedQuantityPack,
+                    FirstSubmittedRun, LastSubmittedRun,
+                    TransactionType, SourceType
+                )
+                VALUES
+                (
+                    source.TransactionKey, source.BN, source.ExpiryDate,
+                    source.ExpiryMonthKey, source.GenericItemNumber,
+                    source.ToAddress, source.GLN,
+                    source.NewQuantityEach, source.NewQuantityPack,
+                    0, 0, source.RunNumber, source.RunNumber,
+                    'CANCEL_DISPATCH', source.SourceType
+                );
+        """
         cursor = connection.cursor()
         try:
-            for row in prepared.values():
-                cursor.execute(sql, (
-                    row["TransactionKey"], row["BN"], row["ExpiryDate"],
+            json_batch_size = max(
+                100,
+                int(os.getenv("FULL_DISPATCH_JSON_BATCH_SIZE", "4000") or 4000),
+            )
+            bulk_rows = [
+                [
+                    row["TransactionKey"], row["BN"], str(row["ExpiryDate"]),
                     row["ExpiryMonthKey"], row["GenericItemNumber"],
                     row["ToAddress"], row["GLN"], row["ReturnType"],
                     row["Each"], row["Pack"], str(run_number),
-                ))
+                ]
+                for row in prepared.values()
+            ]
+            for row_batch in _chunks(bulk_rows, json_batch_size):
+                cursor.execute(
+                    bulk_sql,
+                    json.dumps(
+                        row_batch,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
             connection.commit()
-        except Exception:
+        except Exception as bulk_exc:
             connection.rollback()
-            raise
+            logger.warning(
+                "OPENJSON Cancel Dispatch ledger save failed; using row fallback: %s",
+                bulk_exc,
+            )
+            cursor = connection.cursor()
+            try:
+                for row in prepared.values():
+                    cursor.execute(sql, (
+                        row["TransactionKey"], row["BN"], row["ExpiryDate"],
+                        row["ExpiryMonthKey"], row["GenericItemNumber"],
+                        row["ToAddress"], row["GLN"], row["ReturnType"],
+                        row["Each"], row["Pack"], str(run_number),
+                    ))
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
     return {"schema_available": True, "saved": len(prepared)}
 

@@ -2125,7 +2125,18 @@ Drug Traceability Reconciliation Platform</textarea></label>
     for(let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
     triggerBlob(name,new Blob([bytes],{type:mime}));
   }
-  function downloadStructured(file){ file.encoding==="base64"?downloadBase64(file.name,file.content,file.mime):downloadText(file.name,file.content,file.mime); }
+  function downloadStructured(file){
+    if(file.downloadUrl){
+      const a=document.createElement("a");
+      a.href=file.downloadUrl;
+      a.download=file.name||"download";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      return;
+    }
+    file.encoding==="base64"?downloadBase64(file.name,file.content,file.mime):downloadText(file.name,file.content,file.mime);
+  }
   function triggerBlob(name,blob){ const url=URL.createObjectURL(blob),a=document.createElement("a"); a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000); }
  
   async function zipTextFiles(map,name){ const zip=new JSZip(); normalizeFileGroup(map).forEach(file=>{ if(file.encoding==="base64") zip.file(file.name,file.content,{base64:true}); else zip.file(file.name,file.content??""); }); triggerBlob(name,await zip.generateAsync({type:"blob"})); }
@@ -2965,12 +2976,14 @@ Drug Traceability Reconciliation Platform</textarea></label>
 
   function normalizeOutputFile(value, fallbackName){
     if(!value||typeof value!=="object") return null;
-    if(typeof value.content!=="string") return null;
+    const downloadUrl=value.download_url||value.downloadUrl||"";
+    if(typeof value.content!=="string"&&!downloadUrl) return null;
     return {
       name:value.file_name||value.name||fallbackName||"output_file",
-      content:value.content,
-      encoding:value.encoding||"base64",
-      mime:value.mime_type||value.mime||"application/octet-stream"
+      content:value.content||"",
+      encoding:value.encoding||(downloadUrl?"url":"base64"),
+      mime:value.mime_type||value.mime||"application/octet-stream",
+      downloadUrl
     };
   }
 
@@ -3052,6 +3065,75 @@ Drug Traceability Reconciliation Platform</textarea></label>
       throw new Error(result.error||result.message||`Request failed with HTTP ${response.status}.`);
     }
     return result;
+  }
+
+  async function uploadFullDispatchChunk(url,blob){
+    let lastError=null;
+    for(let attempt=1;attempt<=3;attempt++){
+      try{
+        const response=await fetch(url,{
+          method:"POST",
+          body:blob,
+          cache:"no-store",
+          credentials:"same-origin",
+          headers:{"Content-Type":"application/octet-stream"}
+        });
+        return await parseApiResponse(response);
+      }catch(error){
+        lastError=error;
+        if(attempt<3) await new Promise(resolve=>setTimeout(resolve,750*attempt));
+      }
+    }
+    throw lastError||new Error("Unable to upload Full Dispatch file chunk.");
+  }
+
+  async function queueChunkedFullDispatch(inventoryFile,sfdaFile,onProgress=null){
+    const chunkSize=4*1024*1024;
+    const files={inventory:inventoryFile,sfda:sfdaFile};
+    const metadata={files:{}};
+    Object.entries(files).forEach(([field,file])=>{
+      metadata.files[field]={
+        file_name:file.name,
+        content_type:file.type||"application/octet-stream",
+        size_bytes:file.size,
+        block_count:Math.max(1,Math.ceil(file.size/chunkSize))
+      };
+    });
+
+    const startResponse=await fetch("/api/full-reconciliation/dispatch-upload/start",{
+      method:"POST",
+      cache:"no-store",
+      credentials:"same-origin",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(metadata)
+    });
+    const session=await parseApiResponse(startResponse);
+    const jobId=session.job_id;
+    if(!jobId) throw new Error("Full Dispatch upload session did not return a job id.");
+
+    const totalBytes=inventoryFile.size+sfdaFile.size;
+    let uploadedBytes=0;
+    for(const [field,file] of Object.entries(files)){
+      const blocks=metadata.files[field].block_count;
+      for(let index=0;index<blocks;index++){
+        const start=index*chunkSize;
+        const end=Math.min(file.size,start+chunkSize);
+        await uploadFullDispatchChunk(
+          `/api/full-reconciliation/dispatch-upload/${encodeURIComponent(jobId)}/${field}/${index}`,
+          file.slice(start,end)
+        );
+        uploadedBytes+=end-start;
+        if(typeof onProgress==="function"){
+          onProgress(Math.min(30,5+Math.round((uploadedBytes/totalBytes)*25)));
+        }
+      }
+    }
+
+    const completeResponse=await fetch(
+      `/api/full-reconciliation/dispatch-upload/${encodeURIComponent(jobId)}/complete`,
+      {method:"POST",cache:"no-store",credentials:"same-origin"}
+    );
+    return await parseApiResponse(completeResponse);
   }
 
   element("step1AsnFiles")?.addEventListener("change",()=>{ setFileMeta("step1AsnFiles","step1AsnMeta",true); updateFullSetupButtons(); });
@@ -3271,19 +3353,20 @@ Drug Traceability Reconciliation Platform</textarea></label>
     const inventory=element("step2DispatchInventoryFile");
     const sfda=element("step2DispatchSfdaFile");
     if(!inventory?.files.length||!sfda?.files.length){ showSetupError("Please select Current Inventory and the updated SFDA report."); return; }
-    const formData=new FormData();
-    formData.append("inventory",inventory.files[0],inventory.files[0].name);
-    formData.append("sfda",sfda.files[0],sfda.files[0].name);
     button.disabled=true; button.textContent="Running Full Dispatch Reconciliation...";
     startSetupProgress("fullDispatch");
     try{
-      const response=await fetch("/api/full-reconciliation/dispatch",{method:"POST",body:formData,cache:"no-store"});
-      let result=await parseApiResponse(response);
+      stopSetupProgress("fullDispatch");
+      configureProgress("fullDispatch",5,"Uploading Inventory and SFDA files...");
+      let result=await queueChunkedFullDispatch(
+        inventory.files[0],
+        sfda.files[0],
+        percent=>configureProgress("fullDispatch",percent,"Uploading Inventory and SFDA files...")
+      );
       if(String(result.status||"").toLowerCase()==="accepted"){
-        stopSetupProgress("fullDispatch");
-        configureProgress("fullDispatch",12,"Full Dispatch queued; processing in background...");
+        configureProgress("fullDispatch",32,"Full Dispatch queued; processing in background...");
         result=await waitForReconciliationJob(result.status_url,job=>{
-          const percent=Math.max(12,Math.min(99,Number(job.progress||12)));
+          const percent=Math.max(32,Math.min(99,Number(job.progress||32)));
           configureProgress("fullDispatch",percent,job.current_stage||"Full Dispatch is processing in background...");
         });
       }
@@ -3319,10 +3402,17 @@ Drug Traceability Reconciliation Platform</textarea></label>
       return;
     }
     const zip=new JSZip();
-    fullSetupFiles.forEach(file=>{
-      if(file.encoding==="base64") zip.file(file.name,file.content,{base64:true});
-      else zip.file(file.name,file.content||"");
-    });
+    await Promise.all(fullSetupFiles.map(async file=>{
+      if(file.downloadUrl){
+        const response=await fetch(file.downloadUrl,{cache:"no-store",credentials:"same-origin"});
+        if(!response.ok) throw new Error(`Unable to download ${file.name} (HTTP ${response.status}).`);
+        zip.file(file.name,await response.arrayBuffer());
+      }else if(file.encoding==="base64"){
+        zip.file(file.name,file.content,{base64:true});
+      }else{
+        zip.file(file.name,file.content||"");
+      }
+    }));
     const blob=await zip.generateAsync({type:"blob"});
     triggerBlob("Full_Reconciliation_Results.zip",blob);
   });

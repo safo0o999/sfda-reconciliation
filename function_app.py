@@ -26,6 +26,9 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 _PROCESS_STARTED_AT = datetime.now(timezone.utc)
 _RESET_ENGINE_VERSION = "WAREHOUSE_RESET_V9_VERIFIED"
 _HISTORICAL_REBUILD_ENGINE_VERSION = "VERSIONED_BUILD_V8_20260826"
+_FULL_DISPATCH_PERFORMANCE_VERSION = (
+    "FULL_DISPATCH_PERF_V1_CHUNKED_MANIFEST_OPENJSON_20260904"
+)
 
 
 _VARIANCE_CACHE: Dict[int, Dict[str, Any]] = {}
@@ -324,7 +327,8 @@ def save_run_archive(
     outputs: Dict[str, Any],
     summary: Dict[str, Any],
     submitted_by: str,
-) -> int:
+    return_output_manifest: bool = False,
+) -> Any:
     from engine.blob_storage import BlobStorage
 
     storage = BlobStorage()
@@ -332,12 +336,21 @@ def save_run_archive(
     stored_files = 0
 
     for item in input_files:
-        uploaded = storage.upload_input(
-            run_number,
-            item["file_name"],
-            item["data"],
-            item["content_type"],
-        )
+        if item.get("blob_name") and item.get("container"):
+            uploaded = {
+                "container": item["container"],
+                "blob_name": item["blob_name"],
+                "content_type": item.get("content_type") or "application/octet-stream",
+                "size_bytes": int(item.get("size_bytes") or 0),
+                "etag": item.get("etag", ""),
+            }
+        else:
+            uploaded = storage.upload_input(
+                run_number,
+                item["file_name"],
+                item["data"],
+                item["content_type"],
+            )
         save_run_file_record(
             run_number,
             "input",
@@ -347,7 +360,9 @@ def save_run_archive(
         )
         stored_files += 1
 
-    for _, file_name, value in iter_generated_files(outputs):
+    output_groups: Dict[str, Dict[str, Any]] = {}
+    output_files: List[Dict[str, Any]] = []
+    for group_name, file_name, value in iter_generated_files(outputs):
         file_bytes, content_type, _ = decode_generated_file(file_name, value)
         uploaded = storage.upload_output(
             run_number,
@@ -363,6 +378,15 @@ def save_run_archive(
             uploaded,
         )
         stored_files += 1
+        reference = {
+            "file_name": file_name,
+            "encoding": "url",
+            "mime_type": content_type,
+            "size_bytes": int(uploaded.get("size_bytes") or len(file_bytes)),
+            "download_url": build_download_url(run_number, "output", file_name),
+        }
+        output_groups.setdefault(group_name, {})[file_name] = reference
+        output_files.append(reference)
 
     metadata = {
         "run_number": run_number,
@@ -377,7 +401,7 @@ def save_run_archive(
             {
                 "file_name": item["file_name"],
                 "content_type": item["content_type"],
-                "size_bytes": len(item["data"]),
+                "size_bytes": int(item.get("size_bytes") or len(item.get("data") or b"")),
             }
             for item in input_files
         ],
@@ -400,7 +424,14 @@ def save_run_archive(
         "JSON",
         uploaded,
     )
-    return stored_files + 1
+    archive_count = stored_files + 1
+    if return_output_manifest:
+        return {
+            "stored_files": archive_count,
+            "outputs": output_groups,
+            "files": output_files,
+        }
+    return archive_count
 
 
 def build_download_url(run_number: str, category: str, file_name: str) -> str:
@@ -2558,6 +2589,16 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
     run_number = build_run_number("FULL-DISPATCH")
     submitted_by = get_submitted_by(req)
     run_created = False
+    run_started_at = time.perf_counter()
+    last_stage_at = run_started_at
+    stage_timings: Dict[str, float] = {}
+
+    def mark_stage(name: str) -> None:
+        nonlocal last_stage_at
+        now = time.perf_counter()
+        stage_timings[name] = round(now - last_stage_at, 3)
+        last_stage_at = now
+
     try:
         inventory_file = req.files.get("inventory")
         sfda_file = req.files.get("sfda")
@@ -2568,8 +2609,33 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
 
         inventory_name, inventory_bytes, inventory_content_type = read_uploaded_bytes(inventory_file)
         sfda_name, sfda_bytes, sfda_content_type = read_uploaded_bytes(sfda_file)
+        archive_inputs = [
+            _archive_input_from_request(
+                req,
+                "inventory",
+                inventory_name,
+                inventory_bytes,
+                inventory_content_type,
+            ),
+            _archive_input_from_request(
+                req,
+                "sfda",
+                sfda_name,
+                sfda_bytes,
+                sfda_content_type,
+            ),
+        ]
         inventory_df = read_excel_bytes(inventory_name, inventory_bytes)
         sfda_df = read_excel_bytes(sfda_name, sfda_bytes)
+        if all(item.get("blob_name") for item in archive_inputs):
+            # Queued inputs are already durable. Release their raw byte buffers
+            # before loading Customer History and generating large workbooks.
+            for uploaded in (inventory_file, sfda_file):
+                release = getattr(uploaded, "release", None)
+                if callable(release):
+                    release()
+            del inventory_bytes, sfda_bytes
+        mark_stage("read_inventory_and_sfda")
         from engine.database import (
             complete_reconciliation_run,
             confirm_full_cancel_dispatch_transactions_from_sfda,
@@ -2606,6 +2672,7 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
         customer_history = get_customer_history_df()
         if customer_history.empty:
             raise ValueError("Customer History is empty. Complete Step 1 first.")
+        mark_stage("load_customer_history")
 
         # First upgrade run only: reserve allocations from successful legacy
         # Full Dispatch runs that pre-date the dedicated consumption ledger.
@@ -2639,12 +2706,14 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
             if cancel_schema_available
             else pd.DataFrame()
         )
+        mark_stage("confirm_prior_dispatch_and_load_ledgers")
 
         replace_latest_inventory_snapshot(inventory_df, inventory_name)
         replace_latest_sfda_snapshot(sfda_df, sfda_name)
         batch_master = get_batch_master_df()
         if batch_master.empty:
             raise ValueError("Historical Batch Master is empty. Complete Step 1 first.")
+        mark_stage("save_snapshots_and_load_batch_master")
 
         full_engine = FullReconciliationEngine(
             pd.DataFrame(), pd.DataFrame(), sfda_df
@@ -2658,6 +2727,7 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
             validated_sfda_identity,
         )
         batch_master = get_batch_master_df()
+        mark_stage("validate_identity_and_sync_batch_master")
 
         result = full_engine.run_dispatch_reconciliation(
             inventory_df,
@@ -2674,6 +2744,7 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
         dispatch_upload = result["dispatch_upload"]
         return_cancel_details = result["return_cancel_details"]
         cancel_dispatch_upload = result["cancel_dispatch_upload"]
+        mark_stage("calculate_dispatch_and_cancel")
 
         full_dispatch_pending_saved = 0
         if not dispatch_upload.empty:
@@ -2690,6 +2761,7 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
         # Current SFDA state becomes the proof baseline for the next Full
         # Dispatch run. It does not change historical WMS dispatch totals.
         replace_full_dispatch_sfda_baseline(sfda_df, sfda_name)
+        mark_stage("save_pending_ledgers_and_baseline")
 
         outputs = {
             "batch_master": Exporter.build_batch_master_two_sheet_file(
@@ -2724,7 +2796,9 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
                 cancel_dispatch_upload
             ),
         }
+        mark_stage("generate_output_files")
         summary = {
+            "full_dispatch_performance_version": _FULL_DISPATCH_PERFORMANCE_VERSION,
             "inventory_rows": int(len(inventory_df)),
             "sfda_rows": int(len(sfda_df)),
             "batch_master_rows": int(len(batch_master)),
@@ -2747,27 +2821,24 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
                 cancel_pending_result.get("schema_available", False)
             ),
             "full_dispatch_ledger_bootstrap": ledger_bootstrap,
+            "stage_timings_seconds": stage_timings,
         }
 
-        archived_files = save_run_archive(
+        archive_result = save_run_archive(
             run_number=run_number,
             mode="FULL_DISPATCH",
-            input_files=[
-                {
-                    "file_name": inventory_name,
-                    "data": inventory_bytes,
-                    "content_type": inventory_content_type,
-                },
-                {
-                    "file_name": sfda_name,
-                    "data": sfda_bytes,
-                    "content_type": sfda_content_type,
-                },
-            ],
+            input_files=archive_inputs,
             outputs=outputs,
             summary=summary,
             submitted_by=submitted_by,
+            return_output_manifest=True,
         )
+        archived_files = int(archive_result["stored_files"])
+        lightweight_outputs = archive_result["outputs"]
+        del outputs
+        mark_stage("archive_output_files")
+        summary["stage_timings_seconds"] = stage_timings
+        summary["total_seconds"] = round(time.perf_counter() - run_started_at, 3)
 
         complete_reconciliation_run(
             run_number=run_number,
@@ -2785,7 +2856,8 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
             "status": "Completed",
             "step": "full-dispatch",
             "run_number": run_number,
-            "outputs": outputs,
+            "outputs": lightweight_outputs,
+            "output_manifest": {"files": archive_result["files"]},
             "summary": summary,
             "dashboard_preview": build_dashboard_preview(
                 dispatch_details,
@@ -2828,6 +2900,274 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "GET":
         return json_response({"status": "Ready", "required_files": ["inventory", "sfda"]})
     return _safe_queue_reconciliation_job(req, "full_dispatch", ["inventory", "sfda"])
+
+
+_FULL_DISPATCH_UPLOAD_FIELDS = ("inventory", "sfda")
+_UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
+_MAX_RECONCILIATION_FILE_BYTES = int(
+    os.getenv("MAX_RECONCILIATION_FILE_BYTES", str(512 * 1024 * 1024))
+    or 512 * 1024 * 1024
+)
+
+
+def _full_dispatch_upload_job(req: func.HttpRequest, job_id: str) -> Dict[str, Any]:
+    from engine.blob_storage import BlobStorage
+
+    job = BlobStorage().read_background_job_status(job_id)
+    if str(job.get("job_type") or "").lower() != "full_dispatch":
+        raise ValueError("The upload session is not a Full Dispatch job.")
+    return job
+
+
+@app.route(route="full-reconciliation/dispatch-upload/start", methods=["POST"])
+def full_dispatch_upload_start(req: func.HttpRequest) -> func.HttpResponse:
+    """Create a chunked upload session so large files never use one long request."""
+    denied = _auth_guard(req)
+    if denied:
+        return denied
+    try:
+        payload = req.get_json()
+        file_specs = payload.get("files") if isinstance(payload, dict) else None
+        if not isinstance(file_specs, dict):
+            raise ValueError("Full Dispatch upload metadata is required.")
+
+        from engine.blob_storage import BlobStorage
+        from engine.warehouse_context import current_warehouse_id, current_warehouse_name
+
+        storage = BlobStorage()
+        storage.initialize_containers()
+        reset_lock = storage.read_warehouse_reset_lock()
+        if reset_lock:
+            return error_response(
+                "Warehouse reset is in progress.",
+                409,
+                f"Reset job {reset_lock.get('job_id') or 'unknown'} must finish before reconciliation.",
+            )
+
+        upload_manifest: Dict[str, Any] = {}
+        for field in _FULL_DISPATCH_UPLOAD_FIELDS:
+            spec = file_specs.get(field)
+            if not isinstance(spec, dict):
+                raise ValueError(f"{field} file metadata is required.")
+            file_name = storage.sanitize_file_name(str(spec.get("file_name") or ""))
+            if not file_name.lower().endswith((".xlsx", ".xls")):
+                raise ValueError(f"{field} must be an Excel .xlsx or .xls file.")
+            size_bytes = int(spec.get("size_bytes") or 0)
+            block_count = int(spec.get("block_count") or 0)
+            expected_blocks = max(1, (size_bytes + _UPLOAD_CHUNK_BYTES - 1) // _UPLOAD_CHUNK_BYTES)
+            if size_bytes < 1 or size_bytes > _MAX_RECONCILIATION_FILE_BYTES:
+                raise ValueError(
+                    f"{field} file size must be between 1 byte and "
+                    f"{_MAX_RECONCILIATION_FILE_BYTES} bytes."
+                )
+            if block_count != expected_blocks:
+                raise ValueError(f"{field} upload block count is invalid.")
+            upload_manifest[field] = {
+                "file_name": file_name,
+                "content_type": str(spec.get("content_type") or "application/octet-stream"),
+                "size_bytes": size_bytes,
+                "block_count": block_count,
+            }
+
+        job_id = build_run_number("JOB")
+        warehouse_id = int(current_warehouse_id())
+        warehouse_name = str(current_warehouse_name())
+        submitted_by = get_submitted_by(req)
+        storage.write_background_job_status(
+            job_id,
+            {
+                "job_id": job_id,
+                "job_type": "full_dispatch",
+                "status": "Uploading",
+                "progress": 1,
+                "current_stage": "Uploading Full Dispatch files in chunks",
+                "submitted_by": submitted_by,
+                "warehouse_id": warehouse_id,
+                "warehouse_name": warehouse_name,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "upload_manifest": upload_manifest,
+                "result": {},
+                "error": "",
+            },
+        )
+        return json_response(
+            {
+                "status": "Ready",
+                "job_id": job_id,
+                "chunk_size": _UPLOAD_CHUNK_BYTES,
+            }
+        )
+    except (TypeError, ValueError) as exc:
+        return error_response("Unable to start Full Dispatch upload.", 400, str(exc))
+    except Exception as exc:
+        logger.exception("Full Dispatch chunked upload start failed")
+        return error_response("Unable to start Full Dispatch upload.", 500, str(exc))
+
+
+@app.route(
+    route="full-reconciliation/dispatch-upload/{job_id}/{field}/{chunk_index}",
+    methods=["POST"],
+)
+def full_dispatch_upload_chunk(req: func.HttpRequest) -> func.HttpResponse:
+    """Stage one bounded Azure Block Blob chunk; the same chunk is retry-safe."""
+    denied = _auth_guard(req)
+    if denied:
+        return denied
+    try:
+        job_id = str(req.route_params.get("job_id") or "").strip()
+        field = str(req.route_params.get("field") or "").strip().lower()
+        chunk_index = int(req.route_params.get("chunk_index") or -1)
+        if field not in _FULL_DISPATCH_UPLOAD_FIELDS:
+            raise ValueError("Unknown Full Dispatch upload field.")
+
+        job = _full_dispatch_upload_job(req, job_id)
+        if str(job.get("status") or "").lower() != "uploading":
+            raise ValueError("This Full Dispatch upload session is no longer open.")
+        spec = (job.get("upload_manifest") or {}).get(field) or {}
+        block_count = int(spec.get("block_count") or 0)
+        if chunk_index < 0 or chunk_index >= block_count:
+            raise ValueError("Upload chunk index is outside the expected range.")
+
+        data = req.get_body() or b""
+        total_size = int(spec.get("size_bytes") or 0)
+        expected_size = min(
+            _UPLOAD_CHUNK_BYTES,
+            total_size - (chunk_index * _UPLOAD_CHUNK_BYTES),
+        )
+        if len(data) != expected_size:
+            raise ValueError(
+                f"Upload chunk has {len(data)} bytes; expected {expected_size}."
+            )
+
+        from engine.blob_storage import BlobStorage
+        saved = BlobStorage().stage_job_input_block(
+            job_id,
+            field,
+            str(spec.get("file_name") or field),
+            chunk_index,
+            data,
+        )
+        return json_response(
+            {
+                "status": "Uploaded",
+                "job_id": job_id,
+                "field": field,
+                "chunk_index": chunk_index,
+                "size_bytes": saved["size_bytes"],
+            }
+        )
+    except (TypeError, ValueError, FileNotFoundError) as exc:
+        return error_response("Full Dispatch upload chunk was rejected.", 400, str(exc))
+    except Exception as exc:
+        logger.exception("Full Dispatch chunk upload failed")
+        return error_response("Full Dispatch upload chunk failed.", 500, str(exc))
+
+
+@app.route(route="full-reconciliation/dispatch-upload/{job_id}/complete", methods=["POST"])
+def full_dispatch_upload_complete(req: func.HttpRequest) -> func.HttpResponse:
+    """Commit staged files and enqueue only their small Blob manifest."""
+    denied = _auth_guard(req)
+    if denied:
+        return denied
+    try:
+        job_id = str(req.route_params.get("job_id") or "").strip()
+        job = _full_dispatch_upload_job(req, job_id)
+        status = str(job.get("status") or "").lower()
+        if status == "queued":
+            return json_response(
+                {
+                    "status": "Accepted",
+                    "job_id": job_id,
+                    "job_type": "full_dispatch",
+                    "status_url": f"/api/reconciliation-job/{job_id}",
+                },
+                202,
+            )
+        if status != "uploading":
+            raise ValueError("This Full Dispatch upload session cannot be completed.")
+
+        from engine.blob_storage import BlobStorage
+        storage = BlobStorage()
+        reset_lock = storage.read_warehouse_reset_lock()
+        if reset_lock:
+            raise ValueError(
+                f"Reset job {reset_lock.get('job_id') or 'unknown'} must finish before reconciliation."
+            )
+
+        manifest: Dict[str, Any] = {}
+        for field in _FULL_DISPATCH_UPLOAD_FIELDS:
+            spec = (job.get("upload_manifest") or {}).get(field) or {}
+            saved = storage.commit_job_input_blocks(
+                job_id,
+                field,
+                str(spec.get("file_name") or field),
+                int(spec.get("block_count") or 0),
+                str(spec.get("content_type") or "application/octet-stream"),
+            )
+            expected_size = int(spec.get("size_bytes") or 0)
+            if int(saved.get("size_bytes") or 0) != expected_size:
+                raise ValueError(
+                    f"Committed {field} file size does not match the selected file."
+                )
+            manifest[field] = {
+                "file_name": saved["file_name"],
+                "container": saved["container"],
+                "blob_name": saved["blob_name"],
+                "content_type": saved["content_type"],
+                "size_bytes": saved["size_bytes"],
+                "etag": saved.get("etag", ""),
+            }
+
+        queued_status = {
+            **job,
+            "status": "Queued",
+            "progress": 5,
+            "current_stage": "Files uploaded; waiting for background worker",
+            "input_manifest": manifest,
+            "upload_manifest": {},
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        storage.write_background_job_status(job_id, queued_status)
+        try:
+            _send_reconciliation_job_message(
+                job_id,
+                "full_dispatch",
+                manifest,
+                str(job.get("submitted_by") or "Web User"),
+                int(job.get("warehouse_id") or 0),
+                str(job.get("warehouse_name") or ""),
+            )
+        except Exception:
+            storage.write_background_job_status(
+                job_id,
+                {
+                    **queued_status,
+                    "status": "Failed",
+                    "progress": 100,
+                    "current_stage": "Queue submission failed",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "error": "Unable to enqueue Full Dispatch after upload.",
+                },
+            )
+            raise
+
+        return json_response(
+            {
+                "status": "Accepted",
+                "application": APPLICATION_NAME,
+                "version": APPLICATION_VERSION,
+                "job_id": job_id,
+                "job_type": "full_dispatch",
+                "status_url": f"/api/reconciliation-job/{job_id}",
+                "message": "Full Dispatch was uploaded and queued in the background.",
+            },
+            202,
+        )
+    except (TypeError, ValueError, FileNotFoundError) as exc:
+        return error_response("Unable to complete Full Dispatch upload.", 400, str(exc))
+    except Exception as exc:
+        logger.exception("Full Dispatch chunked upload completion failed")
+        return error_response("Unable to complete Full Dispatch upload.", 500, str(exc))
 
 
 def _variance_management_result(force_refresh: bool = False) -> Dict[str, Any]:
@@ -3554,6 +3894,9 @@ class _BackgroundUploadedFile:
     def read(self) -> bytes:
         return self._data
 
+    def release(self) -> None:
+        self._data = b""
+
 
 class _BackgroundFiles:
     def __init__(self, values: Dict[str, Any]) -> None:
@@ -3570,7 +3913,13 @@ class _BackgroundFiles:
 
 
 class _BackgroundRequest:
-    def __init__(self, files: Dict[str, Any], submitted_by: str = "Background Worker") -> None:
+    def __init__(
+        self,
+        files: Dict[str, Any],
+        submitted_by: str = "Background Worker",
+        input_manifest: Optional[Dict[str, Any]] = None,
+        job_id: str = "",
+    ) -> None:
         self.files = _BackgroundFiles(files)
         self.form: Dict[str, Any] = {}
         self.params: Dict[str, Any] = {}
@@ -3578,6 +3927,34 @@ class _BackgroundRequest:
         self.headers: Dict[str, Any] = {"X-User-Name": submitted_by}
         self.method = "POST"
         self.url = "background://reconciliation"
+        self.input_manifest = dict(input_manifest or {})
+        self.background_job_id = str(job_id or "")
+
+
+def _archive_input_from_request(
+    req: Any,
+    field: str,
+    file_name: str,
+    file_bytes: bytes,
+    content_type: str,
+) -> Dict[str, Any]:
+    """Reuse a queued input Blob instead of uploading identical bytes again."""
+    manifest = getattr(req, "input_manifest", {}) or {}
+    existing = manifest.get(field) if isinstance(manifest, dict) else None
+    if isinstance(existing, dict) and existing.get("blob_name"):
+        return {
+            "file_name": str(existing.get("file_name") or file_name),
+            "container": str(existing.get("container") or "runs-inputs"),
+            "blob_name": str(existing["blob_name"]),
+            "content_type": str(existing.get("content_type") or content_type),
+            "size_bytes": int(existing.get("size_bytes") or len(file_bytes)),
+            "etag": str(existing.get("etag") or ""),
+        }
+    return {
+        "file_name": file_name,
+        "data": file_bytes,
+        "content_type": content_type,
+    }
 
 
 def _http_response_payload(response: func.HttpResponse) -> Dict[str, Any]:
@@ -3594,6 +3971,44 @@ def _http_response_payload(response: func.HttpResponse) -> Dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("Background processing returned an invalid payload.")
     return parsed
+
+
+def _send_reconciliation_job_message(
+    job_id: str,
+    job_type: str,
+    manifest: Dict[str, Any],
+    submitted_by: str,
+    warehouse_id: int,
+    warehouse_name: str,
+) -> None:
+    """Send one canonical reconciliation queue message."""
+    connection_string = os.getenv("AzureWebJobsStorage")
+    if not connection_string:
+        raise RuntimeError("AzureWebJobsStorage is missing.")
+
+    queue = QueueClient.from_connection_string(
+        connection_string,
+        "reconciliation-jobs",
+        message_encode_policy=TextBase64EncodePolicy(),
+    )
+    try:
+        queue.create_queue()
+    except ResourceExistsError:
+        pass
+
+    queue.send_message(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "job_type": job_type,
+                "input_manifest": manifest,
+                "submitted_by": submitted_by,
+                "warehouse_id": int(warehouse_id),
+                "warehouse_name": warehouse_name,
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 def _queue_reconciliation_job(
@@ -3639,9 +4054,11 @@ def _queue_reconciliation_job(
         )
         manifest[field] = {
             "file_name": saved["file_name"],
+            "container": saved["container"],
             "blob_name": saved["blob_name"],
             "content_type": saved["content_type"],
             "size_bytes": saved["size_bytes"],
+            "etag": saved.get("etag", ""),
         }
 
     warehouse_id = int(current_warehouse_id())
@@ -3693,32 +4110,13 @@ def _queue_reconciliation_job(
             f"Reset job {reset_lock.get('job_id') or 'unknown'} must finish before reconciliation.",
         )
 
-    connection_string = os.getenv("AzureWebJobsStorage")
-    if not connection_string:
-        raise RuntimeError("AzureWebJobsStorage is missing.")
-
-    queue = QueueClient.from_connection_string(
-        connection_string,
-        "reconciliation-jobs",
-        message_encode_policy=TextBase64EncodePolicy(),
-    )
-    try:
-        queue.create_queue()
-    except ResourceExistsError:
-        pass
-
-    queue.send_message(
-        json.dumps(
-            {
-                "job_id": job_id,
-                "job_type": job_type,
-                "input_manifest": manifest,
-                "submitted_by": submitted_by,
-                "warehouse_id": warehouse_id,
-                "warehouse_name": warehouse_name,
-            },
-            ensure_ascii=False,
-        )
+    _send_reconciliation_job_message(
+        job_id,
+        job_type,
+        manifest,
+        submitted_by,
+        warehouse_id,
+        warehouse_name,
     )
 
     return json_response(
@@ -4078,6 +4476,7 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
                     downloaded["data"],
                     str(item.get("content_type") or downloaded["content_type"]),
                 )
+            downloaded = None
 
             storage.write_background_job_status(
                 job_id,
@@ -4091,7 +4490,12 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
                     "error": "",
                 },
             )
-            background_req = _BackgroundRequest(files, submitted_by)
+            background_req = _BackgroundRequest(
+                files,
+                submitted_by,
+                input_manifest=input_manifest,
+                job_id=job_id,
+            )
             if job_type == "daily_accept":
                 response = run_daily(background_req, "accept")
             elif job_type == "daily_dispatch":

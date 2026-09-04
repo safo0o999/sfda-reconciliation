@@ -1,5 +1,6 @@
 import os
 import json
+import base64
 import logging
 import re
 from datetime import datetime, timezone, timedelta
@@ -609,6 +610,84 @@ class BlobStorage:
         result["file_name"] = safe_name
         result["category"] = safe_category
         return result
+
+    @staticmethod
+    def _upload_block_id(chunk_index: int) -> str:
+        """Return a fixed-width Azure Block Blob id for one browser chunk."""
+        index = int(chunk_index)
+        if index < 0:
+            raise ValueError("chunk_index must be zero or greater.")
+        return base64.b64encode(f"{index:08d}".encode("ascii")).decode("ascii")
+
+    def stage_job_input_block(
+        self,
+        job_id: str,
+        category: str,
+        file_name: str,
+        chunk_index: int,
+        data: bytes,
+    ) -> Dict[str, Any]:
+        """Stage one retry-safe browser upload chunk without buffering the file."""
+        safe_category = self.sanitize_file_name(category).lower()
+        safe_name = self.sanitize_file_name(file_name)
+        blob_name = self.scoped_blob_name(f"{job_id}/{safe_category}/{safe_name}")
+        block_id = self._upload_block_id(chunk_index)
+        blob = self.service.get_blob_client(
+            container=INPUTS_CONTAINER,
+            blob=blob_name,
+        )
+        blob.stage_block(block_id=block_id, data=data)
+        return {
+            "container": INPUTS_CONTAINER,
+            "blob_name": blob_name,
+            "file_name": safe_name,
+            "category": safe_category,
+            "block_id": block_id,
+            "size_bytes": len(data),
+        }
+
+    def commit_job_input_blocks(
+        self,
+        job_id: str,
+        category: str,
+        file_name: str,
+        block_count: int,
+        content_type: str = "application/octet-stream",
+    ) -> Dict[str, Any]:
+        """Commit all staged chunks and return the normal job-input manifest row."""
+        safe_category = self.sanitize_file_name(category).lower()
+        safe_name = self.sanitize_file_name(file_name)
+        count = int(block_count)
+        if count < 1:
+            raise ValueError("block_count must be at least one.")
+        blob_name = self.scoped_blob_name(f"{job_id}/{safe_category}/{safe_name}")
+        blob = self.service.get_blob_client(
+            container=INPUTS_CONTAINER,
+            blob=blob_name,
+        )
+        blob.commit_block_list(
+            [self._upload_block_id(index) for index in range(count)],
+            content_settings=ContentSettings(content_type=content_type),
+            metadata={
+                "job_id": str(job_id),
+                "category": safe_category,
+                "file_name": safe_name,
+            },
+        )
+        properties = blob.get_blob_properties()
+        return {
+            "container": INPUTS_CONTAINER,
+            "blob_name": blob_name,
+            "file_name": safe_name,
+            "category": safe_category,
+            "size_bytes": int(properties.size or 0),
+            "content_type": (
+                properties.content_settings.content_type
+                or content_type
+            ),
+            "etag": str(properties.etag or ""),
+            "last_modified": properties.last_modified,
+        }
 
     def upload_job_output(
         self,
