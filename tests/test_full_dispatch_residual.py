@@ -119,5 +119,84 @@ class FullDispatchResidualTests(unittest.TestCase):
                 Exporter.FULL_DISPATCH_RECONCILIATION_COLUMNS,
             )
 
+    def test_cutover_closes_legacy_customer_history_and_reserves_new_growth(self):
+        subject = engine()
+        inventory = pd.DataFrame([{
+            "BN": "B001", "Expiry Date": "2027-11-15",
+            "Available Quantity": 70, "Trade Name": "Drug A",
+            "Generic Item Number": "1001", "Trade Item Number": "T1",
+        }])
+        validated_sfda = pd.DataFrame([{
+            "GTIN": "06281234567890", "Drug Name": "Drug A", "BN": "B001",
+            "Expiry Date": pd.Timestamp("2027-11-15"),
+            "Expiry Month Key": "2027-11", "Generic Item Number": "1001",
+            "Quantity": 100, "Active": 100, "Quantity sent pending": 0,
+            "Quantity Receive Pending": 0,
+        }])
+        customer_history = pd.DataFrame([{
+            "To Address": "Customer A", "GLN": "1000000000001",
+            "GTIN": "06281234567890", "Drug Name": "Drug A",
+            "Generic Item Number": "1001", "Trade Description": "Drug A",
+            "BN": "B001", "Expiry Date": pd.Timestamp("2027-11-15"),
+            "Expiry Month Key": "2027-11", "PackageSize": 1,
+            "Dispatch Quantity Each": 80, "Dispatch Quantity Pack": 80,
+            "First Dispatch Date": pd.Timestamp("2026-06-01"),
+            "Last Dispatch Date": pd.Timestamp("2026-09-01"), "Custody": "",
+            "Trade Item Number": "T1",
+        }])
+        cutover = pd.DataFrame([{
+            "BN": "B001", "Expiry Month Key": "2027-11",
+            "Generic Item Number": "1001", "To Address": "Customer A",
+            "GLN": "1000000000001", "Cutover Closed Quantity Each": 50,
+            "Cutover Closed Quantity Pack": 50,
+        }])
+        reserved = pd.DataFrame([{
+            "BN": "B001", "Expiry Date": pd.Timestamp("2027-11-15"),
+            "Generic Item Number": "1001", "To Address": "Customer A",
+            "GLN": "1000000000001",
+            "Reserved Full Dispatch Quantity Each": 10,
+            "Reserved Full Dispatch Quantity Pack": 10,
+            "Confirmed Full Dispatch Quantity Each": 0,
+            "Confirmed Full Dispatch Quantity Pack": 0,
+        }])
+
+        result = subject.build_dispatch_reconciliation(
+            inventory,
+            pd.DataFrame(),
+            customer_history,
+            confirmed_full_dispatch_df=reserved,
+            batch_master_df=pd.DataFrame([{
+                "BN": "B001", "Expiry Month Key": "2027-11",
+                "Generic Item Number": "1001", "Trade Item Number": "T1",
+            }]),
+            validated_sfda_identity_df=validated_sfda,
+            cutover_baseline_df=cutover,
+        )
+
+        customer = result.loc[result["To Address"].eq("Customer A")].iloc[0]
+        self.assertEqual(int(customer["Historical Dispatch Quantity Pack"]), 80)
+        self.assertEqual(int(customer["Available Historical Dispatch Quantity Pack"]), 20)
+        self.assertEqual(int(customer["To Be Dispatch"]), 20)
+        self.assertEqual(int(result["To Be Dispatch"].sum()), 20)
+
+        # Once the complete 30-pack post-cutover movement is reserved, an
+        # unchanged SFDA report must not regenerate it for the customer or the
+        # residual Dummy GLN.
+        reserved.loc[:, "Reserved Full Dispatch Quantity Each"] = 30
+        reserved.loc[:, "Reserved Full Dispatch Quantity Pack"] = 30
+        rerun = subject.build_dispatch_reconciliation(
+            inventory,
+            pd.DataFrame(),
+            customer_history,
+            confirmed_full_dispatch_df=reserved,
+            batch_master_df=pd.DataFrame([{
+                "BN": "B001", "Expiry Month Key": "2027-11",
+                "Generic Item Number": "1001", "Trade Item Number": "T1",
+            }]),
+            validated_sfda_identity_df=validated_sfda,
+            cutover_baseline_df=cutover,
+        )
+        self.assertEqual(int(rerun["To Be Dispatch"].sum()), 0)
+
 if __name__ == "__main__":
     unittest.main()

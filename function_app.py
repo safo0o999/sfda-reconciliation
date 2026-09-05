@@ -29,6 +29,7 @@ _HISTORICAL_REBUILD_ENGINE_VERSION = "VERSIONED_BUILD_V8_20260826"
 _FULL_DISPATCH_PERFORMANCE_VERSION = (
     "FULL_DISPATCH_PERF_V1_CHUNKED_MANIFEST_OPENJSON_20260904"
 )
+_FULL_DISPATCH_CUTOVER_VERSION = "FULL_DISPATCH_CUTOVER_V1_ATOMIC_20260905"
 
 
 _VARIANCE_CACHE: Dict[int, Dict[str, Any]] = {}
@@ -2641,10 +2642,13 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
             confirm_full_cancel_dispatch_transactions_from_sfda,
             confirm_full_dispatch_transactions_from_sfda,
             create_reconciliation_run,
+            full_dispatch_cutover_schema_available,
             full_cancel_dispatch_schema_available,
             get_batch_master_df,
             get_customer_history_df,
             get_full_cancel_dispatch_confirmed_allocations,
+            get_active_full_dispatch_cutover,
+            get_full_dispatch_cutover_baseline,
             get_full_dispatch_confirmed_allocations,
             get_returns_history_df,
             replace_full_dispatch_sfda_baseline,
@@ -2656,6 +2660,12 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
         )
         from engine.exporter import Exporter
         from engine.full_reconciliation import FullReconciliationEngine
+
+        if not full_dispatch_cutover_schema_available():
+            raise ValueError(
+                "Full Dispatch database migration 004 is not installed. "
+                "Run the database migration before Full Dispatch."
+            )
 
         create_reconciliation_run(
             run_number=run_number,
@@ -2699,6 +2709,8 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
             )
         )
         reserved_full_dispatch = get_full_dispatch_confirmed_allocations()
+        full_dispatch_cutover = get_active_full_dispatch_cutover()
+        cutover_baseline = get_full_dispatch_cutover_baseline()
         cancel_schema_available = full_cancel_dispatch_schema_available()
         confirmed_cancel_dispatch = get_full_cancel_dispatch_confirmed_allocations()
         returns_history = (
@@ -2738,6 +2750,7 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
             validated_sfda_identity,
             returns_history,
             confirmed_cancel_dispatch,
+            cutover_baseline,
         )
         dispatch_details = result["dispatch_details"]
         summary_df = result["summary"]
@@ -2799,6 +2812,7 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
         mark_stage("generate_output_files")
         summary = {
             "full_dispatch_performance_version": _FULL_DISPATCH_PERFORMANCE_VERSION,
+            "full_dispatch_cutover_version": _FULL_DISPATCH_CUTOVER_VERSION,
             "inventory_rows": int(len(inventory_df)),
             "sfda_rows": int(len(sfda_df)),
             "batch_master_rows": int(len(batch_master)),
@@ -2813,6 +2827,8 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
             "dispatch_files": len(outputs["dispatch_files"]),
             "full_dispatch_pending_saved": int(full_dispatch_pending_saved),
             "full_dispatch_confirmation": full_dispatch_confirmation,
+            "full_dispatch_cutover": full_dispatch_cutover,
+            "cutover_baseline_rows": int(len(cutover_baseline)),
             "cancel_dispatch_confirmation": cancel_dispatch_confirmation,
             "cancel_dispatch_allocation_rows": int(len(cancel_dispatch_upload)),
             "cancel_dispatch_files": len(outputs["cancel_dispatch_files"]),
@@ -2900,6 +2916,37 @@ def full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "GET":
         return json_response({"status": "Ready", "required_files": ["inventory", "sfda"]})
     return _safe_queue_reconciliation_job(req, "full_dispatch", ["inventory", "sfda"])
+
+
+@app.route(route="full-reconciliation/dispatch-cutover", methods=["GET", "POST"])
+def full_reconciliation_dispatch_cutover(req: func.HttpRequest) -> func.HttpResponse:
+    """Inspect or activate the one-time Full Dispatch historical cutover."""
+    denied = _auth_guard(req, admin=req.method == "POST")
+    if denied:
+        return denied
+
+    try:
+        from engine.database import (
+            activate_full_dispatch_cutover,
+            get_full_dispatch_cutover_status,
+        )
+
+        if req.method == "GET":
+            return json_response(get_full_dispatch_cutover_status())
+
+        payload = req.get_json() or {}
+        if payload.get("confirm") is not True:
+            return error_response(
+                "Cutover activation requires explicit confirmation.",
+                400,
+            )
+        result = activate_full_dispatch_cutover(get_submitted_by(req))
+        return json_response({"status": "Completed", "cutover": result})
+    except ValueError as exc:
+        return error_response("Full Dispatch cutover was not activated.", 400, str(exc))
+    except Exception as exc:
+        logger.exception("Full Dispatch cutover failed")
+        return error_response("Full Dispatch cutover failed.", 500, str(exc))
 
 
 _FULL_DISPATCH_UPLOAD_FIELDS = ("inventory", "sfda")

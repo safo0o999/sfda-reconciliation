@@ -2630,12 +2630,14 @@ class FullReconciliationEngine:
         confirmed_full_dispatch_df: pd.DataFrame | None = None,
         batch_master_df: pd.DataFrame | None = None,
         validated_sfda_identity_df: pd.DataFrame | None = None,
+        cutover_baseline_df: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """Allocate only unconsumed historical Dispatch evidence by GLN.
+        """Allocate only post-cutover, unreserved Dispatch evidence by GLN.
 
-        Full Reconciliation must not reuse the same historical WMS dispatch
-        quantity after SFDA has already confirmed that quantity. The confirmed
-        ledger is therefore subtracted customer-by-customer before allocation.
+        Before cutover, the legacy confirmed ledger is subtracted customer by
+        customer. After cutover, cumulative Customer History that was already
+        reconciled is closed by the captured baseline, and every newly generated
+        allocation is reserved immediately so later runs cannot assign it again.
         """
 
         sfda = (
@@ -2780,9 +2782,71 @@ class FullReconciliationEngine:
             target.loc[valid_pack, "Current Inventory Quantity Each"]
             / target.loc[valid_pack, "PackageSize"]
         )
+
+        # Post-cutover files are treated as one atomic submission. Until SFDA
+        # proves the movement, their open submitted quantity must reduce the
+        # batch-level requirement as well as the customer-level availability;
+        # otherwise the same gap would be regenerated as a Dummy-GLN row.
+        open_reservations = (
+            confirmed_full_dispatch_df.copy()
+            if confirmed_full_dispatch_df is not None
+            else pd.DataFrame()
+        )
+        if open_reservations.empty:
+            target["_Open Reserved Dispatch Pack"] = 0.0
+        else:
+            for column in ["BN", "Generic Item Number"]:
+                if column not in open_reservations.columns:
+                    open_reservations[column] = ""
+                open_reservations[column] = Normalizer.text(
+                    open_reservations[column]
+                )
+            if "Expiry Month Key" not in open_reservations.columns:
+                open_reservations["Expiry Month Key"] = self._month_key(
+                    Normalizer.date(
+                        open_reservations.get(
+                            "Expiry Date", pd.Series(dtype=object)
+                        )
+                    )
+                )
+            open_reservations["Expiry Month Key"] = Normalizer.text(
+                open_reservations["Expiry Month Key"]
+            )
+            reserved_pack = pd.to_numeric(
+                open_reservations.get(
+                    "Reserved Full Dispatch Quantity Pack", 0
+                ),
+                errors="coerce",
+            ).fillna(0)
+            confirmed_pack = pd.to_numeric(
+                open_reservations.get(
+                    "Confirmed Full Dispatch Quantity Pack", 0
+                ),
+                errors="coerce",
+            ).fillna(0)
+            open_reservations["_Open Reserved Dispatch Pack"] = (
+                reserved_pack - confirmed_pack
+            ).clip(lower=0)
+            open_reservations = (
+                open_reservations.groupby(self.KEYS, dropna=False)[
+                    "_Open Reserved Dispatch Pack"
+                ]
+                .sum()
+                .reset_index()
+            )
+            target = target.merge(
+                open_reservations,
+                on=self.KEYS,
+                how="left",
+                validate="one_to_one",
+            )
+            target["_Open Reserved Dispatch Pack"] = pd.to_numeric(
+                target["_Open Reserved Dispatch Pack"], errors="coerce"
+            ).fillna(0)
         target["Required Dispatch Pack"] = (
             pd.to_numeric(target["Active"], errors="coerce").fillna(0)
             - target["Current Inventory Quantity Pack"]
+            - target["_Open Reserved Dispatch Pack"]
         ).clip(lower=0).astype(int)
 
         # The SFDA Drug Count is the regulatory source of truth for the expiry
@@ -2964,9 +3028,64 @@ class FullReconciliationEngine:
                 errors="coerce",
             ).fillna(0)
 
+        cutover_each_column = "Cutover Closed Quantity Each"
+        cutover_pack_column = "Cutover Closed Quantity Pack"
+        cutover = (
+            cutover_baseline_df.copy()
+            if cutover_baseline_df is not None
+            else pd.DataFrame()
+        )
+        if cutover.empty:
+            details[cutover_each_column] = 0.0
+            details[cutover_pack_column] = 0.0
+        else:
+            cutover_keys = [
+                "BN",
+                "Expiry Month Key",
+                "Generic Item Number",
+                "To Address",
+                "GLN",
+            ]
+            for column in cutover_keys:
+                if column not in cutover.columns:
+                    cutover[column] = ""
+                cutover[column] = (
+                    cutover[column].fillna("").astype(str).str.strip()
+                )
+            for column in [cutover_each_column, cutover_pack_column]:
+                cutover[column] = pd.to_numeric(
+                    cutover.get(column, 0), errors="coerce"
+                ).fillna(0)
+            cutover = (
+                cutover.groupby(cutover_keys, dropna=False)
+                .agg(
+                    **{
+                        cutover_each_column: (cutover_each_column, "sum"),
+                        cutover_pack_column: (cutover_pack_column, "sum"),
+                    }
+                )
+                .reset_index()
+            )
+            details = details.merge(
+                cutover,
+                on=cutover_keys,
+                how="left",
+                validate="many_to_one",
+            )
+            details[cutover_each_column] = pd.to_numeric(
+                details[cutover_each_column], errors="coerce"
+            ).fillna(0)
+            details[cutover_pack_column] = pd.to_numeric(
+                details[cutover_pack_column], errors="coerce"
+            ).fillna(0)
+
         details["Available Historical Dispatch Quantity Each"] = (
             pd.to_numeric(
                 details["Historical Dispatch Quantity Each"],
+                errors="coerce",
+            ).fillna(0)
+            - pd.to_numeric(
+                details[cutover_each_column],
                 errors="coerce",
             ).fillna(0)
             - pd.to_numeric(
@@ -2978,6 +3097,10 @@ class FullReconciliationEngine:
         details["Available Historical Dispatch Quantity Pack"] = (
             pd.to_numeric(
                 details["Historical Dispatch Quantity Pack"],
+                errors="coerce",
+            ).fillna(0)
+            - pd.to_numeric(
+                details[cutover_pack_column],
                 errors="coerce",
             ).fillna(0)
             - pd.to_numeric(
@@ -3673,6 +3796,7 @@ class FullReconciliationEngine:
         validated_sfda_identity_df: pd.DataFrame | None = None,
         returns_history_df: pd.DataFrame | None = None,
         confirmed_cancel_dispatch_df: pd.DataFrame | None = None,
+        cutover_baseline_df: pd.DataFrame | None = None,
     ) -> Dict[str, pd.DataFrame]:
         """Run the Full Dispatch stage after Accept is completed in SFDA."""
 
@@ -3692,6 +3816,7 @@ class FullReconciliationEngine:
             confirmed_full_dispatch_df,
             batch_master_df,
             validated_sfda_identity,
+            cutover_baseline_df,
         )
         empty_accept = pd.DataFrame(columns=self.ACCEPT_RECONCILIATION_COLUMNS)
         empty_variance = pd.DataFrame(columns=self.SUPPLIER_VARIANCE_COLUMNS)

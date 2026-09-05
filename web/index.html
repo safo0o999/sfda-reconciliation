@@ -950,6 +950,10 @@
                   <div class="progress-step" id="fullDispatchStepRead">○ Reading current files</div><div class="progress-step" id="fullDispatchStepValidate">○ Validating data</div><div class="progress-step" id="fullDispatchStepMatch">○ Matching customer history</div><div class="progress-step" id="fullDispatchStepGenerate">○ Generating Dispatch outputs</div>
                 </div>
               </div>
+              <div class="status-banner warning show" id="dispatchCutoverStatus" style="margin-top:14px">
+                <span>!</span><div style="flex:1"><strong>Legacy dispatch cutover not checked.</strong><br>Run Full Dispatch after uploading every final legacy CSV, then verify SFDA Active equals Current Inventory.</div>
+                <button class="btn btn-secondary" id="activateDispatchCutoverButton" type="button" disabled style="white-space:nowrap">Activate Cutover</button>
+              </div>
             </div>
           </div>
         </div>
@@ -1749,6 +1753,9 @@ Drug Traceability Reconciliation Platform</textarea></label>
         }
       }).catch(error=>{
         console.error("Unable to refresh historical status.", error);
+      });
+      Promise.resolve(refreshDispatchCutoverStatus({silent:true})).catch(error=>{
+        console.error("Unable to refresh Full Dispatch cutover status.", error);
       });
     }
  
@@ -2775,6 +2782,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   const setupProgressTimers = {step1:null,fullAccept:null,fullDispatch:null};
   let historicalDataReady = false;
   let historicalStatusData = {};
+  let dispatchCutoverStatusData = {};
 
   function element(id){ return document.getElementById(id); }
 
@@ -2901,6 +2909,73 @@ Drug Traceability Reconciliation Platform</textarea></label>
       }
       return null;
     }
+  }
+
+  async function refreshDispatchCutoverStatus({silent=false}={}){
+    const banner=element("dispatchCutoverStatus");
+    const button=element("activateDispatchCutoverButton");
+    try{
+      const response=await fetch("/api/full-reconciliation/dispatch-cutover",{
+        cache:"no-store",credentials:"same-origin"
+      });
+      const payload=await response.json().catch(()=>({}));
+      if(!response.ok) throw new Error(payload.details||payload.error||"Unable to read cutover status.");
+      dispatchCutoverStatusData=payload||{};
+      if(payload.active){
+        if(banner){
+          banner.className="status-banner success show";
+          banner.innerHTML=`<span>✓</span><div><strong>Full Dispatch cutover is active.</strong><br>Closed ${formatNumber(payload.cutover?.customer_baseline_rows||0)} legacy customer rows. New allocations are reserved by customer when generated.</div>`;
+        }
+      }else if(!payload.schema_available){
+        if(banner){
+          banner.className="status-banner warning show";
+          banner.innerHTML='<span>!</span><div><strong>Cutover database migration is pending.</strong><br>Install SQL migration 004 before activating the new Full Dispatch logic.</div>';
+        }
+      }else{
+        const mismatches=Number(payload.mismatch_rows||0);
+        const canActivate=Boolean(payload.ready_to_activate)&&String(currentUser?.Role||"").toLowerCase()==="admin";
+        if(banner){
+          banner.className=`status-banner ${payload.ready_to_activate?"info":"warning"} show`;
+          banner.innerHTML=`<span>${payload.ready_to_activate?"ⓘ":"!"}</span><div style="flex:1"><strong>${payload.ready_to_activate?"Ready for one-time cutover.":"Legacy cutover is not ready."}</strong><br>${formatNumber(payload.alignment_rows||0)} aligned batches checked · ${formatNumber(mismatches)} mismatches. Activate only after all legacy CSVs are uploaded and SFDA Active equals Current Inventory.${payload.ready_to_activate&&!canActivate?" Administrator access is required.":""}</div><button class="btn btn-secondary" id="activateDispatchCutoverButton" type="button" ${canActivate?"":"disabled"} style="white-space:nowrap">Activate Cutover</button>`;
+          bindDispatchCutoverButton();
+        }
+      }
+      if(button) button.disabled=!(payload.ready_to_activate&&String(currentUser?.Role||"").toLowerCase()==="admin");
+      return payload;
+    }catch(error){
+      if(banner){
+        banner.className="status-banner error show";
+        banner.innerHTML=`<span>!</span><div><strong>Cutover status could not be loaded.</strong><br>${escapeHtml(error.message||String(error))}</div>`;
+      }
+      if(button) button.disabled=true;
+      if(!silent) toast(error.message||String(error),"error");
+      return null;
+    }
+  }
+
+  function bindDispatchCutoverButton(){
+    const button=element("activateDispatchCutoverButton");
+    if(!button||button.dataset.bound==="true") return;
+    button.dataset.bound="true";
+    button.addEventListener("click",async()=>{
+      const approved=window.confirm("Activate the one-time Full Dispatch cutover? Continue only if every final legacy CSV was uploaded and SFDA Active now equals Current Inventory. This closes all existing Customer History as reconciled.");
+      if(!approved) return;
+      button.disabled=true;button.textContent="Activating...";
+      try{
+        const response=await fetch("/api/full-reconciliation/dispatch-cutover",{
+          method:"POST",credentials:"same-origin",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({confirm:true})
+        });
+        const payload=await response.json().catch(()=>({}));
+        if(!response.ok) throw new Error(payload.details||payload.error||"Cutover activation failed.");
+        await refreshDispatchCutoverStatus({silent:true});
+        toast("Full Dispatch cutover activated successfully.","success");
+      }catch(error){
+        toast(error.message||String(error),"error");
+        button.disabled=false;button.textContent="Activate Cutover";
+      }
+    });
   }
 
   function configureProgress(prefix, percent, label, failed=false){
@@ -3341,6 +3416,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       saveDashboardPreview(result.dashboard_preview);
       renderDashboardOverview();
       await refreshHistoricalStatus({silent:true});
+      await refreshDispatchCutoverStatus({silent:true});
       await refreshAzureHistory({silent:true});
       toast("Full Accept Reconciliation completed successfully.","success");
     }catch(error){ finishSetupProgress("fullAccept",false); showSetupError(error.message||String(error)); }
@@ -3390,6 +3466,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       saveDashboardPreview(result.dashboard_preview);
       renderDashboardOverview();
       await refreshHistoricalStatus({silent:true});
+      await refreshDispatchCutoverStatus({silent:true});
       await refreshAzureHistory({silent:true});
       toast("Full Dispatch Reconciliation completed successfully.","success");
     }catch(error){ finishSetupProgress("fullDispatch",false); showSetupError(error.message||String(error)); }

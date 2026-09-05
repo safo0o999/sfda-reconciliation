@@ -3307,6 +3307,8 @@ def reset_current_warehouse_data(
         # Confirmation / pending / daily state first.
         "DailyDispatchConfirmations",
         "FullDispatchConfirmations",
+        "FullDispatchCutoverBaseline",
+        "FullDispatchCutovers",
         "DailyProcessedTransactions",
         "DailyAcceptTransactions",
         "DailyDispatchTransactions",
@@ -7986,12 +7988,332 @@ def refresh_dispatch_history_incremental(
 # SFDA-confirmed Full Dispatch consumption state
 # -----------------------------------------------------------------------------
 
+def _full_dispatch_cutover_schema_available(connection: pyodbc.Connection) -> bool:
+    """Return whether migration 004 is fully installed."""
+    row = connection.cursor().execute(r"""
+        SELECT CASE
+            WHEN OBJECT_ID(N'dbo.FullDispatchCutovers', N'U') IS NOT NULL
+             AND OBJECT_ID(N'dbo.FullDispatchCutoverBaseline', N'U') IS NOT NULL
+             AND COL_LENGTH(N'dbo.FullDispatchTransactions', N'CutoverID') IS NOT NULL
+            THEN 1 ELSE 0 END;
+    """).fetchone()
+    return bool(int(row[0] or 0))
+
+
+def full_dispatch_cutover_schema_available() -> bool:
+    """Public deployment guard for the Full Dispatch cutover extension."""
+    initialize_database()
+    with Database().connect() as connection:
+        return _full_dispatch_cutover_schema_available(connection)
+
+def _get_active_full_dispatch_cutover_with_connection(
+    connection: pyodbc.Connection,
+) -> Optional[Dict[str, Any]]:
+    """Return the active cutover visible to the current warehouse session."""
+    if not _full_dispatch_cutover_schema_available(connection):
+        return None
+    row = connection.cursor().execute(r"""
+        SELECT TOP (1)
+            CutoverID, Status, ActivatedAt, ActivatedBy,
+            InventorySourceFile, SFDASourceFile,
+            CustomerBaselineRows, CustomerBaselinePack,
+            AlignmentRows, MaxDifferencePack
+        FROM dbo.FullDispatchCutovers
+        WHERE Status = N'Active'
+        ORDER BY ActivatedAt DESC;
+    """).fetchone()
+    if row is None:
+        return None
+    return {
+        "cutover_id": str(row[0]),
+        "status": str(row[1] or ""),
+        "activated_at": row[2],
+        "activated_by": str(row[3] or ""),
+        "inventory_source_file": str(row[4] or ""),
+        "sfda_source_file": str(row[5] or ""),
+        "customer_baseline_rows": int(row[6] or 0),
+        "customer_baseline_pack": float(row[7] or 0),
+        "alignment_rows": int(row[8] or 0),
+        "max_difference_pack": float(row[9] or 0),
+    }
+
+
+def get_active_full_dispatch_cutover() -> Optional[Dict[str, Any]]:
+    """Return active Full Dispatch cutover metadata for this warehouse."""
+    initialize_database()
+    with Database().connect() as connection:
+        return _get_active_full_dispatch_cutover_with_connection(connection)
+
+
+def get_full_dispatch_cutover_alignment() -> pd.DataFrame:
+    """Compare latest SFDA Active against physical Inventory in pack units.
+
+    Batch Master supplies the verified SFDA/WMS identity and stable PackageSize.
+    The result contains only exact regulatory batches represented in both the
+    active historical build and the latest SFDA snapshot.
+    """
+    initialize_database()
+    sql = r"""
+        WITH MasterIdentity AS
+        (
+            SELECT
+                BN, ExpiryMonthKey, GenericItemNumber,
+                MAX(NULLIF(GTIN, N'')) AS GTIN,
+                MAX(CASE WHEN PackageSize > 0 THEN PackageSize ELSE 1 END) AS PackageSize
+            FROM dbo.BatchMaster
+            WHERE NULLIF(GTIN, N'') IS NOT NULL
+            GROUP BY BN, ExpiryMonthKey, GenericItemNumber
+        ),
+        Inventory AS
+        (
+            SELECT BN, ExpiryMonthKey, GenericItemNumber,
+                   SUM(AvailableQuantity) AS InventoryEach
+            FROM dbo.LatestInventorySnapshot
+            GROUP BY BN, ExpiryMonthKey, GenericItemNumber
+        ),
+        SFDA AS
+        (
+            SELECT GTIN, BN, ExpiryMonthKey,
+                   SUM(Active) AS SFDAActive
+            FROM dbo.LatestSFDASnapshot
+            GROUP BY GTIN, BN, ExpiryMonthKey
+        )
+        SELECT
+            m.BN,
+            m.ExpiryMonthKey AS [Expiry Month Key],
+            m.GenericItemNumber AS [Generic Item Number],
+            m.GTIN,
+            m.PackageSize,
+            COALESCE(i.InventoryEach, 0) AS [Current Inventory Quantity Each],
+            COALESCE(i.InventoryEach, 0) / NULLIF(m.PackageSize, 0)
+                AS [Current Inventory Quantity Pack],
+            s.SFDAActive AS [SFDA Active],
+            s.SFDAActive
+                - (COALESCE(i.InventoryEach, 0) / NULLIF(m.PackageSize, 0))
+                AS [Difference Pack]
+        FROM MasterIdentity AS m
+        INNER JOIN SFDA AS s
+            ON s.GTIN = m.GTIN
+           AND s.BN = m.BN
+           AND s.ExpiryMonthKey = m.ExpiryMonthKey
+        LEFT JOIN Inventory AS i
+            ON i.BN = m.BN
+           AND i.ExpiryMonthKey = m.ExpiryMonthKey
+           AND i.GenericItemNumber = m.GenericItemNumber;
+    """
+    with Database().connect() as connection:
+        return pd.read_sql(sql, connection)
+
+
+def get_full_dispatch_cutover_status() -> Dict[str, Any]:
+    """Return cutover status plus a lightweight latest-snapshot alignment."""
+    initialize_database()
+    schema_available = full_dispatch_cutover_schema_available()
+    cutover = get_active_full_dispatch_cutover()
+    alignment = get_full_dispatch_cutover_alignment()
+    difference = pd.to_numeric(
+        alignment.get("Difference Pack", pd.Series(dtype=float)),
+        errors="coerce",
+    ).fillna(0).abs()
+    tolerance = max(
+        0.0,
+        float(os.getenv("FULL_DISPATCH_CUTOVER_TOLERANCE_PACK", "0.000001") or 0.000001),
+    )
+    return {
+        "schema_available": schema_available,
+        "active": cutover is not None,
+        "cutover": cutover,
+        "alignment_rows": int(len(alignment)),
+        "mismatch_rows": int(difference.gt(tolerance).sum()),
+        "max_difference_pack": float(difference.max()) if not difference.empty else 0.0,
+        "tolerance_pack": float(tolerance),
+        "ready_to_activate": bool(
+            schema_available
+            and cutover is None
+            and not alignment.empty
+            and not difference.gt(tolerance).any()
+        ),
+    }
+
+
+def activate_full_dispatch_cutover(activated_by: str = "") -> Dict[str, Any]:
+    """Close current cumulative Customer History as the post-alignment baseline.
+
+    Activation is rejected unless every verified SFDA batch in the latest
+    snapshots is aligned to physical Inventory within the configured tolerance.
+    Baseline capture is set-based and transactional.
+    """
+    import uuid
+
+    initialize_database()
+    if not full_dispatch_cutover_schema_available():
+        raise ValueError(
+            "Full Dispatch cutover migration 004 is not installed. "
+            "Run the database migration before activation."
+        )
+    alignment = get_full_dispatch_cutover_alignment()
+    if alignment.empty:
+        raise ValueError(
+            "Cutover cannot be activated because latest Inventory/SFDA alignment is empty. "
+            "Complete a Full Dispatch run with the final updated files first."
+        )
+
+    tolerance = max(
+        0.0,
+        float(os.getenv("FULL_DISPATCH_CUTOVER_TOLERANCE_PACK", "0.000001") or 0.000001),
+    )
+    differences = pd.to_numeric(alignment["Difference Pack"], errors="coerce").fillna(0).abs()
+    mismatch_rows = int(differences.gt(tolerance).sum())
+    max_difference = float(differences.max()) if not differences.empty else 0.0
+    if mismatch_rows:
+        raise ValueError(
+            "Cutover cannot be activated: "
+            f"{mismatch_rows} batch(es) still have SFDA Active/Inventory differences "
+            f"above {tolerance:g} pack. Maximum difference: {max_difference:g} pack."
+        )
+
+    cutover_id = str(uuid.uuid4())
+    with Database().connect() as connection:
+        cursor = connection.cursor()
+        try:
+            existing = _get_active_full_dispatch_cutover_with_connection(connection)
+            if existing is not None:
+                raise ValueError(
+                    "Full Dispatch cutover is already active for this warehouse."
+                )
+
+            inventory_source_row = cursor.execute(r"""
+                SELECT TOP (1) SourceFileName
+                FROM dbo.LatestInventorySnapshot
+                ORDER BY SnapshotUtc DESC;
+            """).fetchone()
+            sfda_source_row = cursor.execute(r"""
+                SELECT TOP (1) SourceFileName
+                FROM dbo.LatestSFDASnapshot
+                ORDER BY SnapshotUtc DESC;
+            """).fetchone()
+            inventory_source = str(inventory_source_row[0] or "") if inventory_source_row else ""
+            sfda_source = str(sfda_source_row[0] or "") if sfda_source_row else ""
+
+            cursor.execute(r"""
+                INSERT INTO dbo.FullDispatchCutovers
+                (
+                    CutoverID, Status, ActivatedBy,
+                    InventorySourceFile, SFDASourceFile,
+                    AlignmentRows, MaxDifferencePack
+                )
+                VALUES (?, N'Active', ?, ?, ?, ?, ?);
+            """, (
+                cutover_id,
+                str(activated_by or ""),
+                inventory_source,
+                sfda_source,
+                int(len(alignment)),
+                max_difference,
+            ))
+
+            cursor.execute(r"""
+                INSERT INTO dbo.FullDispatchCutoverBaseline
+                (
+                    CutoverID, BN, ExpiryMonthKey, GenericItemNumber,
+                    ToAddress, GLN, PackageSize,
+                    ClosedQuantityEach, ClosedQuantityPack
+                )
+                SELECT
+                    ?,
+                    BN,
+                    ExpiryMonthKey,
+                    GenericItemNumber,
+                    LTRIM(RTRIM(ISNULL(ToAddress, N''))),
+                    CASE
+                        WHEN NULLIF(LTRIM(RTRIM(ISNULL(GLN, N''))), N'') IS NULL
+                          OR UPPER(LTRIM(RTRIM(ISNULL(GLN, N'')))) = N'DUMMY'
+                        THEN N'99999999999999'
+                        ELSE LTRIM(RTRIM(GLN))
+                    END,
+                    MAX(CASE WHEN PackageSize > 0 THEN PackageSize ELSE 1 END),
+                    SUM(DispatchQuantityEach),
+                    SUM(DispatchQuantityPack)
+                FROM dbo.CustomerHistory
+                GROUP BY
+                    BN, ExpiryMonthKey, GenericItemNumber,
+                    LTRIM(RTRIM(ISNULL(ToAddress, N''))),
+                    CASE
+                        WHEN NULLIF(LTRIM(RTRIM(ISNULL(GLN, N''))), N'') IS NULL
+                          OR UPPER(LTRIM(RTRIM(ISNULL(GLN, N'')))) = N'DUMMY'
+                        THEN N'99999999999999'
+                        ELSE LTRIM(RTRIM(GLN))
+                    END;
+            """, cutover_id)
+
+            baseline = cursor.execute(r"""
+                SELECT COUNT_BIG(*), COALESCE(SUM(ClosedQuantityPack), 0)
+                FROM dbo.FullDispatchCutoverBaseline
+                WHERE CutoverID = ?;
+            """, cutover_id).fetchone()
+            baseline_rows = int(baseline[0] or 0)
+            baseline_pack = float(baseline[1] or 0)
+
+            cursor.execute(r"""
+                UPDATE dbo.FullDispatchCutovers
+                SET CustomerBaselineRows = ?,
+                    CustomerBaselinePack = ?
+                WHERE CutoverID = ?;
+            """, baseline_rows, baseline_pack, cutover_id)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "status": "Activated",
+        "cutover_id": cutover_id,
+        "customer_baseline_rows": baseline_rows,
+        "customer_baseline_pack": baseline_pack,
+        "alignment_rows": int(len(alignment)),
+        "max_difference_pack": max_difference,
+        "tolerance_pack": tolerance,
+    }
+
+
+def get_full_dispatch_cutover_baseline() -> pd.DataFrame:
+    """Return the active cutover's closed cumulative customer quantities."""
+    initialize_database()
+    columns = [
+        "BN", "Expiry Month Key", "Generic Item Number", "To Address", "GLN",
+        "PackageSize", "Cutover Closed Quantity Each",
+        "Cutover Closed Quantity Pack",
+    ]
+    if not full_dispatch_cutover_schema_available():
+        return pd.DataFrame(columns=columns)
+    sql = r"""
+        SELECT
+            b.BN,
+            b.ExpiryMonthKey AS [Expiry Month Key],
+            b.GenericItemNumber AS [Generic Item Number],
+            b.ToAddress AS [To Address],
+            b.GLN,
+            MAX(b.PackageSize) AS PackageSize,
+            SUM(b.ClosedQuantityEach) AS [Cutover Closed Quantity Each],
+            SUM(b.ClosedQuantityPack) AS [Cutover Closed Quantity Pack]
+        FROM dbo.FullDispatchCutoverBaseline AS b
+        INNER JOIN dbo.FullDispatchCutovers AS c
+            ON c.WarehouseID = b.WarehouseID
+           AND c.CutoverID = b.CutoverID
+           AND c.Status = N'Active'
+        GROUP BY
+            b.BN, b.ExpiryMonthKey, b.GenericItemNumber, b.ToAddress, b.GLN;
+    """
+    with Database().connect() as connection:
+        return pd.read_sql(sql, connection)
+
 def _full_dispatch_transaction_key(
     bn: str,
     expiry_date: Any,
     generic_item_number: str,
     to_address: str,
     gln: str,
+    cutover_id: str = "",
 ) -> str:
     """Return one stable Full Dispatch customer-history consumption key."""
     import hashlib
@@ -8006,6 +8328,7 @@ def _full_dispatch_transaction_key(
             str(generic_item_number or "").strip(),
             str(to_address or "").strip().upper(),
             str(gln or "").strip(),
+            str(cutover_id or "").strip().upper(),
         ]
     )
     return _warehouse_scoped_key(hashlib.sha256(raw.encode("utf-8")).hexdigest())
@@ -8060,7 +8383,7 @@ def get_full_dispatch_confirmed_allocations() -> pd.DataFrame:
     unchanged SFDA correctly regenerates the same operational file.
     """
     initialize_database()
-    base_sql = r"""
+    pre_cutover_sql = r"""
         SELECT
             BN,
             ExpiryDate AS [Expiry Date],
@@ -8077,13 +8400,40 @@ def get_full_dispatch_confirmed_allocations() -> pd.DataFrame:
            OR ConfirmedQuantityEach > 0)
     """
     with Database().connect() as connection:
+        cutover = _get_active_full_dispatch_cutover_with_connection(connection)
+        if cutover is not None:
+            sql = r"""
+                SELECT
+                    BN,
+                    ExpiryDate AS [Expiry Date],
+                    GenericItemNumber AS [Generic Item Number],
+                    ToAddress AS [To Address],
+                    GLN,
+                    SubmittedQuantityEach AS [Reserved Full Dispatch Quantity Each],
+                    SubmittedQuantityPack AS [Reserved Full Dispatch Quantity Pack],
+                    ConfirmedQuantityEach AS [Confirmed Full Dispatch Quantity Each],
+                    ConfirmedQuantityPack AS [Confirmed Full Dispatch Quantity Pack],
+                    LastConfirmedAt AS [Last Full Dispatch Confirmed At]
+                FROM dbo.FullDispatchTransactions
+                WHERE CutoverID = ?
+                  AND (SubmittedQuantityPack > 0 OR SubmittedQuantityEach > 0)
+            """
+            if _full_cancel_dispatch_schema_available(connection):
+                sql += " AND ISNULL(TransactionType, 'DISPATCH') = 'DISPATCH'"
+            sql += ";"
+            return pd.read_sql(
+                sql,
+                connection,
+                params=[cutover["cutover_id"]],
+            )
+
         if _full_cancel_dispatch_schema_available(connection):
             sql = (
-                base_sql
+                pre_cutover_sql
                 + " AND ISNULL(TransactionType, 'DISPATCH') = 'DISPATCH';"
             )
         else:
-            sql = base_sql + ";"
+            sql = pre_cutover_sql + ";"
         return pd.read_sql(sql, connection)
 
 
@@ -8099,6 +8449,15 @@ def save_full_dispatch_pending_transactions(
     """
     initialize_database()
     prepared: Dict[str, Dict[str, Any]] = {}
+    with Database().connect() as cutover_connection:
+        active_cutover = _get_active_full_dispatch_cutover_with_connection(
+            cutover_connection
+        )
+    cutover_id = (
+        str(active_cutover.get("cutover_id") or "")
+        if active_cutover is not None
+        else ""
+    )
 
     for row in rows or []:
         bn = _text(row, "BN").upper()
@@ -8135,6 +8494,7 @@ def save_full_dispatch_pending_transactions(
             generic,
             to_address,
             gln,
+            cutover_id,
         )
 
         current = prepared.setdefault(
@@ -8147,6 +8507,7 @@ def save_full_dispatch_pending_transactions(
                 "GenericItemNumber": generic,
                 "ToAddress": to_address,
                 "GLN": gln,
+                "CutoverID": cutover_id or None,
                 "Each": 0.0,
                 "Pack": 0.0,
             },
@@ -8164,7 +8525,7 @@ def save_full_dispatch_pending_transactions(
             SELECT
                 ? AS TransactionKey, ? AS BN, ? AS ExpiryDate,
                 ? AS ExpiryMonthKey, ? AS GenericItemNumber,
-                ? AS ToAddress, ? AS GLN,
+                ? AS ToAddress, ? AS GLN, ? AS CutoverID,
                 ? AS NewQuantityEach, ? AS NewQuantityPack, ? AS RunNumber
         ) AS source
         ON target.TransactionKey = source.TransactionKey
@@ -8175,13 +8536,24 @@ def save_full_dispatch_pending_transactions(
                 GenericItemNumber = source.GenericItemNumber,
                 ToAddress = source.ToAddress,
                 GLN = source.GLN,
+                CutoverID = source.CutoverID,
                 SubmittedQuantityEach = CASE
+                    WHEN source.CutoverID IS NOT NULL
+                         AND target.LastSubmittedRun = source.RunNumber
+                    THEN target.SubmittedQuantityEach
+                    WHEN source.CutoverID IS NOT NULL
+                    THEN target.SubmittedQuantityEach + source.NewQuantityEach
                     WHEN target.SubmittedQuantityEach >=
                          target.ConfirmedQuantityEach + source.NewQuantityEach
                     THEN target.SubmittedQuantityEach
                     ELSE target.ConfirmedQuantityEach + source.NewQuantityEach
                 END,
                 SubmittedQuantityPack = CASE
+                    WHEN source.CutoverID IS NOT NULL
+                         AND target.LastSubmittedRun = source.RunNumber
+                    THEN target.SubmittedQuantityPack
+                    WHEN source.CutoverID IS NOT NULL
+                    THEN target.SubmittedQuantityPack + source.NewQuantityPack
                     WHEN target.SubmittedQuantityPack >=
                          target.ConfirmedQuantityPack + source.NewQuantityPack
                     THEN target.SubmittedQuantityPack
@@ -8193,7 +8565,7 @@ def save_full_dispatch_pending_transactions(
             INSERT
             (
                 TransactionKey, BN, ExpiryDate, ExpiryMonthKey,
-                GenericItemNumber, ToAddress, GLN,
+                GenericItemNumber, ToAddress, GLN, CutoverID,
                 SubmittedQuantityEach, SubmittedQuantityPack,
                 ConfirmedQuantityEach, ConfirmedQuantityPack,
                 FirstSubmittedRun, LastSubmittedRun
@@ -8202,7 +8574,7 @@ def save_full_dispatch_pending_transactions(
             (
                 source.TransactionKey, source.BN, source.ExpiryDate,
                 source.ExpiryMonthKey, source.GenericItemNumber,
-                source.ToAddress, source.GLN,
+                source.ToAddress, source.GLN, source.CutoverID,
                 source.NewQuantityEach, source.NewQuantityPack,
                 0, 0, source.RunNumber, source.RunNumber
             );
@@ -8219,9 +8591,10 @@ def save_full_dispatch_pending_transactions(
                 CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[4]')) AS GenericItemNumber,
                 CONVERT(nvarchar(1000), JSON_VALUE(j.value, '$[5]')) AS ToAddress,
                 CONVERT(nvarchar(100), JSON_VALUE(j.value, '$[6]')) AS GLN,
-                TRY_CONVERT(decimal(38,6), JSON_VALUE(j.value, '$[7]')) AS NewQuantityEach,
-                TRY_CONVERT(decimal(38,6), JSON_VALUE(j.value, '$[8]')) AS NewQuantityPack,
-                CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[9]')) AS RunNumber
+                TRY_CONVERT(uniqueidentifier, NULLIF(JSON_VALUE(j.value, '$[7]'), '')) AS CutoverID,
+                TRY_CONVERT(decimal(38,6), JSON_VALUE(j.value, '$[8]')) AS NewQuantityEach,
+                TRY_CONVERT(decimal(38,6), JSON_VALUE(j.value, '$[9]')) AS NewQuantityPack,
+                CONVERT(nvarchar(255), JSON_VALUE(j.value, '$[10]')) AS RunNumber
             FROM OPENJSON(CAST(? AS nvarchar(max))) AS j
         )
         MERGE dbo.FullDispatchTransactions WITH (HOLDLOCK) AS target
@@ -8235,13 +8608,24 @@ def save_full_dispatch_pending_transactions(
                 GenericItemNumber = source.GenericItemNumber,
                 ToAddress = source.ToAddress,
                 GLN = source.GLN,
+                CutoverID = source.CutoverID,
                 SubmittedQuantityEach = CASE
+                    WHEN source.CutoverID IS NOT NULL
+                         AND target.LastSubmittedRun = source.RunNumber
+                    THEN target.SubmittedQuantityEach
+                    WHEN source.CutoverID IS NOT NULL
+                    THEN target.SubmittedQuantityEach + source.NewQuantityEach
                     WHEN target.SubmittedQuantityEach >=
                          target.ConfirmedQuantityEach + source.NewQuantityEach
                     THEN target.SubmittedQuantityEach
                     ELSE target.ConfirmedQuantityEach + source.NewQuantityEach
                 END,
                 SubmittedQuantityPack = CASE
+                    WHEN source.CutoverID IS NOT NULL
+                         AND target.LastSubmittedRun = source.RunNumber
+                    THEN target.SubmittedQuantityPack
+                    WHEN source.CutoverID IS NOT NULL
+                    THEN target.SubmittedQuantityPack + source.NewQuantityPack
                     WHEN target.SubmittedQuantityPack >=
                          target.ConfirmedQuantityPack + source.NewQuantityPack
                     THEN target.SubmittedQuantityPack
@@ -8253,7 +8637,7 @@ def save_full_dispatch_pending_transactions(
             INSERT
             (
                 TransactionKey, BN, ExpiryDate, ExpiryMonthKey,
-                GenericItemNumber, ToAddress, GLN,
+                GenericItemNumber, ToAddress, GLN, CutoverID,
                 SubmittedQuantityEach, SubmittedQuantityPack,
                 ConfirmedQuantityEach, ConfirmedQuantityPack,
                 FirstSubmittedRun, LastSubmittedRun
@@ -8262,7 +8646,7 @@ def save_full_dispatch_pending_transactions(
             (
                 source.TransactionKey, source.BN, source.ExpiryDate,
                 source.ExpiryMonthKey, source.GenericItemNumber,
-                source.ToAddress, source.GLN,
+                source.ToAddress, source.GLN, source.CutoverID,
                 source.NewQuantityEach, source.NewQuantityPack,
                 0, 0, source.RunNumber, source.RunNumber
             );
@@ -8280,7 +8664,8 @@ def save_full_dispatch_pending_transactions(
                 [
                     row["TransactionKey"], row["BN"], str(row["ExpiryDate"]),
                     row["ExpiryMonthKey"], row["GenericItemNumber"],
-                    row["ToAddress"], row["GLN"], row["Each"], row["Pack"],
+                    row["ToAddress"], row["GLN"], row["CutoverID"],
+                    row["Each"], row["Pack"],
                     str(run_number),
                 ]
                 for row in prepared.values()
@@ -8309,7 +8694,8 @@ def save_full_dispatch_pending_transactions(
                         (
                             row["TransactionKey"], row["BN"], row["ExpiryDate"],
                             row["ExpiryMonthKey"], row["GenericItemNumber"],
-                            row["ToAddress"], row["GLN"], row["Each"], row["Pack"],
+                            row["ToAddress"], row["GLN"], row["CutoverID"],
+                            row["Each"], row["Pack"],
                             str(run_number),
                         ),
                     )
@@ -8802,6 +9188,42 @@ def confirm_full_cancel_dispatch_transactions_from_sfda(
     }
 
 
+def _prioritize_exact_full_dispatch_confirmation(
+    pending_rows: Sequence[Any],
+    confirmed_pack_evidence: float,
+) -> List[Any]:
+    """Prioritize one uniquely exact customer allocation over batch FIFO.
+
+    SFDA confirms Dispatch movement at batch level and does not return the GLN.
+    When the proven movement exactly equals the open quantity of one and only
+    one previously generated customer allocation, that quantity is strong
+    evidence for that specific allocation.  Put that row first so confirmation
+    is assigned to the matching customer instead of an unrelated older row.
+
+    Ambiguous or non-exact cases preserve the existing stable FIFO order.  A
+    later submission-aware workflow can resolve those cases without guessing.
+    """
+    ordered = list(pending_rows or [])
+    evidence = max(0.0, float(confirmed_pack_evidence or 0))
+    if evidence <= 0 or len(ordered) < 2:
+        return ordered
+
+    tolerance = 0.000001
+    exact_indexes: List[int] = []
+    for index, pending in enumerate(ordered):
+        submitted_pack = float(pending[3] or 0)
+        confirmed_pack = float(pending[4] or 0)
+        open_pack = max(0.0, submitted_pack - confirmed_pack)
+        if abs(open_pack - evidence) <= tolerance:
+            exact_indexes.append(index)
+
+    if len(exact_indexes) != 1:
+        return ordered
+
+    exact_index = exact_indexes[0]
+    return [ordered[exact_index], *ordered[:exact_index], *ordered[exact_index + 1 :]]
+
+
 def confirm_full_dispatch_transactions_from_sfda(
     sfda_df: pd.DataFrame,
     source_file_name: str = "",
@@ -8825,6 +9247,12 @@ def confirm_full_dispatch_transactions_from_sfda(
 
     with Database().connect() as connection:
         transaction_type_available = _full_cancel_dispatch_schema_available(connection)
+        active_cutover = _get_active_full_dispatch_cutover_with_connection(connection)
+        cutover_id = (
+            str(active_cutover.get("cutover_id") or "")
+            if active_cutover is not None
+            else ""
+        )
         previous = pd.read_sql(
             r"""
             SELECT
@@ -8934,14 +9362,22 @@ def confirm_full_dispatch_transactions_from_sfda(
                 """
                 if transaction_type_available:
                     pending_sql += " AND TransactionType = 'DISPATCH'"
+                pending_params: List[Any] = [
+                    bn,
+                    pd.to_datetime(expiry, errors="coerce").strftime("%Y-%m"),
+                ]
+                if cutover_id:
+                    pending_sql += " AND CutoverID = ?"
+                    pending_params.append(cutover_id)
                 pending_sql += " ORDER BY CreatedAt, TransactionKey;"
                 pending_rows = cursor.execute(
                     pending_sql,
-                    (
-                        bn,
-                        pd.to_datetime(expiry, errors="coerce").strftime("%Y-%m"),
-                    ),
+                    pending_params,
                 ).fetchall()
+                pending_rows = _prioritize_exact_full_dispatch_confirmation(
+                    pending_rows,
+                    remaining_pack,
+                )
 
                 batch_confirmed = 0.0
 
