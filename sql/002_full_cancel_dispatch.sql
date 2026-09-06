@@ -16,12 +16,19 @@ BEGIN TRY
         THROW 52200, 'FullDispatchTransactions must exist before installing Cancel Dispatch.', 1;
 
     IF COL_LENGTH(N'dbo.FullDispatchTransactions', N'TransactionType') IS NULL
-        ALTER TABLE dbo.FullDispatchTransactions
-            ADD TransactionType nvarchar(32) NULL;
+        EXEC sys.sp_executesql N'
+            ALTER TABLE dbo.FullDispatchTransactions
+                ADD TransactionType nvarchar(32) NULL;
+        ';
 
-    UPDATE dbo.FullDispatchTransactions
-    SET TransactionType = N'DISPATCH'
-    WHERE TransactionType IS NULL;
+    -- Dynamic SQL is required on first installation. SQL Server compiles a
+    -- static reference to TransactionType before the preceding ALTER TABLE is
+    -- executed and otherwise raises "Invalid column name TransactionType".
+    EXEC sys.sp_executesql N'
+        UPDATE dbo.FullDispatchTransactions
+        SET TransactionType = N''DISPATCH''
+        WHERE TransactionType IS NULL;
+    ';
 
     IF EXISTS (
         SELECT 1 FROM sys.columns
@@ -29,8 +36,10 @@ BEGIN TRY
           AND name = N'TransactionType'
           AND is_nullable = 1
     )
-        ALTER TABLE dbo.FullDispatchTransactions
-            ALTER COLUMN TransactionType nvarchar(32) NOT NULL;
+        EXEC sys.sp_executesql N'
+            ALTER TABLE dbo.FullDispatchTransactions
+                ALTER COLUMN TransactionType nvarchar(32) NOT NULL;
+        ';
 
     IF NOT EXISTS (
         SELECT 1
@@ -41,12 +50,17 @@ BEGIN TRY
         WHERE dc.parent_object_id = OBJECT_ID(N'dbo.FullDispatchTransactions')
           AND c.name = N'TransactionType'
     )
-        ALTER TABLE dbo.FullDispatchTransactions
-            ADD CONSTRAINT DF_FullDispatchTransactions_TransactionType
-            DEFAULT (N'DISPATCH') FOR TransactionType;
+        EXEC sys.sp_executesql N'
+            ALTER TABLE dbo.FullDispatchTransactions
+                ADD CONSTRAINT DF_FullDispatchTransactions_TransactionType
+                DEFAULT (N''DISPATCH'') FOR TransactionType;
+        ';
 
     IF COL_LENGTH(N'dbo.FullDispatchTransactions', N'SourceType') IS NULL
-        ALTER TABLE dbo.FullDispatchTransactions ADD SourceType nvarchar(64) NULL;
+        EXEC sys.sp_executesql N'
+            ALTER TABLE dbo.FullDispatchTransactions
+                ADD SourceType nvarchar(64) NULL;
+        ';
 
     IF NOT EXISTS (
         SELECT 1
@@ -55,9 +69,11 @@ BEGIN TRY
           AND name = N'IX_FullDispatchTransactions_TypeBatch'
     )
     BEGIN
-        CREATE INDEX IX_FullDispatchTransactions_TypeBatch
-            ON dbo.FullDispatchTransactions
-               (TransactionType, BN, ExpiryMonthKey, CreatedAt);
+        EXEC sys.sp_executesql N'
+            CREATE INDEX IX_FullDispatchTransactions_TypeBatch
+                ON dbo.FullDispatchTransactions
+                   (TransactionType, BN, ExpiryMonthKey, CreatedAt);
+        ';
     END;
 
     COMMIT TRANSACTION;
