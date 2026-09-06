@@ -1985,6 +1985,7 @@ class FullReconciliationEngine:
         sfda_df: pd.DataFrame,
         batch_master_df: pd.DataFrame,
         allow_shared_regulatory_identity: bool = False,
+        trust_batch_master_gtin: bool = False,
     ) -> pd.DataFrame:
         """Apply the historical V6 identity gate to current Stage-2 SFDA rows.
 
@@ -2016,6 +2017,7 @@ class FullReconciliationEngine:
 
         master = self._rename_history_columns(master)
         candidate_columns = self.KEYS + [
+            "GTIN",
             "Trade Description",
             "Description",
             "Item Family Group",
@@ -2023,6 +2025,7 @@ class FullReconciliationEngine:
         candidates = self._ensure_columns(master, candidate_columns)[
             candidate_columns
         ].copy()
+        candidates = candidates.rename(columns={"GTIN": "_Batch Master GTIN"})
         for column in self.KEYS:
             candidates[column] = Normalizer.text(candidates[column])
         candidates = candidates.loc[
@@ -2042,6 +2045,37 @@ class FullReconciliationEngine:
         accepted = self._ensure_columns(accepted, output_columns)[
             output_columns
         ].copy()
+
+        if trust_batch_master_gtin:
+            # BatchMaster contains only SFDA-proven product identities.  Full
+            # Dispatch must reconcile the same regulatory grain used by the
+            # cutover check, so an exact stored GTIN + BN + expiry-month match
+            # is stronger evidence than re-running name similarity against a
+            # newly formatted SFDA Drug Name.  The default remains False so
+            # Full Accept and Historical identity admission stay conservative.
+            trusted = candidates.merge(
+                sfda,
+                on=self.SFDA_KEYS,
+                how="inner",
+                validate="many_to_one",
+            )
+            trusted["_Batch Master GTIN"] = Normalizer.text(
+                trusted["_Batch Master GTIN"]
+            )
+            trusted["GTIN"] = Normalizer.text(trusted["GTIN"])
+            trusted = trusted.loc[
+                trusted["_Batch Master GTIN"].ne("")
+                & trusted["_Batch Master GTIN"].eq(trusted["GTIN"])
+            ].copy()
+            trusted = self._ensure_columns(trusted, output_columns)[
+                output_columns
+            ]
+            accepted = pd.concat(
+                [accepted, trusted],
+                ignore_index=True,
+                sort=False,
+            ).drop_duplicates(subset=self.KEYS, keep="first")
+
         if accepted.empty:
             return accepted
 
@@ -2667,6 +2701,7 @@ class FullReconciliationEngine:
                 sfda_df,
                 batch_master_df if batch_master_df is not None else pd.DataFrame(),
                 allow_shared_regulatory_identity=True,
+                trust_batch_master_gtin=True,
             )
         )
         inventory = self._prepare_stage2_inventory(inventory_df)

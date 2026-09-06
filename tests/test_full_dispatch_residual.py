@@ -18,6 +18,73 @@ def engine():
 
 
 class FullDispatchResidualTests(unittest.TestCase):
+    def test_dispatch_trusts_exact_gtin_already_proven_in_batch_master(self):
+        subject = engine()
+        sfda = pd.DataFrame([{
+            "GTIN": "05014124173224",
+            "Drug Name": "FENTANYL 50 MG MCG/ML SOLUTION FOR INJECTION",
+            "BN": "0154941", "Expiry Date": "2028-01-31",
+            "Quantity": 6186, "Active": 3104,
+            "Quantity sent pending": 3082,
+            "Quantity Receive Pending": 0,
+        }])
+        master = pd.DataFrame([{
+            "GTIN": "05014124173224", "BN": "0154941",
+            "Expiry Month Key": "2028-01",
+            "Generic Item Number": "5137230500300",
+            "Trade Description": "UNRELATED CURRENT FORMAT",
+            "Description": "", "Item Family Group": "PHARMACEUTICALS",
+        }])
+
+        conservative = subject.prepare_stage2_sfda_identity(sfda, master)
+        dispatch_identity = subject.prepare_stage2_sfda_identity(
+            sfda,
+            master,
+            allow_shared_regulatory_identity=True,
+            trust_batch_master_gtin=True,
+        )
+
+        self.assertTrue(conservative.empty)
+        self.assertEqual(len(dispatch_identity), 1)
+        self.assertEqual(dispatch_identity.loc[0, "GTIN"], "05014124173224")
+        self.assertEqual(
+            dispatch_identity.loc[0, "Generic Item Number"],
+            "5137230500300",
+        )
+
+    def test_dispatch_keeps_all_generics_with_same_proven_regulatory_gtin(self):
+        subject = engine()
+        sfda = pd.DataFrame([{
+            "GTIN": "06285111000802", "Drug Name": "LIDOCAINE INJECTION",
+            "BN": "155320", "Expiry Date": "2028-09-30",
+            "Quantity": 11798, "Active": 11542,
+            "Quantity sent pending": 256,
+            "Quantity Receive Pending": 0,
+        }])
+        master = pd.DataFrame([
+            {
+                "GTIN": "06285111000802", "BN": "155320",
+                "Expiry Month Key": "2028-09",
+                "Generic Item Number": generic,
+                "Trade Description": "LIDOCAINE INJECTION",
+                "Description": "", "Item Family Group": "PHARMACEUTICALS",
+            }
+            for generic in ["5114290800600", "5114290802800"]
+        ])
+
+        dispatch_identity = subject.prepare_stage2_sfda_identity(
+            sfda,
+            master,
+            allow_shared_regulatory_identity=True,
+            trust_batch_master_gtin=True,
+        )
+
+        self.assertEqual(len(dispatch_identity), 2)
+        self.assertEqual(
+            set(dispatch_identity["Generic Item Number"]),
+            {"5114290800600", "5114290802800"},
+        )
+
     def test_sfda_inventory_comparison_accepts_sub_pack_difference(self):
         subject = engine()
         sfda = pd.DataFrame([{

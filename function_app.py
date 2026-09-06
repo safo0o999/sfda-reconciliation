@@ -2332,7 +2332,6 @@ def _run_full_reconciliation_accept(req: func.HttpRequest) -> func.HttpResponse:
         validated_sfda_identity = full_engine.prepare_stage2_sfda_identity(
             sfda_df,
             batch_master,
-            allow_shared_regulatory_identity=True,
         )
         batch_master_sync = sync_batch_master_sfda_snapshot(
             sfda_df,
@@ -2734,6 +2733,8 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
         validated_sfda_identity = full_engine.prepare_stage2_sfda_identity(
             sfda_df,
             batch_master,
+            allow_shared_regulatory_identity=True,
+            trust_batch_master_gtin=True,
         )
         batch_master_sync = sync_batch_master_sfda_snapshot(
             sfda_df,
