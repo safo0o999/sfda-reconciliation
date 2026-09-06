@@ -1984,6 +1984,7 @@ class FullReconciliationEngine:
         self,
         sfda_df: pd.DataFrame,
         batch_master_df: pd.DataFrame,
+        allow_shared_regulatory_identity: bool = False,
     ) -> pd.DataFrame:
         """Apply the historical V6 identity gate to current Stage-2 SFDA rows.
 
@@ -2071,11 +2072,21 @@ class FullReconciliationEngine:
                 "Stage-2 identity excluded %s BN+expiry-month key(s) accepted for multiple WMS Generics.",
                 ambiguous_generic_keys,
             )
-        return (
-            accepted.loc[accepted["_Accepted Generic Count"].eq(1)]
-            .drop(columns=["_Accepted Generic Count"], errors="ignore")
-            .reset_index(drop=True)
-        )
+        if allow_shared_regulatory_identity:
+            # Full Dispatch reconciles one regulatory balance at
+            # GTIN + BN + expiry month grain.  Several WMS Generics may point
+            # to that same proven SFDA identity; retaining them is safe because
+            # the dispatch allocator collapses the regulatory requirement once
+            # before distributing it across their Customer History rows.
+            return accepted.drop(
+                columns=["_Accepted Generic Count"], errors="ignore"
+            ).reset_index(drop=True)
+
+        return accepted.loc[
+            accepted["_Accepted Generic Count"].eq(1)
+        ].drop(
+            columns=["_Accepted Generic Count"], errors="ignore"
+        ).reset_index(drop=True)
 
     @staticmethod
     def _prepare_stage2_inventory(inventory_df: pd.DataFrame) -> pd.DataFrame:
@@ -2655,6 +2666,7 @@ class FullReconciliationEngine:
             else self.prepare_stage2_sfda_identity(
                 sfda_df,
                 batch_master_df if batch_master_df is not None else pd.DataFrame(),
+                allow_shared_regulatory_identity=True,
             )
         )
         inventory = self._prepare_stage2_inventory(inventory_df)
@@ -2717,19 +2729,25 @@ class FullReconciliationEngine:
         )
         master_trade = self._ensure_columns(
             master_trade,
-            [*self.KEYS, "Trade Item Number"],
-        )[[*self.KEYS, "Trade Item Number"]].copy()
+            [*self.KEYS, "Trade Item Number", "PackageSize"],
+        )[[*self.KEYS, "Trade Item Number", "PackageSize"]].copy()
         for column in self.KEYS:
             master_trade[column] = Normalizer.text(master_trade[column])
+        master_trade["PackageSize"] = pd.to_numeric(
+            master_trade["PackageSize"], errors="coerce"
+        ).fillna(0)
         master_trade = (
-            master_trade.groupby(self.KEYS, dropna=False)["Trade Item Number"]
-            .agg(aggregate_trade_codes)
-            .reset_index()
-            .rename(
-                columns={
-                    "Trade Item Number": "Batch Master Trade Item Number",
+            master_trade.groupby(self.KEYS, dropna=False)
+            .agg(
+                **{
+                    "Batch Master Trade Item Number": (
+                        "Trade Item Number",
+                        aggregate_trade_codes,
+                    ),
+                    "_Batch Master PackageSize": ("PackageSize", "max"),
                 }
             )
+            .reset_index()
         )
         target = target.merge(
             master_trade,
@@ -2775,14 +2793,22 @@ class FullReconciliationEngine:
             validate="many_to_one",
         ).drop(columns=["_Drug Name Key"], errors="ignore")
         target["PackageSize"] = pd.to_numeric(
+            target.get("_Batch Master PackageSize", 0), errors="coerce"
+        ).fillna(0)
+        customer_pack = pd.to_numeric(
             target.get("_Customer PackageSize", 0), errors="coerce"
         ).fillna(0)
+        target.loc[target["PackageSize"].le(0), "PackageSize"] = customer_pack
         fallback_pack = pd.to_numeric(
             target.get("_Configured PackageSize", 0), errors="coerce"
         ).fillna(0)
         target.loc[target["PackageSize"].le(0), "PackageSize"] = fallback_pack
         target = target.drop(
-            columns=["_Customer PackageSize", "_Configured PackageSize"],
+            columns=[
+                "_Batch Master PackageSize",
+                "_Customer PackageSize",
+                "_Configured PackageSize",
+            ],
             errors="ignore",
         )
         target["Current Inventory Quantity Pack"] = 0.0
@@ -2852,11 +2878,56 @@ class FullReconciliationEngine:
             target["_Open Reserved Dispatch Pack"] = pd.to_numeric(
                 target["_Open Reserved Dispatch Pack"], errors="coerce"
             ).fillna(0)
-        target["Required Dispatch Pack"] = (
-            pd.to_numeric(target["Active"], errors="coerce").fillna(0)
-            - target["Current Inventory Quantity Pack"]
-            - target["_Open Reserved Dispatch Pack"]
+        # SFDA owns one balance for GTIN + BN + expiry month.  A regulatory
+        # batch may legitimately map to several WMS Generics, so calculate the
+        # requirement once after summing Inventory and reservations across all
+        # of those Generics.  This keeps Full Dispatch identical to the cutover
+        # alignment grain and prevents duplicated regulatory quantities.
+        regulatory_keys = ["GTIN", "BN", "Expiry Month Key"]
+        for column in regulatory_keys:
+            target[column] = Normalizer.text(target[column])
+
+        regulatory_target = (
+            target.groupby(regulatory_keys, dropna=False)
+            .agg(
+                **{
+                    "Quantity": ("Quantity", "max"),
+                    "Active": ("Active", "max"),
+                    "Quantity sent pending": ("Quantity sent pending", "max"),
+                    "Quantity Receive Pending": ("Quantity Receive Pending", "max"),
+                    "Current Inventory Quantity Each": (
+                        "Current Inventory Quantity Each",
+                        "sum",
+                    ),
+                    "Current Inventory Quantity Pack": (
+                        "Current Inventory Quantity Pack",
+                        "sum",
+                    ),
+                    "_Open Reserved Dispatch Pack": (
+                        "_Open Reserved Dispatch Pack",
+                        "sum",
+                    ),
+                }
+            )
+            .reset_index()
+        )
+        regulatory_target["Required Dispatch Pack"] = (
+            pd.to_numeric(regulatory_target["Active"], errors="coerce").fillna(0)
+            - pd.to_numeric(
+                regulatory_target["Current Inventory Quantity Pack"],
+                errors="coerce",
+            ).fillna(0)
+            - pd.to_numeric(
+                regulatory_target["_Open Reserved Dispatch Pack"],
+                errors="coerce",
+            ).fillna(0)
         ).clip(lower=0).astype(int)
+        target = target.drop(columns=["Required Dispatch Pack"], errors="ignore").merge(
+            regulatory_target[regulatory_keys + ["Required Dispatch Pack"]],
+            on=regulatory_keys,
+            how="left",
+            validate="many_to_one",
+        )
 
         # The SFDA Drug Count is the regulatory source of truth for the expiry
         # date written to Dispatch CSV files. Customer History can contain an
@@ -3158,7 +3229,7 @@ class FullReconciliationEngine:
         # row, allocation = min(available, max(required - prior_available, 0)).
         # This preserves output row-for-row while avoiding thousands of DataFrame
         # .loc writes in Python.
-        group_keys = self.KEYS
+        group_keys = regulatory_keys
         available_pack = pd.to_numeric(
             details["Available Historical Dispatch Quantity Pack"],
             errors="coerce",
@@ -3189,18 +3260,43 @@ class FullReconciliationEngine:
         #
         # This is dispatch-only logic. Full Dispatch never creates/assumes Accept.
         allocated_by_batch = (
-            details.groupby(self.KEYS, dropna=False)["To Be Dispatch"]
+            details.groupby(regulatory_keys, dropna=False)["To Be Dispatch"]
             .sum()
             .reset_index()
             .rename(columns={"To Be Dispatch": "_Known Customer Allocation"})
             if not details.empty
             else pd.DataFrame(
-                columns=[*self.KEYS, "_Known Customer Allocation"]
+                columns=[*regulatory_keys, "_Known Customer Allocation"]
             )
         )
-        residual_target = target.merge(
+        representative = (
+            target.sort_values(
+                [
+                    "Current Inventory Quantity Each",
+                    "Generic Item Number",
+                ],
+                ascending=[False, True],
+                kind="stable",
+            )
+            .drop_duplicates(subset=regulatory_keys, keep="first")
+        )
+        residual_target = regulatory_target.merge(
+            representative[
+                regulatory_keys
+                + [
+                    "Generic Item Number",
+                    "Fallback Trade Item Number",
+                    "SFDA Expiry Date",
+                    "Drug Name",
+                    "PackageSize",
+                ]
+            ],
+            on=regulatory_keys,
+            how="left",
+            validate="one_to_one",
+        ).merge(
             allocated_by_batch,
-            on=self.KEYS,
+            on=regulatory_keys,
             how="left",
             validate="one_to_one",
         )

@@ -134,6 +134,101 @@ class FullDispatchResidualTests(unittest.TestCase):
             next(iter(files.values())),
         )
 
+    def test_shared_gtin_batch_is_dispatched_once_across_multiple_generics(self):
+        subject = engine()
+        inventory = pd.DataFrame([
+            {
+                "BN": "B-MULTI", "Expiry Date": "2028-09-15",
+                "Available Quantity": 60, "Trade Name": "Drug Multi",
+                "Generic Item Number": "G1", "Trade Item Number": "T1",
+            },
+            {
+                "BN": "B-MULTI", "Expiry Date": "2028-09-15",
+                "Available Quantity": 40, "Trade Name": "Drug Multi",
+                "Generic Item Number": "G2", "Trade Item Number": "T2",
+            },
+        ])
+        validated_sfda = pd.DataFrame([
+            {
+                "GTIN": "06281234560001", "Drug Name": "Drug Multi",
+                "BN": "B-MULTI", "Expiry Date": pd.Timestamp("2028-09-15"),
+                "Expiry Month Key": "2028-09", "Generic Item Number": generic,
+                "Quantity": 200, "Active": 200,
+                "Quantity sent pending": 0, "Quantity Receive Pending": 0,
+            }
+            for generic in ["G1", "G2"]
+        ])
+        customer_history = pd.DataFrame([
+            {
+                "To Address": f"Customer {generic}", "GLN": gln,
+                "GTIN": "06281234560001", "Drug Name": "Drug Multi",
+                "Generic Item Number": generic, "Trade Description": "Drug Multi",
+                "BN": "B-MULTI", "Expiry Date": pd.Timestamp("2028-09-15"),
+                "Expiry Month Key": "2028-09", "PackageSize": 1,
+                "Dispatch Quantity Each": quantity,
+                "Dispatch Quantity Pack": quantity,
+                "First Dispatch Date": pd.Timestamp("2028-01-01"),
+                "Last Dispatch Date": pd.Timestamp("2028-01-01"),
+                "Custody": "", "Trade Item Number": trade,
+            }
+            for generic, gln, quantity, trade in [
+                ("G1", "1000000000001", 30, "T1"),
+                ("G2", "1000000000002", 20, "T2"),
+            ]
+        ])
+        batch_master = pd.DataFrame([
+            {
+                "BN": "B-MULTI", "Expiry Month Key": "2028-09",
+                "Generic Item Number": generic, "Trade Item Number": trade,
+                "PackageSize": 1,
+            }
+            for generic, trade in [("G1", "T1"), ("G2", "T2")]
+        ])
+
+        result = subject.build_dispatch_reconciliation(
+            inventory, pd.DataFrame(), customer_history,
+            confirmed_full_dispatch_df=pd.DataFrame(),
+            batch_master_df=batch_master,
+            validated_sfda_identity_df=validated_sfda,
+        )
+
+        self.assertEqual(int(result["To Be Dispatch"].sum()), 100)
+        self.assertEqual(int(result.loc[
+            result["To Address"].eq("UNMAPPED / DUMMY GLN"),
+            "To Be Dispatch",
+        ].sum()), 50)
+
+    def test_regulatory_difference_without_customer_history_uses_dummy_gln(self):
+        subject = engine()
+        inventory = pd.DataFrame([{
+            "BN": "B-DUMMY", "Expiry Date": "2029-03-15",
+            "Available Quantity": 7500, "Trade Name": "Drug Dummy",
+            "Generic Item Number": "G1", "Trade Item Number": "T1",
+        }])
+        validated_sfda = pd.DataFrame([{
+            "GTIN": "06281234560002", "Drug Name": "Drug Dummy",
+            "BN": "B-DUMMY", "Expiry Date": pd.Timestamp("2029-03-15"),
+            "Expiry Month Key": "2029-03", "Generic Item Number": "G1",
+            "Quantity": 375, "Active": 375,
+            "Quantity sent pending": 0, "Quantity Receive Pending": 0,
+        }])
+        batch_master = pd.DataFrame([{
+            "BN": "B-DUMMY", "Expiry Month Key": "2029-03",
+            "Generic Item Number": "G1", "Trade Item Number": "T1",
+            "PackageSize": 40,
+        }])
+
+        result = subject.build_dispatch_reconciliation(
+            inventory, pd.DataFrame(), pd.DataFrame(),
+            confirmed_full_dispatch_df=pd.DataFrame(),
+            batch_master_df=batch_master,
+            validated_sfda_identity_df=validated_sfda,
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result.loc[0, "GLN"], "99999999999999")
+        self.assertEqual(int(result.loc[0, "To Be Dispatch"]), 187)
+
     def test_full_dispatch_report_schema_includes_trade_item_number(self):
         self.assertIn(
             "Trade Item Number",
