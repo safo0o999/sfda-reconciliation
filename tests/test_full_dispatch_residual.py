@@ -397,5 +397,121 @@ class FullDispatchResidualTests(unittest.TestCase):
         )
         self.assertEqual(int(rerun["To Be Dispatch"].sum()), 0)
 
+    def test_cutover_falls_back_to_unique_address_when_gln_is_enriched(self):
+        subject = engine()
+        inventory = pd.DataFrame([{
+            "BN": "15010", "Expiry Date": "2029-03-08",
+            "Available Quantity": 67870, "Trade Name": "CETRALON 10MG",
+            "Generic Item Number": "5116161500000",
+            "Trade Item Number": "5116161500006",
+        }])
+        validated_sfda = pd.DataFrame([{
+            "GTIN": "06291100080984", "Drug Name": "CETRALON 10 MG TAB",
+            "BN": "15010", "Expiry Date": pd.Timestamp("2029-03-08"),
+            "Expiry Month Key": "2029-03",
+            "Generic Item Number": "5116161500000",
+            "Quantity": 33203, "Active": 6915,
+            "Quantity sent pending": 26288,
+            "Quantity Receive Pending": 0,
+        }])
+        customer_history = pd.DataFrame([{
+            "To Address": "MOH - ALHNAKIA HOSPITAL",
+            "GLN": "6820034800195", "GTIN": "06291100080984",
+            "Drug Name": "CETRALON 10 MG TAB",
+            "Generic Item Number": "5116161500000",
+            "Trade Description": "CETRALON 10MG TABLETS JULPHAR",
+            "BN": "15010", "Expiry Date": pd.Timestamp("2029-03-08"),
+            "Expiry Month Key": "2029-03", "PackageSize": 10,
+            "Dispatch Quantity Each": 18000,
+            "Dispatch Quantity Pack": 1800,
+            "First Dispatch Date": pd.Timestamp("2026-06-01"),
+            "Last Dispatch Date": pd.Timestamp("2026-09-03"),
+            "Custody": "TABLETS AND CAPSULES",
+            "Trade Item Number": "5116161500006",
+        }])
+        cutover = pd.DataFrame([{
+            "BN": "15010", "Expiry Month Key": "2029-03",
+            "Generic Item Number": "5116161500000",
+            "To Address": "MOH - ALHNAKIA HOSPITAL",
+            "GLN": "99999999999999", "PackageSize": 10,
+            "Cutover Closed Quantity Each": 16000,
+            "Cutover Closed Quantity Pack": 1600,
+        }])
+
+        result = subject.build_dispatch_reconciliation(
+            inventory, pd.DataFrame(), customer_history,
+            confirmed_full_dispatch_df=pd.DataFrame(),
+            batch_master_df=pd.DataFrame([{
+                "BN": "15010", "Expiry Month Key": "2029-03",
+                "Generic Item Number": "5116161500000",
+                "Trade Item Number": "5116161500006", "PackageSize": 10,
+            }]),
+            validated_sfda_identity_df=validated_sfda,
+            cutover_baseline_df=cutover,
+        )
+
+        customer = result.loc[
+            result["To Address"].eq("MOH - ALHNAKIA HOSPITAL")
+        ].iloc[0]
+        self.assertEqual(
+            int(customer["Available Historical Dispatch Quantity Pack"]),
+            200,
+        )
+        self.assertEqual(int(customer["To Be Dispatch"]), 128)
+
+    def test_cutover_does_not_fallback_when_address_has_multiple_glns(self):
+        subject = engine()
+        inventory = pd.DataFrame([{
+            "BN": "B-AMB", "Expiry Date": "2029-03-08",
+            "Available Quantity": 90, "Trade Name": "Drug A",
+            "Generic Item Number": "G1", "Trade Item Number": "T1",
+        }])
+        validated_sfda = pd.DataFrame([{
+            "GTIN": "06281234560003", "Drug Name": "Drug A",
+            "BN": "B-AMB", "Expiry Date": pd.Timestamp("2029-03-08"),
+            "Expiry Month Key": "2029-03", "Generic Item Number": "G1",
+            "Quantity": 100, "Active": 100,
+            "Quantity sent pending": 0, "Quantity Receive Pending": 0,
+        }])
+        customer_history = pd.DataFrame([{
+            "To Address": "SHARED ADDRESS", "GLN": "3000000000003",
+            "GTIN": "06281234560003", "Drug Name": "Drug A",
+            "Generic Item Number": "G1", "Trade Description": "Drug A",
+            "BN": "B-AMB", "Expiry Date": pd.Timestamp("2029-03-08"),
+            "Expiry Month Key": "2029-03", "PackageSize": 1,
+            "Dispatch Quantity Each": 20, "Dispatch Quantity Pack": 20,
+            "First Dispatch Date": pd.Timestamp("2026-06-01"),
+            "Last Dispatch Date": pd.Timestamp("2026-09-03"),
+            "Custody": "", "Trade Item Number": "T1",
+        }])
+        cutover = pd.DataFrame([
+            {
+                "BN": "B-AMB", "Expiry Month Key": "2029-03",
+                "Generic Item Number": "G1", "To Address": "SHARED ADDRESS",
+                "GLN": gln, "Cutover Closed Quantity Each": 10,
+                "Cutover Closed Quantity Pack": 10,
+            }
+            for gln in ["1000000000001", "2000000000002"]
+        ])
+
+        result = subject.build_dispatch_reconciliation(
+            inventory, pd.DataFrame(), customer_history,
+            confirmed_full_dispatch_df=pd.DataFrame(),
+            batch_master_df=pd.DataFrame([{
+                "BN": "B-AMB", "Expiry Month Key": "2029-03",
+                "Generic Item Number": "G1", "Trade Item Number": "T1",
+                "PackageSize": 1,
+            }]),
+            validated_sfda_identity_df=validated_sfda,
+            cutover_baseline_df=cutover,
+        )
+
+        customer = result.loc[result["To Address"].eq("SHARED ADDRESS")].iloc[0]
+        self.assertEqual(
+            int(customer["Available Historical Dispatch Quantity Pack"]),
+            20,
+        )
+        self.assertEqual(int(customer["To Be Dispatch"]), 10)
+
 if __name__ == "__main__":
     unittest.main()

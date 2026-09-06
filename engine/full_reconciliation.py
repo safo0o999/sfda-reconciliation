@@ -3154,11 +3154,14 @@ class FullReconciliationEngine:
             details[cutover_each_column] = 0.0
             details[cutover_pack_column] = 0.0
         else:
-            cutover_keys = [
+            cutover_address_keys = [
                 "BN",
                 "Expiry Month Key",
                 "Generic Item Number",
                 "To Address",
+            ]
+            cutover_keys = [
+                *cutover_address_keys,
                 "GLN",
             ]
             for column in cutover_keys:
@@ -3171,28 +3174,75 @@ class FullReconciliationEngine:
                 cutover[column] = pd.to_numeric(
                     cutover.get(column, 0), errors="coerce"
                 ).fillna(0)
-            cutover = (
+            exact_cutover_each = "_Exact Cutover Closed Quantity Each"
+            exact_cutover_pack = "_Exact Cutover Closed Quantity Pack"
+            fallback_cutover_each = "_Fallback Cutover Closed Quantity Each"
+            fallback_cutover_pack = "_Fallback Cutover Closed Quantity Pack"
+
+            exact_cutover = (
                 cutover.groupby(cutover_keys, dropna=False)
                 .agg(
                     **{
-                        cutover_each_column: (cutover_each_column, "sum"),
-                        cutover_pack_column: (cutover_pack_column, "sum"),
+                        exact_cutover_each: (cutover_each_column, "sum"),
+                        exact_cutover_pack: (cutover_pack_column, "sum"),
                     }
                 )
                 .reset_index()
             )
+
+            # Historical WMS rows may have had no GLN when the one-time
+            # cutover was captured.  A later GLN-master enrichment can attach
+            # the correct GLN to the same To Address, making an otherwise
+            # identical customer row fail the exact join.  Build a fallback
+            # only for address keys that owned one unambiguous baseline GLN;
+            # multiple-GLN addresses must never borrow another customer's
+            # closed quantity.
+            fallback_cutover = (
+                exact_cutover.groupby(cutover_address_keys, dropna=False)
+                .agg(
+                    **{
+                        "_Cutover GLN Count": ("GLN", "nunique"),
+                        fallback_cutover_each: (exact_cutover_each, "sum"),
+                        fallback_cutover_pack: (exact_cutover_pack, "sum"),
+                    }
+                )
+                .reset_index()
+            )
+            fallback_cutover = fallback_cutover.loc[
+                fallback_cutover["_Cutover GLN Count"].eq(1)
+            ].drop(columns=["_Cutover GLN Count"], errors="ignore")
+
             details = details.merge(
-                cutover,
+                exact_cutover,
                 on=cutover_keys,
                 how="left",
                 validate="many_to_one",
             )
+            details = details.merge(
+                fallback_cutover,
+                on=cutover_address_keys,
+                how="left",
+                validate="many_to_one",
+            )
             details[cutover_each_column] = pd.to_numeric(
-                details[cutover_each_column], errors="coerce"
+                details[exact_cutover_each], errors="coerce"
+            ).combine_first(
+                pd.to_numeric(details[fallback_cutover_each], errors="coerce")
             ).fillna(0)
             details[cutover_pack_column] = pd.to_numeric(
-                details[cutover_pack_column], errors="coerce"
+                details[exact_cutover_pack], errors="coerce"
+            ).combine_first(
+                pd.to_numeric(details[fallback_cutover_pack], errors="coerce")
             ).fillna(0)
+            details = details.drop(
+                columns=[
+                    exact_cutover_each,
+                    exact_cutover_pack,
+                    fallback_cutover_each,
+                    fallback_cutover_pack,
+                ],
+                errors="ignore",
+            )
 
         details["Available Historical Dispatch Quantity Each"] = (
             pd.to_numeric(
