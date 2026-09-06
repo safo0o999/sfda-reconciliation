@@ -225,6 +225,25 @@ class ReturnCancelTests(unittest.TestCase):
         self.assertEqual(list(files), ["Cancel_Dispatch_6281234567890_001.csv"])
         self.assertIn("06281234567890;3;B001;31-08-2027", next(iter(files.values())))
 
+    def test_full_dispatch_workbook_contains_cancel_dispatch_sheet(self):
+        dispatch = pd.DataFrame(columns=Exporter.FULL_DISPATCH_RECONCILIATION_COLUMNS)
+        cancel = engine().build_return_cancel_reconciliation(
+            returns_history(), customer_history()
+        )
+        generated = Exporter.build_full_dispatch_reconciliation_workbook(
+            dispatch,
+            cancel,
+        )
+        payload = generated["Full_Dispatch_Reconciliation.xlsx"]
+        workbook = load_workbook(
+            io.BytesIO(base64.b64decode(payload["content"])),
+            read_only=True,
+        )
+        self.assertEqual(workbook.sheetnames, ["Full Dispatch", "Cancel Dispatch"])
+        cancel_sheet = workbook["Cancel Dispatch"]
+        headers = [cell.value for cell in cancel_sheet[3]]
+        self.assertIn("To Be Cancel Dispatch", headers)
+
 
 if __name__ == "__main__":
     unittest.main()

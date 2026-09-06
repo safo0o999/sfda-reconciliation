@@ -1,6 +1,7 @@
 import base64
 import io
 import re
+from copy import copy
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR
 
 import pandas as pd
@@ -760,6 +761,78 @@ class Exporter:
             f"Cancel_Dispatch_{file_name}": content
             for file_name, content in generated.items()
         }
+
+    @staticmethod
+    def build_full_dispatch_reconciliation_workbook(
+        dispatch_df,
+        cancel_dispatch_df,
+        file_name="Full_Dispatch_Reconciliation.xlsx",
+    ):
+        """Build one operational workbook with Dispatch and Cancel Dispatch tabs.
+
+        The standalone Return/Cancel workbook remains available for backward
+        compatibility. This combined workbook gives the operator both movement
+        directions in the file they already use for Full Dispatch review.
+        """
+        dispatch_payload = Exporter.build_formatted_excel_file(
+            df=dispatch_df,
+            file_name=file_name,
+            sheet_name="Full Dispatch",
+            title="One-Time Full Reconciliation - Dispatch",
+            columns=list(dispatch_df.columns) if dispatch_df is not None else None,
+            sort_columns=["To Address", "Generic Item Number", "BN"],
+        )
+        cancel_payload = Exporter.build_formatted_excel_file(
+            df=cancel_dispatch_df,
+            file_name="Full_Return_Cancel_Reconciliation.xlsx",
+            sheet_name="Cancel Dispatch",
+            title="Full Reconciliation - Return Cancel Dispatch",
+            columns=(
+                list(cancel_dispatch_df.columns)
+                if cancel_dispatch_df is not None
+                else None
+            ),
+            sort_columns=["Return Type", "Return From", "Generic Item Number", "BN"],
+        )
+
+        target_record = dispatch_payload[file_name]
+        source_record = cancel_payload["Full_Return_Cancel_Reconciliation.xlsx"]
+        target_book = load_workbook(io.BytesIO(base64.b64decode(target_record["content"])))
+        source_book = load_workbook(io.BytesIO(base64.b64decode(source_record["content"])))
+        source_sheet = source_book[source_book.sheetnames[0]]
+        target_sheet = target_book.create_sheet(title="Cancel Dispatch")
+
+        for row in source_sheet.iter_rows():
+            for source_cell in row:
+                target_cell = target_sheet.cell(
+                    row=source_cell.row,
+                    column=source_cell.column,
+                    value=source_cell.value,
+                )
+                if source_cell.has_style:
+                    target_cell._style = copy(source_cell._style)
+                if source_cell.hyperlink:
+                    target_cell._hyperlink = copy(source_cell.hyperlink)
+                if source_cell.comment:
+                    target_cell.comment = copy(source_cell.comment)
+
+        for merged_range in source_sheet.merged_cells.ranges:
+            target_sheet.merge_cells(str(merged_range))
+        for key, dimension in source_sheet.column_dimensions.items():
+            target_sheet.column_dimensions[key].width = dimension.width
+            target_sheet.column_dimensions[key].hidden = dimension.hidden
+        for key, dimension in source_sheet.row_dimensions.items():
+            target_sheet.row_dimensions[key].height = dimension.height
+            target_sheet.row_dimensions[key].hidden = dimension.hidden
+
+        target_sheet.freeze_panes = source_sheet.freeze_panes
+        target_sheet.auto_filter.ref = source_sheet.auto_filter.ref
+        target_sheet.sheet_view.showGridLines = source_sheet.sheet_view.showGridLines
+
+        output = io.BytesIO()
+        target_book.save(output)
+        target_record["content"] = base64.b64encode(output.getvalue()).decode("ascii")
+        return dispatch_payload
 
     @staticmethod
     def _is_batch_master_report(file_name, sheet_name):
