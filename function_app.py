@@ -2754,6 +2754,7 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
         )
         dispatch_details = result["dispatch_details"]
         summary_df = result["summary"]
+        sfda_inventory_comparison = result["sfda_inventory_comparison"]
         dispatch_upload = result["dispatch_upload"]
         return_cancel_details = result["return_cancel_details"]
         cancel_dispatch_upload = result["cancel_dispatch_upload"]
@@ -2797,12 +2798,10 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
                 columns=list(return_cancel_details.columns),
                 sort_columns=["Return Type", "Return From", "Generic Item Number", "BN"],
             ),
-            "summary": Exporter.build_formatted_excel_file(
-                df=summary_df,
+            "summary": Exporter.build_full_reconciliation_summary_workbook(
+                summary_df=summary_df,
+                comparison_df=sfda_inventory_comparison,
                 file_name="Full_Reconciliation_Summary.xlsx",
-                sheet_name="Summary",
-                title="Full Reconciliation Summary",
-                columns=list(summary_df.columns),
             ),
             "dispatch_files": Exporter.build_dispatch_files_by_customer(dispatch_upload),
             "cancel_dispatch_files": Exporter.build_cancel_dispatch_files_by_customer(

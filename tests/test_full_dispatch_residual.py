@@ -1,8 +1,11 @@
 import sys
 import unittest
+import base64
+import io
 from unittest.mock import MagicMock
 
 import pandas as pd
+from openpyxl import load_workbook
 
 sys.modules.setdefault("pyodbc", MagicMock())
 
@@ -15,6 +18,40 @@ def engine():
 
 
 class FullDispatchResidualTests(unittest.TestCase):
+    def test_sfda_inventory_comparison_accepts_sub_pack_difference(self):
+        subject = engine()
+        sfda = pd.DataFrame([{
+            "GTIN": "06281234567890", "Drug Name": "Drug A", "BN": "B001",
+            "Expiry Date": "2028-01-15", "Quantity": 1, "Active": 1,
+            "Quantity sent pending": 0, "Quantity Receive Pending": 0,
+        }])
+        inventory = pd.DataFrame([{
+            "BN": "B001", "Expiry Date": "2028-01-15", "Available Quantity": 3,
+            "Trade Name": "Drug A", "Generic Item Number": "1001",
+            "Trade Item Number": "T1",
+        }])
+        batch_master = pd.DataFrame([{
+            "GTIN": "06281234567890", "BN": "B001",
+            "Expiry Month Key": "2028-01", "Generic Item Number": "1001",
+            "PackageSize": 4, "Total Dispatched Qty Pack": 0,
+        }])
+
+        comparison = subject.build_sfda_inventory_comparison(
+            sfda, inventory, batch_master
+        )
+
+        self.assertEqual(comparison.loc[0, "Matching Status"], "MATCH")
+        self.assertEqual(
+            float(comparison.loc[0, "Current Inventory Quantity Pack"]), 0.75
+        )
+        output = Exporter.build_full_reconciliation_summary_workbook(
+            pd.DataFrame([{"Metric": "Matching percentage", "Value": 100}]),
+            comparison,
+        )
+        payload = output["Full_Reconciliation_Summary.xlsx"]["content"]
+        workbook = load_workbook(io.BytesIO(base64.b64decode(payload)))
+        self.assertEqual(workbook.sheetnames, ["Summary", "SFDA vs Inventory"])
+
     def test_inventory_difference_uses_customer_history_then_dummy_gln(self):
         subject = engine()
         inventory = pd.DataFrame([

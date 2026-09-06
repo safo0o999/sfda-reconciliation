@@ -220,6 +220,99 @@ class Exporter:
         payload["content"] = base64.b64encode(output.getvalue()).decode("ascii")
         return generated
 
+    @staticmethod
+    def build_full_reconciliation_summary_workbook(
+        summary_df,
+        comparison_df,
+        file_name="Full_Reconciliation_Summary.xlsx",
+    ):
+        """Build Summary plus the complete SFDA-to-Inventory comparison."""
+        generated = Exporter.build_formatted_excel_file(
+            df=summary_df,
+            file_name=file_name,
+            sheet_name="Summary",
+            title="Full Reconciliation Summary",
+            columns=list(summary_df.columns),
+        )
+        payload = generated[file_name]
+        workbook = load_workbook(io.BytesIO(base64.b64decode(payload["content"])))
+        worksheet = workbook.create_sheet(title="SFDA vs Inventory")
+        report = (
+            comparison_df.copy() if comparison_df is not None else pd.DataFrame()
+        ).dropna(how="all").reset_index(drop=True)
+        columns = list(report.columns)
+        last_column = get_column_letter(max(1, len(columns)))
+        worksheet.merge_cells(f"A1:{last_column}1")
+        worksheet["A1"] = "SFDA Batch Inventory Matching"
+        worksheet["A1"].font = Font(bold=True, color="FFFFFF", size=14)
+        worksheet["A1"].fill = PatternFill(fill_type="solid", fgColor="0F6CBD")
+        worksheet["A1"].alignment = Alignment(horizontal="center", vertical="center")
+        border = Border(
+            left=Side(style="thin", color="B8C4CE"),
+            right=Side(style="thin", color="B8C4CE"),
+            top=Side(style="thin", color="B8C4CE"),
+            bottom=Side(style="thin", color="B8C4CE"),
+        )
+        identifier_columns = {"GTIN", "BN", "Generic Item Number"}
+        max_lengths = [len(str(column)) for column in columns]
+        for column_index, column_name in enumerate(columns, start=1):
+            cell = worksheet.cell(row=2, column=column_index, value=column_name)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(fill_type="solid", fgColor="17365D")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
+        fills = {
+            "MATCH": "E2F0D9",
+            "DISPATCH REQUIRED": "FCE4D6",
+            "ACCEPT REQUIRED": "FFF2CC",
+            "ADJUST DISPATCH QUANTITY": "F4CCCC",
+            "SUPPLIER VARIANCE": "DDEBF7",
+            "UNMAPPED - NO HISTORICAL EVIDENCE": "E7E6E6",
+        }
+        status_index = columns.index("Matching Status") if "Matching Status" in columns else -1
+        for row_offset, values in enumerate(report.itertuples(index=False, name=None), start=1):
+            excel_row = row_offset + 2
+            status = str(values[status_index]) if status_index >= 0 else ""
+            row_fill = PatternFill(fill_type="solid", fgColor=fills.get(status, "FFFFFF"))
+            for offset, value in enumerate(values):
+                column_name = columns[offset]
+                if pd.isna(value):
+                    value = None
+                elif column_name == "Expiry Date":
+                    parsed = pd.to_datetime(value, errors="coerce")
+                    if not pd.isna(parsed):
+                        value = parsed.to_pydatetime()
+                elif column_name in identifier_columns:
+                    value = Exporter._normalize_identifier(value)
+                elif hasattr(value, "item"):
+                    try:
+                        value = value.item()
+                    except Exception:
+                        pass
+                if value is not None:
+                    max_lengths[offset] = max(max_lengths[offset], len(str(value)))
+                cell = worksheet.cell(row=excel_row, column=offset + 1, value=value)
+                cell.border = border
+                cell.fill = row_fill
+                if column_name in identifier_columns:
+                    cell.number_format = "@"
+                elif column_name == "Expiry Date":
+                    cell.number_format = "dd-mm-yyyy"
+                elif isinstance(value, (int, float)):
+                    cell.number_format = "#,##0.####"
+        if len(report) > 0:
+            worksheet.auto_filter.ref = f"A2:{last_column}{len(report) + 2}"
+        worksheet.freeze_panes = "A3"
+        worksheet.sheet_view.showGridLines = False
+        for column_index, max_length in enumerate(max_lengths, start=1):
+            worksheet.column_dimensions[get_column_letter(column_index)].width = min(
+                max(max_length + 2, 12), 45
+            )
+        output = io.BytesIO()
+        workbook.save(output)
+        payload["content"] = base64.b64encode(output.getvalue()).decode("ascii")
+        return generated
+
     FULL_DISPATCH_RECONCILIATION_COLUMNS = [
         "To Address",
         "GLN",

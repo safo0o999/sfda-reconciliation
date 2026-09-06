@@ -8071,6 +8071,24 @@ def get_full_dispatch_cutover_alignment() -> pd.DataFrame:
             FROM dbo.LatestInventorySnapshot
             GROUP BY BN, ExpiryMonthKey, GenericItemNumber
         ),
+        MappedInventory AS
+        (
+            SELECT
+                m.GTIN,
+                m.BN,
+                m.ExpiryMonthKey,
+                SUM(COALESCE(i.InventoryEach, 0)) AS InventoryEach,
+                SUM(
+                    COALESCE(i.InventoryEach, 0)
+                    / NULLIF(m.PackageSize, 0)
+                ) AS InventoryPack
+            FROM MasterIdentity AS m
+            LEFT JOIN Inventory AS i
+                ON i.BN = m.BN
+               AND i.ExpiryMonthKey = m.ExpiryMonthKey
+               AND i.GenericItemNumber = m.GenericItemNumber
+            GROUP BY m.GTIN, m.BN, m.ExpiryMonthKey
+        ),
         SFDA AS
         (
             SELECT GTIN, BN, ExpiryMonthKey,
@@ -8081,25 +8099,19 @@ def get_full_dispatch_cutover_alignment() -> pd.DataFrame:
         SELECT
             m.BN,
             m.ExpiryMonthKey AS [Expiry Month Key],
-            m.GenericItemNumber AS [Generic Item Number],
+            N'' AS [Generic Item Number],
             m.GTIN,
-            m.PackageSize,
-            COALESCE(i.InventoryEach, 0) AS [Current Inventory Quantity Each],
-            COALESCE(i.InventoryEach, 0) / NULLIF(m.PackageSize, 0)
-                AS [Current Inventory Quantity Pack],
+            CAST(1 AS decimal(18, 4)) AS PackageSize,
+            m.InventoryEach AS [Current Inventory Quantity Each],
+            m.InventoryPack AS [Current Inventory Quantity Pack],
             s.SFDAActive AS [SFDA Active],
-            s.SFDAActive
-                - (COALESCE(i.InventoryEach, 0) / NULLIF(m.PackageSize, 0))
-                AS [Difference Pack]
-        FROM MasterIdentity AS m
+            s.SFDAActive - m.InventoryPack AS [Difference Pack]
+        FROM MappedInventory AS m
         INNER JOIN SFDA AS s
             ON s.GTIN = m.GTIN
            AND s.BN = m.BN
            AND s.ExpiryMonthKey = m.ExpiryMonthKey
-        LEFT JOIN Inventory AS i
-            ON i.BN = m.BN
-           AND i.ExpiryMonthKey = m.ExpiryMonthKey
-           AND i.GenericItemNumber = m.GenericItemNumber;
+        ;
     """
     with Database().connect() as connection:
         return pd.read_sql(sql, connection)
@@ -8114,24 +8126,27 @@ def get_full_dispatch_cutover_status() -> Dict[str, Any]:
     difference = pd.to_numeric(
         alignment.get("Difference Pack", pd.Series(dtype=float)),
         errors="coerce",
-    ).fillna(0).abs()
-    tolerance = max(
-        0.0,
-        float(os.getenv("FULL_DISPATCH_CUTOVER_TOLERANCE_PACK", "0.000001") or 0.000001),
+    ).fillna(0)
+    minimum_actionable_pack = max(
+        1.0,
+        float(os.getenv("FULL_DISPATCH_CUTOVER_MIN_ACTIONABLE_PACK", "1") or 1),
     )
+    blocking = difference.ge(minimum_actionable_pack)
     return {
         "schema_available": schema_available,
         "active": cutover is not None,
         "cutover": cutover,
         "alignment_rows": int(len(alignment)),
-        "mismatch_rows": int(difference.gt(tolerance).sum()),
-        "max_difference_pack": float(difference.max()) if not difference.empty else 0.0,
-        "tolerance_pack": float(tolerance),
+        "mismatch_rows": int(blocking.sum()),
+        "max_difference_pack": max(
+            0.0, float(difference.max()) if not difference.empty else 0.0
+        ),
+        "minimum_actionable_pack": float(minimum_actionable_pack),
         "ready_to_activate": bool(
             schema_available
             and cutover is None
             and not alignment.empty
-            and not difference.gt(tolerance).any()
+            and not blocking.any()
         ),
     }
 
@@ -8139,8 +8154,8 @@ def get_full_dispatch_cutover_status() -> Dict[str, Any]:
 def activate_full_dispatch_cutover(activated_by: str = "") -> Dict[str, Any]:
     """Close current cumulative Customer History as the post-alignment baseline.
 
-    Activation is rejected unless every verified SFDA batch in the latest
-    snapshots is aligned to physical Inventory within the configured tolerance.
+    Activation is rejected only when a verified SFDA batch exceeds physical
+    Inventory by at least one complete, dispatchable pack.
     Baseline capture is set-based and transactional.
     """
     import uuid
@@ -8158,18 +8173,21 @@ def activate_full_dispatch_cutover(activated_by: str = "") -> Dict[str, Any]:
             "Complete a Full Dispatch run with the final updated files first."
         )
 
-    tolerance = max(
-        0.0,
-        float(os.getenv("FULL_DISPATCH_CUTOVER_TOLERANCE_PACK", "0.000001") or 0.000001),
+    minimum_actionable_pack = max(
+        1.0,
+        float(os.getenv("FULL_DISPATCH_CUTOVER_MIN_ACTIONABLE_PACK", "1") or 1),
     )
-    differences = pd.to_numeric(alignment["Difference Pack"], errors="coerce").fillna(0).abs()
-    mismatch_rows = int(differences.gt(tolerance).sum())
-    max_difference = float(differences.max()) if not differences.empty else 0.0
+    differences = pd.to_numeric(alignment["Difference Pack"], errors="coerce").fillna(0)
+    mismatch_rows = int(differences.ge(minimum_actionable_pack).sum())
+    max_difference = max(
+        0.0, float(differences.max()) if not differences.empty else 0.0
+    )
     if mismatch_rows:
         raise ValueError(
             "Cutover cannot be activated: "
-            f"{mismatch_rows} batch(es) still have SFDA Active/Inventory differences "
-            f"above {tolerance:g} pack. Maximum difference: {max_difference:g} pack."
+            f"{mismatch_rows} batch(es) still have SFDA Active above Inventory "
+            f"by at least {minimum_actionable_pack:g} pack. Maximum positive "
+            f"difference: {max_difference:g} pack."
         )
 
     cutover_id = str(uuid.uuid4())
@@ -8272,7 +8290,7 @@ def activate_full_dispatch_cutover(activated_by: str = "") -> Dict[str, Any]:
         "customer_baseline_pack": baseline_pack,
         "alignment_rows": int(len(alignment)),
         "max_difference_pack": max_difference,
-        "tolerance_pack": tolerance,
+        "minimum_actionable_pack": minimum_actionable_pack,
     }
 
 

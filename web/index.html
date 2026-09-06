@@ -951,7 +951,7 @@
                 </div>
               </div>
               <div class="status-banner warning show" id="dispatchCutoverStatus" style="margin-top:14px">
-                <span>!</span><div style="flex:1"><strong>Legacy dispatch cutover not checked.</strong><br>Run Full Dispatch after uploading every final legacy CSV, then verify SFDA Active equals Current Inventory.</div>
+                <span>!</span><div style="flex:1"><strong>Legacy dispatch cutover not checked.</strong><br>Run Full Dispatch after uploading every final legacy CSV, then verify SFDA Active does not exceed Current Inventory by one full pack.</div>
                 <button class="btn btn-secondary" id="activateDispatchCutoverButton" type="button" disabled style="white-space:nowrap">Activate Cutover</button>
               </div>
             </div>
@@ -2936,7 +2936,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
         const canActivate=Boolean(payload.ready_to_activate)&&String(currentUser?.Role||"").toLowerCase()==="admin";
         if(banner){
           banner.className=`status-banner ${payload.ready_to_activate?"info":"warning"} show`;
-          banner.innerHTML=`<span>${payload.ready_to_activate?"ⓘ":"!"}</span><div style="flex:1"><strong>${payload.ready_to_activate?"Ready for one-time cutover.":"Legacy cutover is not ready."}</strong><br>${formatNumber(payload.alignment_rows||0)} aligned batches checked · ${formatNumber(mismatches)} mismatches. Activate only after all legacy CSVs are uploaded and SFDA Active equals Current Inventory.${payload.ready_to_activate&&!canActivate?" Administrator access is required.":""}</div><button class="btn btn-secondary" id="activateDispatchCutoverButton" type="button" ${canActivate?"":"disabled"} style="white-space:nowrap">Activate Cutover</button>`;
+          banner.innerHTML=`<span>${payload.ready_to_activate?"ⓘ":"!"}</span><div style="flex:1"><strong>${payload.ready_to_activate?"Ready for one-time cutover.":"Legacy cutover is not ready."}</strong><br>${formatNumber(payload.alignment_rows||0)} SFDA batches checked · ${formatNumber(mismatches)} blocking Dispatch differences. Inventory above SFDA Active is allowed; differences below one full pack are treated as matched.${payload.ready_to_activate&&!canActivate?" Administrator access is required.":""}</div><button class="btn btn-secondary" id="activateDispatchCutoverButton" type="button" ${canActivate?"":"disabled"} style="white-space:nowrap">Activate Cutover</button>`;
           bindDispatchCutoverButton();
         }
       }
@@ -2958,7 +2958,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
     if(!button||button.dataset.bound==="true") return;
     button.dataset.bound="true";
     button.addEventListener("click",async()=>{
-      const approved=window.confirm("Activate the one-time Full Dispatch cutover? Continue only if every final legacy CSV was uploaded and SFDA Active now equals Current Inventory. This closes all existing Customer History as reconciled.");
+      const approved=window.confirm("Activate the one-time Full Dispatch cutover? Continue only if every final legacy CSV was uploaded and no SFDA Active quantity exceeds Current Inventory by one full pack or more. This closes all existing Customer History as reconciled.");
       if(!approved) return;
       button.disabled=true;button.textContent="Activating...";
       try{

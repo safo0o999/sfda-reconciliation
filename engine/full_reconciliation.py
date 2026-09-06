@@ -267,6 +267,15 @@ class FullReconciliationEngine:
         "Value",
     ]
 
+    SFDA_INVENTORY_COMPARISON_COLUMNS = [
+        "GTIN", "Drug Name", "BN", "Expiry Date", "Expiry Month Key",
+        "SFDA Quantity", "SFDA Active", "Quantity Sent Pending",
+        "Quantity Receive Pending", "Generic Item Number", "PackageSize",
+        "Historical Evidence", "Historical Dispatch Quantity Pack",
+        "Current Inventory Quantity Each", "Current Inventory Quantity Pack",
+        "Active vs Inventory Difference Pack", "Matching Status",
+    ]
+
     def __init__(
         self,
         asn_df: pd.DataFrame,
@@ -3309,6 +3318,120 @@ class FullReconciliationEngine:
         ]
         return pd.DataFrame(metrics, columns=self.RECONCILIATION_SUMMARY_COLUMNS)
 
+    def build_sfda_inventory_comparison(
+        self,
+        sfda_df: pd.DataFrame,
+        inventory_df: pd.DataFrame,
+        batch_master_df: pd.DataFrame | None,
+    ) -> pd.DataFrame:
+        """Compare every SFDA batch with current Inventory and history.
+
+        Inventory is reported as zero only when Batch Master proves the batch's
+        historical identity. Differences below one whole pack are MATCH because
+        the SFDA upload format cannot carry a fractional pack.
+        """
+        sfda = Normalizer.normalize_sfda(sfda_df.copy())
+        sfda = self._ensure_columns(
+            sfda,
+            [
+                "GTIN", "Drug Name", "BN", "Expiry Date", "Quantity",
+                "Active", "Quantity sent pending", "Quantity Receive Pending",
+            ],
+        )
+        sfda["Expiry Month Key"] = self._month_key(sfda["Expiry Date"])
+        for column in ["Quantity", "Active", "Quantity sent pending", "Quantity Receive Pending"]:
+            sfda[column] = pd.to_numeric(sfda.get(column, 0), errors="coerce").fillna(0)
+        sfda["BN"] = Normalizer.text(sfda["BN"])
+        sfda["GTIN"] = Normalizer.text(sfda["GTIN"])
+        sfda = sfda.loc[
+            sfda["BN"].ne("") & sfda["GTIN"].ne("")
+            & sfda["Expiry Month Key"].astype(str).str.strip().ne("")
+        ].copy()
+        sfda = sfda.groupby(["GTIN", "BN", "Expiry Month Key"], dropna=False).agg(
+            **{
+                "Drug Name": ("Drug Name", "first"),
+                "Expiry Date": ("Expiry Date", "first"),
+                "SFDA Quantity": ("Quantity", "sum"),
+                "SFDA Active": ("Active", "sum"),
+                "Quantity Sent Pending": ("Quantity sent pending", "sum"),
+                "Quantity Receive Pending": ("Quantity Receive Pending", "sum"),
+            }
+        ).reset_index()
+        if sfda.empty:
+            return pd.DataFrame(columns=self.SFDA_INVENTORY_COMPARISON_COLUMNS)
+
+        master = self._rename_history_columns(
+            batch_master_df.copy() if batch_master_df is not None else pd.DataFrame()
+        )
+        master_columns = [*self.KEYS, "GTIN", "PackageSize", "Total Dispatched Qty Pack"]
+        master = self._ensure_columns(master, master_columns)[master_columns].copy()
+        for column in [*self.KEYS, "GTIN"]:
+            master[column] = Normalizer.text(master[column])
+        master["PackageSize"] = pd.to_numeric(master["PackageSize"], errors="coerce").fillna(0)
+        master.loc[master["PackageSize"].le(0), "PackageSize"] = 1
+        master["Historical Dispatch Quantity Pack"] = pd.to_numeric(
+            master["Total Dispatched Qty Pack"], errors="coerce"
+        ).fillna(0)
+        master = master.loc[
+            master["BN"].ne("") & master["Expiry Month Key"].ne("") & master["GTIN"].ne("")
+        ].copy()
+
+        inventory = self._prepare_stage2_inventory(inventory_df)
+        inventory = inventory.groupby(self.KEYS, dropna=False)[
+            "Current Inventory Quantity Each"
+        ].sum().reset_index()
+        master = master.merge(inventory, on=self.KEYS, how="left", validate="many_to_one")
+        master["Current Inventory Quantity Each"] = pd.to_numeric(
+            master["Current Inventory Quantity Each"], errors="coerce"
+        ).fillna(0)
+        master["Current Inventory Quantity Pack"] = (
+            master["Current Inventory Quantity Each"] / master["PackageSize"]
+        )
+        identity_keys = ["GTIN", "BN", "Expiry Month Key"]
+        master_identity = master.groupby(identity_keys, dropna=False).agg(
+            **{
+                "Generic Item Number": (
+                    "Generic Item Number",
+                    lambda values: " | ".join(sorted({str(v).strip() for v in values if str(v).strip()})),
+                ),
+                "PackageSize": ("PackageSize", "max"),
+                "Historical Dispatch Quantity Pack": ("Historical Dispatch Quantity Pack", "sum"),
+                "Current Inventory Quantity Each": ("Current Inventory Quantity Each", "sum"),
+                "Current Inventory Quantity Pack": ("Current Inventory Quantity Pack", "sum"),
+            }
+        ).reset_index()
+        comparison = sfda.merge(
+            master_identity, on=identity_keys, how="left", validate="one_to_one", indicator=True
+        )
+        has_history = comparison["_merge"].eq("both")
+        comparison["Historical Evidence"] = has_history.map({True: "Yes", False: "No"})
+        comparison["Active vs Inventory Difference Pack"] = (
+            pd.to_numeric(comparison["SFDA Active"], errors="coerce").fillna(0)
+            - pd.to_numeric(comparison["Current Inventory Quantity Pack"], errors="coerce")
+        )
+        difference = comparison["Active vs Inventory Difference Pack"]
+        receive_pending = pd.to_numeric(comparison["Quantity Receive Pending"], errors="coerce").fillna(0)
+        sent_pending = pd.to_numeric(comparison["Quantity Sent Pending"], errors="coerce").fillna(0)
+        historical_dispatch = pd.to_numeric(
+            comparison["Historical Dispatch Quantity Pack"], errors="coerce"
+        ).fillna(0)
+        comparison["Matching Status"] = "UNMAPPED - NO HISTORICAL EVIDENCE"
+        comparison.loc[has_history & difference.abs().lt(1), "Matching Status"] = "MATCH"
+        comparison.loc[has_history & difference.ge(1), "Matching Status"] = "DISPATCH REQUIRED"
+        inventory_higher = has_history & difference.le(-1)
+        comparison.loc[inventory_higher, "Matching Status"] = "SUPPLIER VARIANCE"
+        comparison.loc[
+            inventory_higher & sent_pending.gt(historical_dispatch), "Matching Status"
+        ] = "ADJUST DISPATCH QUANTITY"
+        comparison.loc[
+            inventory_higher & receive_pending.gt(0), "Matching Status"
+        ] = "ACCEPT REQUIRED"
+        return self._ensure_columns(
+            comparison, self.SFDA_INVENTORY_COMPARISON_COLUMNS
+        )[self.SFDA_INVENTORY_COMPARISON_COLUMNS].sort_values(
+            ["Matching Status", "GTIN", "BN", "Expiry Date"], kind="stable"
+        ).reset_index(drop=True)
+
     def build_return_cancel_reconciliation(
         self,
         returns_history_df: pd.DataFrame | None,
@@ -3823,6 +3946,29 @@ class FullReconciliationEngine:
         summary = self.build_reconciliation_summary(
             empty_accept, empty_variance, dispatch_details
         )
+        sfda_inventory_comparison = self.build_sfda_inventory_comparison(
+            sfda_df, inventory_df, batch_master_df
+        )
+        status_counts = sfda_inventory_comparison["Matching Status"].value_counts()
+        comparison_rows = int(len(sfda_inventory_comparison))
+        matched_rows = int(status_counts.get("MATCH", 0))
+        matching_percentage = (
+            round((matched_rows / comparison_rows) * 100, 2)
+            if comparison_rows else 0.0
+        )
+        matching_metrics = [
+            ("SFDA inventory comparison rows", comparison_rows),
+            ("SFDA inventory matched rows", matched_rows),
+            ("SFDA inventory matching percentage", matching_percentage),
+        ]
+        matching_metrics.extend(
+            (f"SFDA status - {status}", int(count))
+            for status, count in status_counts.items()
+        )
+        summary = pd.concat(
+            [summary, pd.DataFrame(matching_metrics, columns=self.RECONCILIATION_SUMMARY_COLUMNS)],
+            ignore_index=True,
+        )
         dispatch_upload = dispatch_details.loc[
             pd.to_numeric(
                 dispatch_details.get("To Be Dispatch", 0),
@@ -3879,6 +4025,7 @@ class FullReconciliationEngine:
             "return_cancel_details": return_cancel_details,
             "cancel_dispatch_upload": cancel_dispatch_upload,
             "validated_sfda_identity": validated_sfda_identity,
+            "sfda_inventory_comparison": sfda_inventory_comparison,
         }
 
     def run_full_reconciliation(

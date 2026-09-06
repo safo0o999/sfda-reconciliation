@@ -42,6 +42,13 @@ class FullDispatchPerformanceTests(unittest.TestCase):
         self.assertIn("FullDispatchCutoverBaseline", migration)
         self.assertIn("IX_FullDispatchTransactions_CutoverBatch", migration)
 
+    def test_cutover_blocks_only_complete_positive_dispatch_difference(self):
+        database = Path("engine/database.py").read_text(encoding="utf-8")
+
+        self.assertIn('FULL_DISPATCH_CUTOVER_MIN_ACTIONABLE_PACK', database)
+        self.assertIn('blocking = difference.ge(minimum_actionable_pack)', database)
+        self.assertNotIn('difference.gt(tolerance).sum()', database)
+
 
 if __name__ == "__main__":
     unittest.main()
