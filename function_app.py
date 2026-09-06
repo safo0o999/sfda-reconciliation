@@ -2838,10 +2838,13 @@ def _run_full_reconciliation_dispatch(req: func.HttpRequest) -> func.HttpRespons
                 df=batch_master,
                 file_name="Batch_Master.xlsx",
             ),
-            "dispatch_details": Exporter.build_full_dispatch_reconciliation_workbook(
-                dispatch_df=dispatch_details,
-                cancel_dispatch_df=return_cancel_details,
+            "dispatch_details": Exporter.build_formatted_excel_file(
+                df=dispatch_details,
                 file_name="Full_Dispatch_Reconciliation.xlsx",
+                sheet_name="Full Dispatch",
+                title="One-Time Full Reconciliation - Dispatch",
+                columns=list(dispatch_details.columns),
+                sort_columns=["To Address", "Generic Item Number", "BN"],
             ),
             "return_cancel_details": Exporter.build_formatted_excel_file(
                 df=return_cancel_details,
