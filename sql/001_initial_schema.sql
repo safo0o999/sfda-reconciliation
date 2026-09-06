@@ -61,6 +61,13 @@ BEGIN TRY
         ALTER TABLE dbo.DispatchEvents ALTER COLUMN ExpiryMonthKey char(7) NOT NULL;
     END;
 
+    IF OBJECT_ID(N'dbo.DispatchEvents', N'U') IS NOT NULL
+       AND COL_LENGTH(N'dbo.DispatchEvents', N'CustomerCode') IS NULL
+    BEGIN
+        PRINT N'Adding DispatchEvents.CustomerCode';
+        ALTER TABLE dbo.DispatchEvents ADD CustomerCode nvarchar(255) NULL;
+    END;
+
     /* -----------------------------------------------------------
        BatchMaster
        ----------------------------------------------------------- */
@@ -119,6 +126,13 @@ BEGIN TRY
             THROW 52005, 'CustomerHistory contains rows that cannot derive ExpiryMonthKey from ExpiryDate.', 1;
 
         ALTER TABLE dbo.CustomerHistory ALTER COLUMN ExpiryMonthKey char(7) NOT NULL;
+    END;
+
+    IF OBJECT_ID(N'dbo.CustomerHistory', N'U') IS NOT NULL
+       AND COL_LENGTH(N'dbo.CustomerHistory', N'CustomerCode') IS NULL
+    BEGIN
+        PRINT N'Adding CustomerHistory.CustomerCode';
+        ALTER TABLE dbo.CustomerHistory ADD CustomerCode nvarchar(255) NULL;
     END;
 
     /* -----------------------------------------------------------

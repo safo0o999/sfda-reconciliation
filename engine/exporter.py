@@ -58,7 +58,7 @@ class Exporter:
     ]
 
     CUSTOMER_HISTORY_COLUMNS = [
-        "To Address", "GLN", "GTIN", "Drug Name", "Generic Item Number", "Trade Code",
+        "To Address", "Customer Code", "GLN", "GTIN", "Drug Name", "Generic Item Number", "Trade Code",
         "Trade Description", "BN", "Expiry Date", "PackageSize",
         "Dispatch Quantity Each", "Dispatch Quantity Pack",
         "First Dispatch Date", "Last Dispatch Date", "Custody",
@@ -316,6 +316,7 @@ class Exporter:
 
     FULL_DISPATCH_RECONCILIATION_COLUMNS = [
         "To Address",
+        "Customer Code",
         "GLN",
         "GTIN",
         "Drug Name",

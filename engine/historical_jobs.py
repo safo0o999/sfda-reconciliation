@@ -277,7 +277,7 @@ def _build_rebuild_summaries_from_prepared(
             }
         ).reset_index()
 
-        ckeys = ["To Address", *keys, "Trade Item Number"]
+        ckeys = ["To Address", "Customer Code", *keys, "Trade Item Number"]
         customer_summary = dispatch.groupby(ckeys, dropna=False).agg(
             **{
                 "Expiry Date": ("Expiry Date", "max"),
@@ -349,6 +349,8 @@ def _build_sto_history_from_prepared(
         if not ref:
             continue
         package_size = pd.to_numeric(pd.Series([ref.get("PackageSize", 0)]), errors="coerce").fillna(0).iloc[0]
+        if float(package_size or 0) <= 0:
+            package_size = 1.0
         qty_each = float(r.get("Received Quantity Each", 0) or 0)
         row = {
             "Inbound Shipment": r.get("Inbound Shipment", ""),
@@ -364,9 +366,9 @@ def _build_sto_history_from_prepared(
             "Trade Description": ref.get("Trade Description", "") or r.get("Receipt Trade Name", ""),
             "Description": r.get("Description", ""),
             "Item Family Group": r.get("Item Family Group", ""),
-            "PackageSize": float(package_size or 0),
+            "PackageSize": float(package_size),
             "Received Quantity Each": qty_each,
-            "Received Quantity Pack": (qty_each / float(package_size)) if float(package_size or 0) > 0 else 0.0,
+            "Received Quantity Pack": qty_each / float(package_size),
             "First Received Date": r.get("First Received Date"),
             "Last Received Date": r.get("Last Received Date"),
             "SFDA Match Status": (

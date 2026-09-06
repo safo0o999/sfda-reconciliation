@@ -96,6 +96,7 @@ class FullReconciliationEngine:
         "Trade Name",
         "Dispatched Quantity",
         "To Address",
+        "Customer Code",
         "Sales Order Number",
         "Order Line",
         "Dispatch Date",
@@ -156,6 +157,7 @@ class FullReconciliationEngine:
 
     CUSTOMER_HISTORY_COLUMNS = [
         "To Address",
+        "Customer Code",
         "GLN",
         "GTIN",
         "Drug Name",
@@ -211,6 +213,7 @@ class FullReconciliationEngine:
 
     DISPATCH_RECONCILIATION_COLUMNS = [
         "To Address",
+        "Customer Code",
         "GLN",
         "GTIN",
         "Drug Name",
@@ -241,7 +244,9 @@ class FullReconciliationEngine:
         "Return Type",
         "Inbound Shipment",
         "Return From",
+        "Return From Code",
         "To Address",
+        "Customer Code",
         "GLN",
         "GTIN",
         "Drug Name",
@@ -259,6 +264,7 @@ class FullReconciliationEngine:
         "Available Cancel Dispatch Quantity Each",
         "Available Cancel Dispatch Quantity Pack",
         "To Be Cancel Dispatch",
+        "Customer Match Method",
         "Return Reconciliation Status",
     ]
 
@@ -1658,6 +1664,7 @@ class FullReconciliationEngine:
         )
         required = [
             "To Address",
+            "Customer Code",
             *self.KEYS,
             "Expiry Date",
             "Trade Item Number",
@@ -1908,6 +1915,7 @@ class FullReconciliationEngine:
         rename_map = {
             "SupplierName": "Supplier Name",
             "SupplierCode": "Supplier Code",
+            "CustomerCode": "Customer Code",
             "GenericItemNumber": "Generic Item Number",
             "TradeItemNumber": "Trade Item Number",
             "TradeDescription": "Trade Description",
@@ -3622,10 +3630,11 @@ class FullReconciliationEngine:
         """Match ASN returns to prior customer dispatch and allocate safe cancels.
 
         This is a side stream: it does not mutate or net Customer History and it
-        never contributes to ordinary Full Dispatch allocation.  ``Supplier
-        Name`` from ASN is exposed by Returns History as ``Return From`` and is
-        matched to Customer History ``To Address`` using a punctuation/case
-        insensitive key.
+        never contributes to ordinary Full Dispatch allocation. ASN ``Supplier
+        Code`` (exposed as ``Return From Code``) is matched first to Full
+        Dispatch ``Ship To Customer`` (persisted as ``Customer Code``) for the
+        same batch/product. Name matching remains a legacy fallback only when no
+        code-backed customer history exists for that return key.
         """
         returns = (
             returns_history_df.copy()
@@ -3638,9 +3647,9 @@ class FullReconciliationEngine:
         returns = self._ensure_columns(
             returns,
             [
-                "Return Type", "Inbound Shipment", "Return From",
+                "Return Type", "Inbound Shipment", "Return From", "Return From Code",
                 "Source Warehouse", "BN", "Expiry Month Key", "Expiry Date",
-                "Generic Item Number", "Received Quantity Each",
+                "Generic Item Number", "PackageSize", "Received Quantity Each",
                 "Received Quantity Pack", "First Received Date",
             ],
         )
@@ -3651,16 +3660,22 @@ class FullReconciliationEngine:
         for column in ["BN", "Expiry Month Key", "Generic Item Number"]:
             returns[column] = Normalizer.text(returns[column])
         returns["Return From"] = returns["Return From"].fillna("").astype(str).str.strip()
-        returns["_Party Key"] = returns["Return From"].map(self._identity_text)
+        returns["Return From Code"] = Normalizer.identifier(
+            returns["Return From Code"]
+        ).str.upper()
+        returns["_Name Party Key"] = returns["Return From"].map(self._identity_text)
         returns["Received Quantity Each"] = pd.to_numeric(
             returns["Received Quantity Each"], errors="coerce"
         ).fillna(0).clip(lower=0)
+        returns["PackageSize"] = pd.to_numeric(
+            returns["PackageSize"], errors="coerce"
+        ).fillna(0)
         returns["First Received Date"] = pd.to_datetime(
             returns["First Received Date"], errors="coerce"
         )
 
         group_keys = [
-            "Return Type", "_Party Key", "Return From", "BN",
+            "Return Type", "_Name Party Key", "Return From", "Return From Code", "BN",
             "Expiry Month Key", "Generic Item Number",
         ]
         returns = (
@@ -3678,6 +3693,7 @@ class FullReconciliationEngine:
                         ),
                     ),
                     "Return Expiry Date": ("Expiry Date", "max"),
+                    "Return PackageSize": ("PackageSize", "max"),
                     "Returned Quantity Each": ("Received Quantity Each", "sum"),
                     "First Received Date": ("First Received Date", "min"),
                 }
@@ -3692,7 +3708,10 @@ class FullReconciliationEngine:
         for column in ["BN", "Expiry Month Key", "Generic Item Number"]:
             customer[column] = Normalizer.text(customer[column])
         customer["To Address"] = customer["To Address"].fillna("").astype(str).str.strip()
-        customer["_Party Key"] = customer["To Address"].map(self._identity_text)
+        customer["Customer Code"] = Normalizer.identifier(
+            customer["Customer Code"]
+        ).str.upper()
+        customer["_Name Party Key"] = customer["To Address"].map(self._identity_text)
         customer["GLN"] = customer["GLN"].fillna("").astype(str).str.strip()
         customer["Dispatch Quantity Each"] = pd.to_numeric(
             customer["Dispatch Quantity Each"], errors="coerce"
@@ -3704,6 +3723,68 @@ class FullReconciliationEngine:
             customer["PackageSize"], errors="coerce"
         ).fillna(0)
 
+        # A customer code is accepted only inside the same regulatory batch
+        # identity. This prevents a valid code on another product/batch from
+        # becoming accidental evidence for the current return.
+        batch_keys = ["BN", "Expiry Month Key", "Generic Item Number"]
+        coded_customer = customer.loc[customer["Customer Code"].ne("")].copy()
+        code_batch_keys = ["Customer Code", *batch_keys]
+        code_candidates = set(
+            map(
+                tuple,
+                coded_customer[code_batch_keys]
+                .drop_duplicates()
+                .itertuples(index=False, name=None),
+            )
+        )
+
+        return_code_matches = []
+        for values in returns[["Return From Code", *batch_keys]].itertuples(
+            index=False, name=None
+        ):
+            return_code_matches.append(bool(values[0]) and tuple(values) in code_candidates)
+        returns["_Code Match Available"] = return_code_matches
+        returns["_Party Key"] = "NAME:" + returns["_Name Party Key"]
+        returns.loc[returns["_Code Match Available"], "_Party Key"] = (
+            "CODE:" + returns.loc[returns["_Code Match Available"], "Return From Code"]
+        )
+
+        customer["_Party Key"] = "NAME:" + customer["_Name Party Key"]
+        customer.loc[customer["Customer Code"].ne(""), "_Party Key"] = (
+            "CODE:" + customer.loc[customer["Customer Code"].ne(""), "Customer Code"]
+        )
+        usable_gln = ~customer["GLN"].isin(["", "99999999999999"])
+        customer["_Usable GLN"] = customer["GLN"].where(usable_gln, "")
+        customer["_Usable GLN Key"] = customer["_Usable GLN"].replace("", pd.NA)
+
+        ambiguity = (
+            customer.loc[customer["Customer Code"].ne("")]
+            .groupby(["_Party Key", *batch_keys], dropna=False)
+            .agg(
+                **{
+                    "_Customer Address Count": ("_Name Party Key", "nunique"),
+                    "_Customer GLN Count": ("_Usable GLN Key", "nunique"),
+                }
+            )
+            .reset_index()
+        )
+        ambiguity["_Ambiguous Customer Code"] = (
+            ambiguity["_Customer GLN Count"].gt(1)
+            | (
+                ambiguity["_Customer GLN Count"].eq(0)
+                & ambiguity["_Customer Address Count"].gt(1)
+            )
+        )
+        customer = customer.merge(
+            ambiguity[["_Party Key", *batch_keys, "_Ambiguous Customer Code"]],
+            on=["_Party Key", *batch_keys],
+            how="left",
+            validate="many_to_one",
+        )
+        customer["_Ambiguous Customer Code"] = customer[
+            "_Ambiguous Customer Code"
+        ].astype("boolean").fillna(False).astype(bool)
+
         customer_keys = ["_Party Key", "BN", "Expiry Month Key", "Generic Item Number"]
         customer = (
             customer.sort_values([*customer_keys, "To Address"], kind="stable")
@@ -3711,7 +3792,8 @@ class FullReconciliationEngine:
             .agg(
                 **{
                     "To Address": ("To Address", "first"),
-                    "GLN": ("GLN", "first"),
+                    "Customer Code": ("Customer Code", "first"),
+                    "GLN": ("_Usable GLN", "max"),
                     "GTIN": ("GTIN", "first"),
                     "Drug Name": ("Drug Name", "first"),
                     "Expiry Date": ("Expiry Date", "max"),
@@ -3721,6 +3803,9 @@ class FullReconciliationEngine:
                     ),
                     "Historical Dispatch Quantity Pack": (
                         "Dispatch Quantity Pack", "sum"
+                    ),
+                    "_Ambiguous Customer Code": (
+                        "_Ambiguous Customer Code", "max"
                     ),
                 }
             )
@@ -3736,15 +3821,30 @@ class FullReconciliationEngine:
         history_expiry = Normalizer.date(details.get("Expiry Date", pd.Series(dtype=object)))
         return_expiry = Normalizer.date(details["Return Expiry Date"])
         details["Expiry Date"] = history_expiry.combine_first(return_expiry)
-        details["PackageSize"] = pd.to_numeric(
+        customer_package_size = pd.to_numeric(
             details.get("PackageSize", 0), errors="coerce"
         ).fillna(0)
+        return_package_size = pd.to_numeric(
+            details.get("Return PackageSize", 0), errors="coerce"
+        ).fillna(0)
+        details["PackageSize"] = customer_package_size.where(
+            customer_package_size.gt(0), return_package_size
+        )
+        # The platform-wide PackageSize contract is strictly positive. Keep the
+        # verified BatchMaster-derived return value when customer matching is
+        # unavailable, and use the established fallback of 1 only when neither
+        # source supplies a positive value.
+        details.loc[details["PackageSize"].le(0), "PackageSize"] = 1.0
         details["Returned Quantity Pack"] = 0.0
         valid_pack = details["PackageSize"].gt(0)
         details.loc[valid_pack, "Returned Quantity Pack"] = (
             details.loc[valid_pack, "Returned Quantity Each"]
             / details.loc[valid_pack, "PackageSize"]
         )
+        code_match = details["_Party Key"].fillna("").astype(str).str.startswith("CODE:")
+        details["Customer Match Method"] = "UNMATCHED"
+        details.loc[~code_match, "Customer Match Method"] = "NAME FALLBACK"
+        details.loc[code_match, "Customer Match Method"] = "CUSTOMER CODE"
 
         confirmed_each = "Previously Confirmed Cancel Dispatch Each"
         confirmed_pack = "Previously Confirmed Cancel Dispatch Pack"
@@ -3830,6 +3930,10 @@ class FullReconciliationEngine:
             ["", "99999999999999"]
         )
         invalid_pack = details["PackageSize"].le(0)
+        ambiguous_code = details.get(
+            "_Ambiguous Customer Code",
+            pd.Series(False, index=details.index, dtype=bool),
+        ).astype("boolean").fillna(False).astype(bool)
         excess = details["_Open Return Pack"].gt(
             details["Available Cancel Dispatch Quantity Pack"]
         )
@@ -3844,7 +3948,15 @@ class FullReconciliationEngine:
         details.loc[no_history, "Return Reconciliation Status"] = (
             "Exception - No Matching Customer Dispatch"
         )
-        details.loc[no_history | no_gln | invalid_pack, "To Be Cancel Dispatch"] = 0
+        details.loc[no_history, "Customer Match Method"] = "UNMATCHED"
+        details.loc[ambiguous_code, "Customer Match Method"] = "AMBIGUOUS CUSTOMER CODE"
+        details.loc[ambiguous_code, "Return Reconciliation Status"] = (
+            "Exception - Ambiguous Customer Code"
+        )
+        details.loc[
+            no_history | no_gln | invalid_pack | ambiguous_code,
+            "To Be Cancel Dispatch",
+        ] = 0
 
         return self._ensure_columns(
             details, self.RETURN_CANCEL_RECONCILIATION_COLUMNS

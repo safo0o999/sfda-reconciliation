@@ -1182,6 +1182,20 @@ class Normalizer:
                 ["To Address", "Customer Name"],
             )
         )
+        # WMS exposes the customer identifier as "Ship To Customer". Keep it
+        # as text so leading zeroes and alphanumeric customer codes survive the
+        # Excel import. This is the durable bridge to ASN Supplier Code for
+        # customer/STO return Cancel Dispatch reconciliation.
+        df["Customer Code"] = Normalizer.identifier(
+            Normalizer._optional_series(
+                df,
+                [
+                    "Ship To Customer",
+                    "Customer Code",
+                    "Ship To Customer Code",
+                ],
+            )
+        ).str.upper()
         df["Sales Order Number"] = Normalizer.identifier(
             Normalizer._required_series(
                 df,

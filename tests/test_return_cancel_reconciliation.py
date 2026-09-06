@@ -13,6 +13,7 @@ sys.modules.setdefault("pyodbc", MagicMock())
 
 from engine.exporter import Exporter
 from engine.full_reconciliation import FullReconciliationEngine
+from engine.normalizer import Normalizer
 from engine.inbound_classification import (
     CUSTOMER_RETURN,
     STO_RETURN,
@@ -24,10 +25,11 @@ def engine():
     return FullReconciliationEngine(pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
 
 
-def customer_history(quantity_each=100, package_size=10):
+def customer_history(quantity_each=100, package_size=10, customer_code=""):
     return pd.DataFrame([
         {
             "To Address": "Customer A - Riyadh",
+            "Customer Code": customer_code,
             "GLN": "6281234567890",
             "GTIN": "06281234567890",
             "Drug Name": "Drug A",
@@ -47,16 +49,24 @@ def customer_history(quantity_each=100, package_size=10):
     ])
 
 
-def returns_history(quantity_each=30, return_from="customer a riyadh", return_type=CUSTOMER_RETURN):
+def returns_history(
+    quantity_each=30,
+    return_from="customer a riyadh",
+    return_type=CUSTOMER_RETURN,
+    return_from_code="",
+    package_size=10,
+):
     return pd.DataFrame([
         {
             "Return Type": return_type,
             "Inbound Shipment": "TRK30-0001" if return_type == CUSTOMER_RETURN else "TRK49-0001",
             "Return From": return_from,
+            "Return From Code": return_from_code,
             "BN": "B001",
             "Expiry Date": pd.Timestamp("2027-08-01"),
             "Expiry Month Key": "2027-08",
             "Generic Item Number": "1001",
+            "PackageSize": package_size,
             "Received Quantity Each": quantity_each,
             "First Received Date": pd.Timestamp("2026-08-01"),
         }
@@ -80,6 +90,96 @@ class ReturnCancelTests(unittest.TestCase):
             result.loc[0, "Return Reconciliation Status"],
             "Cancel Dispatch Required",
         )
+
+    def test_dispatch_normalizer_preserves_ship_to_customer_as_code(self):
+        raw = pd.DataFrame([{
+            "Batch/Lot": "B001",
+            "Best Before Date": "2027-08-31",
+            "Pick Qty": 30,
+            "Trade Description": "Drug A",
+            "To Address": "Customer A",
+            "Ship To Customer": "W2D5_0402",
+            "Sales Order Number": "SO1",
+            "Confirm Date": "2026-08-01 10:00:00",
+            "Generic Item Number": "1001",
+        }])
+        normalized = Normalizer.normalize_dispatch(raw)
+        self.assertEqual(normalized.loc[0, "Customer Code"], "W2D5_0402")
+
+    def test_customer_code_does_not_change_dispatch_event_identity(self):
+        base = pd.DataFrame([{
+            "BN": "B001",
+            "Expiry Month Key": "2027-08",
+            "Expiry Date": pd.Timestamp("2027-08-31"),
+            "Generic Item Number": "1001",
+            "Trade Item Number": "1001",
+            "Trade Name": "Drug A",
+            "Dispatched Quantity": 30,
+            "To Address": "Customer A",
+            "Customer Code": "120400",
+            "Sales Order Number": "SO1",
+            "Order Line": "1",
+            "Dispatch Date": pd.Timestamp("2026-08-01 10:00:00"),
+            "Custody": "",
+            "_Source File": "dispatch.xlsx",
+        }])
+        subject = engine()
+        subject.dispatch = base.copy()
+        first_key = subject._dispatch_events().loc[0, "Event Key"]
+        subject.dispatch.loc[0, "Customer Code"] = "UPDATED-CODE"
+        second_key = subject._dispatch_events().loc[0, "Event Key"]
+        self.assertEqual(first_key, second_key)
+
+    def test_customer_code_matches_when_supplier_and_customer_names_differ(self):
+        result = engine().build_return_cancel_reconciliation(
+            returns_history(
+                return_from="WMS RETURN SUPPLIER NAME",
+                return_from_code="120400",
+            ),
+            customer_history(customer_code="120400"),
+        )
+        self.assertEqual(result.loc[0, "To Address"], "Customer A - Riyadh")
+        self.assertEqual(result.loc[0, "Customer Code"], "120400")
+        self.assertEqual(result.loc[0, "Customer Match Method"], "CUSTOMER CODE")
+        self.assertEqual(result.loc[0, "To Be Cancel Dispatch"], 3)
+
+    def test_ambiguous_customer_code_never_generates_cancel_dispatch(self):
+        first = customer_history(customer_code="120400")
+        second = customer_history(customer_code="120400")
+        second["To Address"] = "Another Customer Alias"
+        second["GLN"] = "6281234567891"
+        result = engine().build_return_cancel_reconciliation(
+            returns_history(
+                return_from="WMS RETURN SUPPLIER NAME",
+                return_from_code="120400",
+            ),
+            pd.concat([first, second], ignore_index=True),
+        )
+        self.assertEqual(result.loc[0, "To Be Cancel Dispatch"], 0)
+        self.assertEqual(
+            result.loc[0, "Return Reconciliation Status"],
+            "Exception - Ambiguous Customer Code",
+        )
+        self.assertEqual(
+            result.loc[0, "Customer Match Method"],
+            "AMBIGUOUS CUSTOMER CODE",
+        )
+
+    def test_customer_code_combines_name_aliases_with_one_gln(self):
+        first = customer_history(quantity_each=60, customer_code="120400")
+        second = customer_history(quantity_each=40, customer_code="120400")
+        second["To Address"] = "Customer A Renamed"
+        result = engine().build_return_cancel_reconciliation(
+            returns_history(
+                quantity_each=100,
+                return_from="Different ASN Supplier Name",
+                return_from_code="120400",
+            ),
+            pd.concat([first, second], ignore_index=True),
+        )
+        self.assertEqual(result.loc[0, "Historical Dispatch Quantity Each"], 100)
+        self.assertEqual(result.loc[0, "To Be Cancel Dispatch"], 10)
+        self.assertEqual(result.loc[0, "Customer Match Method"], "CUSTOMER CODE")
 
     def test_confirmed_cancel_is_not_generated_again(self):
         confirmed = pd.DataFrame([
@@ -113,6 +213,22 @@ class ReturnCancelTests(unittest.TestCase):
         result = engine().build_return_cancel_reconciliation(
             returns_history(return_from="Unknown Customer"), customer_history()
         )
+        self.assertEqual(result.loc[0, "To Be Cancel Dispatch"], 0)
+        self.assertEqual(result.loc[0, "PackageSize"], 10)
+        self.assertEqual(
+            result.loc[0, "Return Reconciliation Status"],
+            "Exception - No Matching Customer Dispatch",
+        )
+
+    def test_unmatched_return_package_size_uses_positive_fallback(self):
+        result = engine().build_return_cancel_reconciliation(
+            returns_history(
+                return_from="Unknown Customer",
+                package_size=0,
+            ),
+            customer_history(),
+        )
+        self.assertEqual(result.loc[0, "PackageSize"], 1)
         self.assertEqual(result.loc[0, "To Be Cancel Dispatch"], 0)
         self.assertEqual(
             result.loc[0, "Return Reconciliation Status"],

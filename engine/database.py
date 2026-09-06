@@ -524,6 +524,7 @@ def _dispatch_parameters(row: Dict[str, Any]) -> Tuple[Any, ...]:
         _text(row, "Trade Name"),
         _number(row, "Dispatched Quantity"),
         _text(row, "To Address"),
+        _text(row, "Customer Code"),
         _text(row, "Sales Order Number"),
         _text(row, "Order Line"),
         _value(row, "Dispatch Date"),
@@ -844,9 +845,9 @@ def append_events(
         (
             EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
             TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
-            SalesOrderNumber, OrderLine, DispatchDate, Custody
+            CustomerCode, SalesOrderNumber, OrderLine, DispatchDate, Custody
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     """
 
     receipt_rows = [
@@ -963,22 +964,23 @@ def append_events(
                 JSON_VALUE(j.value, '$[6]') AS TradeName,
                 TRY_CONVERT(decimal(38, 6), JSON_VALUE(j.value, '$[7]')) AS DispatchedQuantity,
                 JSON_VALUE(j.value, '$[8]') AS ToAddress,
-                JSON_VALUE(j.value, '$[9]') AS SalesOrderNumber,
-                JSON_VALUE(j.value, '$[10]') AS OrderLine,
-                TRY_CONVERT(datetime2(7), JSON_VALUE(j.value, '$[11]')) AS DispatchDate,
-                JSON_VALUE(j.value, '$[12]') AS Custody
+                JSON_VALUE(j.value, '$[9]') AS CustomerCode,
+                JSON_VALUE(j.value, '$[10]') AS SalesOrderNumber,
+                JSON_VALUE(j.value, '$[11]') AS OrderLine,
+                TRY_CONVERT(datetime2(7), JSON_VALUE(j.value, '$[12]')) AS DispatchDate,
+                JSON_VALUE(j.value, '$[13]') AS Custody
             FROM OPENJSON(CAST(? AS nvarchar(max))) AS j
         )
         INSERT INTO dbo.DispatchEvents
         (
             EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
             TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
-            SalesOrderNumber, OrderLine, DispatchDate, Custody
+            CustomerCode, SalesOrderNumber, OrderLine, DispatchDate, Custody
         )
         SELECT
             s.EventKey, s.BN, s.ExpiryMonthKey, s.ExpiryDate, s.GenericItemNumber,
             s.TradeItemNumber, s.TradeName, s.DispatchedQuantity, s.ToAddress,
-            s.SalesOrderNumber, s.OrderLine, s.DispatchDate, s.Custody
+            s.CustomerCode, s.SalesOrderNumber, s.OrderLine, s.DispatchDate, s.Custody
         FROM Parsed AS s
         WHERE s.EventKey IS NOT NULL
           AND NOT EXISTS
@@ -1012,7 +1014,8 @@ def append_events(
 
                     CREATE TABLE #DispatchEventKeyProbe
                     (
-                        EventKey varchar(64) NOT NULL PRIMARY KEY
+                        EventKey varchar(64) NOT NULL PRIMARY KEY,
+                        CustomerCode nvarchar(255) NULL
                     );
                 """)
                 cursor.fast_executemany = True
@@ -1023,8 +1026,8 @@ def append_events(
                     )
                 if prepared_dispatches:
                     cursor.executemany(
-                        "INSERT INTO #DispatchEventKeyProbe (EventKey) VALUES (?);",
-                        [(str(row[0]),) for row in prepared_dispatches],
+                        "INSERT INTO #DispatchEventKeyProbe (EventKey, CustomerCode) VALUES (?, ?);",
+                        [(str(row[0]), str(row[9] or "")) for row in prepared_dispatches],
                     )
                 cursor.fast_executemany = False
 
@@ -1051,6 +1054,24 @@ def append_events(
                     missing_receipts = {str(row[0]) for row in cursor.fetchall()}
 
                 if prepared_dispatches:
+                    # Replaying the same Full Dispatch file after this upgrade
+                    # enriches existing events with Ship To Customer without
+                    # inserting a second movement or changing any quantity.
+                    cursor.execute(
+                        r"""
+                        UPDATE target
+                        SET target.CustomerCode = source.CustomerCode
+                        FROM dbo.DispatchEvents AS target
+                        INNER JOIN #DispatchEventKeyProbe AS source
+                            ON source.EventKey = target.EventKey
+                        WHERE target.WarehouseID = ?
+                          AND target.BuildID = ?
+                          AND NULLIF(LTRIM(RTRIM(source.CustomerCode)), N'') IS NOT NULL
+                          AND ISNULL(target.CustomerCode, N'') <> source.CustomerCode;
+                        """,
+                        warehouse_id,
+                        active_build_id,
+                    )
                     cursor.execute(
                         r"""
                         SELECT s.EventKey
@@ -1068,6 +1089,8 @@ def append_events(
                         active_build_id,
                     )
                     missing_dispatches = {str(row[0]) for row in cursor.fetchall()}
+
+                connection.commit()
 
                 return missing_receipts, missing_dispatches
             finally:
@@ -1147,22 +1170,23 @@ def append_events(
                     JSON_VALUE(j.value, '$[6]') AS TradeName,
                     TRY_CONVERT(decimal(38, 6), JSON_VALUE(j.value, '$[7]')) AS DispatchedQuantity,
                     JSON_VALUE(j.value, '$[8]') AS ToAddress,
-                    JSON_VALUE(j.value, '$[9]') AS SalesOrderNumber,
-                    JSON_VALUE(j.value, '$[10]') AS OrderLine,
-                    TRY_CONVERT(datetime2(7), JSON_VALUE(j.value, '$[11]')) AS DispatchDate,
-                    JSON_VALUE(j.value, '$[12]') AS Custody
+                    JSON_VALUE(j.value, '$[9]') AS CustomerCode,
+                    JSON_VALUE(j.value, '$[10]') AS SalesOrderNumber,
+                    JSON_VALUE(j.value, '$[11]') AS OrderLine,
+                    TRY_CONVERT(datetime2(7), JSON_VALUE(j.value, '$[12]')) AS DispatchDate,
+                    JSON_VALUE(j.value, '$[13]') AS Custody
                 FROM OPENJSON(CAST(? AS nvarchar(max))) AS j
             )
             INSERT INTO #DispatchEventJsonStage
             (
                 EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
                 TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
-                SalesOrderNumber, OrderLine, DispatchDate, Custody
+                CustomerCode, SalesOrderNumber, OrderLine, DispatchDate, Custody
             )
             SELECT
                 EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
                 TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
-                SalesOrderNumber, OrderLine, DispatchDate, Custody
+                CustomerCode, SalesOrderNumber, OrderLine, DispatchDate, Custody
             FROM Parsed
             WHERE EventKey IS NOT NULL;
         """
@@ -1183,7 +1207,7 @@ def append_events(
                     SELECT TOP (0)
                         EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
                         TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
-                        SalesOrderNumber, OrderLine, DispatchDate, Custody
+                        CustomerCode, SalesOrderNumber, OrderLine, DispatchDate, Custody
                     INTO #DispatchEventJsonStage
                     FROM dbo.DispatchEvents;
                 """)
@@ -1264,16 +1288,31 @@ def append_events(
                 if dispatches_to_save:
                     cursor.execute(
                         r"""
+                        UPDATE target
+                        SET target.CustomerCode = source.CustomerCode
+                        FROM dbo.DispatchEvents AS target
+                        INNER JOIN #DispatchEventJsonStage AS source
+                            ON source.EventKey = target.EventKey
+                        WHERE target.WarehouseID = ?
+                          AND target.BuildID = ?
+                          AND NULLIF(LTRIM(RTRIM(source.CustomerCode)), N'') IS NOT NULL
+                          AND ISNULL(target.CustomerCode, N'') <> source.CustomerCode;
+                        """,
+                        warehouse_id,
+                        active_build_id,
+                    )
+                    cursor.execute(
+                        r"""
                         INSERT INTO dbo.DispatchEvents
                         (
                             EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
                             TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
-                            SalesOrderNumber, OrderLine, DispatchDate, Custody
+                            CustomerCode, SalesOrderNumber, OrderLine, DispatchDate, Custody
                         )
                         SELECT
                             s.EventKey, s.BN, s.ExpiryMonthKey, s.ExpiryDate, s.GenericItemNumber,
                             s.TradeItemNumber, s.TradeName, s.DispatchedQuantity, s.ToAddress,
-                            s.SalesOrderNumber, s.OrderLine, s.DispatchDate, s.Custody
+                            s.CustomerCode, s.SalesOrderNumber, s.OrderLine, s.DispatchDate, s.Custody
                         FROM #DispatchEventJsonStage AS s
                         WHERE NOT EXISTS
                         (
@@ -1334,7 +1373,7 @@ def append_events(
                     SELECT TOP (0)
                         EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
                         TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
-                        SalesOrderNumber, OrderLine, DispatchDate, Custody
+                        CustomerCode, SalesOrderNumber, OrderLine, DispatchDate, Custody
                     INTO #DispatchEventStage
                     FROM dbo.DispatchEvents;
                 """)
@@ -1372,9 +1411,9 @@ def append_events(
                         (
                             EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
                             TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
-                            SalesOrderNumber, OrderLine, DispatchDate, Custody
+                            CustomerCode, SalesOrderNumber, OrderLine, DispatchDate, Custody
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                         """,
                         prepared_dispatches,
                     )
@@ -1415,16 +1454,31 @@ def append_events(
                 if prepared_dispatches:
                     cursor.execute(
                         r"""
+                        UPDATE target
+                        SET target.CustomerCode = source.CustomerCode
+                        FROM dbo.DispatchEvents AS target
+                        INNER JOIN #DispatchEventStage AS source
+                            ON source.EventKey = target.EventKey
+                        WHERE target.WarehouseID = ?
+                          AND target.BuildID = ?
+                          AND NULLIF(LTRIM(RTRIM(source.CustomerCode)), N'') IS NOT NULL
+                          AND ISNULL(target.CustomerCode, N'') <> source.CustomerCode;
+                        """,
+                        warehouse_id,
+                        active_build_id,
+                    )
+                    cursor.execute(
+                        r"""
                         INSERT INTO dbo.DispatchEvents
                         (
                             EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
                             TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
-                            SalesOrderNumber, OrderLine, DispatchDate, Custody
+                            CustomerCode, SalesOrderNumber, OrderLine, DispatchDate, Custody
                         )
                         SELECT
                             s.EventKey, s.BN, s.ExpiryMonthKey, s.ExpiryDate, s.GenericItemNumber,
                             s.TradeItemNumber, s.TradeName, s.DispatchedQuantity, s.ToAddress,
-                            s.SalesOrderNumber, s.OrderLine, s.DispatchDate, s.Custody
+                            s.CustomerCode, s.SalesOrderNumber, s.OrderLine, s.DispatchDate, s.Custody
                         FROM #DispatchEventStage s
                         WHERE NOT EXISTS
                         (
@@ -1756,6 +1810,7 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
     customer_sql = r"""
         SELECT
             ToAddress AS [To Address],
+            CustomerCode AS [Customer Code],
             BN,
             ExpiryMonthKey AS [Expiry Month Key],
             MAX(ExpiryDate) AS [Expiry Date],
@@ -1771,7 +1826,7 @@ def get_history_summaries() -> Tuple[pd.DataFrame, pd.DataFrame]:
           AND REPLACE(REPLACE(REPLACE(
                 UPPER(LTRIM(RTRIM(ISNULL(Custody, '')))),
                 ' ', ''), '-', ''), '_', '') <> 'BIOCHEMICALS'
-        GROUP BY ToAddress, BN, ExpiryMonthKey, GenericItemNumber, TradeItemNumber;
+        GROUP BY ToAddress, CustomerCode, BN, ExpiryMonthKey, GenericItemNumber, TradeItemNumber;
     """
 
     with Database().connect() as connection:
@@ -1879,12 +1934,15 @@ def _get_sto_receipt_history(
             COALESCE(NULLIF(b.TradeName, ''), r.TradeName, '') AS [Trade Description],
             r.Description,
             r.ItemFamilyGroup AS [Item Family Group],
-            COALESCE(b.PackageSize, 0) AS PackageSize,
+            CASE
+                WHEN COALESCE(b.PackageSize, 0) > 0 THEN b.PackageSize
+                ELSE CAST(1 AS decimal(38, 6))
+            END AS PackageSize,
             r.ReceivedQuantityEach AS [Received Quantity Each],
             CASE
                 WHEN COALESCE(b.PackageSize, 0) > 0
                 THEN r.ReceivedQuantityEach / b.PackageSize
-                ELSE 0
+                ELSE r.ReceivedQuantityEach
             END AS [Received Quantity Pack],
             r.FirstReceivedDate AS [First Received Date],
             r.LastReceivedDate AS [Last Received Date],
@@ -1975,10 +2033,10 @@ def get_sto_return_history_df() -> pd.DataFrame:
 def get_returns_history_df() -> pd.DataFrame:
     """Return the unified STO + customer return history from durable ASN events.
 
-    The ASN ``Supplier Name`` is the party returning the stock.  Full Dispatch
-    later matches it to Customer History ``To Address`` and obtains the GLN from
-    the approved warehouse mapping.  This derived view deliberately does not
-    mutate ReceiptEvents, DispatchEvents, Batch Master, or Customer History.
+    ASN ``Supplier Code`` is retained as ``Return From Code`` so Full Dispatch
+    can match it to the original WMS ``Ship To Customer`` code inside the same
+    batch/product key. ``Supplier Name`` remains available for audited legacy
+    fallback. This derived view deliberately does not mutate movement history.
     """
     parts: List[pd.DataFrame] = []
     for prefix, return_type in (
@@ -2057,14 +2115,14 @@ def replace_customer_history(history: pd.DataFrame) -> Dict[str, Any]:
     initialize_database()
     insert_sql = r"""
         INSERT INTO dbo.CustomerHistory
-        (ToAddress, GLN, GTIN, DrugName, GenericItemNumber, TradeDescription,
+        (ToAddress, CustomerCode, GLN, GTIN, DrugName, GenericItemNumber, TradeDescription,
          BN, ExpiryMonthKey, ExpiryDate, PackageSize, DispatchQuantityEach,
          DispatchQuantityPack, FirstDispatchDate, LastDispatchDate,
          Custody, TradeItemNumber, LastUpdated)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
     """
     rows = [(
-        _text(r, "To Address"), _text(r, "GLN"), _text(r, "GTIN"),
+        _text(r, "To Address"), _text(r, "Customer Code"), _text(r, "GLN"), _text(r, "GTIN"),
         _text(r, "Drug Name"), _text(r, "Generic Item Number"),
         _text(r, "Trade Description"), _text(r, "BN"), _text(r, "Expiry Month Key"),
         _value(r, "Expiry Date"), _package_size(r, "PackageSize"),
@@ -2110,6 +2168,7 @@ def get_customer_history_df() -> pd.DataFrame:
         frame = pd.read_sql(r"""
             SELECT
                 ToAddress AS [To Address],
+                CustomerCode AS [Customer Code],
                 GLN,
                 GTIN,
                 DrugName AS [Drug Name],
@@ -2359,6 +2418,7 @@ def get_dispatch_events_df() -> pd.DataFrame:
             TradeName AS [Trade Name],
             DispatchedQuantity AS [Dispatched Quantity],
             ToAddress AS [To Address],
+            CustomerCode AS [Customer Code],
             SalesOrderNumber AS [Sales Order Number],
             OrderLine AS [Order Line],
             DispatchDate AS [Dispatch Date],
@@ -2632,7 +2692,7 @@ def activate_historical_rebuild(
                 _value(r, "Last Received Date"), _text(r, "Item Family Group"), _text(r, "Trade Item Number")
             ) for r in (supplier_history if supplier_history is not None else pd.DataFrame()).to_dict(orient="records")]
             customer_rows = [(
-                _text(r, "To Address"), _text(r, "GLN"), _text(r, "GTIN"), _text(r, "Drug Name"),
+                _text(r, "To Address"), _text(r, "Customer Code"), _text(r, "GLN"), _text(r, "GTIN"), _text(r, "Drug Name"),
                 _text(r, "Generic Item Number"), _text(r, "Trade Description"), _text(r, "BN"),
                 _text(r, "Expiry Month Key"), _value(r, "Expiry Date"), _package_size(r, "PackageSize"),
                 _number(r, "Dispatch Quantity Each"), _number(r, "Dispatch Quantity Pack"),
@@ -2651,8 +2711,8 @@ def activate_historical_rebuild(
                 INSERT INTO dbo.DispatchEvents
                 (EventKey, BN, ExpiryMonthKey, ExpiryDate, GenericItemNumber,
                  TradeItemNumber, TradeName, DispatchedQuantity, ToAddress,
-                 SalesOrderNumber, OrderLine, DispatchDate, Custody)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                 CustomerCode, SalesOrderNumber, OrderLine, DispatchDate, Custody)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """
             master_insert_sql = r"""
                 INSERT INTO dbo.BatchMaster
@@ -2674,11 +2734,11 @@ def activate_historical_rebuild(
             """
             customer_insert_sql = r"""
                 INSERT INTO dbo.CustomerHistory
-                (ToAddress, GLN, GTIN, DrugName, GenericItemNumber, TradeDescription,
+                (ToAddress, CustomerCode, GLN, GTIN, DrugName, GenericItemNumber, TradeDescription,
                  BN, ExpiryMonthKey, ExpiryDate, PackageSize, DispatchQuantityEach,
                  DispatchQuantityPack, FirstDispatchDate, LastDispatchDate,
                  Custody, TradeItemNumber, LastUpdated)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME());
             """
 
             emit("Saving new historical generation", {"build_id": build_id})
@@ -7235,7 +7295,7 @@ def refresh_historical_append_incremental(
             cursor.execute(r"""
                 INSERT INTO dbo.CustomerHistory
                 (
-                    ToAddress, GLN, GTIN, DrugName, GenericItemNumber,
+                    ToAddress, CustomerCode, GLN, GTIN, DrugName, GenericItemNumber,
                     TradeDescription, BN, ExpiryMonthKey, ExpiryDate,
                     PackageSize, DispatchQuantityEach, DispatchQuantityPack,
                     FirstDispatchDate, LastDispatchDate, Custody, TradeItemNumber,
@@ -7243,6 +7303,7 @@ def refresh_historical_append_incremental(
                 )
                 SELECT
                     d.ToAddress,
+                    COALESCE(NULLIF(d.CustomerCode, N''), N''),
                     N'',
                     bm.GTIN,
                     bm.DrugName,
@@ -7273,6 +7334,7 @@ def refresh_historical_append_incremental(
                    AND bm.GenericItemNumber = d.GenericItemNumber
                 GROUP BY
                     d.ToAddress,
+                    d.CustomerCode,
                     d.BN,
                     d.ExpiryMonthKey,
                     d.GenericItemNumber,
@@ -7978,7 +8040,7 @@ def refresh_dispatch_history_incremental(
             cursor.execute(r"""
                 INSERT INTO dbo.CustomerHistory
                 (
-                    ToAddress, GLN, GTIN, DrugName, GenericItemNumber,
+                    ToAddress, CustomerCode, GLN, GTIN, DrugName, GenericItemNumber,
                     TradeDescription, BN, ExpiryMonthKey, ExpiryDate,
                     PackageSize, DispatchQuantityEach, DispatchQuantityPack,
                     FirstDispatchDate, LastDispatchDate, Custody, TradeItemNumber,
@@ -7986,6 +8048,7 @@ def refresh_dispatch_history_incremental(
                 )
                 SELECT
                     d.ToAddress,
+                    COALESCE(NULLIF(d.CustomerCode, N''), N''),
                     N'',
                     bm.GTIN,
                     bm.DrugName,
@@ -8017,6 +8080,7 @@ def refresh_dispatch_history_incremental(
                    AND bm.GenericItemNumber = d.GenericItemNumber
                 GROUP BY
                     d.ToAddress,
+                    d.CustomerCode,
                     d.BN,
                     d.ExpiryMonthKey,
                     d.GenericItemNumber,
