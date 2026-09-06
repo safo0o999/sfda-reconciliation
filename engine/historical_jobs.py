@@ -842,6 +842,28 @@ def process_historical_build_job(
             mark_completed=True,
         )
 
+        completed_input_blob_names = [
+            str(item.get("blob_name") or "")
+            for group_name in ("asn_files", "dispatch_files", "sfda_files")
+            for item in (input_manifest.get(group_name) or [])
+            if isinstance(item, dict)
+        ]
+        try:
+            deleted_inputs = storage.delete_input_blob_names(completed_input_blob_names)
+            logger.info(
+                "Deleted %s completed Historical Build input Blob(s). job_id=%s",
+                deleted_inputs,
+                job_id,
+            )
+        except Exception:
+            # The build is already committed and active. Cleanup failure must not
+            # roll its terminal status back to Failed; the retention timer remains
+            # available as an orphan-input safety net.
+            logger.exception(
+                "Immediate Historical input cleanup failed. job_id=%s",
+                job_id,
+            )
+
         # User-visible work is complete as soon as the new BuildID is active.
         # Cleanup runs later on the same durable background queue and cannot
         # delay the downloadable workbook or Append readiness.

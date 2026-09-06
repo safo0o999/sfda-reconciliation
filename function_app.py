@@ -1505,6 +1505,18 @@ def history_run(req: func.HttpRequest) -> func.HttpResponse:
         # sources and de-duplicate by category + file name.
         sql_files = list_reconciliation_run_files(run_number)
         blob_files = blob_files_for_ui(run_number)
+        retained_blob_names = {
+            str(file.get("BlobName") or file.get("blob_name") or "").strip()
+            for file in blob_files
+            if str(file.get("BlobName") or file.get("blob_name") or "").strip()
+        }
+        retained_file_keys = {
+            (
+                str(file.get("FileCategory") or file.get("category") or "").lower(),
+                str(file.get("FileName") or file.get("file_name") or "").split("/")[-1].lower(),
+            )
+            for file in blob_files
+        }
 
         merged_files: Dict[tuple, Dict[str, Any]] = {}
 
@@ -1528,6 +1540,16 @@ def history_run(req: func.HttpRequest) -> func.HttpResponse:
                     expired = bool(not pd.isna(parsed) and parsed.to_pydatetime() < input_cutoff)
                 except Exception:
                     expired = False
+            if category == "input":
+                sql_blob_name = str(file.get("BlobName") or "").strip()
+                retained = (
+                    bool(sql_blob_name and sql_blob_name in retained_blob_names)
+                    or (
+                        category,
+                        str(file.get("FileName") or "").split("/")[-1].lower(),
+                    ) in retained_file_keys
+                )
+                expired = expired or not retained
             file["RetentionExpired"] = expired
             file["download_url"] = "" if expired else build_download_url(
                 run_number,
@@ -1589,8 +1611,16 @@ def history_run(req: func.HttpRequest) -> func.HttpResponse:
                             "SizeBytes": int(item.get("size_bytes") or 0),
                             "ETag": "",
                             "CreatedAt": job_created,
-                            "RetentionExpired": manifest_expired,
-                            "download_url": "" if manifest_expired else build_download_url(
+                            "RetentionExpired": (
+                                manifest_expired
+                                or str(item.get("blob_name") or "").strip()
+                                not in retained_blob_names
+                            ),
+                            "download_url": "" if (
+                                manifest_expired
+                                or str(item.get("blob_name") or "").strip()
+                                not in retained_blob_names
+                            ) else build_download_url(
                                 run_number, "input", file_name
                             ),
                         }
@@ -1668,15 +1698,39 @@ def history_download(req: func.HttpRequest) -> func.HttpResponse:
         safe_name = BlobStorage.sanitize_file_name(
             str(file_name).split("/")[-1]
         )
+        actual_blob_name = ""
+
+        # Prefer the exact BlobName retained in SQL. This avoids reconstructing
+        # an incorrect root path for inputs stored below sfda/, inventory/, ASN,
+        # or dispatch subfolders.
+        try:
+            from engine.database import list_reconciliation_run_files
+
+            for item in list_reconciliation_run_files(run_number):
+                if (
+                    str(item.get("FileCategory") or "").lower() == category
+                    and str(item.get("FileName") or "") == file_name
+                    and item.get("BlobName")
+                ):
+                    actual_blob_name = str(item["BlobName"])
+                    break
+        except Exception:
+            logger.exception(
+                "Unable to resolve History BlobName from SQL. run_number=%s file=%s",
+                run_number,
+                file_name,
+            )
 
         # Historical Data Builder inputs are stored under
         # <run>/asn/<file>, <run>/dispatch/<file>, etc. Resolve the real BlobName
         # from storage instead of assuming every file is directly under <run>/.
-        actual_blob_name = ""
         for item in storage.list_all_run_files(run_number):
             if (
                 str(item.get("category", "")).lower() == category.lower()
-                and str(item.get("file_name", "")) == file_name
+                and (
+                    str(item.get("file_name", "")) == file_name
+                    or str(item.get("file_name", "")).split("/")[-1] == file_name
+                )
             ):
                 actual_blob_name = str(item.get("blob_name", ""))
                 break
@@ -4573,6 +4627,24 @@ def reconciliation_background_worker(message: func.QueueMessage) -> None:
                 },
             )
             if not failed:
+                try:
+                    deleted_inputs = storage.delete_input_blob_names([
+                        str(item.get("blob_name") or "")
+                        for item in input_manifest.values()
+                        if isinstance(item, dict)
+                    ])
+                    logger.info(
+                        "Deleted %s successful background-job input Blob(s). job_id=%s",
+                        deleted_inputs,
+                        job_id,
+                    )
+                except Exception:
+                    # Input cleanup is best-effort and must never change a
+                    # successfully completed reconciliation into a failed run.
+                    logger.exception(
+                        "Immediate input cleanup failed. job_id=%s",
+                        job_id,
+                    )
                 _refresh_dashboard_summary_safe()
         except Exception as exc:
             logger.exception("Background reconciliation job failed. job_id=%s", job_id)

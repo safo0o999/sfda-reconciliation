@@ -318,6 +318,36 @@ class BlobStorage:
             "deleted_input_blobs": deleted,
         }
 
+    def delete_input_blob_names(self, blob_names: List[str]) -> int:
+        """Delete explicitly identified input blobs after successful processing.
+
+        Callers pass only Blob names returned by ``upload_input`` or
+        ``upload_job_input``.  Output and metadata containers are never touched.
+        The warehouse prefix check prevents one warehouse from deleting another
+        warehouse's uploaded files.
+        """
+        from engine.warehouse_context import current_warehouse_id
+
+        warehouse_id = int(current_warehouse_id())
+        scoped_prefix = self.warehouse_prefix() + "/"
+        safe_names: List[str] = []
+        for value in blob_names or []:
+            blob_name = str(value or "").strip()
+            if not blob_name:
+                continue
+            if blob_name.startswith(scoped_prefix):
+                safe_names.append(blob_name)
+                continue
+            # Warehouse 1 predates warehouse-scoped Blob paths. Preserve support
+            # for its legacy run inputs while keeping all other warehouses strict.
+            if warehouse_id == 1 and not blob_name.lower().startswith("w"):
+                safe_names.append(blob_name)
+
+        if not safe_names:
+            return 0
+        container = self.service.get_container_client(INPUTS_CONTAINER)
+        return self._delete_blob_names(container, sorted(set(safe_names)))
+
 
     def write_background_job_status(
         self,

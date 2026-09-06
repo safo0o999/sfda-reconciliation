@@ -2458,14 +2458,17 @@ Drug Traceability Reconciliation Platform</textarea></label>
     button.disabled=true;button.textContent="Preparing ZIP...";
     try{
       const zip=new JSZip();
+      let missing=0;
       for(const file of downloadable){
         const response=await fetch(file.download_url,{cache:"no-store",credentials:"same-origin"});
+        if(response.status===404){missing+=1;continue;}
         if(!response.ok) throw new Error(`Unable to download ${file.FileName||"file"} (HTTP ${response.status}).`);
         const category=String(file.FileCategory||"files").toLowerCase();
         zip.file(`${category}/${file.FileName||"file"}`,await response.arrayBuffer());
       }
+      if(!Object.keys(zip.files).length) throw new Error("No retained files are available for this run.");
       triggerBlob(`${activeRunNumber||"Reconciliation_Run"}_All_Files.zip`,await zip.generateAsync({type:"blob"}));
-      const skipped=activeRunFiles.length-downloadable.length;
+      const skipped=activeRunFiles.length-downloadable.length+missing;
       toast(skipped?`ZIP created. ${skipped} expired input file(s) were skipped.`:"All run files downloaded in one ZIP.","success");
     }catch(error){toast(error.message||String(error),"error");}
     finally{button.disabled=false;button.textContent=original;}
