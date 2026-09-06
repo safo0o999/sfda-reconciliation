@@ -8427,14 +8427,14 @@ def get_full_dispatch_confirmed_allocations() -> pd.DataFrame:
                     GenericItemNumber AS [Generic Item Number],
                     ToAddress AS [To Address],
                     GLN,
-                    SubmittedQuantityEach AS [Reserved Full Dispatch Quantity Each],
-                    SubmittedQuantityPack AS [Reserved Full Dispatch Quantity Pack],
+                    ConfirmedQuantityEach AS [Reserved Full Dispatch Quantity Each],
+                    ConfirmedQuantityPack AS [Reserved Full Dispatch Quantity Pack],
                     ConfirmedQuantityEach AS [Confirmed Full Dispatch Quantity Each],
                     ConfirmedQuantityPack AS [Confirmed Full Dispatch Quantity Pack],
                     LastConfirmedAt AS [Last Full Dispatch Confirmed At]
                 FROM dbo.FullDispatchTransactions
                 WHERE CutoverID = ?
-                  AND (SubmittedQuantityPack > 0 OR SubmittedQuantityEach > 0)
+                  AND (ConfirmedQuantityPack > 0 OR ConfirmedQuantityEach > 0)
             """
             if _full_cancel_dispatch_schema_available(connection):
                 sql += " AND ISNULL(TransactionType, 'DISPATCH') = 'DISPATCH'"
@@ -8556,22 +8556,12 @@ def save_full_dispatch_pending_transactions(
                 GLN = source.GLN,
                 CutoverID = source.CutoverID,
                 SubmittedQuantityEach = CASE
-                    WHEN source.CutoverID IS NOT NULL
-                         AND target.LastSubmittedRun = source.RunNumber
-                    THEN target.SubmittedQuantityEach
-                    WHEN source.CutoverID IS NOT NULL
-                    THEN target.SubmittedQuantityEach + source.NewQuantityEach
                     WHEN target.SubmittedQuantityEach >=
                          target.ConfirmedQuantityEach + source.NewQuantityEach
                     THEN target.SubmittedQuantityEach
                     ELSE target.ConfirmedQuantityEach + source.NewQuantityEach
                 END,
                 SubmittedQuantityPack = CASE
-                    WHEN source.CutoverID IS NOT NULL
-                         AND target.LastSubmittedRun = source.RunNumber
-                    THEN target.SubmittedQuantityPack
-                    WHEN source.CutoverID IS NOT NULL
-                    THEN target.SubmittedQuantityPack + source.NewQuantityPack
                     WHEN target.SubmittedQuantityPack >=
                          target.ConfirmedQuantityPack + source.NewQuantityPack
                     THEN target.SubmittedQuantityPack
@@ -8628,22 +8618,12 @@ def save_full_dispatch_pending_transactions(
                 GLN = source.GLN,
                 CutoverID = source.CutoverID,
                 SubmittedQuantityEach = CASE
-                    WHEN source.CutoverID IS NOT NULL
-                         AND target.LastSubmittedRun = source.RunNumber
-                    THEN target.SubmittedQuantityEach
-                    WHEN source.CutoverID IS NOT NULL
-                    THEN target.SubmittedQuantityEach + source.NewQuantityEach
                     WHEN target.SubmittedQuantityEach >=
                          target.ConfirmedQuantityEach + source.NewQuantityEach
                     THEN target.SubmittedQuantityEach
                     ELSE target.ConfirmedQuantityEach + source.NewQuantityEach
                 END,
                 SubmittedQuantityPack = CASE
-                    WHEN source.CutoverID IS NOT NULL
-                         AND target.LastSubmittedRun = source.RunNumber
-                    THEN target.SubmittedQuantityPack
-                    WHEN source.CutoverID IS NOT NULL
-                    THEN target.SubmittedQuantityPack + source.NewQuantityPack
                     WHEN target.SubmittedQuantityPack >=
                          target.ConfirmedQuantityPack + source.NewQuantityPack
                     THEN target.SubmittedQuantityPack

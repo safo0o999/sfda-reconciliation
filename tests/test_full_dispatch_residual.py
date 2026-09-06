@@ -378,11 +378,11 @@ class FullDispatchResidualTests(unittest.TestCase):
         self.assertEqual(int(customer["To Be Dispatch"]), 20)
         self.assertEqual(int(result["To Be Dispatch"].sum()), 20)
 
-        # Once the complete 30-pack post-cutover movement is reserved, an
-        # unchanged SFDA report must not regenerate it for the customer or the
-        # residual Dummy GLN.
-        reserved.loc[:, "Reserved Full Dispatch Quantity Each"] = 30
-        reserved.loc[:, "Reserved Full Dispatch Quantity Pack"] = 30
+        # Generating a CSV is not confirmation. With no SFDA evidence, the
+        # ledger returns zero confirmed consumption and the same 30-pack gap
+        # must be regenerated rather than silently treated as dispatched.
+        reserved.loc[:, "Reserved Full Dispatch Quantity Each"] = 0
+        reserved.loc[:, "Reserved Full Dispatch Quantity Pack"] = 0
         rerun = subject.build_dispatch_reconciliation(
             inventory,
             pd.DataFrame(),
@@ -395,7 +395,29 @@ class FullDispatchResidualTests(unittest.TestCase):
             validated_sfda_identity_df=validated_sfda,
             cutover_baseline_df=cutover,
         )
-        self.assertEqual(int(rerun["To Be Dispatch"].sum()), 0)
+        self.assertEqual(int(rerun["To Be Dispatch"].sum()), 30)
+
+        # Once SFDA proves 20 packs, only the remaining 10 are proposed.
+        reserved.loc[:, "Reserved Full Dispatch Quantity Each"] = 20
+        reserved.loc[:, "Reserved Full Dispatch Quantity Pack"] = 20
+        reserved.loc[:, "Confirmed Full Dispatch Quantity Each"] = 20
+        reserved.loc[:, "Confirmed Full Dispatch Quantity Pack"] = 20
+        partially_updated_sfda = validated_sfda.copy()
+        partially_updated_sfda.loc[:, "Active"] = 80
+        partially_updated_sfda.loc[:, "Quantity sent pending"] = 20
+        partial_confirmation = subject.build_dispatch_reconciliation(
+            inventory,
+            pd.DataFrame(),
+            customer_history,
+            confirmed_full_dispatch_df=reserved,
+            batch_master_df=pd.DataFrame([{
+                "BN": "B001", "Expiry Month Key": "2027-11",
+                "Generic Item Number": "1001", "Trade Item Number": "T1",
+            }]),
+            validated_sfda_identity_df=partially_updated_sfda,
+            cutover_baseline_df=cutover,
+        )
+        self.assertEqual(int(partial_confirmation["To Be Dispatch"].sum()), 10)
 
     def test_cutover_falls_back_to_unique_address_when_gln_is_enriched(self):
         subject = engine()

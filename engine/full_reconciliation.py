@@ -2853,10 +2853,10 @@ class FullReconciliationEngine:
             / target.loc[valid_pack, "PackageSize"]
         )
 
-        # Post-cutover files are treated as one atomic submission. Until SFDA
-        # proves the movement, their open submitted quantity must reduce the
-        # batch-level requirement as well as the customer-level availability;
-        # otherwise the same gap would be regenerated as a Dummy-GLN row.
+        # Only SFDA-confirmed movement is supplied here as reserved quantity.
+        # Merely generating a CSV is not proof that it was uploaded, so an
+        # unchanged SFDA report must regenerate the same customer allocation.
+        # The SQL ledger keeps repeated submissions idempotent.
         open_reservations = (
             confirmed_full_dispatch_df.copy()
             if confirmed_full_dispatch_df is not None

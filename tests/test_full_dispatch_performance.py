@@ -32,12 +32,16 @@ class FullDispatchPerformanceTests(unittest.TestCase):
             4,
         )
 
-    def test_post_cutover_dispatch_is_reserved_at_batch_and_customer_level(self):
+    def test_post_cutover_dispatch_requires_sfda_confirmation(self):
         database = Path("engine/database.py").read_text(encoding="utf-8")
         engine = Path("engine/full_reconciliation.py").read_text(encoding="utf-8")
         migration = Path("sql/004_full_dispatch_cutover.sql").read_text(encoding="utf-8")
 
-        self.assertIn("SubmittedQuantityPack AS [Reserved Full Dispatch Quantity Pack]", database)
+        self.assertIn("ConfirmedQuantityPack AS [Reserved Full Dispatch Quantity Pack]", database)
+        self.assertIn(
+            "target.ConfirmedQuantityPack + source.NewQuantityPack",
+            database,
+        )
         self.assertIn('target["_Open Reserved Dispatch Pack"]', engine)
         self.assertIn("FullDispatchCutoverBaseline", migration)
         self.assertIn("IX_FullDispatchTransactions_CutoverBatch", migration)
