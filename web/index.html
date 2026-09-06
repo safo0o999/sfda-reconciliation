@@ -420,6 +420,7 @@
     .mini-donut-wrap{padding:16px;display:grid;grid-template-columns:110px 1fr;gap:14px;align-items:center}.mini-donut{width:100px;height:100px;border-radius:50%;background:conic-gradient(#239247 0 80%,#d94747 80% 90%,#c8ced8 90% 100%);position:relative}.mini-donut:after{content:"";position:absolute;inset:22px;background:#fff;border-radius:50%}.mini-donut-label{position:absolute;inset:0;display:grid;place-items:center;z-index:2;text-align:center;font-size:11px;font-weight:900}.mini-legend{display:grid;gap:8px;font-size:10px}.mini-legend-row{display:flex;justify-content:space-between;gap:8px}
     .recent-upload-list{padding:8px 14px 14px}.recent-upload-row{display:grid;grid-template-columns:1fr auto;gap:8px;padding:9px 0;border-bottom:1px solid #edf1f6;font-size:10px}.recent-upload-row:last-child{border-bottom:0}.upload-type{font-weight:800}.upload-time{color:var(--muted);margin-top:3px}
     .bottom-ops-grid{display:grid;grid-template-columns:1.05fr 1fr;gap:14px}.legend-footer{display:flex;flex-wrap:wrap;gap:24px;padding:13px 16px;margin-top:14px;font-size:10px}.legend-item{display:flex;align-items:center;gap:8px}.legend-symbol{width:21px;height:21px;border-radius:50%;display:grid;place-items:center;font-weight:900}
+    .bottom-ops-grid>.table-card{display:flex;flex-direction:column}.bottom-ops-grid>.table-card .table-scroll{height:365px;max-height:365px}.bottom-ops-grid>.table-card .table-pagination{margin-top:auto}
     .inline-results{display:none;margin-top:24px;padding-top:20px;border-top:1px solid var(--line)}.inline-results.show{display:block}.result-anchor{scroll-margin-top:86px}
     .result-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;margin-bottom:14px}.result-head h2{margin:0;font-size:22px}.result-head p{margin:5px 0 0;color:var(--muted);font-size:11px}
     @media(max-width:1250px){.ops-kpis{grid-template-columns:repeat(3,1fr)}.ops-layout{grid-template-columns:1fr}.dashboard-filter-bar{grid-template-columns:repeat(2,1fr)}.dashboard-filter-bar .btn{width:100%}}
@@ -497,6 +498,21 @@
     @media(max-width:650px){.history-kpi-grid{grid-template-columns:1fr}}
 
     .variance-pagination{display:flex;align-items:center;justify-content:flex-end;gap:10px;padding:10px 14px;border-top:1px solid var(--line);background:#fff}
+    .table-pagination{display:flex;align-items:center;justify-content:flex-end;gap:8px;min-height:48px;padding:9px 14px;border-top:1px solid var(--line);background:#fff}
+    .table-pagination .page-summary{margin-right:auto;color:var(--muted);font-size:9px;font-weight:700}
+    .table-pagination .page-buttons{display:flex;align-items:center;gap:5px}
+    .table-pagination button{min-width:32px;height:30px;border:1px solid var(--line);border-radius:8px;background:#fff;color:#34465d;font-size:9px;font-weight:800;cursor:pointer}
+    .table-pagination button:hover:not(:disabled){border-color:#7bb0e4;color:#075fc8}
+    .table-pagination button.active{border-color:#075fc8;background:#075fc8;color:#fff}
+    .table-pagination button:disabled{opacity:.42;cursor:not-allowed}
+    .historical-match-primary{display:flex;align-items:end;justify-content:space-between;gap:12px;padding:8px 0 14px;border-bottom:1px solid var(--line)}
+    .historical-match-primary strong{font-size:32px;color:#168a48;line-height:1}.historical-match-primary span{font-size:10px;font-weight:800;color:var(--muted)}
+    .historical-match-rate{display:flex;align-items:center;justify-content:space-between;padding:13px 0;border-bottom:1px solid var(--line);font-size:10px}.historical-match-rate strong{font-size:20px;color:#075fc8}
+    .home-breakdown-card{margin-top:14px}.home-breakdown-chart{display:grid;gap:12px}
+    .breakdown-row{display:grid;grid-template-columns:minmax(170px,240px) minmax(220px,1fr) 90px;gap:12px;align-items:center}
+    .breakdown-label{font-size:10px;font-weight:800;color:#34465d}.breakdown-track{height:18px;background:#edf1f6;border-radius:999px;overflow:hidden}.breakdown-bar{height:100%;border-radius:999px;min-width:2px}.breakdown-value{text-align:right;font-size:10px;font-weight:900;color:#22344a}
+    .pi-global-search-card{display:grid;grid-template-columns:minmax(260px,1fr) 190px auto;gap:10px;padding:14px;margin-bottom:16px;background:linear-gradient(135deg,#f7fbff,#fff)}
+    .modal-actions{display:flex;align-items:center;gap:8px}
     .variance-page-info{display:flex;flex-direction:column;align-items:center;min-width:150px;font-size:10px;color:var(--muted)}
     .variance-page-info strong{color:#22344a;font-size:10px}
     .variance-page-size{display:flex;align-items:center;gap:6px;font-size:9px;font-weight:800;color:var(--muted)}
@@ -516,6 +532,7 @@
     .auth-message.show{display:block}.auth-message.error{background:#feecec;color:#a31f25}.auth-message.success{background:#e8f7ee;color:#107c41}.auth-message.info{background:#e8f2ff;color:#075fc8}
     .admin-users-table{min-width:760px}.admin-user-actions{display:flex;gap:6px;flex-wrap:wrap}
     .user-card .user-name,.user-card .user-role{max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    @media(max-width:700px){.pi-global-search-card{grid-template-columns:1fr}.breakdown-row{grid-template-columns:1fr}.breakdown-value{text-align:left}.table-pagination{align-items:flex-start;flex-direction:column}.table-pagination .page-summary{margin-right:0}}
 
   .password-field-wrap{
     position:relative;
@@ -625,8 +642,8 @@
  
     <nav class="nav">
       <button class="nav-button active" data-page="home"><span class="nav-icon">⌂</span>Home</button>
-      <button class="nav-button" data-page="upload"><span class="nav-icon">⇧</span>Upload & Run</button>
-      <button class="nav-button" data-page="full-reconciliation"><span class="nav-icon">▦</span>Full Reconciliation</button>
+      <button class="nav-button" data-page="upload" hidden><span class="nav-icon">⇧</span>Upload & Run</button>
+      <button class="nav-button" data-page="full-reconciliation"><span class="nav-icon">▦</span>Reconciliation</button>
       <button class="nav-button" data-page="history"><span class="nav-icon">◷</span>History</button>
       <button class="nav-button" data-page="reports"><span class="nav-icon">▥</span>Reports</button>
       <button class="nav-button" data-page="intelligence"><span class="nav-icon">◆</span>Product Intelligence</button>
@@ -685,7 +702,7 @@
         <div class="ops-layout">
           <div class="ops-main">
             <div class="card table-card compact-table">
-              <div class="card-header"><div><div class="card-title">Reconciliation Overview</div><div class="card-subtitle">Latest completed run preview</div></div><button class="btn btn-secondary" data-go="upload">Open Current Run</button></div>
+              <div class="card-header"><div><div class="card-title">Reconciliation Overview</div><div class="card-subtitle">Latest completed run preview · 10 rows per page</div></div><button class="btn btn-secondary" data-go="full-reconciliation">Open Reconciliation</button></div>
               <div class="table-scroll"><table>
                 <thead>
                   <tr><th colspan="4"></th><th colspan="3" class="group-head group-sfda">SFDA</th><th colspan="2" class="group-head group-receive">WMS Receive</th><th colspan="2" class="group-head group-inventory">WMS Inventory</th><th colspan="1" class="group-head group-dispatch">WMS Dispatch</th><th></th></tr>
@@ -695,28 +712,32 @@
                   <tr><td colspan="13"><div class="empty"><strong>No reconciliation data loaded</strong>Run a reconciliation to populate this operational table.</div></td></tr>
                 </tbody>
               </table></div>
+              <div class="table-pagination" id="homeOverviewPagination"></div>
             </div>
  
             <div class="bottom-ops-grid">
               <div class="card table-card compact-table">
                 <div class="card-header"><div><div class="card-title">Top Exceptions</div><div class="card-subtitle">Highest-priority reconciliation issues</div></div><button class="btn btn-secondary" data-go="variance">View All</button></div>
                 <div class="table-scroll"><table><thead><tr><th>BN</th><th>Expiry Date</th><th>Issue Type</th><th>Description</th><th>Variance</th><th>Action</th></tr></thead><tbody id="homeExceptionsBody"><tr><td colspan="6"><div class="empty"><strong>No exception details available</strong>Detailed records will be loaded from the database phase.</div></td></tr></tbody></table></div>
+                <div class="table-pagination" id="homeExceptionsPagination"></div>
               </div>
               <div class="card table-card compact-table">
                 <div class="card-header"><div><div class="card-title">Dispatch by Customer</div><div class="card-subtitle">Historical customer movement from Product Intelligence</div></div><button class="btn btn-secondary" data-go="intelligence">View Product Intelligence</button></div>
                 <div class="table-scroll"><table><thead><tr><th>Customer</th><th>GLN</th><th>Dispatched Packs</th><th>Last Dispatch</th><th>Mapping</th></tr></thead><tbody id="homeCustomerDispatchBody"><tr><td colspan="5"><div class="empty"><strong>No customer intelligence loaded</strong>Refresh the dashboard to load Product Intelligence.</div></td></tr></tbody></table></div>
+                <div class="table-pagination" id="homeCustomerPagination"></div>
               </div>
             </div>
           </div>
  
           <aside class="ops-side">
-            <div class="card"><div class="card-header"><div class="card-title">Quick Actions</div></div><div class="quick-actions"><button class="btn btn-success" data-go="upload">▶ Run Reconciliation</button><button class="btn btn-primary" data-go="upload">⇩ Prepare Accept</button><button class="btn btn-warning" data-go="upload">⇢ Prepare Dispatch</button><button class="btn btn-purple" data-go="history">◷ Upload History</button></div></div>
-            <div class="card"><div class="card-header"><div><div class="card-title">Historical Database Summary</div><div class="card-subtitle">Current warehouse historical foundation</div></div></div><div class="card-body"><div class="status-line"><span>Batch Master</span><strong id="homeHistoricalBatchRows">—</strong></div><div class="status-line"><span>Supplier History</span><strong id="homeHistoricalSupplierRows">—</strong></div><div class="status-line"><span>Customer History</span><strong id="homeHistoricalCustomerRows">—</strong></div><div class="status-line"><span>Last Build</span><strong id="homeHistoricalLastBuild">—</strong></div></div></div>
+            <div class="card"><div class="card-header"><div class="card-title">Quick Actions</div></div><div class="quick-actions"><button class="btn btn-success" data-go="full-reconciliation">▶ Open Reconciliation</button><button class="btn btn-primary" data-go="full-reconciliation">⇩ Prepare Accept</button><button class="btn btn-warning" data-go="full-reconciliation">⇢ Prepare Dispatch</button><button class="btn btn-purple" data-go="full-reconciliation">◷ Build / Append History</button></div></div>
+            <div class="card historical-match-card"><div class="card-header"><div><div class="card-title">Historical Matching Summary</div><div class="card-subtitle">SFDA vs warehouse batch matching breakdown</div></div></div><div class="card-body"><div class="historical-match-primary"><strong id="homeHistoricalMatchedRows">—</strong><span>Matched Batches</span></div><div class="historical-match-rate"><span>Match Rate</span><strong id="homeHistoricalMatchRate">—</strong></div><div class="status-line"><span>Missing in SFDA</span><strong id="homeHistoricalMissingSfda">—</strong></div><div class="status-line"><span>SFDA Quantity Below Received</span><strong id="homeHistoricalQuantityShort">—</strong></div><div class="status-line"><span>SFDA Quantity Above Received</span><strong id="homeHistoricalQuantityHigh">—</strong></div><div class="status-line"><span>STO Awaiting Supplier Upload</span><strong id="homeHistoricalStoFollowup">—</strong></div><div class="status-line"><span>Last Build</span><strong id="homeHistoricalLastBuild">—</strong></div></div></div>
             <div class="card"><div class="card-header"><div><div class="card-title">Recent Uploads</div><div class="card-subtitle">Latest locally selected report types</div></div></div><div class="recent-upload-list" id="recentUploads"><div class="empty"><strong>No uploads yet</strong>Selected files will appear after a run.</div></div></div>
             <div class="card"><div class="card-header"><div class="card-title">System Status</div></div><div class="card-body"><div class="status-line"><span>Azure Function</span><span class="status-ok" id="homeHealth">Checking...</span></div><div class="status-line"><span>Version</span><strong id="homeVersion">—</strong></div><div class="status-line"><span>Total Local Runs</span><strong id="homeRuns">0</strong></div><div class="status-line"><span>Successful Runs</span><strong id="homeSuccess">0</strong></div><div class="status-line"><span>Generated Files</span><strong id="homeGenerated">—</strong></div></div></div>
           </aside>
         </div>
  
+        <div class="card home-breakdown-card"><div class="card-header"><div><div class="card-title">Batch Matching &amp; Reconciliation Breakdown</div><div class="card-subtitle">Long-form operational chart across the current warehouse dataset</div></div></div><div class="card-body"><div class="home-breakdown-chart" id="homeBreakdownChart"></div></div></div>
         <div class="card legend-footer"><div class="legend-item"><span class="legend-symbol" style="background:#e9f8ee;color:#178043">✓</span><span><strong>OK</strong><br>All good</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fff3db;color:#bd7400">◷</span><span><strong>Dispatch Pending</strong><br>Pending dispatch to SFDA</span></div><div class="legend-item"><span class="legend-symbol" style="background:#fdeaea;color:#c63034">!</span><span><strong>Diff / Exception</strong><br>Needs attention</span></div><div class="legend-item"><span class="legend-symbol" style="background:#eaf4ff;color:#0866bd">?</span><span><strong>Dummy GLN</strong><br>Customer has no GLN</span></div></div>
         <div id="recentActivity" hidden></div>
       </section>
@@ -826,7 +847,7 @@
       <section class="page" id="page-full-reconciliation">
         <div class="page-head">
           <div>
-            <h1>Full Reconciliation</h1>
+            <h1>Reconciliation</h1>
             <p>Build the historical foundation once, then run the one-time reconciliation against current Inventory and SFDA data.</p>
           </div>
           <div class="actions">
@@ -892,11 +913,11 @@
 
           <!-- STEP 2 -->
           <div class="card" id="step2Card" style="padding:20px;height:100%">
-            <div class="card-title" style="font-size:18px;color:#6b4eff">Step 2 — Full Reconciliation</div>
+            <div class="card-title" style="font-size:18px;color:#6b4eff">Step 2 — Reconciliation</div>
             <div class="card-subtitle" style="margin:6px 0 18px">Run Accept first, upload it to SFDA, then use the updated SFDA report for Dispatch.</div>
 
             <div class="status-banner warning show" id="step2LockMessage" style="margin-bottom:16px">
-              <span>🔒</span><div><strong>Historical data required.</strong><br>Complete Step 1 before running Full Reconciliation.</div>
+              <span>🔒</span><div><strong>Historical data required.</strong><br>Complete Step 1 before running Reconciliation.</div>
             </div>
 
             <div class="card" id="historicalReadyCard" style="box-shadow:none;margin-bottom:16px;display:none">
@@ -960,7 +981,7 @@
 
         <!-- RESULTS -->
         <div class="inline-results result-anchor" id="fullReconciliationResults" style="display:none;margin-top:32px">
-          <div class="result-head"><div><h2>Full Reconciliation Results</h2><p>Historical audit files and one-time reconciliation outputs.</p></div><button class="btn btn-purple" id="fullDownloadAllButton">⇩ Download All Results</button></div>
+          <div class="result-head"><div><h2>Reconciliation Results</h2><p>Historical audit files and reconciliation outputs.</p></div><button class="btn btn-purple" id="fullDownloadAllButton">⇩ Download All Results</button></div>
           <div class="status-banner info show" id="fullResultsInfo"><span>ⓘ</span><div>No completed operation is loaded yet.</div></div>
           <div class="tabs"><button class="tab-btn active" data-tab="full-summary">Overview</button><button class="tab-btn" data-tab="full-master">Historical Files</button><button class="tab-btn" data-tab="full-reports">Reconciliation Files</button></div>
           <div class="tab-panel active" id="tab-full-summary"><div style="display:grid;gap:16px"><div class="card" style="padding:20px"><h3>Generated Files</h3><p>Files produced by the latest Step 1 or Step 2 operation.</p><div class="file-list" id="fullMasterPreview"></div></div></div></div>
@@ -1084,6 +1105,11 @@
         <div class="status-banner error" id="piError"></div>
 
         <div id="piDashboard" hidden>
+          <div class="card pi-global-search-card">
+            <input class="control" id="piSearch" placeholder="Search all tables by BN, GTIN, drug, supplier, customer, code, or GLN...">
+            <select class="control" id="piStatusFilter"><option value="">All batch statuses</option></select>
+            <button class="btn btn-secondary" id="piResetButton">Reset</button>
+          </div>
           <div class="pi-overview-grid">
             <div class="card pi-table-card">
               <div class="card-header">
@@ -1092,11 +1118,6 @@
                   <div class="card-subtitle" id="piBatchSubtitle">0 batches</div>
                 </div>
                 <span class="badge info" id="piFilteredCount">0 shown</span>
-              </div>
-              <div class="pi-compact-filters">
-                <input class="control" id="piSearch" placeholder="Search GTIN, drug, generic, or batch...">
-                <select class="control" id="piStatusFilter"><option value="">All statuses</option></select>
-                <button class="btn btn-secondary" id="piResetButton">Reset</button>
               </div>
               <select id="piSupplierFilter" hidden><option value=""></option></select>
               <select id="piCustomerFilter" hidden><option value=""></option></select>
@@ -1118,6 +1139,7 @@
                   <tbody id="piBatchBody"></tbody>
                 </table>
               </div>
+              <div class="table-pagination" id="piBatchPagination"></div>
               <div class="table-footer"><span id="piBatchFooter">0 records</span><span>Source: Azure SQL + latest snapshots</span></div>
             </div>
 
@@ -1155,6 +1177,7 @@
                   <tbody id="piSupplierBody"></tbody>
                 </table>
               </div>
+              <div class="table-pagination" id="piSupplierPagination"></div>
               <div class="table-footer"><span id="piSupplierFooter">0 records</span><span>Source: Azure SQL + latest snapshots</span></div>
             </div>
 
@@ -1166,6 +1189,7 @@
                   <tbody id="piCustomerBody"></tbody>
                 </table>
               </div>
+              <div class="table-pagination" id="piCustomerPagination"></div>
               <div class="table-footer"><span id="piCustomerFooter">0 records</span><span>Source: Azure SQL + latest snapshots</span></div>
             </div>
           </div>
@@ -1341,7 +1365,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   <div class="modal-card">
     <div class="modal-head">
       <div><div class="modal-title" id="runDetailsTitle">Run Details</div><div class="modal-subtitle" id="runDetailsSubtitle">Loading...</div></div>
-      <button class="icon-btn" id="closeRunDetails" type="button">×</button>
+      <div class="modal-actions"><button class="btn btn-primary" id="downloadRunZipButton" type="button" hidden>⇩ Download All ZIP</button><button class="icon-btn" id="closeRunDetails" type="button">×</button></div>
     </div>
     <div class="modal-body" id="runDetailsBody"><div class="empty"><strong>Loading run details</strong>Please wait.</div></div>
   </div>
@@ -1382,6 +1406,10 @@ Drug Traceability Reconciliation Platform</textarea></label>
   let historyLoaded = false;
   let historyLoading = false;
   let activeHistoryFilter = "all";
+  let activeRunNumber = "";
+  let activeRunFiles = [];
+  const HOME_PAGE_SIZE = 10;
+  const homePages = {overview:1,exceptions:1,customers:1};
   let varianceData = {summary:{},items:[],email:{}};
   let dashboardProductData = {summary:{},customers:[],alerts:[]};
   let dashboardVarianceData = {summary:{},items:[]};
@@ -1392,6 +1420,8 @@ Drug Traceability Reconciliation Platform</textarea></label>
   let variancePage = 1;
   let variancePageSize = 100;
   let varianceSearchTimer = null;
+  const PI_PAGE_SIZE = 10;
+  const piPages = {batches:1,suppliers:1,customers:1};
   let currentUser = null;
   let authSettings = {};
   let applicationStarted = false;
@@ -1407,6 +1437,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
     const key=dashboardPreviewStorageKey();
     if(!key) return;
     localStorage.setItem(key,JSON.stringify(Array.isArray(rows)?rows:[]));
+    homePages.overview=1;
     // Remove the pre-Multi-Warehouse cache so it can never leak into another warehouse.
     localStorage.removeItem(LEGACY_DASHBOARD_PREVIEW_KEY);
   }
@@ -1416,6 +1447,29 @@ Drug Traceability Reconciliation Platform</textarea></label>
   }
   const formatNumber = value => Number(value || 0).toLocaleString("en-US");
   const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
+
+  function pageSlice(rows,page,pageSize=10){
+    const values=Array.isArray(rows)?rows:[];
+    const pages=Math.max(1,Math.ceil(values.length/pageSize));
+    const current=Math.max(1,Math.min(Number(page)||1,pages));
+    return {rows:values.slice((current-1)*pageSize,current*pageSize),page:current,pages,total:values.length};
+  }
+
+  function renderTablePagination(containerId,stateKey,pageData,onChange){
+    const container=$(containerId);
+    if(!container) return;
+    const {page,pages,total}=pageData;
+    const start=total?((page-1)*10)+1:0;
+    const end=Math.min(page*10,total);
+    const candidates=[1,page-1,page,page+1,pages].filter((value,index,array)=>value>=1&&value<=pages&&array.indexOf(value)===index).sort((a,b)=>a-b);
+    container.innerHTML=`<span class="page-summary">${formatNumber(start)}–${formatNumber(end)} of ${formatNumber(total)}</span><div class="page-buttons"><button type="button" data-page="${page-1}" ${page<=1?"disabled":""}>‹</button>${candidates.map(value=>`<button type="button" data-page="${value}" class="${value===page?"active":""}">${value}</button>`).join("")}<button type="button" data-page="${page+1}" ${page>=pages?"disabled":""}>›</button></div>`;
+    container.querySelectorAll("button[data-page]").forEach(button=>button.addEventListener("click",()=>{
+      const requested=Number(button.dataset.page||1);
+      if(requested<1||requested>pages||requested===page) return;
+      if(stateKey) stateKey.current=requested;
+      onChange(requested);
+    }));
+  }
  
   function setAuthMessage(message,type="info"){
     const box=$("authMessage");
@@ -1713,7 +1767,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   const PAGE_LABELS = {
     home:"Dashboard",
     upload:"Upload & Run",
-    "full-reconciliation":"Full Reconciliation",
+    "full-reconciliation":"Reconciliation",
     history:"History",
     reports:"Reports",
     intelligence:"Product Intelligence",
@@ -2378,6 +2432,10 @@ Drug Traceability Reconciliation Platform</textarea></label>
   function closeRunDetails(){
     $('runDetailsModal').classList.remove('show');
     $('runDetailsModal').setAttribute('aria-hidden','true');
+    activeRunNumber="";
+    activeRunFiles=[];
+    const zipButton=$('downloadRunZipButton');
+    if(zipButton) zipButton.hidden=true;
   }
  
   function renderRunFileSection(title,files){
@@ -2390,6 +2448,27 @@ Drug Traceability Reconciliation Platform</textarea></label>
           ?`<span class="badge warning">Input expired · metadata kept</span>`
           :`<a class="btn btn-primary" href="${escapeHtml(file.download_url)}">Download</a>`}
       </div>`).join('')}</div>`;
+  }
+
+  async function downloadActiveRunZip(){
+    const button=$('downloadRunZipButton');
+    const downloadable=activeRunFiles.filter(file=>file.download_url&&!file.RetentionExpired);
+    if(!downloadable.length){toast("No retained files are available for this run.","error");return;}
+    const original=button.textContent;
+    button.disabled=true;button.textContent="Preparing ZIP...";
+    try{
+      const zip=new JSZip();
+      for(const file of downloadable){
+        const response=await fetch(file.download_url,{cache:"no-store",credentials:"same-origin"});
+        if(!response.ok) throw new Error(`Unable to download ${file.FileName||"file"} (HTTP ${response.status}).`);
+        const category=String(file.FileCategory||"files").toLowerCase();
+        zip.file(`${category}/${file.FileName||"file"}`,await response.arrayBuffer());
+      }
+      triggerBlob(`${activeRunNumber||"Reconciliation_Run"}_All_Files.zip`,await zip.generateAsync({type:"blob"}));
+      const skipped=activeRunFiles.length-downloadable.length;
+      toast(skipped?`ZIP created. ${skipped} expired input file(s) were skipped.`:"All run files downloaded in one ZIP.","success");
+    }catch(error){toast(error.message||String(error),"error");}
+    finally{button.disabled=false;button.textContent=original;}
   }
  
   async function openRunDetails(runNumber){
@@ -2405,6 +2484,10 @@ Drug Traceability Reconciliation Platform</textarea></label>
       if(!response.ok||payload.status==='Failed') throw new Error(payload.error||payload.message||`HTTP ${response.status}`);
       const run=payload.run||{};
       const files=Array.isArray(payload.files)?payload.files:[];
+      activeRunNumber=run.RunNumber||runNumber||"";
+      activeRunFiles=files;
+      const zipButton=$('downloadRunZipButton');
+      zipButton.hidden=!files.some(file=>file.download_url&&!file.RetentionExpired);
       $('runDetailsSubtitle').textContent=`${run.Status||'Unknown'} · ${run.SubmittedBy||'Web User'} · ${run.ApplicationVersion||'—'}`;
       const start=run.StartedAtSaudi||run.StartedAtUtc||run.StartedAt||null;
       const end=run.CompletedAtSaudi||run.CompletedAtUtc||run.CompletedAt||null;
@@ -2436,6 +2519,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
   }
  
   $('closeRunDetails').addEventListener('click',closeRunDetails);
+  $('downloadRunZipButton').addEventListener('click',downloadActiveRunZip);
   $('runDetailsModal').addEventListener('click',event=>{if(event.target===$('runDetailsModal')) closeRunDetails();});
   document.addEventListener('keydown',event=>{if(event.key==='Escape') closeRunDetails();});
  
@@ -2468,12 +2552,15 @@ Drug Traceability Reconciliation Platform</textarea></label>
   function renderDashboardOverview(){
     const body=$("homeOverviewBody");
     if(!body) return;
-    const rows=getDashboardPreview();
-    if(!rows.length){
+    const allRows=getDashboardPreview();
+    if(!allRows.length){
       body.innerHTML=`<tr><td colspan="13"><div class="empty"><strong>No reconciliation data loaded</strong>Run a reconciliation to populate this operational table.</div></td></tr>`;
+      renderTablePagination("homeOverviewPagination",null,{page:1,pages:1,total:0},()=>{});
       return;
     }
-    body.innerHTML=rows.map(row=>{
+    const pageData=pageSlice(allRows,homePages.overview,HOME_PAGE_SIZE);
+    homePages.overview=pageData.page;
+    body.innerHTML=pageData.rows.map(row=>{
       const status=String(row.Status||"OK");
       const badgeClass=status==="OK"?"success":status==="DIFF"?"failed":"warning";
       return `<tr>
@@ -2492,6 +2579,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
         <td><span class="badge ${badgeClass}">${escapeHtml(status)}</span></td>
       </tr>`;
     }).join("");
+    renderTablePagination("homeOverviewPagination",null,pageData,page=>{homePages.overview=page;renderDashboardOverview();});
   }
  
   function dashboardPreviewTotals(){
@@ -2501,6 +2589,21 @@ Drug Traceability Reconciliation Platform</textarea></label>
       dispatch:rows.reduce((sum,row)=>sum+Number(row["To Be Dispatch"]||0),0),
       variance:rows.reduce((sum,row)=>sum+Math.abs(Number(row.Variance||0)),0)
     };
+  }
+
+  function renderHomeBreakdownChart(){
+    const chart=$("homeBreakdownChart");
+    if(!chart) return;
+    const data=historicalStatusData||{};
+    const rows=[
+      {label:"Matched SFDA & Warehouse",value:Number(data.matching_batches||0),color:"#168a48"},
+      {label:"Missing Batch in SFDA",value:Number(data.missing_in_sfda_batches||0),color:"#d13438"},
+      {label:"SFDA Quantity Below Received",value:Number(data.sfda_quantity_lower_batches||0),color:"#d97706"},
+      {label:"SFDA Quantity Above Received",value:Number(data.sfda_quantity_higher_batches||0),color:"#6b4eff"},
+      {label:"STO Awaiting Supplier Upload",value:Number(data.sto_followup_batches||0),color:"#07889b"}
+    ];
+    const max=Math.max(1,...rows.map(row=>row.value));
+    chart.innerHTML=rows.map(row=>`<div class="breakdown-row"><div class="breakdown-label">${escapeHtml(row.label)}</div><div class="breakdown-track"><div class="breakdown-bar" style="width:${Math.max(0,row.value/max*100)}%;background:${row.color}"></div></div><div class="breakdown-value">${formatNumber(row.value)} batches</div></div>`).join("");
   }
 
   function renderDashboardLinkedData(){
@@ -2518,7 +2621,10 @@ Drug Traceability Reconciliation Platform</textarea></label>
 
     const exceptionBody=$("homeExceptionsBody");
     if(exceptionBody){
-      const items=(variance.items||[]).slice(0,10);
+      const allItems=variance.items||[];
+      const pageData=pageSlice(allItems,homePages.exceptions,HOME_PAGE_SIZE);
+      homePages.exceptions=pageData.page;
+      const items=pageData.rows;
       if(items.length){
         exceptionBody.innerHTML=items.map(item=>`<tr>
           <td><strong>${escapeHtml(item.BN||"—")}</strong></td>
@@ -2531,11 +2637,15 @@ Drug Traceability Reconciliation Platform</textarea></label>
       }else{
         exceptionBody.innerHTML=`<tr><td colspan="6"><div class="empty"><strong>Details load on demand</strong>Open Variance Management to load the current exception list.</div></td></tr>`;
       }
+      renderTablePagination("homeExceptionsPagination",null,pageData,page=>{homePages.exceptions=page;renderDashboardLinkedData();});
     }
 
     const customerBody=$("homeCustomerDispatchBody");
     if(customerBody){
-      const customers=(product.customers||[]).slice(0,10);
+      const allCustomers=product.customers||[];
+      const pageData=pageSlice(allCustomers,homePages.customers,HOME_PAGE_SIZE);
+      homePages.customers=pageData.page;
+      const customers=pageData.rows;
       customerBody.innerHTML=customers.length?customers.map(row=>{
         const gln=String(row.GLN||"").trim();
         const mapping=(!gln)?"Not Mapped":(gln==="99999999999999"||gln.toUpperCase()==="DUMMY")?"Dummy":"Registered";
@@ -2548,7 +2658,9 @@ Drug Traceability Reconciliation Platform</textarea></label>
           <td><span class="badge ${badge}">${mapping}</span></td>
         </tr>`;
       }).join(""):`<tr><td colspan="5"><div class="empty"><strong>No customer history</strong>No customer dispatch history is available for this warehouse.</div></td></tr>`;
+      renderTablePagination("homeCustomerPagination",null,pageData,page=>{homePages.customers=page;renderDashboardLinkedData();});
     }
+    renderHomeBreakdownChart();
   }
 
   async function loadDashboardVarianceData({forceRefresh=false}={}){
@@ -2556,7 +2668,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
     if(exceptionBody){
       exceptionBody.innerHTML='<tr><td colspan="6"><div class="empty"><strong>Loading Variance Management</strong>Retrieving the highest-priority current exceptions.</div></td></tr>';
     }
-    const params=new URLSearchParams({page:"1",page_size:"25"});
+    const params=new URLSearchParams({page:"1",page_size:"100"});
     if(forceRefresh) params.set("refresh","true");
     const response=await fetch(`${VARIANCE_API_URL}?${params.toString()}`,{
       cache:"no-store",
@@ -2614,19 +2726,26 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }
   }
 
-  function formatHistoricalCoverage(fromValue,toValue){
-    const monthLabel=value=>{
+  function formatHistoricalCoverage(fromValue,toValue,lastBuildValue=null){
+    const monthParts=value=>{
       if(!value) return "";
       const match=String(value).trim().match(/^(\d{4})-(\d{2})/);
       if(!match) return "";
       const year=Number(match[1]),month=Number(match[2]);
       if(month<1||month>12) return "";
-      return new Intl.DateTimeFormat("en-US",{month:"short",year:"numeric"})
-        .format(new Date(Date.UTC(year,month-1,1)));
+      return {year,month};
     };
-    const from=monthLabel(fromValue),to=monthLabel(toValue);
-    if(!from||!to) return "—";
-    return from===to?from:`${from} → ${to}`;
+    const format=parts=>new Intl.DateTimeFormat("en-US",{month:"short",year:"numeric"}).format(new Date(Date.UTC(parts.year,parts.month-1,1)));
+    const from=monthParts(fromValue),rawTo=monthParts(toValue);
+    if(!from||!rawTo) return "—";
+    const now=new Date();
+    const current={year:now.getUTCFullYear(),month:now.getUTCMonth()+1};
+    const build=monthParts(lastBuildValue)||current;
+    const ceiling=(build.year*12+build.month)<(current.year*12+current.month)?build:current;
+    const rawKey=rawTo.year*12+rawTo.month,ceilingKey=ceiling.year*12+ceiling.month;
+    const to=rawKey>ceilingKey?ceiling:rawTo;
+    const fromLabel=format(from),toLabel=format(to);
+    return fromLabel===toLabel?fromLabel:`${fromLabel} → ${toLabel}`;
   }
 
   function renderHistoricalDashboardCards(status){
@@ -2634,11 +2753,15 @@ Drug Traceability Reconciliation Platform</textarea></label>
     if($("homeSfdaBatches")) $("homeSfdaBatches").textContent=formatNumber(data.total_sfda_batches||0);
     if($("homeMissingSupplierBatches")) $("homeMissingSupplierBatches").textContent=formatNumber(data.missing_supplier_batches||0);
     if($("homeStoFollowup")) $("homeStoFollowup").textContent=formatNumber(data.sto_followup_batches||0);
-    if($("homeHistoricalCoverage")) $("homeHistoricalCoverage").textContent=formatHistoricalCoverage(data.historical_from,data.historical_to);
-    if($("homeHistoricalBatchRows")) $("homeHistoricalBatchRows").textContent=formatNumber(data.batch_master_rows||0);
-    if($("homeHistoricalSupplierRows")) $("homeHistoricalSupplierRows").textContent=formatNumber(data.supplier_history_rows||0);
-    if($("homeHistoricalCustomerRows")) $("homeHistoricalCustomerRows").textContent=formatNumber(data.customer_history_rows||0);
+    if($("homeHistoricalCoverage")) $("homeHistoricalCoverage").textContent=formatHistoricalCoverage(data.historical_from,data.historical_to,data.last_build_utc);
+    if($("homeHistoricalMatchedRows")) $("homeHistoricalMatchedRows").textContent=formatNumber(data.matching_batches||0);
+    if($("homeHistoricalMatchRate")) $("homeHistoricalMatchRate").textContent=`${Number(data.match_rate_pct||0).toFixed(1)}%`;
+    if($("homeHistoricalMissingSfda")) $("homeHistoricalMissingSfda").textContent=formatNumber(data.missing_in_sfda_batches||0);
+    if($("homeHistoricalQuantityShort")) $("homeHistoricalQuantityShort").textContent=formatNumber(data.sfda_quantity_lower_batches||0);
+    if($("homeHistoricalQuantityHigh")) $("homeHistoricalQuantityHigh").textContent=formatNumber(data.sfda_quantity_higher_batches||0);
+    if($("homeHistoricalStoFollowup")) $("homeHistoricalStoFollowup").textContent=formatNumber(data.sto_followup_batches||0);
     if($("homeHistoricalLastBuild")) $("homeHistoricalLastBuild").textContent=formatHistoricalDate(data.last_build_utc);
+    renderHomeBreakdownChart();
   }
 
   function updateDashboard(){
@@ -2868,7 +2991,7 @@ Drug Traceability Reconciliation Platform</textarea></label>
       if(readyCard) readyCard.style.display="none";
       if(banner){
         banner.className="status-banner warning show";
-        banner.innerHTML='<span>!</span><div><strong>Historical data has not been built.</strong><br>Complete Step 1 to enable Full Reconciliation.</div>';
+        banner.innerHTML='<span>!</span><div><strong>Historical data has not been built.</strong><br>Complete Step 1 to enable Reconciliation.</div>';
       }
     }
     updateFullSetupButtons();
@@ -3798,26 +3921,30 @@ Drug Traceability Reconciliation Platform</textarea></label>
     }
 
     fillPiSelect("piStatusFilter",Object.keys(dist),"All statuses");
-    renderPiSuppliers();
-    renderPiCustomers();
     renderPiStatus();
     applyProductFilters();
   }
   function fillPiSelect(id,values,label){const el=$(id),current=el.value;el.innerHTML=`<option value="">${label}</option>`;[...new Set(values)].sort().forEach(v=>el.insertAdjacentHTML("beforeend",`<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`));el.value=current;}
-  function applyProductFilters(){
+  function applyProductFilters(resetPages=true){
     if(!piData)return;
     const q=$("piSearch").value.trim().toLowerCase();
     const status=$("piStatusFilter").value;
-    const rows=(piData.batches||[]).filter(row=>{
-      const hay=[row.GTIN,row["Drug Name"],row.BN,row["Generic Item Number"]].join(" ").toLowerCase();
+    if(resetPages){piPages.batches=1;piPages.suppliers=1;piPages.customers=1;}
+    const batchRows=(piData.batches||[]).filter(row=>{
+      const hay=[row.GTIN,row["Drug Name"],row.BN,row["Generic Item Number"],row["Trade Item Number"],row["Trade Name"]].join(" ").toLowerCase();
       return(!q||hay.includes(q))&&(!status||row.Status===status);
     });
-    renderPiBatches(rows);
+    const supplierRows=(piData.suppliers||[]).filter(row=>!q||[row["Supplier Name"],row["Supplier Code"]].join(" ").toLowerCase().includes(q));
+    const customerRows=(piData.customers||[]).filter(row=>!q||[row["To Address"],row.GLN].join(" ").toLowerCase().includes(q));
+    renderPiBatches(batchRows);
+    renderPiSuppliers(supplierRows);
+    renderPiCustomers(customerRows);
   }
 
   function renderPiBatches(rows){
     const body=$("piBatchBody");
-    body.innerHTML=rows.length?rows.map(row=>`<tr>
+    const pageData=pageSlice(rows,piPages.batches,PI_PAGE_SIZE);piPages.batches=pageData.page;
+    body.innerHTML=pageData.rows.length?pageData.rows.map(row=>`<tr>
       <td class="pi-drug-cell"><strong>${escapeHtml(row["Drug Name"]||"—")}</strong><small>${escapeHtml(row.GTIN||row["Generic Item Number"]||"—")}</small></td>
       <td><strong>${escapeHtml(row.BN||"—")}</strong><div class="file-info">${escapeHtml(row["Generic Item Number"]||"")}</div></td>
       <td>${piDate(row["Expiry Date"])}</td>
@@ -3831,18 +3958,21 @@ Drug Traceability Reconciliation Platform</textarea></label>
     $("piFilteredCount").textContent=`${formatNumber(rows.length)} shown`;
     $("piBatchSubtitle").textContent=`${formatNumber((piData.batches||[]).length)} total batches`;
     $("piBatchFooter").textContent=`${formatNumber(rows.length)} records`;
+    renderTablePagination("piBatchPagination",null,pageData,page=>{piPages.batches=page;applyProductFilters(false);});
   }
 
-  function renderPiSuppliers(){
-    const rows=piData.suppliers||[];
-    $("piSupplierBody").innerHTML=rows.length?rows.map(row=>`<tr><td><strong>${escapeHtml(row["Supplier Name"]||"—")}</strong></td><td>${escapeHtml(row["Supplier Code"]||"—")}</td><td>${piNum(row.received_pack)}</td><td>${piDate(row.last_receipt)}</td></tr>`).join(""):`<tr><td colspan="4" class="empty-cell">No supplier history.</td></tr>`;
+  function renderPiSuppliers(rows=piData.suppliers||[]){
+    const pageData=pageSlice(rows,piPages.suppliers,PI_PAGE_SIZE);piPages.suppliers=pageData.page;
+    $("piSupplierBody").innerHTML=pageData.rows.length?pageData.rows.map(row=>`<tr><td><strong>${escapeHtml(row["Supplier Name"]||"—")}</strong></td><td>${escapeHtml(row["Supplier Code"]||"—")}</td><td>${piNum(row.received_pack)}</td><td>${piDate(row.last_receipt)}</td></tr>`).join(""):`<tr><td colspan="4" class="empty-cell">No matching supplier history.</td></tr>`;
     $("piSupplierFooter").textContent=`${formatNumber(rows.length)} records`;
+    renderTablePagination("piSupplierPagination",null,pageData,page=>{piPages.suppliers=page;applyProductFilters(false);});
   }
 
-  function renderPiCustomers(){
-    const rows=piData.customers||[];
-    $("piCustomerBody").innerHTML=rows.length?rows.map(row=>`<tr><td><strong>${escapeHtml(row["To Address"]||"—")}</strong></td><td>${escapeHtml(row.GLN||"—")}</td><td>${piNum(row.dispatched_pack)}</td><td>${piDate(row.last_dispatch)}</td></tr>`).join(""):`<tr><td colspan="4" class="empty-cell">No customer history.</td></tr>`;
+  function renderPiCustomers(rows=piData.customers||[]){
+    const pageData=pageSlice(rows,piPages.customers,PI_PAGE_SIZE);piPages.customers=pageData.page;
+    $("piCustomerBody").innerHTML=pageData.rows.length?pageData.rows.map(row=>`<tr><td><strong>${escapeHtml(row["To Address"]||"—")}</strong></td><td>${escapeHtml(row.GLN||"—")}</td><td>${piNum(row.dispatched_pack)}</td><td>${piDate(row.last_dispatch)}</td></tr>`).join(""):`<tr><td colspan="4" class="empty-cell">No matching customer history.</td></tr>`;
     $("piCustomerFooter").textContent=`${formatNumber(rows.length)} records`;
+    renderTablePagination("piCustomerPagination",null,pageData,page=>{piPages.customers=page;applyProductFilters(false);});
   }
 
   function renderPiStatus(){

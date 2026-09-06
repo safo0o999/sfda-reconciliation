@@ -245,9 +245,12 @@ class ProductIntelligenceEngine:
         return {
             "status": "Completed",
             "summary": summary,
-            "batches": self._records(intelligence.sort_values(["Status", "Generic Item Number", "BN"], kind="stable"), 500),
-            "suppliers": self._records(supplier_table, 100),
-            "customers": self._records(customer_table, 100),
+            # Return the complete filtered datasets; the browser displays only
+            # 10 rows per page and keeps the remaining rows available through
+            # pagination and the shared search bar.
+            "batches": self._records(intelligence.sort_values(["Status", "Generic Item Number", "BN"], kind="stable")),
+            "suppliers": self._records(supplier_table),
+            "customers": self._records(customer_table),
             "alerts": alerts,
             "status_distribution": intelligence["Status"].value_counts().to_dict(),
             "metadata": {

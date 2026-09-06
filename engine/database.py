@@ -2938,7 +2938,7 @@ def get_historical_status() -> Dict[str, Any]:
     supplier_rows = int(row[1] or 0)
     customer_rows = int(row[2] or 0)
 
-    return {
+    result = {
         "exists": batch_rows > 0,
         "batch_master_rows": batch_rows,
         "supplier_history_rows": supplier_rows,
@@ -2950,9 +2950,81 @@ def get_historical_status() -> Dict[str, Any]:
         "historical_from": row[7],
         "historical_to": row[8],
     }
+    result.update(get_dashboard_matching_summary())
+    return result
 
 
-def get_dashboard_customer_summary(limit: int = 10) -> Dict[str, Any]:
+def get_dashboard_matching_summary() -> Dict[str, Any]:
+    """Return a compact SFDA/WMS batch-match breakdown for Home.
+
+    The query is set-based and warehouse-scoped. A product batch is counted as
+    an exact match only when BN, expiry month and the proven GTIN all match the
+    latest SFDA snapshot. Generic-proof-only batches therefore remain visible
+    under ``missing_in_sfda_batches`` instead of inflating the exact-match rate.
+    """
+
+    initialize_database()
+    from engine.warehouse_context import current_warehouse_id
+
+    warehouse_id = int(current_warehouse_id())
+    sql = r"""
+        WITH BatchRows AS
+        (
+            SELECT
+                BN,
+                ExpiryMonthKey,
+                GenericItemNumber,
+                NULLIF(LTRIM(RTRIM(ISNULL(GTIN, ''))), '') AS GTIN,
+                SUM(
+                    COALESCE(TotalReceiveQty, 0)
+                    / CASE WHEN COALESCE(PackageSize, 0) > 0 THEN PackageSize ELSE 1 END
+                ) AS ReceivedPack
+            FROM dbo.BatchMaster
+            WHERE WarehouseID = ?
+            GROUP BY BN, ExpiryMonthKey, GenericItemNumber,
+                     NULLIF(LTRIM(RTRIM(ISNULL(GTIN, ''))), '')
+        ),
+        SFDARows AS
+        (
+            SELECT
+                BN,
+                ExpiryMonthKey,
+                NULLIF(LTRIM(RTRIM(ISNULL(GTIN, ''))), '') AS GTIN,
+                SUM(COALESCE(Quantity, 0)) AS SFDAQuantity
+            FROM dbo.LatestSFDASnapshot
+            WHERE WarehouseID = ?
+            GROUP BY BN, ExpiryMonthKey,
+                     NULLIF(LTRIM(RTRIM(ISNULL(GTIN, ''))), '')
+        )
+        SELECT
+            COUNT_BIG(*) AS TotalWarehouseBatches,
+            SUM(CASE WHEN sf.BN IS NOT NULL THEN 1 ELSE 0 END) AS MatchingBatches,
+            SUM(CASE WHEN sf.BN IS NULL THEN 1 ELSE 0 END) AS MissingInSFDABatches,
+            SUM(CASE WHEN sf.BN IS NOT NULL AND sf.SFDAQuantity + 0.000001 < bm.ReceivedPack THEN 1 ELSE 0 END) AS SFDAQuantityLowerBatches,
+            SUM(CASE WHEN sf.BN IS NOT NULL AND sf.SFDAQuantity > bm.ReceivedPack + 0.000001 THEN 1 ELSE 0 END) AS SFDAQuantityHigherBatches
+        FROM BatchRows AS bm
+        LEFT JOIN SFDARows AS sf
+          ON sf.BN = bm.BN
+         AND sf.ExpiryMonthKey = bm.ExpiryMonthKey
+         AND sf.GTIN = bm.GTIN;
+    """
+
+    with Database().connect() as connection:
+        row = connection.cursor().execute(sql, warehouse_id, warehouse_id).fetchone()
+
+    total = int(row[0] or 0)
+    matching = int(row[1] or 0)
+    return {
+        "matching_total_batches": total,
+        "matching_batches": matching,
+        "missing_in_sfda_batches": int(row[2] or 0),
+        "sfda_quantity_lower_batches": int(row[3] or 0),
+        "sfda_quantity_higher_batches": int(row[4] or 0),
+        "match_rate_pct": (matching / total * 100.0) if total else 0.0,
+    }
+
+
+def get_dashboard_customer_summary(limit: int = 100) -> Dict[str, Any]:
     """Return Home customer/GLN metrics without building Product Intelligence.
 
     SQL first aggregates CustomerHistory to one row per customer, then the small
@@ -3031,7 +3103,7 @@ def refresh_dashboard_summary_cache() -> Dict[str, Any]:
 
     warehouse_id = int(current_warehouse_id())
     historical = get_historical_status()
-    customer = get_dashboard_customer_summary(limit=10)
+    customer = get_dashboard_customer_summary(limit=100)
     customer_summary = customer.get("summary") or {}
     customers_json = json.dumps(
         customer.get("customers") or [],
@@ -3119,16 +3191,18 @@ def refresh_dashboard_summary_cache() -> Dict[str, Any]:
 
 
 def get_cached_dashboard_summary() -> Dict[str, Any]:
-    """Return Home Dashboard data from one warehouse-scoped SQL row.
+    """Return cached Home data plus the current compact match breakdown.
 
     Existing deployments may have no cached row immediately after the migration;
     in that one-time case the cache is built synchronously. Subsequent Home
-    refreshes are a single-row read.
+    refreshes keep the large historical/customer payload cached; only the small
+    set-based match aggregate is evaluated against the latest SFDA snapshot.
     """
     initialize_database()
     from engine.warehouse_context import current_warehouse_id
 
     warehouse_id = int(current_warehouse_id())
+    matching_summary = get_dashboard_matching_summary()
     sql = r"""
         SELECT
             BatchMasterRows,
@@ -3195,19 +3269,21 @@ def get_cached_dashboard_summary() -> Dict[str, Any]:
             raise
 
     if row is None:
+        historical = {
+            "exists": False,
+            "batch_master_rows": 0,
+            "supplier_history_rows": 0,
+            "customer_history_rows": 0,
+            "last_build_utc": None,
+            "total_sfda_batches": 0,
+            "missing_supplier_batches": 0,
+            "sto_followup_batches": 0,
+            "historical_from": None,
+            "historical_to": None,
+        }
+        historical.update(matching_summary)
         return {
-            "historical": {
-                "exists": False,
-                "batch_master_rows": 0,
-                "supplier_history_rows": 0,
-                "customer_history_rows": 0,
-                "last_build_utc": None,
-                "total_sfda_batches": 0,
-                "missing_supplier_batches": 0,
-                "sto_followup_batches": 0,
-                "historical_from": None,
-                "historical_to": None,
-            },
+            "historical": historical,
             "customer": {
                 "summary": {
                     "customer_count": 0,
@@ -3226,8 +3302,7 @@ def get_cached_dashboard_summary() -> Dict[str, Any]:
         customers = []
 
     batch_rows = int(row[0] or 0)
-    return {
-        "historical": {
+    historical = {
             "exists": batch_rows > 0,
             "batch_master_rows": batch_rows,
             "supplier_history_rows": int(row[1] or 0),
@@ -3238,7 +3313,10 @@ def get_cached_dashboard_summary() -> Dict[str, Any]:
             "sto_followup_batches": int(row[6] or 0),
             "historical_from": row[7],
             "historical_to": row[8],
-        },
+        }
+    historical.update(matching_summary)
+    return {
+        "historical": historical,
         "customer": {
             "summary": {
                 "customer_count": int(row[9] or 0),
